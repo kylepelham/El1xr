@@ -1294,6 +1294,35 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic slots for a capped view heap: `VICTORY_DYNAMIC_SLOTS`, default
+/// [`DYNAMIC`], never more than half of `null` (the heap's last slot). A
+/// host without a cap keeps the default.
+fn dynamic_slots_on(null: u32, asked: Option<u32>) -> u32 {
+    if null == 0 {
+        return DYNAMIC;
+    }
+    let most = (null / 2).max(DYNAMIC);
+    asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, most)
+}
+
+fn dynamic_slots(null: u32) -> u32 {
+    static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let slots = dynamic_slots_on(null, asked);
+        if slots != DYNAMIC {
+            tracing::warn!(
+                slots,
+                title_in_place = null.saturating_sub(slots),
+                "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS)"
+            );
+        }
+        slots
+    })
+}
+
 /// (Neptune) Since the last line in the log: tables that waited for slots, the microseconds
 /// they waited, and tables given up (their draws not drawn).
 pub(crate) static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 3] =
@@ -1319,7 +1348,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1331,6 +1359,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -5860,6 +5889,15 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn dynamic_slots_stay_within_half_a_capped_heap() {
+        assert_eq!(dynamic_slots_on(0, Some(524_288)), DYNAMIC);
+        assert_eq!(dynamic_slots_on(2_000_000, None), DYNAMIC);
+        assert_eq!(dynamic_slots_on(2_000_000, Some(524_288)), 524_288);
+        assert_eq!(dynamic_slots_on(800_000, Some(524_288)), 400_000);
+        assert_eq!(dynamic_slots_on(2_000_000, Some(1)), DYNAMIC);
     }
 
     #[test]
