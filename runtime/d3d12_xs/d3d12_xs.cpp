@@ -1,4 +1,4 @@
-// d3d12_xs.dll d'AnyXboxX : traduction de D3D12.X (DirectX 12 de la console).
+// d3d12_xs.dll d'El1xr : traduction de D3D12.X (DirectX 12 de la console).
 //
 // Première étape : les fonctions dont le contrat est identique sur PC sont
 // redirigées vers le d3d12.dll de Windows par l'éditeur de liens (aucun code).

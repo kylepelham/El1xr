@@ -1,4 +1,4 @@
-// Objets d'interface du runtime GDK servis par AnyXboxX (voir served_interfaces.inc).
+// Objets d'interface du runtime GDK servis par El1xr (voir served_interfaces.inc).
 #pragma once
 
 #include <windows.h>
@@ -24,7 +24,7 @@ void* GameInterface();
 void* FeatureInterface();
 void* DisplayInterface();
 
-// XUID du profil local si `user` est un handle XUser valide d'AnyXboxX.
+// XUID du profil local si `user` est un handle XUser valide d'El1xr.
 bool LocalUserId(const void* user, uint64_t* xuid);
 
 // Sauvegardes (save_interface.cpp) et stockage local persistant (local_storage_interface.cpp).

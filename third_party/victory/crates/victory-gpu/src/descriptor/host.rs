@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::sync::atomic::AtomicU64;
 use std::sync::{Condvar, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -144,7 +145,11 @@ impl DynamicBits {
     }
 }
 
+/// Distinguishes host heaps even when a title heap address is reused.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1388,6 +1393,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -2486,7 +2492,10 @@ impl HostHeap {
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        // The set keeps its allocation across passes. It is emptied under
+        // the same lock as before, so writes racing this drain still belong
+        // to the next pass.
+        changed.drain().collect()
     }
 
     /// [`HostHeap::note_buffer_into`] without a batch, for tests.
@@ -2657,20 +2666,27 @@ impl HostHeap {
         stale
     }
 
+    /// The identity to store with a range this heap allocated.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned) when they came from this heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     #[cfg(test)]
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        self.release_many(&[(first, n)]);
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        self.release_many(id, &[(first, n)]);
     }
 
     /// Gives back a batch of `(first, n)` dynamic slot ranges under one lock,
     /// retiring any host resources those slots kept alive so released dynamic
-    /// tables do not pin evicted VRAM/shared memory.
-    pub(crate) fn release_many(&self, ranges: &[(u32, u32)]) {
-        if ranges.is_empty() {
+    /// tables do not pin evicted VRAM/shared memory. Ranges another host heap
+    /// took (`id` not this heap's: the title heap's address was reused) are
+    /// left alone.
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() || id != self.id {
             return;
         }
         let mut retired: Vec<ID3D12Resource> = Vec::new();
@@ -4945,6 +4961,27 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// The set of changed buffer slots is emptied, not replaced: it keeps
+    /// its allocation from one heap pass to the next.
+    #[test]
+    fn dirty_descriptor_drain_retains_capacity() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let capacity = {
+            let mut changed = heap.changed.lock().unwrap();
+            changed.extend([1, 2, 3]);
+            changed.capacity()
+        };
+        let mut first = heap.buffer_changes();
+        first.sort_unstable();
+        assert_eq!(first, vec![1, 2, 3]);
+        assert!(heap.buffer_changes().is_empty());
+        assert_eq!(heap.changed.lock().unwrap().capacity(), capacity);
+        heap.changed.lock().unwrap().insert(2);
+        assert_eq!(heap.buffer_changes(), vec![2]);
+    }
+
     /// The unsigned twin of a 16-bit float or signed format has its layout,
     /// and only buffer views in such a format are shown as another view.
     #[test]
@@ -5820,6 +5857,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(old) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(new) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(old.id(), new.id());
+        let first = new.dynamic(2).expect("two dynamic slots");
+        let free = new.free.load(std::sync::atomic::Ordering::Relaxed);
+        new.release(old.id(), first, 2);
+        assert_eq!(new.free.load(std::sync::atomic::Ordering::Relaxed), free);
+        new.release(new.id(), first, 2);
+        assert_eq!(
+            new.free.load(std::sync::atomic::Ordering::Relaxed),
+            free + 2
+        );
+    }
+
+    #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
@@ -5829,7 +5886,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 101));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 41));
     }
@@ -6112,7 +6169,7 @@ mod dynamic_bits_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some()
         );
-        heap.release(slot, 1);
+        heap.release(heap.id(), slot, 1);
         assert!(
             heap.kept[slot as usize]
                 .lock()
@@ -6128,10 +6185,10 @@ mod dynamic_bits_tests {
         let waiter_heap = std::sync::Arc::clone(&heap);
         let handle = std::thread::spawn(move || waiter_heap.dynamic(16));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        heap.release(fill_b, 16);
+        heap.release(heap.id(), fill_b, 16);
         let got = handle.join().unwrap();
         assert_eq!(got, Some(fill_b));
-        heap.release(fill_a, heap.dynamic - 17);
-        heap.release(fill_b, 16);
+        heap.release(heap.id(), fill_a, heap.dynamic - 17);
+        heap.release(heap.id(), fill_b, 16);
     }
 }

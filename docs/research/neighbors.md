@@ -2,7 +2,7 @@
 
 # Neighbouring projects: where they are ahead and how to catch up
 
-State on 21 November 2026. AnyXboxX is GPL-3.0 or later: the code of the three projects can
+State on 21 November 2026. El1xr is GPL-3.0 or later: the code of the three projects can
 be reused with credit in [THIRD_PARTY.md](../../THIRD_PARTY.md). None of the three
 starts a commercial Series X game yet (TomBox reaches the Fortnite lobby, according to their notes).
 Details per project: [tombox.md](tombox.md), [xbox2windows.md](xbox2windows.md).
@@ -37,28 +37,28 @@ Our copy of `third_party/leonida/` moves from `8bd0087d2d` to `bb2e18421d`: the 
 from 6,580 to 9,722 lines, without changing the `translate(chemin)` call that `emu/rdna2_spirv.py` uses.
 According to their README at this commit:
 
-| Area | Their state | For AnyXboxX |
+| Area | Their state | For El1xr |
 | --- | --- | --- |
 | RDNA 2 → SPIR-V | all 26,503 shaders of the game translated and accepted by `spirv-val`; 21,545 are wave64 | picked up by the updated copy |
 | Wave64 on GPUs with 32-wide subgroups (NVIDIA, Intel) | exact in compute and mesh (`--wave64-emulate`), approximate in VS/PS/GS | translator option, not yet exposed by `scarlett.py --spirv` |
 | GPU tests of the translator | more than 30 GPU and driver pairs (NVIDIA, AMD GCN3 to RDNA4, Intel, Apple, llvmpipe) | to compare with our `--banc` bench (#70) |
-| D3D12 Xbox → Vulkan | queue, command lists, barriers, copies, queries; no pipelines or draws yet | AnyXboxX aims at native D3D12 via TomBox (#18, #22) |
+| D3D12 Xbox → Vulkan | queue, command lists, barriers, copies, queries; no pipelines or draws yet | El1xr aims at native D3D12 via TomBox (#18, #22) |
 | Controllers | GameInput shim on SDL3 (rumble, DualSense triggers) | candidate for a GameInput issue |
 | BCPack textures | "clean-room" Python decoder for BC1 to BC7, a history table is missing | check provenance before any reuse (rule 2) |
 
 ## TomBox on 22 November 2026 (commit `51f5319`)
 
-The `third_party/tombox` submodule moves from `838f43f` to `51f5319` (15 commits). AnyXboxX's Rust
+The `third_party/tombox` submodule moves from `838f43f` to `51f5319` (15 commits). El1xr's Rust
 workspace and the 7 DLLs served by `ANYXBOXX_TOMBOX_DIR` (`tools/build_tombox.py`) build
 without changes.
 
-| Area | Their progress | For AnyXboxX |
+| Area | Their progress | For El1xr |
 | --- | --- | --- |
-| Licence | moved from MIT or Apache 2.0 to GPL-3.0 or later; `xma` stays LGPL-2.1 or later | compatible with AnyXboxX's GPL-3.0; notices updated |
+| Licence | moved from MIT or Apache 2.0 to GPL-3.0 or later; `xma` stays LGPL-2.1 or later | compatible with El1xr's GPL-3.0; notices updated |
 | `xg_x`, `xg_xs` | texture layout rewritten from the console model (0 mismatches on 3 builds), `XGEncodeDCC` exact on 1,000 cases | picked up by the built DLLs (`xg_xs`) |
 | GDK libraries | 37 defects fixed (`XTaskQueue` shutdown, `XVersion` order, GDK error codes, D3D12 device wrapper, `xmem`); 34 fixed return values identical to the console | picked up for `xmem`, `d3d12_xs`, `d3d12_x` |
 | `d3d12_xs` | ABI per console OS version | picked up by the built DLL |
-| Sandbox | fix for a drive-letter escape in `fs::resolve` (50,000 fuzz cases) | not used: AnyXboxX has its own launcher |
+| Sandbox | fix for a drive-letter escape in `fs::resolve` (50,000 fuzz cases) | not used: El1xr has its own launcher |
 | Console debugging tools (`xbtp`, `xtf*`) | sessions and clients reimplemented | out of scope for now |
 
 ## Xbox2Windows on 22 November 2026 (commit `0f8e7fa`)
@@ -68,7 +68,7 @@ Our copy of `third_party/xbox2windows/` moves from `bc24dfd7eb` to `0f8e7fa` (33
 wider than 64 bits; three generic modules are added (`call_evidence.py`, `probe_roots.py`,
 `pe_inventory.py`) with `tests/shader_probe_check.py`.
 
-| Area | Their progress | For AnyXboxX |
+| Area | Their progress | For El1xr |
 | --- | --- | --- |
 | Pixel shaders (AOT to DXIL) | 851 of the game's 12,101 pixel shaders compiled and identical on RTX 4060 and WARP; DPP16/DPP8, SDWA, conversions, `v_sin`/`v_cos` | compare our HLSL translations with their cases (#21) |
 | Compute and mesh | 12 exact compute shaders; one indexed mesh shader rendered like the CPU reference | to take into `--banc` (#70) |
@@ -85,7 +85,7 @@ wider than 64 bits; three generic modules are added (`call_evidence.py`, `probe_
 - **Leonida**: copy at `a0acd33d77` (9,722 → 10,704 lines: `ds_wrxchg*_rtn_b64`, typed buffers
   SINT and `32_32_32_UINT`, wave64 analysis of graphics shaders in the new `wave64_halves.py`).
 - **Xbox2Windows** (17 commits): CPU recompilation (SSE2 to SSE4.2, x87), DPP and SDWA in their
-  pixel shader recompiler; nothing new to copy for AnyXboxX.
+  pixel shader recompiler; nothing new to copy for El1xr.
 
 ## Update of 22 November, 6 pm
 
@@ -118,7 +118,7 @@ wider than 64 bits; three generic modules are added (`call_evidence.py`, `probe_
   a removed device, PSO warm-up, race fixed in the `xmem` sweep, XVM audio service.
 - **Leonida** `162821017e` → `aa2988cc55` (2,531 commits in four hours): typed buffer loads
   through a single size table; new copied dependency, `wave64_emulate_opt.py`. `buffer_store_short`
-  (reserved by AnyXboxX on their #2300) is still not handled on their side.
+  (reserved by El1xr on their #2300) is still not handled on their side.
 - **Xbox2Windows** `ff7f68a` → `6f48648`: the DXIL retarget refuses unresolved `xbox.*` calls before a PSO;
   new copied dependency, `tools/xbox_intrinsic_gate.py`.
 
@@ -126,13 +126,13 @@ wider than 64 bits; three generic modules are added (`call_evidence.py`, `probe_
 
 Everything specific to one game: archive and resource formats (RPF, AWC, TTPF, XBCH,
 FSSM), file names, hashes, shader inventories, online modules of specific games,
-Bink and FFX cases of Xbox2Windows. AnyXboxX stays a generic platform (rule 1 of AGENTS.md).
+Bink and FFX cases of Xbox2Windows. El1xr stays a generic platform (rule 1 of AGENTS.md).
 
 ## Full Leonida repository (23 November)
 
 The upstream Leonida repository was deleted on 2026-11-24 and its submodule was removed. See [leonida-gta6.md](leonida-gta6.md) for the earlier comparison of the GDK functions of the two runtimes.
 
-First launches of the 1.0.2.1 executable under `gta6rt` (stops measured in order, the Leonida pull requests that treat them, and the resulting work list for AnyXboxX): [first-boot-1021.md](first-boot-1021.md).
+First launches of the 1.0.2.1 executable under `gta6rt` (stops measured in order, the Leonida pull requests that treat them, and the resulting work list for El1xr): [first-boot-1021.md](first-boot-1021.md).
 
 The same executable carried to the frame loop under Leonida's `gta6rt` (stops, four measured causes of black frames, static findings, our mistakes, what the TomBox proxy must still serve): [leonida-boot-2026-11-23.md](leonida-boot-2026-11-23.md).
 

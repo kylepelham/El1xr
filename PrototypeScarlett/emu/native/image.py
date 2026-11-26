@@ -116,7 +116,7 @@ class NativeImage:
             self.bound[f"{dll}!{name}"] = address
         if untranslated:
             raise UntranslatedImport("Exécution native : fonctions console pas encore traduites par "
-                                     f"AnyXboxX ({len(untranslated)}) : " + ", ".join(untranslated))
+                                     f"El1xr ({len(untranslated)}) : " + ", ".join(untranslated))
 
     def resolve(self, dll, name):
         runtime = self.shims.runtime

@@ -5,7 +5,7 @@
 State as of the evening of 23 November 2026. This note files the research of that day (Claude and Codex, on the
 maintainer's machine) on the boot of build 1.0.2.1 under [Leonida](https://github.com/ItsNotRexed/Leonida)'s
 `gta6rt`, from the first stop to the frame loop. It continues [first-boot-1021.md](first-boot-1021.md), which stops at
-the first six stops and the work list for AnyXboxX. Neighbours in general: [neighbors.md](neighbors.md); Leonida's
+the first six stops and the work list for El1xr. Neighbours in general: [neighbors.md](neighbors.md); Leonida's
 GTA 6 notes: [leonida-gta6.md](leonida-gta6.md).
 
 **Rule 1 of [AGENTS.md](../../AGENTS.md) applies, and more strictly than in the first note.** This note holds
@@ -251,7 +251,7 @@ lines9686-rgb's run.
 | #6279 | still open while #1864 on main already produced the same bytes | after a change on main, re-measure and close an overlapped PR |
 | Overlapping slot 55 work | #8869 also served slot 55 | we kept slot 55 in #7759 and proposed the other PR for slot 81, to be decided by the maintainers |
 
-## 7. What this implies for AnyXboxX
+## 7. What this implies for El1xr
 
 Since PR #109 the proxy of TomBox is the default
 (`runtime/build/tombox`), and it serves `d3d12_xs`, `xmem` and `XCRDAPI`. Everything above says what that proxy must

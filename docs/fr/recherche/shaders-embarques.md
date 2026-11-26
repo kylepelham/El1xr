@@ -11,7 +11,7 @@ Ce sont les seuls vrais shaders console disponibles avant l'exécutable du jeu.
 
 | Étape | Résultat |
 |---|---|
-| Désassemblage par AnyXboxX (sans llvm-mc) | 54 197 instructions ; 1 431 mots sans texte, des données entre les programmes d'un même blob (jusqu'à 5 programmes) |
+| Désassemblage par El1xr (sans llvm-mc) | 54 197 instructions ; 1 431 mots sans texte, des données entre les programmes d'un même blob (jusqu'à 5 programmes) |
 | Traduction RDNA 2 → SPIR-V (traducteur de Leonida, nourri par notre désassemblage) | **51 programmes sur 52** |
 | Échec restant | `buffer_store_short`, règle absente du traducteur |
 

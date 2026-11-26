@@ -1,4 +1,4 @@
-// Outils communs aux objets d'interface du runtime GDK servis par AnyXboxX.
+// Outils communs aux objets d'interface du runtime GDK servis par El1xr.
 //
 // Un objet est statique : sa table de méthodes suit l'ordre relevé dans
 // gdk_api_table.inc (0 QueryInterface, 1 AddRef, 2 Release, puis les API), et

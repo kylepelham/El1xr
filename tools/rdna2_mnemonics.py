@@ -2,7 +2,7 @@
 
 Source : les tests d'encodage publics de LLVM (llvm/test/MC/AMDGPU/gfx10_asm_*.s,
 gfx1030_new.s et mtbuf-gfx10.s, licence Apache 2.0 avec exception LLVM). Chaque ligne « encoding: [...] »
-est passée au décodeur d'AnyXboxX ; on vérifie au passage que la longueur qu'il calcule
+est passée au décodeur d'El1xr ; on vérifie au passage que la longueur qu'il calcule
 est celle de LLVM. Les noms de gfx1030 (RDNA 2) l'emportent sur ceux de gfx1010. Les lignes
 sans « encoding: » (« // GFX10: [0xfa,...] », gfx10_asm_dpp16.s, dpp8.s, mimg.s) comptent aussi :
 l'instruction est alors la ligne source qui les précède (seule source de v_sat_pk_u8_i16).

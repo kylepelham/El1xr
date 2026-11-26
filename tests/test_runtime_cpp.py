@@ -89,7 +89,7 @@ def test_xmem_frees_each_block_with_the_allocator_that_made_it(runtime_dir):
     try:
         hooked = xmem.XMemAlloc(32, 0)
         assert hooked == ctypes.addressof(pool)
-        xmem.XMemFree(before, 0)            # bloc par défaut : libéré par AnyXboxX
+        xmem.XMemFree(before, 0)            # bloc par défaut : libéré par El1xr
         assert freed == []
         xmem.XMemFree(hooked, 0)            # bloc du jeu : rendu à son crochet
         assert freed == [hooked]
@@ -125,7 +125,7 @@ def test_unknown_interface_delegated_to_windows_fails_cleanly(runtime_dir):
     assert code & 0x8000_0000 and pointer == "None"
 
 
-# Ces tests vérifient l'implémentation d'AnyXboxX : si le runtime GDK de Windows est
+# Ces tests vérifient l'implémentation d'El1xr : si le runtime GDK de Windows est
 # présent et autorisé (ANYXBOXX_SYSTEM_RUNTIME=1), c'est lui qui sert toutes les interfaces.
 anyxboxx_only = pytest.mark.skipif(
     __import__("os").environ.get("ANYXBOXX_SYSTEM_RUNTIME") != "0" and SYSTEM_RUNTIME.is_file(),
@@ -273,7 +273,7 @@ def test_gamertag_has_its_own_interface(runtime_dir):
                           ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t))
     buffer, used = ctypes.create_string_buffer(16), ctypes.c_size_t()
     assert get(user, 0, 16, buffer, ctypes.byref(used)) == S_OK
-    assert buffer.value == b"AnyXboxX" and used.value == 9
+    assert buffer.value == b"El1xr" and used.value == 6
     assert get(user, 0, 4, ctypes.create_string_buffer(4), ctypes.byref(used)) == 0x8007007A   # tampon trop petit
 
 

@@ -773,8 +773,16 @@ fn lazy_copyback_multithread_concurrent_fault_stress() {
             std::ptr::write_bytes(block.ptr, 0x11, LEN);
         }
         let shadow = make_test_shadow(h, base_addr as u64, LEN as u64, true).expect("shadow");
+        // `MEM_PRIVATE` has no second view to fill the page through while it is still
+        // `PAGE_NOACCESS`: the flush makes it readable, then copies (`unprotect_and_write_page`).
+        // A thread that touches it in between takes no fault and may read the bytes from
+        // before the dispatch (never anything else). Every thread that faulted waits for the
+        // whole copy, and the page ends whole, checked after each collision.
+        const SAMPLES: [usize; 6] = [0, 17, 511, 4096, 12_345, PAGE / 4 - 1];
+        let mut before_tag = None;
         for round in 1u32..=4 {
             let tag = round.wrapping_mul(0x2222_0003);
+            let before = move |global: u32| before_tag.map_or(0x1111_1111, |t: u32| t ^ global);
             pipe.dispatch_on(h, &list, &shadow, 0, LEN, tag, 1);
             assert_eq!(shadow.deferred_count.load(Ordering::Acquire), PAGES, "private round={round}");
 
@@ -787,13 +795,14 @@ fn lazy_copyback_multithread_concurrent_fault_stress() {
                             barrier.wait();
                             let page_ptr = (base_addr + page_idx * PAGE) as *mut u32;
                             // First touch collides all 8 threads on `PAGE_NOACCESS` during GPU readback.
-                            let first = unsafe { page_ptr.read_volatile() };
-                            assert_eq!(first, tag ^ (page_idx * (PAGE / 4)) as u32);
-                            for sample in [17usize, 511, 4096, 12_345, PAGE / 4 - 1] {
+                            for sample in SAMPLES {
                                 let global_u32 = (page_idx * (PAGE / 4) + sample) as u32;
-                                // SAFETY: page is already flushed to PAGE_READWRITE.
+                                // SAFETY: committed page; the VEH flushes it on a fault.
                                 let got = unsafe { page_ptr.add(sample).read_volatile() };
-                                assert_eq!(got, tag ^ global_u32);
+                                assert!(
+                                    got == tag ^ global_u32 || got == before(global_u32),
+                                    "private round={round} tid={tid} page={page_idx} sample={sample} got={got:#x}"
+                                );
                             }
                             let slot = 100 + tid;
                             let marker = 0xBEEF_0000 ^ (round << 8) ^ (page_idx as u32) ^ (tid as u32);
@@ -802,7 +811,15 @@ fn lazy_copyback_multithread_concurrent_fault_stress() {
                         });
                     }
                 });
+                let page_ptr = (base_addr + page_idx * PAGE) as *const u32;
+                for sample in SAMPLES {
+                    let global_u32 = (page_idx * (PAGE / 4) + sample) as u32;
+                    // SAFETY: the page is flushed and `PAGE_READWRITE` now.
+                    let got = unsafe { page_ptr.add(sample).read_volatile() };
+                    assert_eq!(got, tag ^ global_u32, "private round={round} page={page_idx} sample={sample}");
+                }
             }
+            before_tag = Some(tag);
         }
         drop(shadow);
     }

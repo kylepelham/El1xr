@@ -1,5 +1,5 @@
 // Identité du jeu lue dans son MicrosoftGame.config (dossier donné par ANYXBOXX_GAME_DIR,
-// que le mode natif d'AnyXboxX renseigne avant de lancer le jeu).
+// que le mode natif d'El1xr renseigne avant de lancer le jeu).
 #pragma once
 
 #include <cstdint>

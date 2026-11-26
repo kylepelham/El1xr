@@ -22,7 +22,7 @@ Setup: i7-13700KF, RTX 4070 SUPER, Windows 11. VIctory `main` plus its pull requ
 - Measured: the D3D12 debug layer counts 119 compute shaders refused because they ask for 64-lane waves (the driver maximum is 32), 117 barriers with a wrong "before" state and 74 vertex buffers still in UAV state.
 - Measured: 351 programs are not yet translated by VIctory in the world. Main reasons (counts): select on an untracked mask 82, lane mask read as data 76, address in an SGPR outside a root parameter 35, structured buffer of unknown stride 31, scalar load read as data 24.
 
-## What it means for AnyXboxX
+## What it means for El1xr
 
 Our issues [#68](https://github.com/LooperSalty/AnyXboxX/issues/68) (structured control flow and lane masks) and [#70](https://github.com/LooperSalty/AnyXboxX/issues/70) (wave64) are exactly these gaps: lane masks read as data and selects on untracked masks are #68; the 119 refused compute shaders are #70. We reuse instead of rewriting, following the "what to take" approach of [neighbors.md](neighbors.md): xcl's wave64-on-wave32 approach (two halves, read as a design, not copied because of the licence) and VIctory's pull requests #223 and #233 (GPL-3.0 or later, reusable with credit).
 

@@ -1,4 +1,4 @@
-# Contributing to AnyXboxX
+# Contributing to El1xr
 
 Thanks for your interest. These rules apply to everyone except the maintainer.
 
@@ -45,7 +45,7 @@ For a large change, open an issue first to discuss it.
 
 The implementation relies on public sources: AMD's RDNA 2 ISA documentation, Microsoft Learn (GDK, Win32, D3D12), LLVM's tests, and open-source code under a compatible licence, credited in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-You may use your own copy of the game's executable and build: launch it (native, VIctory through `tools/lancer_victory.ps1`, AnyXboxX), measure, debug, analyse it statically and dynamically, and use what you learn to steer your PRs. Measurements and findings drawn from running it (summarised logs, counts, technical identifiers such as shader hashes or pass names, test results) may be cited in PRs and in the docs, with how they were obtained (measured, read statically, assumed). The limit: no file, code or asset of the game or the console in the repository. Three things drawn from the game are allowed, as in VIctory's policy (VIctory's `docs/asset-policy.md`): byte-pattern signatures (short patterns written by us, with masks) that locate functions or data in the executable, the per-build offsets of the functions we hook (under names we choose), and the build identity (hash of the executable, CodeView GUID/age).
+You may use your own copy of the game's executable and build: launch it (native, VIctory through `tools/lancer_victory.ps1`, El1xr), measure, debug, analyse it statically and dynamically, and use what you learn to steer your PRs. Measurements and findings drawn from running it (summarised logs, counts, technical identifiers such as shader hashes or pass names, test results) may be cited in PRs and in the docs, with how they were obtained (measured, read statically, assumed). The limit: no file, code or asset of the game or the console in the repository. Three things drawn from the game are allowed, as in VIctory's policy (VIctory's `docs/asset-policy.md`): byte-pattern signatures (short patterns written by us, with masks) that locate functions or data in the executable, the per-build offsets of the functions we hook (under names we choose), and the build identity (hash of the executable, CodeView GUID/age).
 
 ## Taking code from another repository
 

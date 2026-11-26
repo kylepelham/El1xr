@@ -6,7 +6,7 @@
 
 ## Point de départ vérifié
 
-Les deux manifestes du paquet désignent `game_scarlett_master.exe`, que le layout place dans le chunk 1001. Le fichier est absent de sa destination et la recherche récursive locale par nom exact ne l'a pas trouvé. Cela n'exclut pas un fichier renommé ou dans un conteneur. Depuis la racine d'AnyXboxX, `python PrototypeScarlett/scarlett.py --rapport ..` échoue actuellement en signalant l'exécutable absent. Ses imports, ses chemins d'exécution et ses shaders effectivement utilisés restent inconnus.
+Les deux manifestes du paquet désignent `game_scarlett_master.exe`, que le layout place dans le chunk 1001. Le fichier est absent de sa destination et la recherche récursive locale par nom exact ne l'a pas trouvé. Cela n'exclut pas un fichier renommé ou dans un conteneur. Depuis la racine d'El1xr, `python PrototypeScarlett/scarlett.py --rapport ..` échoue actuellement en signalant l'exécutable absent. Ses imports, ses chemins d'exécution et ses shaders effectivement utilisés restent inconnus.
 
 L'[avancée](../avancee.md) rapporte l'initialisation isolée de 16 DLL du paquet, avec 876 imports résolus sur 1 337 dans la configuration mesurée. Cette mesure porte sur leurs tables d'imports et leur initialisation, pas sur l'exécutable manquant ni sur toutes les fonctions des DLL. Les démonstrations PC ne prouvent pas qu'un jeu Scarlett fonctionne.
 

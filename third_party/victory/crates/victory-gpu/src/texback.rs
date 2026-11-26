@@ -23,9 +23,14 @@
 //! never reads are copied back too (about a megabyte per such list). The
 //! copy shows what the list's last write left; a title read in between sees
 //! the frame before, as it would before the console's GPU has run.
+//!
+//! Each copy-back is tied to the allocation it was armed for ([`Ticket`],
+//! from fxceless/victory-fork #999): if the title releases the texture, places
+//! another texture at its memory, or the runtime remaps that memory before
+//! the list has run, the texels are not written there.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -76,6 +81,127 @@ fn modes_allowed() -> &'static [u32] {
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
     !kinds.is_empty() && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+}
+
+/// An outstanding copy-back into one allocation of title memory: changes of
+/// mapping and of resources invalidate only the ones that could touch the
+/// memory they changed.
+struct Ticket {
+    owner: usize,
+    at: usize,
+    end: usize,
+    valid: AtomicBool,
+}
+
+static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+static TRACKING: AtomicBool = AtomicBool::new(false);
+
+fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
+    let ticket = Arc::new(Ticket {
+        owner,
+        at,
+        end,
+        valid: AtomicBool::new(true),
+    });
+    let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    tickets.retain(|weak| weak.strong_count() != 0);
+    tickets.push(Arc::downgrade(&ticket));
+    TRACKING.store(true, Ordering::Relaxed);
+    ticket
+}
+
+fn invalidate(matches: impl Fn(&Ticket) -> bool) {
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
+    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+        let Some(ticket) = weak.upgrade() else {
+            return false;
+        };
+        if matches(&ticket) {
+            ticket.valid.store(false, Ordering::Release);
+        }
+        true
+    });
+}
+
+/// Title texture `owner` is being freed.
+pub(crate) fn released(owner: usize) {
+    invalidate(|ticket| ticket.owner == owner);
+}
+
+/// A texture was made at title memory `at`.
+pub(crate) fn replaced(at: usize) {
+    invalidate(|ticket| ticket.at == at);
+}
+
+/// The runtime mapped or unmapped `[at, at + len)`.
+pub(crate) fn remapped(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    invalidate(|ticket| at < ticket.end && ticket.at < end);
+}
+
+/// A texture of a kind copied back that a list's shaders write, taken when
+/// the draw or dispatch is prepared: its host copy, held apart from the
+/// title's resource (which the title may release before the list closes),
+/// its console layout and swizzle mode, and its allocation's ticket.
+pub(crate) struct Target {
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    layout: victory_formats::texture::Layout,
+    mode: u32,
+    ticket: Arc<Ticket>,
+}
+
+impl Target {
+    pub(crate) fn new(resource: This) -> Option<Self> {
+        let copy = crate::resource::host_copy(resource)?;
+        let (layout, at, size, mode) = crate::resource::title_texture(resource)?;
+        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
+        let ticket = track(resource as usize, at, end);
+        Some(Self {
+            copy,
+            layout,
+            mode,
+            ticket,
+        })
+    }
+
+    /// The title texture it was taken for.
+    pub(crate) fn owner(&self) -> usize {
+        self.ticket.owner
+    }
+}
+
+/// A list's shaders write title texture `owner`: its [`Target`] joins
+/// `wanted` once. One already there whose allocation changed since (the
+/// memory reused or remapped between two writes of the list) is taken
+/// again in its place; kept, the copy-back would be dropped at the close.
+pub(crate) fn want(wanted: &mut Vec<Target>, owner: usize, make: impl FnOnce() -> Option<Target>) {
+    want_in(
+        wanted,
+        |t| t.owner() == owner,
+        |t| t.ticket.valid.load(Ordering::Acquire),
+        make,
+    );
+}
+
+fn want_in<T>(
+    wanted: &mut Vec<T>,
+    same: impl Fn(&T) -> bool,
+    fresh: impl Fn(&T) -> bool,
+    make: impl FnOnce() -> Option<T>,
+) {
+    let at = wanted.iter().position(same);
+    if at.is_some_and(|i| fresh(&wanted[i])) {
+        return;
+    }
+    let Some(target) = make() else {
+        return;
+    };
+    match at {
+        Some(i) => wanted[i] = target,
+        None => wanted.push(target),
+    }
 }
 
 /// Pooled D3D12 read-back buffer reused across texture copy-backs so repeated
@@ -155,9 +281,15 @@ pub(crate) struct Back {
     rows: Vec<u32>,
     mips: u32,
     layout: victory_formats::texture::Layout,
-    /// The texture's title memory and its layout's bytes.
-    at: usize,
-    size: usize,
+    /// The allocation the texels go to (title memory, [`Ticket`]).
+    ticket: Arc<Ticket>,
+}
+
+impl Back {
+    /// The title memory the copy-back writes once its list has run.
+    pub(crate) fn range(&self) -> (usize, usize) {
+        (self.ticket.at, self.ticket.end)
+    }
 }
 
 impl Drop for Back {
@@ -168,15 +300,16 @@ impl Drop for Back {
     }
 }
 
-/// Records into `list` the copy of `texture` (title resource `resource`'s
-/// host copy, in the copy-source state) into a read-back buffer.
-pub(crate) fn record(
-    list: &ID3D12GraphicsCommandList,
-    resource: This,
-    texture: &ID3D12Resource,
-) -> Option<Back> {
+/// Records into `list` the copy of `target`'s host copy (in the copy-source
+/// state) into a read-back buffer; nothing if its allocation changed since.
+pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
+    if !target.ticket.valid.load(Ordering::Acquire) {
+        return None;
+    }
     let host = crate::host::host()?;
-    let (layout, at, size, mode) = crate::resource::title_texture(resource)?;
+    let texture = &target.copy.texture;
+    let (layout, mode) = (target.layout, target.mode);
+    let (at, size) = (target.ticket.at, target.ticket.end - target.ticket.at);
     // SAFETY: a live texture.
     let desc = unsafe { texture.GetDesc() };
     if !layout.addressable() {
@@ -196,7 +329,7 @@ pub(crate) fn record(
     if !modes_allowed().contains(&mode) {
         return None;
     }
-    arm_log(resource, at, &desc, size, mode);
+    arm_log(target.ticket.owner, at, &desc, size, mode);
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
     let n = subresources as usize;
@@ -216,6 +349,15 @@ pub(crate) fn record(
             Some(&mut total),
         )
     };
+    // The last footprint's extent can leave out its row-end padding, and
+    // the tiler reads whole pitched rows: the buffer must hold them.
+    for (footprint, &rows) in footprints.iter().zip(&rows) {
+        let f = footprint.Footprint;
+        let pitched = u64::from(f.RowPitch)
+            .checked_mul(u64::from(rows))?
+            .checked_mul(u64::from(f.Depth))?;
+        total = total.max(footprint.Offset.checked_add(pitched)?);
+    }
     let buffer = take_readback_buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -243,20 +385,19 @@ pub(crate) fn record(
         rows,
         mips,
         layout,
-        at,
-        size,
+        ticket: target.ticket,
     })
 }
 
 /// Logs the first copy of each texture: where it lies, its format and size,
 /// and the tile mode its texels go in.
-fn arm_log(resource: This, at: usize, desc: &D3D12_RESOURCE_DESC, size: usize, mode: u32) {
+fn arm_log(resource: usize, at: usize, desc: &D3D12_RESOURCE_DESC, size: usize, mode: u32) {
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 32 && !seen.contains(&at) {
         seen.push(at);
         tracing::info!(
-            resource = ?resource,
+            resource = format_args!("{resource:#x}"),
             address = format_args!("{at:#x}"),
             format = desc.Format.0,
             width = desc.Width,
@@ -277,9 +418,14 @@ pub(crate) fn land(back: &Back) {
     let Some(buffer) = back.buffer.as_ref() else {
         return;
     };
-    let mut tiled = vec![0u8; back.size];
+    if stale(back) {
+        return;
+    }
+    let (at, end) = back.range();
+    let size = end - at;
+    let mut tiled = vec![0u8; size];
     // Bytes of title memory the subresources do not cover stay as they are.
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    crate::host::copy_mapped(tiled.as_mut_ptr(), at as *const u8, size, false);
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -311,10 +457,31 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above, and its contents are no longer accessed.
     unsafe { buffer.resource.Unmap(0, None) };
-    if tiled_ok {
-        crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+    // Looked at again just before the write: a change of the allocation
+    // while the texels were tiled still keeps them out. (A remap between
+    // this and the copy leaves an unmapped destination alone,
+    // `crate::host::copy_mapped`.)
+    if tiled_ok && !stale(back) {
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
         LANDED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether `back`'s allocation changed since it was armed (counted, and
+/// logged now and then).
+fn stale(back: &Back) -> bool {
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    if back.ticket.valid.load(Ordering::Acquire) {
+        return false;
+    }
+    let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+    if skipped.is_power_of_two() {
+        tracing::info!(
+            skipped,
+            "texture copy-backs skipped: their title allocation changed"
+        );
+    }
+    true
 }
 
 #[cfg(test)]
