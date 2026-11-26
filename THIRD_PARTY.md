@@ -55,6 +55,8 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
+| [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) (DoubleGhosty) | GPL-3.0 ou ultérieure | | Échantillonneurs immédiats choisis entre deux branches uniformes par un phi (commit `754cafc9`, `victory-shader` `emit/lower.rs`) |
+| [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) (Taynan Piza ; PR de cwWwWwW, alex/nullexxx, efsebayern, meshahid.973) | GPL-3.0 ou ultérieure | | Emplacements dynamiques rendus au seul tas qui les a pris (PR #53, portée de fxceless/victory-fork #1324) ; pointeur nul pour une bibliothèque de pipelines vide (PR #31, d'après Marvisak/VIctory `e5a8c2f`) ; réserve d'instantanés triée par capacité (PR #58) ; blocs de relocalisation PE validés (PR #25) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
