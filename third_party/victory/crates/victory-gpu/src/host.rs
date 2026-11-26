@@ -1762,8 +1762,6 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1815,15 +1813,18 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more, and its size: one kept
+/// ([`SPARE`], `crate::scratch_spare::take_kept`) or a new one.
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
@@ -1831,15 +1832,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
-        buffer,
-        data: data as usize,
-        gpu,
-    })
+    Some((Chunk { buffer, data: data as usize, gpu }, size))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past
+/// `crate::scratch_spare::spare_most` and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -1850,7 +1848,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, crate::scratch_spare::spare_most())
             } else {
                 Some(chunk)
             };
@@ -8703,7 +8701,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8737,7 +8735,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
