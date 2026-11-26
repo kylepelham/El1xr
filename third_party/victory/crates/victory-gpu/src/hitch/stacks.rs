@@ -9,11 +9,12 @@
 //! (VIctory's own functions from its PDB, system DLLs by export, title code
 //! as a bare address) and logs the most frequent ones.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, RtlLookupFunctionEntry, RtlVirtualUnwind,
     SYMBOL_INFO, SYMOPT_DEFERRED_LOADS, SYMOPT_UNDNAME, SymFromAddr, SymInitialize, SymSetOptions,
@@ -28,12 +29,16 @@ use windows_sys::Win32::System::Threading::{
 pub(crate) const SAMPLE_AFTER_MS: u64 = 60;
 /// A frame this long or longer has its samples named.
 pub(crate) const SAMPLE_FROM_MS: u64 = 250;
+/// A thread of ours in a span this old is sampled too while a frame is late.
+const OTHER_AFTER_MS: u64 = 40;
 /// Frames unwound per sample.
-const DEPTH: usize = 32;
+const DEPTH: usize = 48;
 /// Innermost frames a group is keyed by.
-const KEY_FRAMES: usize = 12;
-/// Samples kept per late frame (about 20 s at the sampling rate).
-const MOST_SAMPLES: usize = 4000;
+const KEY_FRAMES: usize = 22;
+/// Samples kept per late frame.
+const MOST_SAMPLES: usize = 8000;
+/// Threads whose open spans are known.
+const THREADS: usize = 128;
 
 /// Whether the sampler runs.
 fn enabled() -> bool {
@@ -44,6 +49,79 @@ fn enabled() -> bool {
     })
 }
 
+/// A thread that opened spans: its id, its stack's bounds, the
+/// milliseconds (of [`epoch`], plus one) its outermost open span began (0:
+/// none open) and the innermost open phase.
+struct Known {
+    id: AtomicU32,
+    stack: [AtomicU64; 2],
+    since_ms: AtomicU64,
+    phase: AtomicU32,
+}
+
+static KNOWN: [Known; THREADS] = [const {
+    Known {
+        id: AtomicU32::new(0),
+        stack: [const { AtomicU64::new(0) }; 2],
+        since_ms: AtomicU64::new(0),
+        phase: AtomicU32::new(0),
+    }
+}; THREADS];
+static KNOWN_TAKEN: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// This thread's entry in [`KNOWN`] (`usize::MAX`: none left).
+    static MINE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn mine() -> Option<&'static Known> {
+    let at = MINE.with(|mine| {
+        if let Some(at) = mine.get() {
+            return at;
+        }
+        let at = {
+            let at = KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed) as usize;
+            if let Some(k) = KNOWN.get(at) {
+                let (mut low, mut high) = (0usize, 0usize);
+                // SAFETY: writes this thread's stack bounds.
+                unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+                k.stack[0].store(low as u64, Ordering::Relaxed);
+                k.stack[1].store(high as u64, Ordering::Relaxed);
+                k.id.store(super::thread_id(), Ordering::Relaxed);
+            }
+            at
+        };
+        mine.set(Some(at));
+        at
+    });
+    KNOWN.get(at)
+}
+
+/// A span opened (`outermost`: none was open on this thread).
+pub(crate) fn opened(phase: super::Phase, outermost: bool, now: Instant) {
+    if !enabled() {
+        return;
+    }
+    let Some(k) = mine() else { return };
+    k.phase.store(phase as u32, Ordering::Relaxed);
+    if outermost {
+        let ms = now.saturating_duration_since(epoch()).as_millis() as u64 + 1;
+        k.since_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+/// A span closed; `parent` is open again, or none.
+pub(crate) fn closed(parent: Option<super::Phase>) {
+    if !enabled() {
+        return;
+    }
+    let Some(k) = mine() else { return };
+    match parent {
+        Some(p) => k.phase.store(p as u32, Ordering::Relaxed),
+        None => k.since_ms.store(0, Ordering::Relaxed),
+    }
+}
+
 /// The presenting thread, its stack's bounds and its last present
 /// (milliseconds of [`epoch`]).
 static PRESENTER: AtomicU32 = AtomicU32::new(0);
@@ -51,11 +129,15 @@ static STACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// One sample: whose (`u32::MAX`: the presenting thread; else the phase a
+/// thread of ours was in) and its frames.
+type Sample = (u32, [u64; DEPTH]);
+
 /// Samples of the frame running late, and frames ended that the sampler is
 /// to name: (frame, its time in microseconds, its samples).
 struct Shared {
-    samples: Vec<[u64; DEPTH]>,
-    ended: Vec<(u64, u64, Vec<[u64; DEPTH]>)>,
+    samples: Vec<Sample>,
+    ended: Vec<(u64, u64, Vec<Sample>)>,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -106,50 +188,73 @@ pub(crate) fn frame_ended(frame: u64, frame_us: u64, me: u32) {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
+/// Handles of the threads sampled, kept open.
+struct Handles(std::collections::HashMap<u32, HANDLE>);
+
+impl Handles {
+    fn get(&mut self, id: u32) -> Option<HANDLE> {
+        if let Some(&h) = self.0.get(&id) {
+            return Some(h);
+        }
+        // SAFETY: opens a thread of this process.
+        let h = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                0,
+                id,
+            )
+        };
+        if h.is_null() {
+            return None;
+        }
+        self.0.insert(id, h);
+        Some(h)
+    }
+}
+
 fn sampler() {
     let symbols = Symbols::new();
     tracing::info!(
         symbols = symbols.ready,
-        "late frames: the presenting thread's stack is sampled past {SAMPLE_AFTER_MS} ms and named for frames of {SAMPLE_FROM_MS} ms or more (VICTORY_HITCH_STACKS)"
+        "late frames: the presenting thread's stack, and those of our threads in a call of {OTHER_AFTER_MS} ms or more, are sampled past {SAMPLE_AFTER_MS} ms and named for frames of {SAMPLE_FROM_MS} ms or more (VICTORY_HITCH_STACKS)"
     );
-    let mut open: Option<(u32, HANDLE)> = None;
+    let mut handles = Handles(std::collections::HashMap::new());
+    let me = super::thread_id();
     loop {
         std::thread::sleep(Duration::from_millis(5));
         let ended = std::mem::take(&mut SHARED.lock().unwrap_or_else(|e| e.into_inner()).ended);
         for (frame, frame_us, samples) in ended {
             report(&symbols, frame, frame_us, &samples);
         }
-        let late = now_ms().saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed));
+        let now = now_ms();
+        let late = now.saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed));
         if late < SAMPLE_AFTER_MS {
             continue;
         }
-        let id = PRESENTER.load(Ordering::Relaxed);
-        if open.is_none_or(|(had, _)| had != id) {
-            if let Some((_, h)) = open.take() {
-                // SAFETY: opened below.
-                unsafe { CloseHandle(h) };
-            }
-            // SAFETY: opens a thread of this process.
-            let h = unsafe {
-                OpenThread(
-                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                    0,
-                    id,
-                )
-            };
-            if h.is_null() {
+        let presenter = PRESENTER.load(Ordering::Relaxed);
+        let mut taken: Vec<Sample> = Vec::new();
+        if let Some(h) = handles.get(presenter) {
+            let low = STACK[0].load(Ordering::Relaxed) as usize;
+            let high = STACK[1].load(Ordering::Relaxed) as usize;
+            taken.push((u32::MAX, sample(h, low, high)));
+        }
+        let known = (KNOWN_TAKEN.load(Ordering::Relaxed) as usize).min(THREADS);
+        for k in &KNOWN[..known] {
+            let id = k.id.load(Ordering::Relaxed);
+            let since = k.since_ms.load(Ordering::Relaxed);
+            if id == 0 || id == presenter || id == me || since == 0 || now + 1 < since + OTHER_AFTER_MS {
                 continue;
             }
-            open = Some((id, h));
+            let phase = k.phase.load(Ordering::Relaxed);
+            if let Some(h) = handles.get(id) {
+                let low = k.stack[0].load(Ordering::Relaxed) as usize;
+                let high = k.stack[1].load(Ordering::Relaxed) as usize;
+                taken.push((phase, sample(h, low, high)));
+            }
         }
-        let Some((_, thread)) = open else { continue };
-        let low = STACK[0].load(Ordering::Relaxed) as usize;
-        let high = STACK[1].load(Ordering::Relaxed) as usize;
-        let frames = sample(thread, low, high);
         let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-        if shared.samples.len() < MOST_SAMPLES {
-            shared.samples.push(frames);
-        }
+        let room = MOST_SAMPLES.saturating_sub(shared.samples.len());
+        shared.samples.extend(taken.into_iter().take(room));
     }
 }
 
@@ -225,7 +330,15 @@ impl Symbols {
         // modules are loaded (their symbols on first use).
         let ready = unsafe {
             SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            SymInitialize(GetCurrentProcess(), std::ptr::null(), 1) != 0
+            // Rust links its PDB by bare name: look beside the executable.
+            let search = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| format!("{}\0", d.display())));
+            SymInitialize(
+                GetCurrentProcess(),
+                search.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                1,
+            ) != 0
         };
         Symbols { ready }
     }
@@ -255,8 +368,34 @@ impl Symbols {
                 return shorten(&name);
             }
         }
-        format!("{address:#x}")
+        module_offset(address)
     }
+}
+
+/// `module+0xoffset` for code without a name, or the bare address.
+fn module_offset(address: u64) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    let mut path = [0u16; 260];
+    // SAFETY: looks up the module holding `address` without holding it;
+    // the name is written into `path`.
+    let len = unsafe {
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as usize as *const u16,
+            &mut module,
+        ) == 0
+        {
+            return format!("{address:#x}");
+        }
+        GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) as usize
+    };
+    let path = String::from_utf16_lossy(&path[..len]);
+    let file = path.rsplit('\\').next().unwrap_or(&path);
+    format!("{file}+{:#x}", address - module as u64)
 }
 
 /// A function's path without its crate's generic noise: `a::b::c<T>::d`
@@ -280,13 +419,15 @@ fn shorten(name: &str) -> String {
     parts[keep..].join("::")
 }
 
-/// Logs the most frequent stacks of a late frame.
-fn report(symbols: &Symbols, frame: u64, frame_us: u64, samples: &[[u64; DEPTH]]) {
+/// Logs the most frequent stacks of a late frame: the presenting
+/// thread's, and those of our threads in a long call.
+fn report(symbols: &Symbols, frame: u64, frame_us: u64, samples: &[Sample]) {
     use std::collections::HashMap;
     let mut names: HashMap<u64, String> = HashMap::new();
     let mut name = |a: u64| names.entry(a).or_insert_with(|| symbols.name(a)).clone();
-    let mut groups: HashMap<Vec<String>, usize> = HashMap::new();
-    for frames in samples {
+    let mut groups: HashMap<(u32, Vec<String>), usize> = HashMap::new();
+    let mut totals: HashMap<u32, usize> = HashMap::new();
+    for (whose, frames) in samples {
         let mut key: Vec<String> = Vec::with_capacity(KEY_FRAMES);
         for &pc in frames.iter().take_while(|&&pc| pc != 0) {
             let n = name(pc);
@@ -297,15 +438,26 @@ fn report(symbols: &Symbols, frame: u64, frame_us: u64, samples: &[[u64; DEPTH]]
                 break;
             }
         }
-        *groups.entry(key).or_default() += 1;
+        *groups.entry((*whose, key)).or_default() += 1;
+        *totals.entry(*whose).or_default() += 1;
     }
-    let mut groups: Vec<(Vec<String>, usize)> = groups.into_iter().collect();
+    let mut groups: Vec<((u32, Vec<String>), usize)> = groups.into_iter().collect();
     groups.sort_by(|a, b| b.1.cmp(&a.1));
-    let total = samples.len();
-    for (key, n) in groups.iter().take(4) {
+    let mut shown: HashMap<u32, usize> = HashMap::new();
+    for ((whose, key), n) in &groups {
+        let count = shown.entry(*whose).or_default();
+        let most = if *whose == u32::MAX { 4 } else { 3 };
+        if *count >= most {
+            continue;
+        }
+        *count += 1;
+        let who = super::NAMES
+            .get(*whose as usize)
+            .map_or("the presenting thread".to_owned(), |p| format!("threads in {p}"));
         tracing::info!(
-            "hitch stacks: frame {frame} took {:.1} ms; {n} of {total} samples of the presenting thread in: {}",
+            "hitch stacks: frame {frame} took {:.1} ms; {n} of {} samples of {who}: {}",
             frame_us as f64 / 1e3,
+            totals[whose],
             key.join(" <- ")
         );
     }
@@ -314,6 +466,16 @@ fn report(symbols: &Symbols, frame: u64, frame_us: u64, samples: &[[u64; DEPTH]]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    #[test]
+    fn a_thread_keeps_one_entry() {
+        let first = mine().map(std::ptr::from_ref);
+        let taken = KNOWN_TAKEN.load(Ordering::Relaxed);
+        assert!(first.is_some());
+        assert_eq!(mine().map(std::ptr::from_ref), first);
+        assert_eq!(KNOWN_TAKEN.load(Ordering::Relaxed), taken);
+    }
 
     #[test]
     fn names_lose_generics_and_hashes() {

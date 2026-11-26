@@ -56,7 +56,7 @@ pub enum Phase {
 
 const PHASES: usize = 12;
 
-const NAMES: [&str; PHASES] = [
+pub(crate) const NAMES: [&str; PHASES] = [
     "submit",
     "present",
     "heap buffers",
@@ -88,7 +88,7 @@ thread_local! {
     static THREAD_ID: Cell<u32> = const { Cell::new(0) };
 }
 
-fn thread_id() -> u32 {
+pub(crate) fn thread_id() -> u32 {
     THREAD_ID.with(|id| {
         if id.get() == 0 {
             id.set(os_thread_id());
@@ -152,6 +152,8 @@ pub fn span(phase: Phase) -> Span {
         open.set(Some((phase, now)));
         parent
     });
+    #[cfg(windows)]
+    stacks::opened(phase, parent.is_none(), now);
     Span { phase, parent }
 }
 
@@ -164,6 +166,8 @@ impl Drop for Span {
             }
             open.set(self.parent.map(|p| (p, now)));
         });
+        #[cfg(windows)]
+        stacks::closed(self.parent);
     }
 }
 
