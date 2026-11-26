@@ -193,6 +193,7 @@ if (-not $NoTunedSettings) {
         VICTORY_HEAP_PASS_DIRTY          = '1'         # the heap pass looks only at slots marked since its last pass
         VICTORY_COPY_COALESCE            = '1024'      # changed runs up to 1024 bytes apart go up as one range
         VICTORY_REAPER                   = '1'         # drop released host D3D12 objects on a background reaper thread
+        VICTORY_ASYNC_SUBMIT             = '1'         # submissions prepared on a thread of ours; the title's call returns at once
         VICTORY_GUARD_HOT                = '0'         # keep page guards active on hot view memory blocks
         VICTORY_AMBIENT                  = '0.8'       # ambient diffuse light level (RTX visual fix)
         VICTORY_AMBIENT_AIR              = '1.5'       # ambient air/sky multiplier (RTX visual fix)
