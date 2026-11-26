@@ -32,6 +32,8 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+#[cfg(windows)]
+mod flight_settle;
 pub mod frame;
 pub mod frametime;
 #[cfg(windows)]
