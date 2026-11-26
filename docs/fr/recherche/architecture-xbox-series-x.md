@@ -2,7 +2,7 @@
 
 # Architecture de la Xbox Series X
 
-Recherche faite le 21 novembre 2026 pour guider le développement d'AnyXboxX. Chaque fait porte sa source. La mention **vérifié** signifie que la page a été lue ; **à confirmer** signifie que le fait vient d'un extrait de recherche ou d'une source secondaire.
+Recherche faite le 21 novembre 2026 pour guider le développement d'El1xr. Chaque fait porte sa source. La mention **vérifié** signifie que la page a été lue ; **à confirmer** signifie que le fait vient d'un extrait de recherche ou d'une source secondaire.
 
 ## Matériel
 
@@ -33,13 +33,13 @@ Recherche faite le 21 novembre 2026 pour guider le développement d'AnyXboxX. Ch
 - **Hyperviseur** : un Hyper-V adapté sépare un système hôte, une partition « système » (interface, applications) et une partition exclusive pour le jeu [VT, à confirmer].
 - **Conteneurs XVD/XVC** : en-tête signé, données chiffrées en AES-XTS ; la clé du contenu (CIK) est elle-même protégée par une clé de distribution (ODK) [XVD, vérifié].
 
-## Ce que cela implique pour AnyXboxX
+## Ce que cela implique pour El1xr
 
 1. **CPU** : le jeu tourne en x86-64 natif. Unicorn suffit pour un prototype ; un émulateur jouable exécuterait le code directement sur le processeur du PC, comme Wine.
 2. **GPU** : c'est le gros du travail. Il faut traduire les appels D3D12.X vers Direct3D 12 ou Vulkan, sans pouvoir s'appuyer sur une documentation publique.
 3. **Mémoire** : les deux zones de débit (10 + 6 Gio) n'ont pas besoin d'être reproduites ; un tas unique suffit.
 4. **Stockage** : DirectStorage et BCPack peuvent être émulés en logiciel, avec un coût en temps de chargement.
-5. **Contenu** : les paquets de jeux sont chiffrés par des clés que seule la console détient. AnyXboxX n'exécute donc que des programmes non chiffrés, comme sa démo.
+5. **Contenu** : les paquets de jeux sont chiffrés par des clés que seule la console détient. El1xr n'exécute donc que des programmes non chiffrés, comme sa démo.
 
 ## Sources
 

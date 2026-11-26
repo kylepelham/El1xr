@@ -1,10 +1,12 @@
 # Composants tiers
 
-AnyXboxX est distribué sous [GNU GPL 3.0 ou ultérieure](LICENSE). Les composants suivants gardent leur propre licence.
+El1xr (Bone/Nevaa) est distribué sous [GNU GPL 3.0 ou ultérieure](LICENSE). Les composants suivants gardent leur propre licence.
+
+El1xr est un fork d'AnyXboxX ([LooperSalty/AnyXboxX](https://github.com/LooperSalty/AnyXboxX), Looper_Salty et ses contributeurs), sous la même licence. Le code et l'historique repris d'AnyXboxX restent attribués à leurs auteurs ; les mentions « AnyXboxX » ci-dessous qui décrivent le passé du projet sont gardées telles quelles.
 
 Jusqu'au 21 novembre 2026, AnyXboxX était sous LGPL 2.1 ou ultérieure. La clause « ou ultérieure » permet de passer à la GPL 3.0, et l'auteur du projet en était le seul contributeur. Ce passage permet de reprendre du code GPL-3.0, comme celui de Leonida. Les composants ci-dessous sont tous compatibles avec la GPL 3.0 : MIT, Apache 2.0, BSD 3 clauses et LGPL 2.1 ou ultérieure.
 
-| Composant | Origine | Licence | Utilisation dans AnyXboxX |
+| Composant | Origine | Licence | Utilisation dans El1xr |
 | --- | --- | --- | --- |
 | Module `Task` de libHttpClient | [microsoft/libHttpClient](https://github.com/microsoft/libHttpClient) | MIT | File de tâches du runtime GDK (`runtime/third_party/libhttpclient-task`) |
 | Tests d'encodage AMDGPU de LLVM | [llvm/llvm-project](https://github.com/llvm/llvm-project), `llvm/test/MC/AMDGPU` | Apache 2.0 avec exception LLVM | Tables générées `PrototypeScarlett/emu/rdna2_ops.py` et `rdna2_shapes.py` (outils `tools/rdna2_*.py`) |
@@ -20,7 +22,7 @@ Jusqu'au 21 novembre 2026, AnyXboxX était sous LGPL 2.1 ou ultérieure. La clau
 | Encodage MIMG gfx10 (`SIInstrFormats.td`, classe `MIMGe_gfx10`) de LLVM | [llvm/llvm-project](https://github.com/llvm/llvm-project) | Apache 2.0 avec exception LLVM | Champs de l'instruction `image_sample` (`rdna2_image.instruction_fields`) |
 | Encodages gfx10 `MUBUFe_gfx10`, `MTBUFe_gfx10` (`BUFInstructions.td`), `FLAT_Real_gfx10` (`FLATInstructions.td`), syntaxe `getMUBUFAsmOps`/`getMTBUFAsmOps`, `AMDGPUInstPrinter` (`printOffset`, `printFlatOffset`, `printCPol`, `printFormat`, `printDim`), calcul des registres d'image (`AMDGPUDisassembler::convertMIMGInst`, `getAddrSizeMIMGOp`, dimensions et variantes de `MIMGInstructions.td`) de LLVM | [llvm/llvm-project](https://github.com/llvm/llvm-project), `llvm/lib/Target/AMDGPU` | Apache 2.0 avec exception LLVM | Ports en Python : `PrototypeScarlett/emu/rdna2_operands_vmem.py` (tampons, FLAT/GLOBAL/SCRATCH) et `rdna2_operands_mimg.py` (images) ; tests du désassembleur (`llvm/test/MC/Disassembler/AMDGPU/gfx10_*.txt`) pour quelques encodages de `tests/test_rdna2.py` |
 | Textes de licence ajoutés en amont par TomBox (commit `f89e410`) : portage de `rocjitsu` (`v_log_f32`, `v_exp_f32`, `v_sin_f32`, `v_cos_f32`, `crates/tombox-xshader/src/trans32/`) et correctifs de brcly/TuxBox (`tools/reference/tombox-*.patch`) | [ROCm/rocm-systems](https://github.com/ROCm/rocm-systems) (AMD), [brcly/TuxBox](https://github.com/brcly/TuxBox) | MIT (rocjitsu), Apache 2.0 (TuxBox) | Présents dans le sous-module `third_party/tombox`, compilé tel quel par `tools/build_tombox.py` ; textes dans `crates/tombox-xshader/src/trans32/LICENSE-rocjitsu.txt` et `THIRD_PARTY/LICENSE-TuxBox-APACHE-2.0.txt` |
-| Décodeur rANS `_bcpack_rans` de Xbox2Windows, copie de bcpack-rs (Ahmet Dedeler) et de `silicon-rans` (Microsoft) | [R0Y00/Xbox2Windows](https://github.com/R0Y00/Xbox2Windows), `tools/_bcpack_rans` | MIT ou Apache 2.0 (bcpack-rs), MIT (silicon-rans) | Non copié dans AnyXboxX : aucun fichier de `third_party/xbox2windows` ne l'importe ; mentionné pour mémoire, ses textes de licence (`LICENSE-MIT`, `LICENSE-APACHE`) restent en amont |
+| Décodeur rANS `_bcpack_rans` de Xbox2Windows, copie de bcpack-rs (Ahmet Dedeler) et de `silicon-rans` (Microsoft) | [R0Y00/Xbox2Windows](https://github.com/R0Y00/Xbox2Windows), `tools/_bcpack_rans` | MIT ou Apache 2.0 (bcpack-rs), MIT (silicon-rans) | Non copié dans El1xr : aucun fichier de `third_party/xbox2windows` ne l'importe ; mentionné pour mémoire, ses textes de licence (`LICENSE-MIT`, `LICENSE-APACHE`) restent en amont |
 | Décodeur XMA2 / WMA Pro `xma` de TomBox, portage Rust de FFmpeg `libavcodec/wmaprodec.c` | [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator), [FFmpeg](https://ffmpeg.org) | LGPL-2.1 ou ultérieure | `rust/anyxboxx-audio` (son console) ; avis d'origine dans `third_party/tombox/crates/compat/xma/NOTICE` |
 | Luminances HDR de repli de DXVK (`NormalizeDisplayMetadata`, `src/wsi/wsi_edid.h`, commit `ff55077`) | [doitsujin/dxvk](https://github.com/doitsujin/dxvk) | zlib | Valeurs 0,01 / 1 499 / 799 nits reprises (pas de code copié) dans `runtime/xgameruntime/hdr_luminance.h`, quand l'écran n'annonce pas de métadonnées HDR statiques ([#191](https://github.com/LooperSalty/AnyXboxX/issues/191)) |
 | Banc GPU de Xbox2Windows (`tools/gpu-check/Run-GpuCheck.ps1`), commit `bcdce96` | [R0Y00/Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | MIT | Modèle de `tools/Run-GpuCheck.ps1` (tests lancés sur un adaptateur choisi, rapport Markdown par carte) ; avis MIT dans l'en-tête du script |
@@ -40,7 +42,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 
 | Dépôt d'origine | Licence | Dans la base Neptune (d'après son `NEPTUNE-README.txt`) | Repris après |
 | --- | --- | --- | --- |
-| Neptune (VIctory Edit.), paquet du 2026-11-25 au soir (auteur sans contact public) | GPL-3.0 ou ultérieure | L'assemblage et ses propres changements : temps d'image, souris et clavier, Rich Presence Discord, éclairage ambiant de remplacement, file de textures et mémoire de la carte, attente de pipelines bornée à 2,5 s, `play.ps1` (jeu de réglages repris dans `tools/lancer_victory.ps1`) | Rich Presence Discord éteinte sauf `VICTORY_DISCORD=1` |
+| Neptune (VIctory Edit.), paquet du 2026-11-25 au soir (auteur sans contact public ; son titre de fenêtre nommait « Victory Edit by Traffic & zm0kie ») | GPL-3.0 ou ultérieure | L'assemblage et ses propres changements : temps d'image, souris et clavier, Rich Presence Discord, éclairage ambiant de remplacement, file de textures et mémoire de la carte, attente de pipelines bornée à 2,5 s, `play.ps1` (jeu de réglages repris dans `tools/lancer_victory.ps1`) | Rich Presence Discord éteinte sauf `VICTORY_DISCORD=1` |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (Marvisak et ses contributeurs) | GPL-3.0 ou ultérieure | Le runtime d'origine | |
 | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (fxceless ; PR de Jonirulah, Flyander, AscilCH) | GPL-3.0 | La base : niveaux à la demande, synchronisation du tas de descripteurs (`a26859f`, `9376fd6`) | |
 | [myokex/victory-amd](https://github.com/myokex/victory-amd) (myokex) | GPL-3.0 | La base, avec fxceless/victory-fork | |
@@ -53,6 +55,8 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |
 | [LooperSalty/victory](https://github.com/LooperSalty/victory) (Looper_Salty) | GPL-3.0 ou ultérieure | | Les quatre commits `xg:` (`19feca8`, `1f0fe1d`, `36955ee`, `fb021f7`) : `xg_xs.dll` du GDK de l'utilisateur comme oracle ou service (`VICTORY_XG_DLL`, `VICTORY_XG_MODE`, jamais copiée dans le dépôt) et HLE qui répond comme la DLL de Microsoft |
+| [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) (DoubleGhosty) | GPL-3.0 ou ultérieure | | Échantillonneurs immédiats choisis entre deux branches uniformes par un phi (commit `754cafc9`, `victory-shader` `emit/lower.rs`) |
+| [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) (Taynan Piza ; PR de cwWwWwW, alex/nullexxx, efsebayern, meshahid.973) | GPL-3.0 ou ultérieure | | Emplacements dynamiques rendus au seul tas qui les a pris (PR #53, portée de fxceless/victory-fork #1324) ; pointeur nul pour une bibliothèque de pipelines vide (PR #31, d'après Marvisak/VIctory `e5a8c2f`) ; réserve d'instantanés triée par capacité (PR #58) ; blocs de relocalisation PE validés (PR #25) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 

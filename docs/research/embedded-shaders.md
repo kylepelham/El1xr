@@ -11,7 +11,7 @@ These are the only real console shaders available before the game executable.
 
 | Step | Result |
 |---|---|
-| Disassembly by AnyXboxX (without llvm-mc) | 54,197 instructions; 1,431 words without text, data between the programs of one blob (up to 5 programs) |
+| Disassembly by El1xr (without llvm-mc) | 54,197 instructions; 1,431 words without text, data between the programs of one blob (up to 5 programs) |
 | RDNA 2 → SPIR-V translation (Leonida's translator, fed by our disassembly) | **51 programs out of 52** |
 | Remaining failure | `buffer_store_short`, a rule missing from the translator |
 

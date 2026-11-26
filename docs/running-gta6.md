@@ -1,6 +1,6 @@
 > Français : [lancer-gta6.md](fr/lancer-gta6.md)
 
-# Running GTA VI (Xbox Series 1.0.2.1 build) with AnyXboxX
+# Running GTA VI (Xbox Series 1.0.2.1 build) with El1xr
 
 This guide installs and starts the project, and lists everything you need to repeat our tests on the Xbox Series 1.0.2.1 build of GTA VI, up to where we are today: the first cutscene. It does not provide the game and does not explain how to get it: you bring your own copy. Never put game files in this repository or attach them to an issue.
 
@@ -182,7 +182,7 @@ Measured or observed by the maintainer (Windows 11, RTX 4070 Super), from the VI
 
 ## Previous pin: fork `7b0f736` (24 November, night)
 
-`third_party/victory` points to `fxceless/victory-fork` at commit `7b0f736` ("Shader tests: recognise the software adapter from the device's own adapter"). It was first pinned at `d279e69` ("Make host pipeline waits configurable and prewarm pending requests (#1)", contributed by ZazaJr24); `7b0f736` adds `e9765a7` ("Fix the device loss introduced by the wave64 update") and `004bf69`. Newer commits, from `1684989` on, are not taken: the maintainer judged them a regression. The fork is not a GitHub fork attached to VIctory; its licence is GPL-3.0, compatible with AnyXboxX (GPL-3.0 or later). It replaces our former `anyxboxx/stable` integration.
+`third_party/victory` points to `fxceless/victory-fork` at commit `7b0f736` ("Shader tests: recognise the software adapter from the device's own adapter"). It was first pinned at `d279e69` ("Make host pipeline waits configurable and prewarm pending requests (#1)", contributed by ZazaJr24); `7b0f736` adds `e9765a7` ("Fix the device loss introduced by the wave64 update") and `004bf69`. Newer commits, from `1684989` on, are not taken: the maintainer judged them a regression. The fork is not a GitHub fork attached to VIctory; its licence is GPL-3.0, compatible with El1xr (GPL-3.0 or later). It replaces our former `anyxboxx/stable` integration.
 
 Measured by the maintainer on 2026-11-24 (i7-13700KF + RTX 4070 SUPER, Windows 11) by running our own copy of the 1.0.2.1 build, from the VIctory log of the run (frame rate and draw counters as the program prints them), against our former `last` integration:
 
@@ -281,7 +281,7 @@ Variable added to the table above (diagnostic, `diag` build):
 3. Visual Studio 2022 or 2026 Build Tools with the "Desktop development with C++" workload (MSVC).
 4. Windows SDK 10.0.26100 (provides `dxc`).
 5. Optional: the Windows optional feature "Graphics Tools" (D3D12 debug layer, needed only for `VICTORY_D3D12_DEBUG`).
-6. Python 3.12, only for the AnyXboxX test suite (see Tests).
+6. Python 3.12, only for the El1xr test suite (see Tests).
 
 Get the code (VIctory is included):
 
@@ -402,7 +402,7 @@ The branches `anyxboxx/stable` and `anyxboxx/essai` of `LooperSalty/victory` are
 cargo test -p victory-gpu -p victory-shader --manifest-path third_party/victory/Cargo.toml
 ```
 
-AnyXboxX itself (see the Setup section of [AGENTS.md](../AGENTS.md)):
+El1xr itself (see the Setup section of [AGENTS.md](../AGENTS.md)):
 
 ```powershell
 py -3.12 -m venv .venv
@@ -413,4 +413,4 @@ py -3.12 -m venv .venv
 
 ## Where to report
 
-Open an issue on [AnyXboxX](https://github.com/LooperSalty/AnyXboxX/issues) or on [VIctory](https://github.com/Marvisak/VIctory/issues) (issue #264 collects the NVIDIA GPU hangs). Describe the symptom, your GPU and driver, and the relevant lines of `crashes.log`. Never attach a game file.
+Open an issue on [AnyXboxX, the upstream of El1xr](https://github.com/LooperSalty/AnyXboxX/issues) or on [VIctory](https://github.com/Marvisak/VIctory/issues) (issue #264 collects the NVIDIA GPU hangs). Describe the symptom, your GPU and driver, and the relevant lines of `crashes.log`. Never attach a game file.

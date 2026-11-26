@@ -37,7 +37,7 @@ BRANCHES64 = {
 # lignes ou numéro de ligne. Lire VCC ou EXEC comme une valeur (v_mov_b32 v1, vcc_lo) reste permis.
 WAVE32_ONLY = re.compile(r"s\[1(?:06|07|26|27)\]\s*>>|\bBallot\(|\bReadLane\(|\blane\b")
 
-PRELUDE = """// Généré par AnyXboxX (emu/rdna2_hlsl_wave64.py) : programme RDNA 2 wave64 recompilé en HLSL.
+PRELUDE = """// Généré par El1xr (emu/rdna2_hlsl_wave64.py) : programme RDNA 2 wave64 recompilé en HLSL.
 // Wave virtuel de 64 lignes = un groupe de 64 threads (ligne n = SV_GroupIndex n), quelle que soit la
 // taille des waves du GPU : masques et lectures de ligne passent par la mémoire groupshared.
 #define END_PC 0xFFFFFFFFu

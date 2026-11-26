@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="582" viewBox="0 0 880 582" font-family="Segoe UI, Arial, sans-serif" font-size="13">
 <rect width="880" height="582" fill="#f7f8fa"/>
 <text x="24" y="34" font-size="18" font-weight="600" fill="#1d2230">Test bench: modules of a GDK Scarlett package</text>
-<text x="24" y="58" fill="#4b5263">Share of imported functions resolved (HLE or package DLL) · ✓ = DllMain returned TRUE in AnyXboxX</text>
+<text x="24" y="58" fill="#4b5263">Share of imported functions resolved (HLE or package DLL) · ✓ = DllMain returned TRUE in El1xr</text>
 <text x="240" y="109" text-anchor="end" fill="#1d2230">amd_fidelityfx_loader_xbox.dll</text>
 <rect x="250" y="96" width="520" height="18" rx="3" fill="#e3e6ee"/>
 <rect x="250" y="96" width="494" height="18" rx="3" fill="#107c10"/>

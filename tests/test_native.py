@@ -115,7 +115,7 @@ def test_game_runs_from_its_own_folder(tmp_path, monkeypatch, runtime_dir):
 
 
 def test_console_xmem_import_is_served_by_cpp_runtime(tmp_path, runtime_dir):
-    """Le jeu importe xmem.dll!XMemAlloc : la DLL C++ d'AnyXboxX répond."""
+    """Le jeu importe xmem.dll!XMemAlloc : la DLL C++ d'El1xr répond."""
     def code(iat):
         return (Asm().frame().mov_ecx(64).zero_rdx()
                 .call_iat(iat[("xmem.dll", "XMemAlloc")]).unframe().ret().build())
@@ -126,7 +126,7 @@ def test_console_xmem_import_is_served_by_cpp_runtime(tmp_path, runtime_dir):
 
 
 def test_dll_loaded_by_windows_also_gets_cpp_runtime(tmp_path, runtime_dir):
-    """Une DLL du jeu chargée par Windows trouve xmem.dll déjà préchargé par AnyXboxX."""
+    """Une DLL du jeu chargée par Windows trouve xmem.dll déjà préchargé par El1xr."""
     build_pe(tmp_path / "helper.dll",
              lambda iat: (Asm().frame().mov_ecx(64).zero_rdx()
                           .call_iat(iat[("xmem.dll", "XMemAlloc")]).unframe().ret()

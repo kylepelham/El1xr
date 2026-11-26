@@ -536,11 +536,6 @@ fn changed_slots(
 
 /// Gives back a list's dynamic slots in batches by heap, taking `SHADER_HEAPS`
 /// and each host heap's dynamic lock once per contiguous run of the same heap.
-/// Each entry is (title heap, host heap identity, first, count): a range goes
-/// back only if the host heap behind the title heap is the one that took it
-/// ([`host::HostHeap::id`]); the title can release the heap a list's slots
-/// came from, and a later heap can be made at the same address before the
-/// list is reset.
 #[cfg(windows)]
 pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
     if entries.is_empty() {
@@ -552,10 +547,12 @@ pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
     while i < entries.len() {
         let (heap, id) = (entries[i].0, entries[i].1);
         batch.clear();
-        while i < entries.len() && entries[i].0 == heap && entries[i].1 == id {
+        while i < entries.len() && (entries[i].0, entries[i].1) == (heap, id) {
             batch.push((entries[i].2, entries[i].3));
             i += 1;
         }
+        // A heap whose address a new one took since keeps the new host
+        // heap's identity: `release_many` leaves its slots alone.
         if heaps.iter().any(|&(_, _, h)| h == heap)
             // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
             && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()

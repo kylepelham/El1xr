@@ -1,4 +1,4 @@
-"""Mesure, sans llvm-mc, ce que le désassembleur d'AnyXboxX et le traducteur SPIR-V font de programmes FSSM.
+"""Mesure, sans llvm-mc, ce que le désassembleur d'El1xr et le traducteur SPIR-V font de programmes FSSM.
 
 Entrée : un dossier où <nom>.dxbc (conteneur) et fssm/<nom>.fssm (programme RDNA 2 décompressé) ont été
 extraits localement, par exemple avec tools/pe_shader_containers.py et tools/fssm_unpack.py de Leonida.

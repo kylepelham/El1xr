@@ -2,11 +2,11 @@
 
 # Préparer la compatibilité du paquet Scarlett étudié
 
-Cette note sert aux agents qui poursuivent AnyXboxX. Elle décrit une stratégie de recherche et de tests, pas une recette permettant actuellement de lancer le jeu. Elle s'appuie sur la copie locale et sur les [notes d'analyse du paquet](paquet/README.md).
+Cette note sert aux agents qui poursuivent El1xr. Elle décrit une stratégie de recherche et de tests, pas une recette permettant actuellement de lancer le jeu. Elle s'appuie sur la copie locale et sur les [notes d'analyse du paquet](paquet/README.md).
 
 ## État vérifié
 
-- Le layout et `MicrosoftGame.Config` désignent `game_scarlett_master.exe`, absent de la copie. Depuis la racine AnyXboxX, `python PrototypeScarlett/scarlett.py --rapport ..` renvoie explicitement cette absence. Les imports, le point d'entrée, les interfaces et les shaders effectivement utilisés par l'exécutable sont inconnus. Les ressources ne permettent pas de reconstituer son code.
+- Le layout et `MicrosoftGame.Config` désignent `game_scarlett_master.exe`, absent de la copie. Depuis la racine El1xr, `python PrototypeScarlett/scarlett.py --rapport ..` renvoie explicitement cette absence. Les imports, le point d'entrée, les interfaces et les shaders effectivement utilisés par l'exécutable sont inconnus. Les ressources ne permettent pas de reconstituer son code.
 - L'initialisation de DLL documentée dans [l'avancée](../avancee.md) et les essais [SimpleTriangle et SDL](../jeu-de-test.md) constituent des tests partiels. Les deux exemples exécutés sont des versions PC : ils ne démontrent pas la compatibilité d'un exécutable Scarlett. Un import résolu ou un `DllMain` réussi ne prouve pas que toutes les fonctions de la DLL fonctionneront.
 - Le mode natif exécute du code avec les droits du processus utilisateur. Utiliser des programmes de test de confiance ; le mode Unicorn sert aux diagnostics isolés.
 - Les données locales et leur provenance n'ont pas été authentifiées. Les résultats ci-dessous concernent les fichiers examinés, pas nécessairement toutes les versions du jeu.
@@ -30,7 +30,7 @@ python .\inspect_etpf.py .\data\ttdb\graphics\ttdb_graphics.ttpf --debut 485 --l
 python .\stats_etpf.py .
 ```
 
-Depuis la racine AnyXboxX :
+Depuis la racine El1xr :
 
 ```powershell
 python -m pytest
@@ -49,7 +49,7 @@ Pour une catégorie précise de 153 groupes de dimensions candidates 512 × 512,
 
 La comparaison de 16 agencements pour ces 153 groupes donne le meilleur score à des tuiles Morton 128 dans 142 cas ; 11 groupes favorisent des variantes linéaires. Utiliser ce résultat comme piste de test, pas comme conversion universelle. Le contrôle des indices sur des données synthétiques confirme seulement que l'outil applique des permutations valides.
 
-L'index ETPF comprend aussi une table candidate de valeurs 64 bits triées. Des comparaisons entre fichiers appuient leur association aux lignes de même rang, mais trois paires de valeurs identiques ont donné des contenus zlib différents. Si un futur lecteur les utilise pour la recherche, conserver le contexte du fichier et ne pas dédupliquer les ressources uniquement sur cette valeur. La commande `python ..\comparer_cles_etpf.py .. --comparer-blocs` reproduit les comparaisons depuis la racine AnyXboxX.
+L'index ETPF comprend aussi une table candidate de valeurs 64 bits triées. Des comparaisons entre fichiers appuient leur association aux lignes de même rang, mais trois paires de valeurs identiques ont donné des contenus zlib différents. Si un futur lecteur les utilise pour la recherche, conserver le contexte du fichier et ne pas dédupliquer les ressources uniquement sur cette valeur. La commande `python ..\comparer_cles_etpf.py .. --comparer-blocs` reproduit les comparaisons depuis la racine El1xr.
 
 Pour examiner une valeur dans un fichier précis, `inspect_etpf.py --cle` fournit son rang et la ligne candidate correspondante, après vérification de l'ordre de la table. Voir l'exemple et les limites dans l'analyse ETPF ; cet outil ne met pas encore en œuvre le chargement de ressources du jeu.
 

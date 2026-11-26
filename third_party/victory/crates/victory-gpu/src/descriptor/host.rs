@@ -145,7 +145,11 @@ impl DynamicBits {
     }
 }
 
+/// Distinguishes host heaps even when a title heap address is reused.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -245,14 +249,7 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
-    /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release_many`]).
-    id: u64,
 }
-
-/// Each host heap's identity, handed out in order: a range of dynamic slots
-/// is given back to the heap that took it, and a heap made later at the same
-/// address is not that heap ([`HostHeap::release_many`]).
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
 /// texture code, which has no heap at hand ([`next_start`],
@@ -1641,12 +1638,6 @@ impl HostHeap {
         self.count
     }
 
-    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
-    /// to it, never to a heap made later at the same address.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
@@ -2675,8 +2666,13 @@ impl HostHeap {
         stale
     }
 
+    /// The identity to store with a range this heap allocated.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned), if this heap took them (`id`, [`HostHeap::id`]).
+    /// returned) when they came from this heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     #[cfg(test)]
@@ -2686,11 +2682,9 @@ impl HostHeap {
 
     /// Gives back a batch of `(first, n)` dynamic slot ranges under one lock,
     /// retiring any host resources those slots kept alive so released dynamic
-    /// tables do not pin evicted VRAM/shared memory. Only if they were taken
-    /// by this heap: `id` is [`HostHeap::id`]'s. The title can release the
-    /// heap a list's slots came from, and a later heap can be made at the
-    /// same address; the list's reset then names the old heap, and must not
-    /// free the new one's slots ([`NEXT_ID`]).
+    /// tables do not pin evicted VRAM/shared memory. Ranges another host heap
+    /// took (`id` not this heap's: the title heap's address was reused) are
+    /// left alone.
     pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
         if ranges.is_empty() || id != self.id {
             return;
@@ -4988,37 +4982,6 @@ mod tests {
         assert_eq!(heap.buffer_changes(), vec![2]);
     }
 
-    /// A range of dynamic slots is given back only to the heap that took it:
-    /// the title can release a heap while a list still holds slots of it,
-    /// and a later heap can be made at the same address before that list is
-    /// reset.
-    #[cfg(windows)]
-    #[test]
-    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some(a) = HostHeap::new(false, 4) else {
-            return; // no host GPU
-        };
-        let Some(b) = HostHeap::new(false, 4) else {
-            return;
-        };
-        assert_ne!(a.id(), b.id());
-        let first = a.dynamic(2).expect("two dynamic slots");
-        let free = a.free.load(Relaxed);
-        a.release(b.id(), first, 2);
-        assert_eq!(
-            a.free.load(Relaxed),
-            free,
-            "another heap's identity gave the range back"
-        );
-        a.release(a.id(), first, 2);
-        assert_eq!(
-            a.free.load(Relaxed),
-            free + 2,
-            "their own heap did not get the range back"
-        );
-    }
-
     /// The unsigned twin of a 16-bit float or signed format has its layout,
     /// and only buffer views in such a format are shown as another view.
     #[test]
@@ -5891,6 +5854,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(old) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(new) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(old.id(), new.id());
+        let first = new.dynamic(2).expect("two dynamic slots");
+        let free = new.free.load(std::sync::atomic::Ordering::Relaxed);
+        new.release(old.id(), first, 2);
+        assert_eq!(new.free.load(std::sync::atomic::Ordering::Relaxed), free);
+        new.release(new.id(), first, 2);
+        assert_eq!(
+            new.free.load(std::sync::atomic::Ordering::Relaxed),
+            free + 2
+        );
     }
 
     #[test]

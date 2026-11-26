@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Developer CLI for AnyXboxX / VIctory builds, tests, policy checks, benchmarks, and captures.
+"""Developer CLI for El1xr / VIctory builds, tests, policy checks, benchmarks, and captures.
 
 Full command output is saved under E:/Gta6/AnyXboxX-coord/dev/ and every command prints a single
 concise final summary line: `DEV <cmd> PASS|FAIL key=value ...`.
@@ -18,6 +18,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+import dev_gate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -42,8 +44,6 @@ FRAME_RE = re.compile(
 )
 DSTORAGE_RE = re.compile(r"dstorage: last [0-9.]+ s.*?mb_per_s=([0-9.]+)")
 POLICY_FILES_RE = re.compile(r"asset policy:\s*(\d+)\s+files ok")
-CARGO_PASSED_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+)\s+passed;")
-PYTEST_PASSED_RE = re.compile(r"\b(\d+)\s+passed\b")
 ALERT_LEVEL_RE = re.compile(r"\b(WARN|ERROR)\b")
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 
@@ -320,19 +320,34 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
+    return f"DEV {cmd} {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+
 def cmd_test(args: argparse.Namespace) -> int:
-    cargo_cmd = ["cargo", "test", "--manifest-path", str(VICTORY_MANIFEST)]
-    if args.crate:
-        cargo_cmd.extend(["-p", args.crate])
-    steps = [
-        ("cargo test", cargo_cmd, REPO_ROOT),
-        ("cargo xtask policy", ["cargo", "xtask", "policy"], VICTORY_DIR),
-        ("pytest", [sys.executable, "-m", "pytest"], REPO_ROOT),
-    ]
-    ok, outputs = run_logged_steps(steps, DEV_DIR / "test.log")
-    cargo_passed = sum(int(m.group(1)) for m in CARGO_PASSED_RE.finditer(outputs.get("cargo test", "")))
-    pytest_passed = sum(int(m.group(1)) for m in PYTEST_PASSED_RE.finditer(outputs.get("pytest", "")))
-    print(f"DEV test {'PASS' if ok else 'FAIL'} passed={cargo_passed + pytest_passed}")
+    ensure_coord_dirs()
+    ok, _build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate)
+    print(_dev_line("test", ok, fields))
+    return 0 if ok else 1
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """The merge gate: every workspace test, policy and pytest, and no compiler warning."""
+    ensure_coord_dirs()
+    runs = max(1, args.runs)
+    walls: list[str] = []
+    fields: dict[str, str] = {}
+    ok = True
+    for _ in range(runs):
+        ok, build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None)
+        ok = ok and not build.warnings
+        walls.append(fields["wall_s"])
+        if not ok:
+            break
+    fields["runs"] = f"{len(walls)}/{runs}"
+    if runs > 1:
+        fields["walls_s"] = ",".join(walls)
+    print(_dev_line("gate", ok, fields))
     return 0 if ok else 1
 
 
@@ -418,7 +433,7 @@ def cmd_scout(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev.py",
-        description="AnyXboxX / VIctory developer CLI with single-line DEV summaries.",
+        description="El1xr / VIctory developer CLI with single-line DEV summaries.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -429,9 +444,15 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--both", action="store_true", help="Build both release and diag profiles.")
     p_build.set_defaults(func=cmd_build)
 
-    p_test = sub.add_parser("test", help="Run cargo tests, cargo xtask policy, and pytest.")
-    p_test.add_argument("--crate", help="Limit cargo test to a single workspace crate (-p).")
+    p_test = sub.add_parser(
+        "test", help="Build, then run every workspace test binary, cargo xtask policy and pytest at once."
+    )
+    p_test.add_argument("--crate", help="Limit cargo tests to a single workspace crate (-p).")
     p_test.set_defaults(func=cmd_test)
+
+    p_gate = sub.add_parser("gate", help="Merge gate: `test` over the whole workspace, failing on any warning.")
+    p_gate.add_argument("--runs", type=int, default=1, help="Run it this many times in a row (default: 1).")
+    p_gate.set_defaults(func=cmd_gate)
 
     p_policy = sub.add_parser("policy", help="Run cargo xtask policy.")
     p_policy.set_defaults(func=cmd_policy)

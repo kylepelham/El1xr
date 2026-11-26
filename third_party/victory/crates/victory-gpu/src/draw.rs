@@ -328,9 +328,8 @@ pub(crate) struct State {
     /// contents another had takes that one's host slots, and only its own title slots'
     /// notes are made here.
     seen_tables: std::collections::HashSet<(u64, u32, u64)>,
-    /// The dynamic slots the list holds: title heap, that heap's identity
-    /// (`HostHeap::id`), first, count; given back when the list has run, is
-    /// reset or released.
+    /// The dynamic slots the list holds: title heap, host heap identity,
+    /// first, count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot

@@ -84,7 +84,7 @@ def test_first_exception_names_the_module_and_rva(tmp_path, runtime_dir):
 
 
 # W13 (first-boot-1021.md) : le titre importe GameInput.dll!#1, le GameInputCreate v0 du GameInput.lib
-# du GDK. AnyXboxX ne le sert pas : la DLL de l'hôte le fournit, sinon le lanceur nomme l'import manquant.
+# du GDK. El1xr ne le sert pas : la DLL de l'hôte le fournit, sinon le lanceur nomme l'import manquant.
 GAME_INPUT_OUT = 0x300
 
 
@@ -140,7 +140,7 @@ def test_tombox_dir_serves_missing_console_libraries(tmp_path, runtime_dir):
     imports = [("xmem.dll", "XMemAlloc"), ("xmem.dll", "XMemGetAllocationStatistics"),
                ("xg_xs.dll", "XGComputeTexture2DLayout")]
     exe = build_pe(tmp_path / "xg.exe", code, imports=imports, dll=False)
-    assert launch(runtime_dir, exe).returncode == 1                  # xg_xs absent d'AnyXboxX
+    assert launch(runtime_dir, exe).returncode == 1                  # xg_xs absent d'El1xr
     environment = {**os.environ, "ANYXBOXX_TOMBOX_DIR": str(TOMBOX_DIR)}
     result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
                             timeout=60, env=environment)
@@ -157,7 +157,7 @@ NEW_TOMBOX_LIBRARIES = {"d3d12_x.dll": "D3D12XboxCreateDevice", "xapu.dll": "XAp
 def test_tombox_dir_serves_esram_apu_and_umd_libraries(tmp_path, runtime_dir):
     imports = list(NEW_TOMBOX_LIBRARIES.items())
     exe = build_pe(tmp_path / "libs.exe", lambda iat: Asm().mov_eax(42).ret().build(), imports=imports, dll=False)
-    assert launch(runtime_dir, exe).returncode != 42                 # bibliothèques absentes d'AnyXboxX
+    assert launch(runtime_dir, exe).returncode != 42                 # bibliothèques absentes d'El1xr
     environment = {**os.environ, "ANYXBOXX_TOMBOX_DIR": str(TOMBOX_DIR)}
     result = subprocess.run([str(runtime_dir / "anyxboxx.exe"), str(exe)], capture_output=True, text=True,
                             timeout=60, env=environment)

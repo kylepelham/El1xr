@@ -2769,9 +2769,6 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only and depends on preceding
-    /// `Step::Texture` refreshes having completed.
-    AfterTexture(std::sync::Arc<dyn Fn() + Send + Sync>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date and uploads it on the
@@ -3449,7 +3446,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::AfterTexture(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
@@ -8925,17 +8922,6 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
-    /// As [`HostList::defer_host`], for work that runs after queued
-    /// [`HostList::defer_texture`] refreshes finish.
-    pub(crate) fn defer_after_texture(&self, work: impl Fn() + Send + Sync + 'static) {
-        // (Neptune) Title memory or a buffer changes at this place in the list: a table made
-        // ready before it is made ready again after it (`crate::draw`).
-        self.changes.fetch_add(1, Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::AfterTexture(std::sync::Arc::new(work)));
-    }
-
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted and records its upload on the prelude if changed, keeping
     /// both staging and host texture alive until the list is reset.
@@ -9020,10 +9006,6 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
-                }
-                Step::AfterTexture(work) => {
-                    batch.after_textures.push(work.clone());
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -9274,9 +9256,6 @@ struct Batch {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Due staging buffers deferred until the next title write or flush.
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
-    /// Host callbacks that run in FIFO order right after `pending_textures`
-    /// finish refreshing.
-    after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Disjoint upload-memory fills (`dst`, `src`, `len`) deferred until the
     /// next title write or flush so large batches copy in parallel.
     pending_fills: Vec<(usize, usize, usize)>,
@@ -9373,8 +9352,7 @@ impl Batch {
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
     }
 
-    /// Refreshes any queued due textures, in parallel when `VICTORY_WIDE_REFRESH=1`,
-    /// then runs any deferred post-texture callbacks in FIFO order.
+    /// Refreshes any queued due textures, in parallel when `VICTORY_WIDE_REFRESH=1`.
     fn flush_textures(&mut self) {
         if !self.pending_textures.is_empty() {
             if wide_refresh() && self.pending_textures.len() >= 2 {
@@ -9389,19 +9367,6 @@ impl Batch {
                 for staging in self.pending_textures.drain(..) {
                     staging.refresh();
                 }
-            }
-        }
-        for work in self.after_textures.drain(..) {
-            #[cfg(feature = "diagnostics")]
-            let started = std::time::Instant::now();
-            work();
-            #[cfg(feature = "diagnostics")]
-            {
-                crate::copystat::add(crate::copystat::C::Runs, 1);
-                crate::copystat::add(
-                    crate::copystat::C::RunUs,
-                    started.elapsed().as_micros() as u64,
-                );
             }
         }
     }
@@ -10412,7 +10377,7 @@ fn logical_processors() -> u32 {
 }
 
 /// The window's title, before the figures.
-const TITLE: &str = "Neptune (Victory Edit by Traffic & zm0kie)";
+const TITLE: &str = "El1xr by Bone/Nevaa (VIctory)";
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -11800,7 +11765,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("Neptune (Victory Edit by Traffic & zm0kie)"),
+            w!("El1xr by Bone/Nevaa (VIctory)"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

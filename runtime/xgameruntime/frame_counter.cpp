@@ -119,7 +119,7 @@ class FrameCounter {
       title_ = text;
     }
     wchar_t title[384];
-    swprintf_s(title, L"%s | AnyXboxX %.0f i/s (1 %% bas %.0f)", title_.c_str(), fps, low_fps);
+    swprintf_s(title, L"%s | El1xr %.0f i/s (1 %% bas %.0f)", title_.c_str(), fps, low_fps);
     SetWindowTextW(desc.OutputWindow, title);
   }
 

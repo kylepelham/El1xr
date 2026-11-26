@@ -1,4 +1,4 @@
-// Interface XPackage servie par AnyXboxX : le jeu est un paquet entièrement installé en local.
+// Interface XPackage servie par El1xr : le jeu est un paquet entièrement installé en local.
 //
 // Fournisseur {AF406016…}, interface {0B9D556E…}, méthodes 3 à 41 (gdk_api_table.inc).
 // Signatures : en-tête public XPackage.h. Identité lue dans MicrosoftGame.config ; tous

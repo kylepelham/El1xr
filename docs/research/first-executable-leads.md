@@ -6,7 +6,7 @@ State as of 22 November 2026. This note goes with the [compatibility plan](packa
 
 ## Verified starting point
 
-The two package manifests point to `game_scarlett_master.exe`, which the layout places in chunk 1001. The file is absent from its destination, and the local recursive search by exact name did not find it. This does not rule out a renamed file or one inside a container. From the AnyXboxX root, `python PrototypeScarlett/scarlett.py --rapport ..` currently fails and reports the missing executable. Its imports, its execution paths and the shaders it actually uses remain unknown.
+The two package manifests point to `game_scarlett_master.exe`, which the layout places in chunk 1001. The file is absent from its destination, and the local recursive search by exact name did not find it. This does not rule out a renamed file or one inside a container. From the El1xr root, `python PrototypeScarlett/scarlett.py --rapport ..` currently fails and reports the missing executable. Its imports, its execution paths and the shaders it actually uses remain unknown.
 
 The [progress notes](../progress.md) report the isolated initialisation of 16 package DLLs, with 876 imports resolved out of 1,337 in the measured configuration. This measurement covers their import tables and their initialisation, not the missing executable and not every function of the DLLs. PC demonstrations do not prove that a Scarlett game works.
 
