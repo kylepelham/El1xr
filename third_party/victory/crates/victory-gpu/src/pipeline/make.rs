@@ -624,6 +624,11 @@ fn next() -> Arc<Pending> {
     }
 }
 
+/// Reserved stack per pipeline compile worker (64 MiB): NVIDIA's shader
+/// compiler recurses deeply on large world compute pipelines and overflowed
+/// the default 2 MiB stack, failing compilation as out of memory.
+const WORKER_STACK_BYTES: usize = 64 << 20;
+
 /// Starts the workers (half the logical processors, 2 to 12) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -634,6 +639,11 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // The driver compiles pipelines on this thread, recursively:
+                // NVIDIA's compiler overflowed the default 2 MB on a world
+                // compute program and refused it as out of memory (reserved
+                // address space; committed only as used).
+                .stack_size(WORKER_STACK_BYTES)
                 .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
@@ -974,5 +984,24 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn pipeline_worker_stack_size_reserves_64_mib() {
+        assert_eq!(WORKER_STACK_BYTES, 64 << 20);
+        // Verify the OS accepts a 64 MiB stack reservation and a 4 MiB local
+        // frame (which would overflow the default 2 MiB Rust thread stack)
+        // succeeds cleanly.
+        let sum = std::thread::Builder::new()
+            .name("victory-pipelines-stack-test".into())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(|| {
+                let buf = [1u8; 4 << 20];
+                std::hint::black_box(&buf).iter().take(16).map(|&b| b as usize).sum::<usize>()
+            })
+            .expect("spawn 64 MiB stack worker")
+            .join()
+            .expect("4 MiB stack frame must not overflow 64 MiB worker stack");
+        assert_eq!(sum, 16);
     }
 }
