@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Developer CLI for AnyXboxX / VIctory builds, tests, policy checks, benchmarks, and captures.
+"""Developer CLI for El1xr / VIctory builds, tests, policy checks, benchmarks, and captures.
 
 Full command output is saved under E:/Gta6/AnyXboxX-coord/dev/ and every command prints a single
 concise final summary line: `DEV <cmd> PASS|FAIL key=value ...`.
@@ -418,7 +418,7 @@ def cmd_scout(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev.py",
-        description="AnyXboxX / VIctory developer CLI with single-line DEV summaries.",
+        description="El1xr / VIctory developer CLI with single-line DEV summaries.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

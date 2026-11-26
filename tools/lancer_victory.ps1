@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-  Builds (cargo skips the work when current) and launches VIctory (third_party/victory, Neptune base) on the user's own
-  game folder.
+  El1xr launcher (Bone/Nevaa): builds (cargo skips the work when current) and launches VIctory (third_party/victory,
+  Neptune base) on the user's own game folder.
 
 .PARAMETER GameDir
   Folder of the game package (kept outside this repository). It must contain game_scarlett_master.exe.
@@ -100,7 +100,7 @@ $victory = Join-Path $repo 'third_party\victory'
 $manifest = Join-Path $victory 'Cargo.toml'
 
 if (-not (Test-Path -LiteralPath $manifest)) {
-    throw "third_party/victory/Cargo.toml is missing: this copy of AnyXboxX is incomplete."
+    throw "third_party/victory/Cargo.toml is missing: this copy of El1xr is incomplete."
 }
 
 $gameExe = Join-Path $GameDir 'game_scarlett_master.exe'
@@ -122,6 +122,7 @@ if ($useDiag) {
 
 # Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a pull that changes
 # third_party/victory (an old victory.exe would ignore the settings the new tree reads).
+Write-Host 'El1xr by Bone/Nevaa, running on VIctory (Marvisak and contributors).'
 Write-Host "Building VIctory ($(if ($useDiag) { 'diag profile, diagnostics feature' } else { 'release' }))..."
 # Windows PowerShell 5.1 wraps redirected native stderr (`2>`) in NativeCommandError, which
 # $ErrorActionPreference = 'Stop' turns into a terminating error on benign warnings; rely on $LASTEXITCODE.

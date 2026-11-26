@@ -22,7 +22,7 @@ Banc : i7-13700KF, RTX 4070 SUPER, Windows 11. VIctory `main` plus sa pull reque
 - Mesuré : la couche de débogage D3D12 compte 119 compute shaders refusés car ils demandent des vagues de 64 lignes (le maximum du pilote est 32), 117 barrières avec un mauvais état « avant » et 74 tampons de sommets encore en état UAV.
 - Mesuré : 351 programmes ne se traduisent pas encore chez VIctory dans le monde. Principales raisons (comptes) : select sur masque non suivi 82, masque de lignes lu comme donnée 76, adresse dans un SGPR hors paramètre racine 35, structured buffer de pas inconnu 31, lecture scalaire comme donnée 24.
 
-## Ce que cela signifie pour AnyXboxX
+## Ce que cela signifie pour El1xr
 
 Nos issues [#68](https://github.com/LooperSalty/AnyXboxX/issues/68) (contrôle de flux structuré et masques de lanes) et [#70](https://github.com/LooperSalty/AnyXboxX/issues/70) (wave64) sont exactement ces manques : masques de lignes lus comme données et select sur masque non suivi relèvent de #68 ; les 119 compute shaders refusés relèvent de #70. On réutilise plutôt que de réécrire, selon l'approche « ce qu'il faut reprendre » de [voisins.md](voisins.md) : l'approche wave64-sur-32 de xcl (deux moitiés, lue comme conception, non copiée à cause de la licence) et les PR VIctory #223 et #233 (GPL-3.0 ou ultérieure, reprises avec crédit).
 

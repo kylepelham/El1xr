@@ -1,5 +1,5 @@
 """Compile les DLL console de TomBox (sous-module third_party/tombox) depuis leur dépôt public,
-puis les copie dans runtime/build/tombox, dossier que le runtime d'AnyXboxX lit par défaut.
+puis les copie dans runtime/build/tombox, dossier que le runtime d'El1xr lit par défaut.
 
 Leur crate compat-common incorpore à la compilation des données de serveurs privés de jeux
 (`backend_data/`, profils et vidéos Fortnite, routes Trackmania et XDefiant) qui ne sont pas

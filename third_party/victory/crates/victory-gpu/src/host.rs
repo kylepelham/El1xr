@@ -10393,7 +10393,7 @@ fn logical_processors() -> u32 {
 }
 
 /// The window's title, before the figures.
-const TITLE: &str = "Neptune (Victory Edit by Traffic & zm0kie)";
+const TITLE: &str = "El1xr by Bone/Nevaa (VIctory)";
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -11781,7 +11781,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("Neptune (Victory Edit by Traffic & zm0kie)"),
+            w!("El1xr by Bone/Nevaa (VIctory)"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

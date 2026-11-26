@@ -4,7 +4,7 @@
 
 [Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) (R0Y00, MIT licence) studies static recompilation of Xbox Series X|S software to Windows x64: CPU functions translated to C++ and then to Windows DLLs, gfx1013 pixel shaders translated to HLSL, BC7 textures recovered and displayed, script state replayed. Each result is checked on hardware GPUs and on WARP, and a community GPU bench covers more than 40 cards. State recorded on 21 November 2026 (commit `18d57d9`).
 
-## Taken into AnyXboxX (in Rust, `rust/anyxboxx-texture`)
+## Taken into El1xr (in Rust, `rust/anyxboxx-texture`)
 
 | Item | Their source | Our port | Verification |
 | --- | --- | --- | --- |
@@ -17,4 +17,4 @@ The command line `anyxboxx_texture bc7 <blocs.bin> <largeur> <hauteur> <sortie.p
 ## Not taken, and why
 
 - **BCPack**: their `tools/bcpack_probe.py` tests a rANS coding hypothesis on the 48-byte header of a stream; it is not a decoder, and the model of the variable lanes is still open (their issue #15). The "no zlib" blocks in Codex's notes on ETPF ([ETPF_ANALYSIS.md](package/ETPF_ANALYSIS.md)) may be of this kind, without proof.
-- **CPU recompilation and FidelityFX**: a different approach from AnyXboxX's native execution; their fixtures remain a useful reference for future tests.
+- **CPU recompilation and FidelityFX**: a different approach from El1xr's native execution; their fixtures remain a useful reference for future tests.

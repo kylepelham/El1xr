@@ -52,7 +52,7 @@ Measurement: `python PrototypeScarlett/scarlett.py --traduction <package folder>
 | `xmem.dll` | `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` | `XALLOC_ATTRIBUTES` attributes decoded with the ERA layout (ported from Xbox2Windows): PC heap at the requested alignment (64 bytes at least, 4 KiB for large blocks), graphics types in their own page region, physical memory refused; allocation hooks; `XMemVirtualQuery(process, address, buffer)` with a graphics-memory flag at +0x30 (PC policy, field not confirmed). The statistics return a clean failure: their structure is not public. |
 | `d3d12_xs.dll` | `D3D12SerializeVersionedRootSignature`, `D3D12CreateRootSignatureDeserializer` | Redirected to the PC's `d3d12.dll`: same contract, public structures. |
 
-The C++ runtime is preloaded by its full path. Windows then finds these DLLs by name: a game DLL loaded by Windows itself also receives those of AnyXboxX.
+The C++ runtime is preloaded by its full path. Windows then finds these DLLs by name: a game DLL loaded by Windows itself also receives those of El1xr.
 
 The game's main executable is absent from the package. Its own console imports, notably the creation of the D3D12.X device, will be added to this list.
 
@@ -64,17 +64,17 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 
 | Interface | Functions | Served by |
 |---|---|---|
-| `XStore` (+ 3 interface versions) | 70 | **AnyXboxX** (local license, empty products, offline purchase and download) |
+| `XStore` (+ 3 interface versions) | 70 | **El1xr** (local license, empty products, offline purchase and download) |
 | `XGameUi` | 42 | Windows |
-| `XUser` (+ 4 interface versions, `XUserGetGamertag`) | 44 | **AnyXboxX** (offline profile) |
+| `XUser` (+ 4 interface versions, `XUserGetGamertag`) | 44 | **El1xr** (offline profile) |
 | `XGameStreaming` | 32 | Windows |
 | `XPackage` | 31 | Windows |
-| `XGameSave` (+ `XGameSaveFiles`) | 30 | **AnyXboxX** (PC disk) |
-| `XTaskQueue` / `XAsync` / `XThread` | 27 | **AnyXboxX** |
+| `XGameSave` (+ `XGameSaveFiles`) | 30 | **El1xr** (PC disk) |
+| `XTaskQueue` / `XAsync` / `XThread` | 27 | **El1xr** |
 
 ## Xbox Series X identity
 
-`XSystemGetDeviceType` is not an interface: `xgameruntime.lib`, linked into the game, reads `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM`, value `ConsoleMode`. The value 0x64 gives `XboxScarlettAnaconda`, and a missing value gives `Pc`. In native mode, AnyXboxX redirects the registry functions of the game **and of the DLLs in its folder** to a simulated registry (`runtime/xgameruntime/registry.cpp`): only this key is simulated, the rest goes to the real registry.
+`XSystemGetDeviceType` is not an interface: `xgameruntime.lib`, linked into the game, reads `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM`, value `ConsoleMode`. The value 0x64 gives `XboxScarlettAnaconda`, and a missing value gives `Pc`. In native mode, El1xr redirects the registry functions of the game **and of the DLLs in its folder** to a simulated registry (`runtime/xgameruntime/registry.cpp`): only this key is simulated, the rest goes to the real registry.
 
 `XGameGetXboxTitleId` returns the `<TitleId>` of the game's `MicrosoftGame.config`. `XSystemGetAnalyticsInfo` reports the "Windows.Xbox" family and the "Xbox Series X" model, and the Xbox Live sandbox is `RETAIL`.
 
@@ -82,11 +82,11 @@ On PC, each `X*` function of the GDK static library (`xgameruntime.lib`) calls `
 
 `XGameSave` and `XPersistentLocalStorage` write to the PC disk, in `%LOCALAPPDATA%\AnyXboxX\<TitleId>\` (or `ANYXBOXX_SAVE_DIR`). The layout is `saves\<configuration>\<XUID>\<container>\<blob>.blob`. Game names are encoded as `%XX` for any character outside `[A-Za-z0-9_-]`: no name can leave the folder. Each blob is written to a temporary file, then renamed, which avoids half-written saves. The simulated quota is 256 MiB per configuration; there is no cloud sync. Local storage reports the size of the `<PersistentLocalStorage><SizeMB>` of the `MicrosoftGame.config`.
 
-`runtime/xgameruntime/served_interfaces.inc` lists the interfaces served by AnyXboxX. This file is read by both the C++ code and the `--traduction` measurement.
+`runtime/xgameruntime/served_interfaces.inc` lists the interfaces served by El1xr. This file is read by both the C++ code and the `--traduction` measurement.
 
 ## Native execution
 
-Since 21 November 2026, `--natif` loads an executable and runs it directly on the processor (Wine approach). First result: the **SimpleTriangle** test game **is displayed**, with the GDK runtime served by AnyXboxX. Details, screenshots and limits: [jeu-de-test.md](test-game.md).
+Since 21 November 2026, `--natif` loads an executable and runs it directly on the processor (Wine approach). First result: the **SimpleTriangle** test game **is displayed**, with the GDK runtime served by El1xr. Details, screenshots and limits: [jeu-de-test.md](test-game.md).
 
 ## Multi-module loading
 

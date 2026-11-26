@@ -1,4 +1,4 @@
-// Identité Xbox Series X servie par AnyXboxX : XSystem, analytique, Title ID, lancement,
+// Identité Xbox Series X servie par El1xr : XSystem, analytique, Title ID, lancement,
 // fonctionnalités du runtime et report d'extinction de l'écran.
 //
 // Méthodes et interfaces : gdk_api_table.inc. Signatures : en-têtes publics XSystem.h,

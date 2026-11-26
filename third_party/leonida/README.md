@@ -2,7 +2,7 @@
 
 Fichiers copiés **sans modification** depuis [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida),
 dossier `tools/`, commit `1cc6e3c121` (23 novembre 2026, 15 h). Licence : GNU GPL 3.0 (fichier `LICENSE`,
-la même que celle d'AnyXboxX). Tout le mérite de ce code revient aux auteurs de Leonida.
+la même que celle d'El1xr). Tout le mérite de ce code revient aux auteurs de Leonida.
 
 | Fichier | Rôle |
 | --- | --- |
@@ -20,7 +20,7 @@ la même que celle d'AnyXboxX). Tout le mérite de ce code revient aux auteurs d
 | `report_paths.py` | deux chemins de rapport désignent-ils le même fichier ? (refus d'écraser une entrée) |
 | `gfx10_formats.json` | noms des formats GFX10 |
 
-AnyXboxX l'appelle par `PrototypeScarlett/emu/rdna2_spirv.py`, sur le texte produit par son propre
+El1xr l'appelle par `PrototypeScarlett/emu/rdna2_spirv.py`, sur le texte produit par son propre
 désassembleur (sans `llvm-mc`) : `scarlett.py --rdna2 <shader.bin> --spirv <vs|ps|cs|ms|gs>`.
 
 Ce qui n'est **pas** copié : tout ce qui est propre à un jeu (formats d'archives et de ressources,
