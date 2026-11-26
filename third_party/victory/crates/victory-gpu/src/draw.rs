@@ -4722,7 +4722,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             // One lookup of the host copy (and twin) for the upload, the
             // twin and the state: each lookup takes the texture's lock, and
             // the copy's flags are kept, not asked of the driver.
