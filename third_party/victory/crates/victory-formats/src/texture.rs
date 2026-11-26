@@ -97,9 +97,15 @@ pub struct Pipes {
 
 impl Pipes {
     /// Xbox Series X: 32 pipes, 8 packers.
-    pub const SERIES_X: Pipes = Pipes { pipes_log2: 5, packers_log2: 3 };
+    pub const SERIES_X: Pipes = Pipes {
+        pipes_log2: 5,
+        packers_log2: 3,
+    };
     /// Xbox Series S: 8 pipes, 4 packers.
-    pub const SERIES_S: Pipes = Pipes { pipes_log2: 3, packers_log2: 2 };
+    pub const SERIES_S: Pipes = Pipes {
+        pipes_log2: 3,
+        packers_log2: 2,
+    };
 }
 
 #[rustfmt::skip]
@@ -266,7 +272,7 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block of each element coordinate bit, per
     /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    pattern: std::borrow::Cow<'static, [Vec<u32>; 3]>,
     /// The XOR modes' pattern, by coordinate bit, when the layout was made
     /// by [`Layout::for_gpu`]; `None` otherwise (and `pattern` is empty).
     flips: Option<Flips>,
@@ -343,6 +349,25 @@ fn spread(bits: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// Only tile kind, element size and block size enter the three coordinate
+/// offset tables, so layouts can share the immutable tables instead of
+/// allocating three vectors per texture.
+fn layout_pattern(
+    kind: usize,
+    element_log2: u32,
+    block_log2: u32,
+) -> std::borrow::Cow<'static, [Vec<u32>; 3]> {
+    use std::{borrow::Cow, sync::OnceLock};
+    type Tables = [Vec<u32>; 3];
+    static CACHE: [[[OnceLock<Tables>; 5]; 3]; 3] =
+        [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
+    let block = ((block_log2 - 8) / 4) as usize;
+    Cow::Borrowed(
+        CACHE[kind][block][element_log2 as usize]
+            .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))),
+    )
+}
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -373,6 +398,10 @@ impl Layout {
 
     fn build(desc: &Desc, gpu: Option<(Pipes, u32)>) -> Result<Layout, Error> {
         let d = *desc;
+        // A linear layout reserves storage for a single sample per texel.
+        if d.samples > 1 && d.swizzle == Swizzle::LINEAR {
+            return Err(Error::Invalid);
+        }
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
@@ -441,13 +470,18 @@ impl Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
-        let thick = d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
+        let thick =
+            d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
         let block = if thick {
             // ComputeThickBlockDimension
             let amp = (block_log2 - 10) / 3;
             let rest = (block_log2 - 10) % 3;
             let b = BLOCK_1K_3D[element_log2 as usize];
-            [b[0] << amp, b[1] << (amp + rest / 2), b[2] << (amp + u32::from(rest != 0))]
+            [
+                b[0] << amp,
+                b[1] << (amp + rest / 2),
+                b[2] << (amp + u32::from(rest != 0)),
+            ]
         } else {
             // ComputeThinBlockDimension
             let samples_log2 = d.samples.trailing_zeros();
@@ -463,7 +497,12 @@ impl Layout {
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block),
+            )
+        };
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -478,10 +517,8 @@ impl Layout {
                 offset: 0,
                 tail: None,
             });
-            slice_size = u64::from(mips[0].pitch)
-                * u64::from(mips[0].rows)
-                * bpe
-                * u64::from(d.samples);
+            slice_size =
+                u64::from(mips[0].pitch) * u64::from(mips[0].rows) * bpe * u64::from(d.samples);
         } else {
             // GetMipTailDim: the largest mip the tail takes.
             let mut tail_max = block;
@@ -617,7 +654,7 @@ impl Layout {
             } else {
                 usize::from(d.swizzle.display())
             };
-            pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            layout_pattern(kind, element_log2, block_log2)
         } else {
             Default::default()
         };
@@ -700,7 +737,10 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2, flip(&flips[1], y) ^ flip(&flips[2], z) ^ self.xor)
+        (
+            blocks << log2,
+            flip(&flips[1], y) ^ flip(&flips[2], z) ^ self.xor,
+        )
     }
 
     /// The XOR modes' part of an address that depends on the column: whole
@@ -721,7 +761,8 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -757,7 +798,12 @@ impl Layout {
             .iter()
             .map(|m| match m.tail {
                 Some(_) => self.alignment,
-                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+                None => {
+                    m.offset
+                        + u64::from(m.pitch)
+                            * u64::from(m.rows)
+                            * u64::from(self.desc.element_bytes)
+                }
             })
             .max()
             .unwrap_or(self.size)
@@ -823,11 +869,17 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        // A volume slice needs room for its last row before the next slice begins.
+        if depth > 1 && depth_pitch < slice_bytes {
+            return Err(Error::TooSmall);
+        }
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
         let (tiled_len, linear_len) = if DETILE {
             (src.len(), dst.len())
@@ -1056,7 +1108,10 @@ impl Texture {
         Texture::build(desc, |d| Layout::for_gpu(d, pipes, pipe_bank_xor))
     }
 
-    fn build(desc: &TextureDesc, layout: impl Fn(&Desc) -> Result<Layout, Error>) -> Result<Texture, Error> {
+    fn build(
+        desc: &TextureDesc,
+        layout: impl Fn(&Desc) -> Result<Layout, Error>,
+    ) -> Result<Texture, Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
@@ -1064,7 +1119,14 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
+            0 => {
+                32 - desc
+                    .width
+                    .max(desc.height)
+                    .max(depth3d)
+                    .max(1)
+                    .leading_zeros()
+            }
             n => n,
         };
         let plane = |bytes| Desc {
@@ -1196,7 +1258,11 @@ mod tests {
             let mut seen = vec![false; l.size as usize];
             let mut tiled = vec![0u8; l.size as usize];
             let n = d.element_bytes as usize;
-            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            let slices = if d.dimension == Dimension::Tex3d {
+                1
+            } else {
+                d.depth
+            };
             for slice in 0..slices {
                 for mip in 0..d.mips {
                     let m = l.mips[mip as usize];
@@ -1225,7 +1291,11 @@ mod tests {
                                 seen[at] = true;
                             }
                         }
-                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                        assert!(
+                            back[base + plane - 11..base + plane]
+                                .iter()
+                                .all(|&b| b == 0xcc)
+                        );
                     }
                 }
             }
@@ -1335,7 +1405,11 @@ mod tests {
     fn smaller_mips_need_only_the_start_of_the_texture() {
         // 1024x1024 BC1 (8-byte elements) in 4 KiB blocks: the tail (from
         // 64x64 on), then 128x128 in two blocks, 256x256 in eight.
-        let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        let l = Layout::new(&Desc {
+            block: 4,
+            ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
         assert_eq!(l.bytes_from(0), l.size);
         let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
         assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
@@ -1346,14 +1420,20 @@ mod tests {
             let pitch = m.width as usize * 8;
             let read = |tiled: &[u8]| {
                 let mut linear = vec![0; pitch * m.height as usize];
-                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize).map(|()| linear)
+                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize)
+                    .map(|()| linear)
             };
             let len = l.bytes_from(mip) as usize;
             assert_eq!(read(&tiled[..len]), read(&tiled));
             assert_eq!(read(&tiled[..len - 1]), Err(Error::TooSmall));
         }
         // Slices each hold their chain: the whole texture.
-        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        let l = Layout::new(&Desc {
+            depth: 2,
+            block: 4,
+            ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
         assert_eq!(l.bytes_from(4), l.size);
     }
 
@@ -1438,7 +1518,10 @@ mod tests {
     /// z1^y5^x6, z0^x5^y6, x6^x8^y8, x3, y3, y6^x7. Blocks are 128 x 128.
     #[test]
     fn hand_checked_xor_addresses() {
-        let d = Desc { depth: 2, ..desc(512, 256, 1, 4, Swizzle::SW_64KB_R_X) };
+        let d = Desc {
+            depth: 2,
+            ..desc(512, 256, 1, 4, Swizzle::SW_64KB_R_X)
+        };
         let l = Layout::for_gpu(&d, Pipes::SERIES_X, 0).unwrap();
         assert_eq!(l.block, [128, 128, 1]);
         assert_eq!(l.offset(0, 1, 0, 0), Ok(1 << 2));
@@ -1477,8 +1560,17 @@ mod tests {
             Swizzle::SW_64KB_D_X,
             Swizzle::SW_64KB_R_X,
         ] {
-            for (pipes, base) in [(Pipes::SERIES_X, 0), (Pipes::SERIES_S, 0x2d), (Pipes::SERIES_X, 0x1f3)] {
-                for (w, h, bpe, mips) in [(256, 256, 4, 1), (256, 256, 8, 1), (100, 60, 4, 7), (33, 17, 1, 6)] {
+            for (pipes, base) in [
+                (Pipes::SERIES_X, 0),
+                (Pipes::SERIES_S, 0x2d),
+                (Pipes::SERIES_X, 0x1f3),
+            ] {
+                for (w, h, bpe, mips) in [
+                    (256, 256, 4, 1),
+                    (256, 256, 8, 1),
+                    (100, 60, 4, 7),
+                    (33, 17, 1, 6),
+                ] {
                     let l = Layout::for_gpu(&desc(w, h, mips, bpe, swizzle), pipes, base).unwrap();
                     assert!(l.addressable(), "{swizzle:?}");
                     let n = bpe as usize;
@@ -1487,17 +1579,25 @@ mod tests {
                     for mip in 0..mips {
                         let m = &l.mips[mip as usize];
                         let (mw, mh) = (m.width as usize, m.height as usize);
-                        let linear: Vec<u8> = (0..mw * mh * n).map(|i| (i * 7 + mip as usize) as u8).collect();
-                        l.tile(&mut tiled, mip, 0, &linear, mw * n, mw * mh * n).unwrap();
+                        let linear: Vec<u8> = (0..mw * mh * n)
+                            .map(|i| (i * 7 + mip as usize) as u8)
+                            .collect();
+                        l.tile(&mut tiled, mip, 0, &linear, mw * n, mw * mh * n)
+                            .unwrap();
                         let mut back = vec![0u8; linear.len()];
-                        l.detile(&tiled, mip, 0, &mut back, mw * n, mw * mh * n).unwrap();
+                        l.detile(&tiled, mip, 0, &mut back, mw * n, mw * mh * n)
+                            .unwrap();
                         assert_eq!(back, linear, "{swizzle:?} {w}x{h} mip {mip}");
                         for y in 0..mh as u32 {
                             for x in 0..mw as u32 {
                                 let at = l.offset(mip, x, y, 0).unwrap() as usize;
                                 assert!(at + n <= seen.len());
                                 let want = &linear[(y as usize * mw + x as usize) * n..][..n];
-                                assert_eq!(&tiled[at..at + n], want, "{swizzle:?} mip {mip} ({x},{y})");
+                                assert_eq!(
+                                    &tiled[at..at + n],
+                                    want,
+                                    "{swizzle:?} mip {mip} ({x},{y})"
+                                );
                                 assert!(!seen[at], "{swizzle:?} mip {mip} ({x},{y}) twice");
                                 seen[at..at + n].fill(true);
                             }
@@ -1515,14 +1615,23 @@ mod tests {
     fn rows_flip_a_low_bit_of_their_own() {
         for p in patterns::PATTERNS.iter().filter(|p| p.swizzle.xor()) {
             let d = Desc {
-                dimension: if p.thick { Dimension::Tex3d } else { Dimension::Tex2d },
+                dimension: if p.thick {
+                    Dimension::Tex3d
+                } else {
+                    Dimension::Tex2d
+                },
                 ..desc(1, 1, 1, 1 << p.element_log2, p.swizzle)
             };
             let l = Layout::for_gpu(&d, p.pipes.unwrap_or(Pipes::SERIES_X), u32::MAX).unwrap();
             let flips = l.flips.unwrap();
             let rows = flips[1..].as_flattened().iter().fold(l.xor, |a, &f| a | f);
             let columns = flips[0].iter().fold(0, |a, &f| a | f);
-            assert_eq!(columns & (rows & rows.wrapping_neg()), 0, "{d:?} {:?}", p.pipes);
+            assert_eq!(
+                columns & (rows & rows.wrapping_neg()),
+                0,
+                "{d:?} {:?}",
+                p.pipes
+            );
         }
     }
 
@@ -1530,12 +1639,71 @@ mod tests {
     /// pipe configuration changes the XOR modes' addresses, not their sizes.
     #[test]
     fn xor_edge_cases() {
-        let l = Layout::for_gpu(&desc(64, 64, 1, 4, Swizzle::SW_4KB_R_X), Pipes::SERIES_X, 0).unwrap();
+        let l =
+            Layout::for_gpu(&desc(64, 64, 1, 4, Swizzle::SW_4KB_R_X), Pipes::SERIES_X, 0).unwrap();
         assert!(!l.addressable());
         let d = desc(256, 256, 1, 4, Swizzle::SW_64KB_R_X);
         let x = Layout::for_gpu(&d, Pipes::SERIES_X, 0).unwrap();
         let s = Layout::for_gpu(&d, Pipes::SERIES_S, 0).unwrap();
         assert_eq!((x.size, x.block), (s.size, s.block));
         assert_ne!(x.offset(0, 77, 91, 0), s.offset(0, 77, 91, 0));
+    }
+
+    #[test]
+    fn shared_swizzle_offsets_are_reused_across_layouts() {
+        for (kind, blocks) in [
+            (0, &[8, 12, 16][..]),
+            (1, &[8, 12, 16][..]),
+            (2, &[12, 16][..]),
+        ] {
+            for &block in blocks {
+                for element in 0..5 {
+                    let shared = super::layout_pattern(kind, element, block);
+                    let again = super::layout_pattern(kind, element, block);
+                    let owned =
+                        super::pattern(kind, element, block).map(|bits| super::spread(&bits));
+                    assert_eq!(shared.as_ref(), &owned);
+                    assert!(std::ptr::eq(shared.as_ref(), again.as_ref()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_multisampling_is_rejected_while_tiled_msaa_succeeds() {
+        let linear = desc(64, 64, 1, 4, Swizzle::LINEAR);
+        assert!(Layout::new(&linear).is_ok());
+        for samples in [2, 4, 8] {
+            let d = Desc { samples, ..linear };
+            assert!(Layout::new(&d).is_err());
+            assert!(
+                Layout::new(&Desc {
+                    swizzle: Swizzle::SW_64KB_R_X,
+                    ..d
+                })
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_volume_slices_are_rejected_without_touching_buffers() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let mut tiled = vec![0x42; layout.size as usize];
+            let mut linear = [0x55; 72];
+            for pitch in [0, 35] {
+                assert!(layout.detile(&tiled, 0, 0, &mut linear, 20, pitch).is_err());
+                assert!(layout.tile(&mut tiled, 0, 0, &linear, 20, pitch).is_err());
+                assert_eq!(linear, [0x55; 72]);
+                assert!(tiled.iter().all(|&v| v == 0x42));
+            }
+            assert!(layout.detile(&tiled, 0, 0, &mut linear, 20, 36).is_ok());
+        }
     }
 }

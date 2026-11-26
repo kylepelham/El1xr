@@ -6142,8 +6142,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (_, lo, hi, at, from, _) in &kept {
-                        list.CopyBufferRegion(&buffer, *at, snaps, *from, (*hi - *lo) as u64);
+                    for (at, from, len) in
+                        crate::relay_runs::relay_kept_runs(&kept, crate::relay_runs::enabled())
+                    {
+                        list.CopyBufferRegion(&buffer, at, snaps, from, len);
                     }
                     list.Close()?;
                     own.queue
@@ -6182,13 +6184,15 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &pieces {
+                    for (shadow, lo, hi, at) in
+                        crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
+                    {
                         list.CopyBufferRegion(
                             &buffer,
-                            *at,
+                            at,
                             &shadow.buffer,
-                            *lo as u64,
-                            (*hi - *lo) as u64,
+                            lo as u64,
+                            (hi - lo) as u64,
                         );
                     }
                     list.Close()?;

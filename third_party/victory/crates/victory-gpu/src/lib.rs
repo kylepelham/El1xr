@@ -15,17 +15,19 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod alloc_backoff;
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod cores;
 pub mod descriptor;
 pub mod device;
-#[cfg(windows)]
-mod alloc_backoff;
-#[cfg(windows)]
-mod ambient;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -34,63 +36,63 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod frametime;
+mod heap_pass;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod indirect;
+#[cfg(windows)]
+mod inplace;
+pub mod list;
+#[cfg(windows)]
+mod memory;
+pub mod object;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod pacing;
+pub mod pipeline;
 #[cfg(windows)]
 mod pixels;
-#[cfg(windows)]
-mod screenshot;
-#[cfg(windows)]
-mod scratch_spare;
-#[cfg(windows)]
-mod indirect;
-#[cfg(windows)]
-mod cores;
-#[cfg(windows)]
-mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
-pub mod list;
-pub mod object;
-pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
-mod heap_pass;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod ramline;
+#[cfg(windows)]
+mod relay_runs;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
+mod scratch_spare;
+#[cfg(windows)]
+mod screenshot;
+#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod memory;
-#[cfg(windows)]
-mod ramline;
-#[cfg(windows)]
 mod shadow;
+pub mod signature;
 #[cfg(windows)]
 mod submit_chunk;
-#[cfg(windows)]
-mod windowup;
-#[cfg(windows)]
-mod tiles;
-pub mod signature;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod tiles;
+#[cfg(windows)]
 pub mod titlemem;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod windowup;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -100,7 +102,8 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 pub use shadow::LazyAccessHold;
 #[cfg(windows)]
 pub use watch::{
-    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
-    writing_hold as kernel_will_write_hold, written_through_view,
+    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range,
+    title_memory_remapped, title_memory_remapping, title_memory_remapping_range,
+    title_memory_written, writing as kernel_will_write, writing_hold as kernel_will_write_hold,
+    written_through_view,
 };
