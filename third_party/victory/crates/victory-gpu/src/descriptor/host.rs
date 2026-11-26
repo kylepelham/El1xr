@@ -2501,7 +2501,10 @@ impl HostHeap {
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        // The set keeps its allocation across passes. It is emptied under
+        // the same lock as before, so writes racing this drain still belong
+        // to the next pass.
+        changed.drain().collect()
     }
 
     /// [`HostHeap::note_buffer_into`] without a batch, for tests.
@@ -4963,6 +4966,27 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set of changed buffer slots is emptied, not replaced: it keeps
+    /// its allocation from one heap pass to the next.
+    #[test]
+    fn dirty_descriptor_drain_retains_capacity() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let capacity = {
+            let mut changed = heap.changed.lock().unwrap();
+            changed.extend([1, 2, 3]);
+            changed.capacity()
+        };
+        let mut first = heap.buffer_changes();
+        first.sort_unstable();
+        assert_eq!(first, vec![1, 2, 3]);
+        assert!(heap.buffer_changes().is_empty());
+        assert_eq!(heap.changed.lock().unwrap().capacity(), capacity);
+        heap.changed.lock().unwrap().insert(2);
+        assert_eq!(heap.buffer_changes(), vec![2]);
+    }
 
     /// A range of dynamic slots is given back only to the heap that took it:
     /// the title can release a heap while a list still holds slots of it,
