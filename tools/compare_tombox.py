@@ -1,5 +1,5 @@
 """Confronte le désassembleur RDNA 2 de TomBox (tombox-xshader, via rust/anyxboxx_rdna2) aux
-encodages publics des tests de LLVM, comme le décodeur d'AnyXboxX (tools/rdna2_mnemonics.py).
+encodages publics des tests de LLVM, comme le décodeur d'El1xr (tools/rdna2_mnemonics.py).
 
 Pour chaque encodage : longueur (mots de 32 bits) et mnémonique de TomBox comparés à LLVM.
 Le rapport classe les écarts par famille ; les mnémoniques inconnus de TomBox (« vop3<0x…> »)

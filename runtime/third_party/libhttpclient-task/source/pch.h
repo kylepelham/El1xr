@@ -1,4 +1,4 @@
-// En-tête précompilé d'AnyXboxX pour le module Task de libHttpClient (MIT).
+// En-tête précompilé d'El1xr pour le module Task de libHttpClient (MIT).
 // Remplace Source/Common/pch.h et pch_common.h : seules les définitions dont le
 // module Task a besoin, sans la trace ni l'allocateur de libHttpClient.
 #pragma once

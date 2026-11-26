@@ -47,7 +47,6 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -458,7 +457,20 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            if bytes.is_empty() {
+                let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                    &mut raw,
+                )
+                .ok()?;
+                <ID3D12PipelineLibrary as windows::core::Interface>::from_raw(raw).cast()
+            } else {
+                device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            }
         }
     };
     if !blob.bytes().is_empty() {
@@ -554,14 +566,63 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match library.saving.try_read() {
+        Ok(_stores) => store(library, &wide, &pso),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let _stores = e.into_inner();
+            store(library, &wide, &pso);
+        }
+        // A save is serialising the library (seconds, for 1.2 GB): the
+        // pipeline goes to its draws now and into the library after the
+        // save (the worker waited out the save, and its draws were dropped
+        // meanwhile).
+        Err(std::sync::TryLockError::WouldBlock) => {
+            lock_unstored().0.push((wide, pso.clone()));
+        }
     }
     Ok(pso)
+}
+
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &name.to_string());
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs) is refused, which leaves the library as it was.
+    match unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) } {
+        Ok(()) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            if STORE_REFUSED.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::info!(error = %e, %name, "host pipeline library refused to store a pipeline");
+            }
+        }
+    }
+}
+
+/// Pipelines the library refused to store (a run that made 257 saved none).
+static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Pipelines made while a save held the library, to store after it.
+struct Unstored(Vec<(HSTRING, ID3D12PipelineState)>);
+// SAFETY: D3D12 pipeline states are free-threaded.
+unsafe impl Send for Unstored {}
+
+fn lock_unstored() -> MutexGuard<'static, Unstored> {
+    static UNSTORED: Mutex<Unstored> = Mutex::new(Unstored(Vec::new()));
+    UNSTORED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Stores the pipelines made during a save.
+fn store_unstored(library: &Library) {
+    let unstored = std::mem::take(&mut lock_unstored().0);
+    if unstored.is_empty() {
+        return;
+    }
+    let _all = one_call();
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    for (name, pso) in &unstored {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -581,6 +642,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    store_unstored(library);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
@@ -591,7 +653,8 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = used().as_mut().is_some_and(|e| std::mem::take(&mut e.changed));
+        if !used_changed && added == 0 {
             return;
         }
         if added == 0 {
@@ -610,10 +673,11 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    store_unstored(library);
     // With what earlier runs listed: a run that asks for no title pipeline
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used().iter().flat_map(|e| e.lines()).map(str::to_owned).collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -638,6 +702,7 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            store_refused = STORE_REFUSED.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -681,35 +746,34 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+/// Title pipeline keys requested by draws or dispatches (this run and the
+/// last), in the order to make them early ([`super::early`]).
+static USED: Mutex<Option<super::early::Early>> = Mutex::new(None);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+fn used() -> std::sync::MutexGuard<'static, Option<super::early::Early>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let early = super::early::Early::read(&listed, EARLY_MAX);
+        tracing::info!(pipelines = early.len(), "title pipelines to start early");
+        *used = Some(early);
     }
     used
 }
 
-/// Whether the title pipeline with `key` was requested in this or an earlier run.
-pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+/// The rank to make the title pipeline with `key` early at (lowest first),
+/// if it was requested in this or an earlier run.
+pub(crate) fn wanted_early(key: &str) -> Option<u32> {
+    used().as_ref().and_then(|e| e.rank(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
+    if let Some(early) = used().as_mut() {
+        early.note(key);
     }
 }
 
@@ -738,6 +802,18 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    /// No blob: the empty library is asked for with a null pointer (vkd3d-proton
+    /// refuses the dangling pointer of an empty slice).
+    #[test]
+    fn no_blob_gives_an_empty_library() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let library = open(&device, Blob::None).expect("an empty library");
+        // SAFETY: a plain query on a live library.
+        assert!(unsafe { library.library.GetSerializedSize() } > 0);
     }
 
     /// A mapped file reads as the file's bytes, a file written through a

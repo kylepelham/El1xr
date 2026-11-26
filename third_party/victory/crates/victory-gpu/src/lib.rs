@@ -36,13 +36,19 @@ pub mod frame;
 pub mod frametime;
 pub mod hitch;
 #[cfg(windows)]
+mod heap_rounds;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod pacing;
+#[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
 mod screenshot;
+#[cfg(windows)]
+mod scratch_spare;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -74,6 +80,8 @@ mod ramline;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod submit_chunk;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;
@@ -85,8 +93,12 @@ mod texture;
 #[cfg(windows)]
 pub mod titlemem;
 #[cfg(windows)]
+#[cfg(windows)]
+mod defrag;
 mod watch;
 
+#[cfg(windows)]
+pub use defrag::log_defrag_counters;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

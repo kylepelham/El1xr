@@ -1025,6 +1025,7 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]

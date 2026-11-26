@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="456" viewBox="0 0 760 456" font-family="Segoe UI, Arial, sans-serif" font-size="13">
 <rect width="760" height="456" fill="#f7f8fa"/>
-<text x="24" y="34" font-size="18" font-weight="600" fill="#1d2230">AnyXboxX: Xbox Series X translation progress</text>
+<text x="24" y="34" font-size="18" font-weight="600" fill="#1d2230">El1xr: Xbox Series X translation progress</text>
 <text x="24" y="56" fill="#4b5263">Share translated for the Xbox Series X · green complete, orange partial, red not started</text>
 <text x="270" y="90" text-anchor="end" fill="#1d2230">CPU instructions (x86-64, Zen 2)</text>
 <rect x="300" y="76" width="220" height="18" rx="3" fill="#e3e6ee"/>
@@ -37,7 +37,7 @@
 <rect x="300" y="352" width="220" height="18" rx="3" fill="#107c10"/>
 <text x="532" y="366" fill="#1d2230">100%</text>
 <text x="300" y="386" font-size="11" fill="#4b5263">served by TomBox's d3d12_xs.dll (194/200 methods by their count), not yet tried with a game</text>
-<text x="270" y="412" text-anchor="end" fill="#1d2230">GDK runtime functions served by AnyXboxX</text>
+<text x="270" y="412" text-anchor="end" fill="#1d2230">GDK runtime functions served by El1xr</text>
 <rect x="300" y="398" width="220" height="18" rx="3" fill="#e3e6ee"/>
 <rect x="300" y="398" width="117" height="18" rx="3" fill="#e8890c"/>
 <text x="532" y="412" fill="#1d2230">210/396 (53%)</text>

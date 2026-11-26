@@ -195,6 +195,7 @@ impl Bits {
         Some(unsafe { &*ptr })
     }
 
+    #[cfg(test)]
     fn set(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece_or_make(word) {
@@ -225,13 +226,6 @@ impl Bits {
         self.piece(word).is_some_and(|piece| {
             piece[word % Bits::WORDS].fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit
                 != 0
-        })
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn word(&self, word: usize) -> u64 {
-        self.piece(word).map_or(0, |piece| {
-            piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst)
         })
     }
 
@@ -2867,28 +2861,6 @@ impl BlockSet {
         true
     }
 
-    fn remove_range(&mut self, from: usize, to: usize) {
-        if from >= to {
-            return;
-        }
-        if let Some((&s, &e)) = self.0.range(..from).next_back()
-            && e > from
-        {
-            self.0.insert(s, from);
-            if e > to {
-                self.0.insert(to, e);
-                return;
-            }
-        }
-        while let Some((&s, &e)) = self.0.range(from..to).next() {
-            self.0.remove(&s);
-            if e > to {
-                self.0.insert(to, e);
-                break;
-            }
-        }
-    }
-
     /// Removes all blocks in `[from, to)` and returns the removed sub-intervals
     /// in ascending order.
     fn take_range(&mut self, from: usize, to: usize) -> Vec<(usize, usize)> {
@@ -4980,6 +4952,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     if reservation::enabled() {
         ask_once_end();
     }
@@ -5370,6 +5343,7 @@ mod tests {
             )
             .is_none()
         );
+        before_virtual_free(p, 4 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -6004,6 +5978,7 @@ mod tests {
         let (now, pages) = writes(p, p + 2 * PAGE, true).expect("fallback to write watch");
         assert!(pages.contains(&(p / PAGE + 1, now)));
         assert!(!VIEWS.any(wb, we), "fallback must clear stale VIEWS bits");
+        before_virtual_free(p, 2 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

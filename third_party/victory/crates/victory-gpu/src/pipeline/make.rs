@@ -23,7 +23,9 @@
 //! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
 //! loading waits only).
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -148,9 +150,21 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // A failed translation must complete this queue entry and wake its waiters.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            }
+        });
         let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -301,7 +315,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
+        start(p, REQUESTED, 0);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
@@ -330,9 +344,12 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() || p.shaders.is_empty() {
+        return;
+    }
+    if let Some(rank) = super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, EARLY, rank);
     }
 }
 
@@ -535,22 +552,49 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+/// A pipeline started early, made in the order of its rank in the early
+/// list ([`super::early`]), then of its creation.
+struct Early {
+    order: Reverse<(u32, u64)>,
+    p: Arc<Pending>,
+}
+
+impl PartialEq for Early {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+impl Eq for Early {}
+impl PartialOrd for Early {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Early {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
 struct Queue {
-    early: VecDeque<Arc<Pending>>,
+    early: BinaryHeap<Early>,
+    created: u64,
     requested: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
-            early: VecDeque::new(),
+            early: BinaryHeap::new(),
+            created: 0,
             requested: VecDeque::new(),
         }
     }
 
-    /// Queues an unrequested pipeline or promotes one queued at creation.
-    /// Returns whether it is new to the queue, or `None` if nothing changed.
-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+    /// Queues an unrequested pipeline or promotes one queued at creation
+    /// (`rank`: its place in the early list). Returns whether it is new to
+    /// the queue, or `None` if nothing changed.
+    fn push(&mut self, p: &Arc<Pending>, priority: u8, rank: u32) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -559,7 +603,11 @@ impl Queue {
         if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else {
-            self.early.push_back(p.clone());
+            self.created += 1;
+            self.early.push(Early {
+                order: Reverse((rank, self.created)),
+                p: p.clone(),
+            });
         }
         Some(prev == NOT_QUEUED)
     }
@@ -567,7 +615,7 @@ impl Queue {
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
+            std::iter::from_fn(|| self.early.pop().map(|e| e.p))
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
@@ -580,7 +628,7 @@ static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
-fn start(p: &Arc<Pending>, priority: u8) {
+fn start(p: &Arc<Pending>, priority: u8, rank: u32) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -591,7 +639,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    if let Some(new) = queue.push(p, priority, rank) {
         if new {
             PEAK.fetch_max(
                 WAITING.fetch_add(1, Ordering::Relaxed) + 1,
@@ -612,13 +660,16 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 12) on first use.
+/// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers =
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 12));
+        let workers = worker_count(
+            std::thread::available_parallelism().map_or(2, |n| n.get()),
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
+        );
+        tracing::info!(workers, "host pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -646,6 +697,22 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+/// How many workers make pipelines: `VICTORY_PIPELINE_WORKERS`, else every
+/// logical processor but 4 (2 to 28). Translating is most of a pipeline the
+/// first time (the library has the host's part of nearly all of them: run
+/// 19 loaded 2,386 and made 257), and each translation takes one processor:
+/// with half of the 32 (at most 12), 1,300 to 1,800 pipelines were still
+/// being made a minute after boot, while the title, on its start screens,
+/// left most processors idle. The workers run below the title's threads.
+fn worker_count(processors: usize, value: Option<&str>) -> usize {
+    const MOST: usize = 28;
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| processors.saturating_sub(4))
+        .clamp(2, MOST)
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -878,6 +945,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
+    #[test]
     fn another_pipeline_can_finish_while_a_waiter_holds_its_lock() {
         let first = Pending::new(Vec::new(), None);
         let second = Pending::new(Vec::new(), None);
@@ -920,10 +1005,10 @@ mod tests {
         // a 12 s window for a pipeline that is never made.
         super::TEST_BUDGET.set(Some(std::time::Duration::ZERO));
 
-        assert!(!super::super::library::wanted_early(&p.key));
+        assert!(super::super::library::wanted_early(&p.key).is_none());
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
-        assert!(super::super::library::wanted_early(&p.key));
+        assert!(super::super::library::wanted_early(&p.key).is_some());
     }
 
     #[test]
@@ -933,16 +1018,42 @@ mod tests {
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
-        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
-        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&earlier, EARLY, 0), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY, 0), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, 0), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED, 0), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED, 0), None);
 
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&promoted, REQUESTED, 0), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn early_pipelines_are_made_in_the_order_of_the_early_list() {
+        let [late, first, second, requested] =
+            std::array::from_fn(|_| Arc::new(Pending::new(Vec::new(), None)));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&late, EARLY, 900), Some(true));
+        assert_eq!(queue.push(&second, EARLY, 7), Some(true));
+        assert_eq!(queue.push(&first, EARLY, 3), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, 0), Some(true));
+        for expected in [&requested, &first, &second, &late] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+        }
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn workers_take_every_processor_but_four() {
+        assert_eq!(worker_count(32, None), 28);
+        assert_eq!(worker_count(16, None), 12);
+        assert_eq!(worker_count(4, None), 2);
+        assert_eq!(worker_count(64, None), 28);
+        assert_eq!(worker_count(32, Some("6")), 6);
+        assert_eq!(worker_count(32, Some("0")), 28);
+        assert_eq!(worker_count(32, Some("x")), 28);
     }
 }

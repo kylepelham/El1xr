@@ -4,7 +4,7 @@
 
 State on 23 November 2026, upstream commit `561b65a832`. Leonida ([ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida), GPL-3.0) statically recompiles the Xbox Series 1.0.2.1 build for Windows: the game's x86-64 code runs natively, the console system software is reimplemented, and the RDNA 2 shaders are translated to SPIR-V for Vulkan. The repository contains no game, no key and no executable.
 
-Since 23 November, AnyXboxX first aims to run this build: we contribute to Leonida and reuse their work, while keeping AnyXboxX a generic project.
+Since 23 November, El1xr first aims to run this build: we contribute to Leonida and reuse their work, while keeping El1xr a generic project.
 
 ## What we take
 
@@ -25,7 +25,7 @@ Their critical path and the D3D12 methods still open are tracked in their issue 
 
 ## GDK functions: comparison of the two runtimes
 
-The comparison is done by name search, without compiling, so the numbers are approximate. AnyXboxX declares 396 methods (`runtime/xgameruntime/gdk_api_table.inc`) and implements about 170. Leonida names about 310 functions in `runtime/shims/xgameruntime*.cpp` and implements about 190. No import of the executable was measured: their `docs/runtime_imports.md` only lists the families that the package's DLLs link (XAsync, XTaskQueue, XUser, XStore, XGameSave, XPackage, XGameUi).
+The comparison is done by name search, without compiling, so the numbers are approximate. El1xr declares 396 methods (`runtime/xgameruntime/gdk_api_table.inc`) and implements about 170. Leonida names about 310 functions in `runtime/shims/xgameruntime*.cpp` and implements about 190. No import of the executable was measured: their `docs/runtime_imports.md` only lists the families that the package's DLLs link (XAsync, XTaskQueue, XUser, XStore, XGameSave, XPackage, XGameUi).
 
 **Implemented by us, missing or stubs on their side** (contribution leads):
 

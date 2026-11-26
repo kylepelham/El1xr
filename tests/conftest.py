@@ -10,7 +10,7 @@ import tempfile  # noqa: E402
 
 import pytest  # noqa: E402
 
-# Tests déterministes : AnyXboxX gère seul le runtime GDK, même si Gaming Services est
+# Tests déterministes : El1xr gère seul le runtime GDK, même si Gaming Services est
 # installé. Les tests de délégation lancent un sous-processus avec la valeur "1".
 os.environ.setdefault("ANYXBOXX_SYSTEM_RUNTIME", "0")
 # Cache de shaders propre à la session de tests : jamais celui de l'utilisateur.

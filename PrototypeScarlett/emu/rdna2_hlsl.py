@@ -31,7 +31,7 @@ MEMORY_FAMILIES = ("SMEM", "DS", "MUBUF", "MTBUF", "FLAT", "GLOBAL", "SCRATCH")
 OUTPUT_SCALE = {1: "2.0f", 2: "4.0f", 3: "0.5f"}
 WAVE_SIZES = (32, 64)
 
-PRELUDE = """// Généré par AnyXboxX (emu/rdna2_hlsl.py) : programme RDNA 2 recompilé en HLSL.
+PRELUDE = """// Généré par El1xr (emu/rdna2_hlsl.py) : programme RDNA 2 recompilé en HLSL.
 #define END_PC 0xFFFFFFFFu
 RWByteAddressBuffer g_memory : register(u0);
 groupshared uint g_lds[8128];      // D3D12 : 32 Kio de mémoire partagée par groupe au plus

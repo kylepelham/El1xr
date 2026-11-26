@@ -4,7 +4,7 @@
 
 Lecture seule, par l'API GitHub (`gh` connecté). Pour chaque dépôt suivi : commits, issues et pull
 requests mis à jour depuis le dernier passage (date gardée dans %LOCALAPPDATA%\\AnyXboxX\\veille.json),
-puis l'état des issues et pull requests ouvertes par AnyXboxX chez eux.
+puis l'état des issues et pull requests ouvertes par El1xr chez eux.
 """
 import json
 import os

@@ -1,4 +1,4 @@
-// XCRDAPI.dll d'AnyXboxX : DStorageGetFactory minimal (note de premier démarrage, W7).
+// XCRDAPI.dll d'El1xr : DStorageGetFactory minimal (note de premier démarrage, W7).
 //
 // Le titre demande une factory DirectStorage au premier usage d'un fichier. La factory suit la
 // disposition de la console (IDStorageFactoryX, slots 0 à 8 : IUnknown, CreateQueue, OpenFile,

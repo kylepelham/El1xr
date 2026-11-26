@@ -1,4 +1,4 @@
-# Runtime C++ d'AnyXboxX : DLL qui remplacent les bibliothèques de la console.
+# Runtime C++ d'El1xr : DLL qui remplacent les bibliothèques de la console.
 #
 #   cmake -S runtime -B runtime/build -A x64
 #   cmake --build runtime/build --config Release
@@ -9,12 +9,12 @@ cmake_minimum_required(VERSION 3.20)
 project(AnyXboxXRuntime LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-  message(FATAL_ERROR "Le runtime d'AnyXboxX se compile pour Windows x64 uniquement.")
+  message(FATAL_ERROR "Le runtime d'El1xr se compile pour Windows x64 uniquement.")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Même CRT que Python (ucrtbase) : stderr est partagé avec le journal d'AnyXboxX.
+# Même CRT que Python (ucrtbase) : stderr est partagé avec le journal d'El1xr.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 # « $<0:> » évite le sous-dossier Release/Debug des générateurs multi-configurations.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<0:>")
