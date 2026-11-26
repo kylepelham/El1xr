@@ -4,9 +4,9 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -75,7 +75,8 @@ static LAZY_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 type PostTransitionHook = Box<dyn FnOnce(usize) + Send>;
 
 #[cfg(test)]
-pub(super) static TRY_DEFER_POST_TRANSITION_HOOK: Mutex<Option<PostTransitionHook>> = Mutex::new(None);
+pub(super) static TRY_DEFER_POST_TRANSITION_HOOK: Mutex<Option<PostTransitionHook>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 static LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -245,7 +246,9 @@ impl LazyTable {
     }
 
     fn is_remapping(&self, page: usize) -> bool {
-        self.remapping.iter().any(|&(_, lo, hi)| lo <= page && page < hi)
+        self.remapping
+            .iter()
+            .any(|&(_, lo, hi)| lo <= page && page < hi)
     }
 }
 
@@ -409,7 +412,8 @@ pub(super) struct LazyTelemetrySnapshot {
 #[cfg(test)]
 pub(super) fn lazy_telemetry_snapshot() -> LazyTelemetrySnapshot {
     LazyTelemetrySnapshot {
-        deferred_pages: LAZY_STATS[0].load(Ordering::Relaxed) + LAZY_STATS[1].load(Ordering::Relaxed),
+        deferred_pages: LAZY_STATS[0].load(Ordering::Relaxed)
+            + LAZY_STATS[1].load(Ordering::Relaxed),
         veh_faults: LAZY_STATS[2].load(Ordering::Relaxed) + LAZY_STATS[3].load(Ordering::Relaxed),
         self_bypass_hits: LAZY_EXTRA_STATS[0].load(Ordering::Relaxed),
         materialize_us: LAZY_EXTRA_STATS[1].load(Ordering::Relaxed),
@@ -444,7 +448,12 @@ fn lazy_mapped_part(page: usize, make: bool) -> Option<&'static LazyMappedPart> 
         if fresh.is_null() {
             return None;
         }
-        match slot.compare_exchange(std::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
+        match slot.compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => ptr = fresh,
             Err(other) => {
                 // SAFETY: ours alone, just allocated with `layout`.
@@ -497,8 +506,15 @@ pub(crate) fn is_lazy_mapped_view_page(page: usize) -> bool {
     part.0[word].load(Ordering::Acquire) & bit != 0
 }
 
-fn lazy_table_insert_busy(table: &mut LazyTable, page: usize, shadow_id: u64, wait: Arc<FlushWait>) {
-    let prev = table.pages.insert(page, LazyEntry::Busy { shadow_id, wait });
+fn lazy_table_insert_busy(
+    table: &mut LazyTable,
+    page: usize,
+    shadow_id: u64,
+    wait: Arc<FlushWait>,
+) {
+    let prev = table
+        .pages
+        .insert(page, LazyEntry::Busy { shadow_id, wait });
     match prev {
         None => {
             // Both `LAZY_ARMED_COUNT` and `LAZY_ARMED_STRIPES` use `SeqCst` so the
@@ -591,7 +607,9 @@ impl Drop for LazyAccessHold {
 /// `VICTORY_LAZY_COPYBACK` is OFF, executes zero atomics and zero locks.
 pub(crate) fn lazy_hold_access(at: usize, len: usize) -> LazyAccessHold {
     if len == 0 || !lazy_copyback() {
-        return LazyAccessHold { kind: HoldKind::None };
+        return LazyAccessHold {
+            kind: HoldKind::None,
+        };
     }
     let first = at / PAGE;
     let last = at.saturating_add(len).div_ceil(PAGE);
@@ -604,7 +622,9 @@ pub(crate) fn lazy_hold_access(at: usize, len: usize) -> LazyAccessHold {
         }
     } else {
         LAZY_HOLD_GLOBAL.fetch_add(1, Ordering::SeqCst);
-        LazyAccessHold { kind: HoldKind::Global }
+        LazyAccessHold {
+            kind: HoldKind::Global,
+        }
     }
 }
 
@@ -676,13 +696,19 @@ impl LazyReadback {
                 Type: D3D12_COMMAND_LIST_TYPE_COPY,
                 ..Default::default()
             };
-            let (queue, list_type) = match host.device.CreateCommandQueue::<ID3D12CommandQueue>(&copy_desc) {
+            let (queue, list_type) = match host
+                .device
+                .CreateCommandQueue::<ID3D12CommandQueue>(&copy_desc)
+            {
                 Ok(q) => (q, D3D12_COMMAND_LIST_TYPE_COPY),
                 Err(_) => (host.queue().clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
             };
-            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(list_type).ok()?;
-            let list: ID3D12GraphicsCommandList =
-                host.device.CreateCommandList(0, list_type, &allocator, None).ok()?;
+            let allocator: ID3D12CommandAllocator =
+                host.device.CreateCommandAllocator(list_type).ok()?;
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, list_type, &allocator, None)
+                .ok()?;
             list.Close().ok()?;
             let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
@@ -866,7 +892,8 @@ impl LazyReadback {
                     self.queue.ExecuteCommandLists(&[Some(cmd)]);
                     self.fence_value += 1;
                     self.queue.Signal(&self.fence, self.fence_value)?;
-                    self.fence.SetEventOnCompletion(self.fence_value, self.event)?;
+                    self.fence
+                        .SetEventOnCompletion(self.fence_value, self.event)?;
                     WaitForSingleObject(self.event, INFINITE);
                     for (slot, &req_idx) in chunk.iter().enumerate() {
                         std::ptr::copy_nonoverlapping(
@@ -1050,7 +1077,8 @@ fn unprotect_and_write_page(
     if n == 0
         || mbi.State != MEM_COMMIT
         || (mbi.BaseAddress as usize) > page_addr
-        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
+        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)
+            < page_addr.saturating_add(PAGE)
         || mbi.Protect != PAGE_NOACCESS
     {
         return false;
@@ -1064,7 +1092,9 @@ fn unprotect_and_write_page(
             let mut old = 0u32;
             let t0 = std::time::Instant::now();
             // SAFETY: atomic PTE flip revealing fully populated physical page.
-            let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+            let ok = unsafe {
+                VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0
+            };
             lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
             return ok;
         }
@@ -1115,7 +1145,8 @@ fn unprotect_and_write_complement(
     if n == 0
         || mbi.State != MEM_COMMIT
         || (mbi.BaseAddress as usize) > page_addr
-        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
+        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize)
+            < page_addr.saturating_add(PAGE)
         || mbi.Protect != PAGE_NOACCESS
     {
         return false;
@@ -1125,7 +1156,8 @@ fn unprotect_and_write_complement(
     {
         let mut own_ok = true;
         if rel_lo > 0 {
-            own_ok &= crate::inplace::write_section_own(section, sec_bytes, off, &gpu_bytes[..rel_lo]);
+            own_ok &=
+                crate::inplace::write_section_own(section, sec_bytes, off, &gpu_bytes[..rel_lo]);
         }
         if own_ok && rel_hi < PAGE {
             own_ok &= crate::inplace::write_section_own(
@@ -1140,7 +1172,9 @@ fn unprotect_and_write_complement(
             let mut old = 0u32;
             let t0 = std::time::Instant::now();
             // SAFETY: atomic PTE flip revealing fully coherent page.
-            let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+            let ok = unsafe {
+                VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0
+            };
             lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
             return ok;
         }
@@ -1161,7 +1195,11 @@ fn unprotect_and_write_complement(
             std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), base, rel_lo);
         }
         if rel_hi < PAGE {
-            std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr().add(rel_hi), base.add(rel_hi), PAGE - rel_hi);
+            std::ptr::copy_nonoverlapping(
+                gpu_bytes.as_ptr().add(rel_hi),
+                base.add(rel_hi),
+                PAGE - rel_hi,
+            );
         }
         std::sync::atomic::fence(Ordering::Release);
     }
@@ -1188,7 +1226,9 @@ fn flush_armed_page(
     let t_mat = std::time::Instant::now();
     let ok = {
         let mut gpu = lock_lazy_gpu_for_readback();
-        gpu.guard.as_mut().is_some_and(|rb| rb.read_page(shadow, offset, &mut buf))
+        gpu.guard
+            .as_mut()
+            .is_some_and(|rb| rb.read_page(shadow, offset, &mut buf))
     };
     let wrote = unprotect_and_write_page(page * PAGE, ok.then_some(buf.as_slice()), section_view);
     lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
@@ -1243,7 +1283,9 @@ fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
     let reqs: Vec<(&Shadow, usize)> = batch.iter().map(|c| (c.shadow, c.offset)).collect();
     let ok = {
         let mut gpu = lock_lazy_gpu_for_readback();
-        gpu.guard.as_mut().is_some_and(|rb| rb.read_pages(&reqs, &mut bufs))
+        gpu.guard
+            .as_mut()
+            .is_some_and(|rb| rb.read_pages(&reqs, &mut bufs))
     };
 
     // Pre-write section-backed pages through persistent `inplace::OWN` ONLY
@@ -1268,7 +1310,8 @@ fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
                     // SAFETY: plain struct filled by `VirtualQuery`.
                     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
                     // SAFETY: valid out pointer.
-                    let qn = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+                    let qn =
+                        unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
                     if qn == 0 {
                         continue;
                     }
@@ -1317,7 +1360,12 @@ fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
             run_last += 1;
             idx += 1;
         }
-        restore_rw_run(run_first, run_last, &mut restored[run_start_idx..idx], run_first);
+        restore_rw_run(
+            run_first,
+            run_last,
+            &mut restored[run_start_idx..idx],
+            run_first,
+        );
     }
 
     // Copy bytes for any restored pages that were not prewritten via `OWN`.
@@ -1503,7 +1551,9 @@ pub(crate) fn lazy_read_bypass(
     let reqs: Vec<(&Shadow, usize)> = armed.iter().map(|(_, s, off)| (s.as_ref(), *off)).collect();
     let read_ok = {
         let mut gpu = lock_lazy_gpu_for_readback();
-        gpu.guard.as_mut().is_some_and(|rb| rb.read_pages(&reqs, &mut page_bufs))
+        gpu.guard
+            .as_mut()
+            .is_some_and(|rb| rb.read_pages(&reqs, &mut page_bufs))
     };
     lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
     if !read_ok {
@@ -1539,7 +1589,9 @@ pub(crate) fn lazy_read_bypass(
 /// both READ and WRITE access violations before `watch` acquires any lock.
 /// Returns `true` iff the fault was handled and execution may resume.
 pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
-    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0 && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) == 0 {
+    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0
+        && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) == 0
+    {
         return false;
     }
     if IN_LAZY_VEH.with(Cell::get) {
@@ -1567,8 +1619,12 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
                 Some(LazyEntry::Busy { wait, .. }) => Ok(Err(wait.clone())),
                 Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
                     Some(shadow) => {
-                        let (shadow_id, offset, page_idx, section_view) =
-                            (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                        let (shadow_id, offset, page_idx, section_view) = (
+                            armed.shadow_id,
+                            armed.offset,
+                            armed.page_idx,
+                            armed.section_view,
+                        );
                         let wait = Arc::new(FlushWait::new());
                         shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
                         lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
@@ -1583,7 +1639,17 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
         };
         match action {
             Ok(Ok((shadow, offset, page_idx, section_view, wait))) => {
-                flush_armed_page(&shadow, page, offset, page_idx, section_view, &wait, true, is_write, true);
+                flush_armed_page(
+                    &shadow,
+                    page,
+                    offset,
+                    page_idx,
+                    section_view,
+                    &wait,
+                    true,
+                    is_write,
+                    true,
+                );
                 return true;
             }
             Ok(Err(wait)) => {
@@ -1597,7 +1663,8 @@ pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
                 continue;
             }
             Err(false) => {
-                return LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0 && is_accessible(addr, is_write);
+                return LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0
+                    && is_accessible(addr, is_write);
             }
         }
     }
@@ -1617,8 +1684,14 @@ pub(crate) fn lazy_flush_range(at: usize, len: usize) {
         return;
     }
     loop {
-        let mut claimed: Vec<(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
-            Vec::new();
+        let mut claimed: Vec<(
+            usize,
+            Arc<Shadow>,
+            usize,
+            usize,
+            Option<(usize, u64, u64)>,
+            Arc<FlushWait>,
+        )> = Vec::new();
         let mut wait_on: Option<Arc<FlushWait>> = None;
         let mut yield_drop = false;
         {
@@ -1639,8 +1712,12 @@ pub(crate) fn lazy_flush_range(at: usize, len: usize) {
                     }
                     Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
                         Some(shadow) => {
-                            let (shadow_id, offset, page_idx, section_view) =
-                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let (shadow_id, offset, page_idx, section_view) = (
+                                armed.shadow_id,
+                                armed.offset,
+                                armed.page_idx,
+                                armed.section_view,
+                            );
                             let wait = Arc::new(FlushWait::new());
                             shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
                             lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
@@ -1660,14 +1737,16 @@ pub(crate) fn lazy_flush_range(at: usize, len: usize) {
         if !claimed.is_empty() {
             let batch: Vec<ClaimedFlushPage<'_>> = claimed
                 .iter()
-                .map(|(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
-                    page: *page,
-                    shadow: shadow.as_ref(),
-                    offset: *offset,
-                    page_idx: *page_idx,
-                    section_view: *section_view,
-                    wait: wait.clone(),
-                })
+                .map(
+                    |(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                        page: *page,
+                        shadow: shadow.as_ref(),
+                        offset: *offset,
+                        page_idx: *page_idx,
+                        section_view: *section_view,
+                        wait: wait.clone(),
+                    },
+                )
                 .collect();
             flush_claimed_batch(&batch, true);
             continue;
@@ -1751,7 +1830,14 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
             Done,
             Wait(Arc<FlushWait>),
             Yield,
-            Release(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>),
+            Release(
+                usize,
+                Arc<Shadow>,
+                usize,
+                usize,
+                Option<(usize, u64, u64)>,
+                Arc<FlushWait>,
+            ),
         }
         let next = {
             let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1762,8 +1848,12 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                     Some(LazyEntry::Busy { wait, .. }) => Next::Wait(wait.clone()),
                     Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
                         Some(shadow) => {
-                            let (shadow_id, offset, page_idx, section_view) =
-                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let (shadow_id, offset, page_idx, section_view) = (
+                                armed.shadow_id,
+                                armed.offset,
+                                armed.page_idx,
+                                armed.section_view,
+                            );
                             let wait = Arc::new(FlushWait::new());
                             shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
                             lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
@@ -1793,7 +1883,9 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                         let mut buf = vec![0u8; PAGE];
                         let ok = {
                             let mut gpu = lock_lazy_gpu_for_readback();
-                            gpu.guard.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                            gpu.guard
+                                .as_mut()
+                                .is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
                         };
                         if ok {
                             lazy_record_bytes_readback(PAGE as u64);
@@ -1808,7 +1900,9 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                     let mut buf = vec![0u8; PAGE];
                     let ok = {
                         let mut gpu = lock_lazy_gpu_for_readback();
-                        gpu.guard.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                        gpu.guard
+                            .as_mut()
+                            .is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
                     };
                     let wrote = if ok {
                         unprotect_and_write_complement(
@@ -1830,7 +1924,9 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                     let mut buf = vec![0u8; PAGE];
                     let ok = {
                         let mut gpu = lock_lazy_gpu_for_readback();
-                        gpu.guard.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                        gpu.guard
+                            .as_mut()
+                            .is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
                     };
                     if ok {
                         lazy_record_bytes_readback(PAGE as u64);
@@ -1872,8 +1968,14 @@ pub(crate) fn lazy_flush_other_shadows(my_id: u64, from: usize, to: usize) -> Ve
     }
     let mut flushed = Vec::new();
     loop {
-        let mut claimed: Vec<(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
-            Vec::new();
+        let mut claimed: Vec<(
+            usize,
+            Arc<Shadow>,
+            usize,
+            usize,
+            Option<(usize, u64, u64)>,
+            Arc<FlushWait>,
+        )> = Vec::new();
         let mut wait_on: Option<(usize, Arc<FlushWait>)> = None;
         let mut yield_drop = false;
         {
@@ -1898,8 +2000,12 @@ pub(crate) fn lazy_flush_other_shadows(my_id: u64, from: usize, to: usize) -> Ve
                     }
                     Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
                         Some(shadow) => {
-                            let (shadow_id, offset, page_idx, section_view) =
-                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let (shadow_id, offset, page_idx, section_view) = (
+                                armed.shadow_id,
+                                armed.offset,
+                                armed.page_idx,
+                                armed.section_view,
+                            );
                             let wait = Arc::new(FlushWait::new());
                             shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
                             lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
@@ -1919,14 +2025,16 @@ pub(crate) fn lazy_flush_other_shadows(my_id: u64, from: usize, to: usize) -> Ve
         if !claimed.is_empty() {
             let batch: Vec<ClaimedFlushPage<'_>> = claimed
                 .iter()
-                .map(|(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
-                    page: *page,
-                    shadow: shadow.as_ref(),
-                    offset: *offset,
-                    page_idx: *page_idx,
-                    section_view: *section_view,
-                    wait: wait.clone(),
-                })
+                .map(
+                    |(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                        page: *page,
+                        shadow: shadow.as_ref(),
+                        offset: *offset,
+                        page_idx: *page_idx,
+                        section_view: *section_view,
+                        wait: wait.clone(),
+                    },
+                )
                 .collect();
             flush_claimed_batch(&batch, true);
             flushed.extend(claimed.iter().map(|c| c.0));
@@ -2007,7 +2115,12 @@ pub(crate) fn lazy_release_range(at: usize, len: usize) {
                     run_last += 1;
                     idx += 1;
                 }
-                restore_rw_run(run_first, run_last, &mut restored[run_start..idx], run_first);
+                restore_rw_run(
+                    run_first,
+                    run_last,
+                    &mut restored[run_start..idx],
+                    run_first,
+                );
             }
             {
                 let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2049,7 +2162,12 @@ pub(super) fn rollback_noaccess_pages_coalesced(pages: &[usize]) {
         let t0 = std::time::Instant::now();
         // SAFETY: restoring `PAGE_READWRITE` on pages we just set `PAGE_NOACCESS`.
         let ok = unsafe {
-            VirtualProtect((from * PAGE) as *const _, count * PAGE, PAGE_READWRITE, &mut _rev) != 0
+            VirtualProtect(
+                (from * PAGE) as *const _,
+                count * PAGE,
+                PAGE_READWRITE,
+                &mut _rev,
+            ) != 0
         };
         lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
         if ok || count == 1 {
@@ -2089,7 +2207,11 @@ pub(super) fn protect_private_run_noaccess(from: usize, to: usize, protected: &m
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: valid out pointer.
         let n = unsafe { VirtualQuery(addr as *const _, &mut mbi, size_of_val(&mbi)) };
-        if n == 0 || mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || mbi.Protect != PAGE_READWRITE {
+        if n == 0
+            || mbi.State != MEM_COMMIT
+            || mbi.Type != MEM_PRIVATE
+            || mbi.Protect != PAGE_READWRITE
+        {
             let skip_end = if n != 0 {
                 (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) / PAGE
             } else {
@@ -2110,7 +2232,12 @@ pub(super) fn protect_private_run_noaccess(from: usize, to: usize, protected: &m
         // SAFETY: `VirtualQuery` verified `[cur, sub_to)` is one uniform
         // committed `MEM_PRIVATE` `PAGE_READWRITE` region.
         let ok = unsafe {
-            VirtualProtect((cur * PAGE) as *const _, count * PAGE, PAGE_NOACCESS, &mut old) != 0
+            VirtualProtect(
+                (cur * PAGE) as *const _,
+                count * PAGE,
+                PAGE_NOACCESS,
+                &mut old,
+            ) != 0
         };
         lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
         if ok && old == PAGE_READWRITE {
@@ -2150,7 +2277,11 @@ pub(crate) fn try_defer_pieces_batch_with_after(
         return vec![false; pieces.len()];
     }
     let mut out = vec![false; pieces.len()];
-    let mut by_key: Vec<((usize, Option<u64>), Arc<Shadow>, Vec<(usize, usize, usize)>)> = Vec::new();
+    let mut by_key: Vec<(
+        (usize, Option<u64>),
+        Arc<Shadow>,
+        Vec<(usize, usize, usize)>,
+    )> = Vec::new();
     for (i, (shadow, lo, hi, after)) in pieces.iter().enumerate() {
         let key = (Arc::as_ptr(shadow) as usize, *after);
         if let Some(entry) = by_key.iter_mut().find(|e| e.0 == key) {
@@ -2189,11 +2320,19 @@ impl Shadow {
         };
 
         let mut out = vec![false; offsets.len()];
-        if offsets.is_empty() || !lazy_copyback() || self.place.is_some() || self.window || self.rebar || self.transient() || self.data.is_null() {
+        if offsets.is_empty()
+            || !lazy_copyback()
+            || self.place.is_some()
+            || self.window
+            || self.rebar
+            || self.transient()
+            || self.data.is_null()
+        {
             return out;
         }
         #[cfg(test)]
-        if !self.lazy_opted_in && std::env::var_os("VICTORY_LAZY_COPYBACK").is_none_or(|v| v != "1") {
+        if !self.lazy_opted_in && std::env::var_os("VICTORY_LAZY_COPYBACK").is_none_or(|v| v != "1")
+        {
             return out;
         }
 
@@ -2316,10 +2455,8 @@ impl Shadow {
         let views_info = crate::inplace::single_view_pages_batch(&addrs);
         let mut mapped_cands: Vec<Cand> = Vec::new();
         let mut private_cands: Vec<Cand> = Vec::new();
-        for ((mut c, is_clean_guarded), vinfo) in cands
-            .into_iter()
-            .zip(clean_guarded)
-            .zip(views_info)
+        for ((mut c, is_clean_guarded), vinfo) in
+            cands.into_iter().zip(clean_guarded).zip(views_info)
         {
             if is_clean_guarded {
                 match vinfo {
@@ -2395,7 +2532,8 @@ impl Shadow {
                         run_last += 1;
                         i += 1;
                     }
-                    let ok_blocks = crate::watch::transition_clean_guards_run_to_noaccess(run_first, run_last);
+                    let ok_blocks =
+                        crate::watch::transition_clean_guards_run_to_noaccess(run_first, run_last);
                     transitioned_set.extend(ok_blocks);
                 }
 
@@ -2501,7 +2639,9 @@ impl Shadow {
                         // SAFETY: plain struct filled by `VirtualQuery`.
                         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
                         // SAFETY: valid out pointer.
-                        let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+                        let n = unsafe {
+                            VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi))
+                        };
                         if n == 0 {
                             return false;
                         }
@@ -2524,7 +2664,8 @@ impl Shadow {
             });
 
             if !private_cands.is_empty() {
-                let mut reserved: Vec<(Cand, Arc<FlushWait>)> = Vec::with_capacity(private_cands.len());
+                let mut reserved: Vec<(Cand, Arc<FlushWait>)> =
+                    Vec::with_capacity(private_cands.len());
                 {
                     let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
                     for c in private_cands {
@@ -2714,7 +2855,12 @@ impl Shadow {
     /// Relay variant of [`Self::try_defer_piece`]: also refuses to defer any
     /// newly-armed piece that has pending/later CPU uploads (`dirty` / `sent`).
     #[cfg(test)]
-    pub(crate) fn try_defer_piece_relay(self: &Arc<Self>, lo: usize, hi: usize, fetched_after: u64) -> bool {
+    pub(crate) fn try_defer_piece_relay(
+        self: &Arc<Self>,
+        lo: usize,
+        hi: usize,
+        fetched_after: u64,
+    ) -> bool {
         self.try_defer_shadow_pieces(&[(lo, hi)], Some(fetched_after))[0]
     }
 
@@ -2735,7 +2881,9 @@ impl Shadow {
         let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         for page in first..last {
             let idx = page - base;
-            if idx >= self.lazy_state.len() || self.lazy_state[idx].load(Ordering::Acquire) != LAZY_RESYNC {
+            if idx >= self.lazy_state.len()
+                || self.lazy_state[idx].load(Ordering::Acquire) != LAZY_RESYNC
+            {
                 continue;
             }
             let page_addr = page * PAGE;
@@ -2777,7 +2925,10 @@ impl Shadow {
             }
             let page_lo = page * PAGE;
             let page_hi = page_lo.saturating_add(PAGE);
-            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+            if skip_busy
+                .iter()
+                .any(|&(ba, be)| ba < page_hi && be > page_lo)
+            {
                 continue;
             }
             let p_lo = page_lo.max(start);
@@ -2787,7 +2938,7 @@ impl Shadow {
             }
             let whole = p_lo == page_lo && p_hi == page_hi;
             let now = if watched {
-                crate::watch::writes(p_lo, p_hi, true).map_or(0, |(now, _)| now)
+                crate::watch::with_writes(p_lo, p_hi, true, |now, _| now).unwrap_or(0)
             } else {
                 0
             };
@@ -2813,7 +2964,10 @@ impl Shadow {
         for page in first..last {
             let page_lo = page * PAGE;
             let page_hi = page_lo.saturating_add(PAGE);
-            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+            if skip_busy
+                .iter()
+                .any(|&(ba, be)| ba < page_hi && be > page_lo)
+            {
                 continue;
             }
             let idx = page - base;
@@ -2858,7 +3012,10 @@ impl Shadow {
         for page in first..last {
             let page_lo = page * PAGE;
             let page_hi = page_lo.saturating_add(PAGE);
-            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+            if skip_busy
+                .iter()
+                .any(|&(ba, be)| ba < page_hi && be > page_lo)
+            {
                 continue;
             }
             let idx = page - base;
@@ -2889,7 +3046,7 @@ impl Shadow {
             }
             let whole = p_lo == page * PAGE && p_hi == (page + 1) * PAGE;
             let now = if watched {
-                crate::watch::writes(p_lo, p_hi, true).map_or(0, |(now, _)| now)
+                crate::watch::with_writes(p_lo, p_hi, true, |now, _| now).unwrap_or(0)
             } else {
                 u64::from(whole)
             };
@@ -2914,7 +3071,8 @@ impl Shadow {
         let mut seg_start: Option<usize> = None;
         for page in first..last {
             let idx = page - base;
-            let skip = idx < self.lazy_state.len() && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire));
+            let skip = idx < self.lazy_state.len()
+                && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire));
             let p_lo = (page * PAGE).max(from);
             let p_hi = ((page + 1) * PAGE).min(to);
             if skip {
@@ -2942,8 +3100,13 @@ impl Shadow {
         let last = (self.start.saturating_add(self.len) as usize).div_ceil(PAGE);
         if lazy_range_may_have_armed(first, last) {
             loop {
-                let mut claimed: Vec<(usize, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
-                    Vec::new();
+                let mut claimed: Vec<(
+                    usize,
+                    usize,
+                    usize,
+                    Option<(usize, u64, u64)>,
+                    Arc<FlushWait>,
+                )> = Vec::new();
                 let mut wait_on: Option<Arc<FlushWait>> = None;
                 {
                     let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2952,7 +3115,9 @@ impl Shadow {
                         .range(first..last)
                         .filter_map(|(&page, entry)| match entry {
                             LazyEntry::Armed(a) if a.shadow_id == self.id => Some(page),
-                            LazyEntry::Busy { shadow_id, .. } if *shadow_id == self.id => Some(page),
+                            LazyEntry::Busy { shadow_id, .. } if *shadow_id == self.id => {
+                                Some(page)
+                            }
                             _ => None,
                         })
                         .take(LAZY_READBACK_BATCH_PAGES)
@@ -2980,14 +3145,16 @@ impl Shadow {
                 if !claimed.is_empty() {
                     let batch: Vec<ClaimedFlushPage<'_>> = claimed
                         .iter()
-                        .map(|(page, offset, page_idx, section_view, wait)| ClaimedFlushPage {
-                            page: *page,
-                            shadow: self,
-                            offset: *offset,
-                            page_idx: *page_idx,
-                            section_view: *section_view,
-                            wait: wait.clone(),
-                        })
+                        .map(
+                            |(page, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                                page: *page,
+                                shadow: self,
+                                offset: *offset,
+                                page_idx: *page_idx,
+                                section_view: *section_view,
+                                wait: wait.clone(),
+                            },
+                        )
                         .collect();
                     flush_claimed_batch(&batch, save_baseline);
                     continue;
@@ -3001,7 +3168,9 @@ impl Shadow {
         }
         if !save_baseline {
             let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
-            table.flushed_baselines.retain(|&(sid, _), _| sid != self.id);
+            table
+                .flushed_baselines
+                .retain(|&(sid, _), _| sid != self.id);
         }
     }
 
@@ -3026,7 +3195,10 @@ pub(crate) fn lazy_range_may_have_armed_bytes(at: usize, len: usize) -> bool {
 
 /// Filters `relay_hand_back` differing `(at, n)` pieces, deferring eligible
 /// full-page pieces when `VICTORY_LAZY_COPYBACK=1`.
-pub(crate) fn filter_relay_found(shadow: &Arc<Shadow>, found: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn filter_relay_found(
+    shadow: &Arc<Shadow>,
+    found: Vec<(usize, usize)>,
+) -> Vec<(usize, usize)> {
     if !lazy_copyback() || found.is_empty() {
         return found;
     }

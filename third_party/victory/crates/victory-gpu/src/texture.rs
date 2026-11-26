@@ -1239,9 +1239,15 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
-        {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if let Some((now, clean)) = waited(1, || {
+            crate::watch::with_writes(start, start + size, false, |now, written| {
+                (
+                    now,
+                    last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked),
+                )
+            })
+        }) {
+            if clean {
                 return 0;
             }
             last.asked = now;
@@ -1272,8 +1278,14 @@ impl Staging {
         // another on the screen).
         let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) =
-                waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, unwritten)) = waited(1, || {
+                crate::watch::with_writes(start, start + size, true, |now, written| {
+                    (
+                        now,
+                        last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked),
+                    )
+                })
+            })
         {
             // (Neptune) `VICTORY_TEXTURE_HASH_EVERY=<frames>` (8): how often a guarded texture is
             // hashed all the same. The hash is for a write the guards did not see; they see
@@ -1287,7 +1299,6 @@ impl Staging {
                     .unwrap_or(8)
                     .max(1)
             });
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame

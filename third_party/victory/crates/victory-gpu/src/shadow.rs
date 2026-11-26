@@ -2174,7 +2174,10 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool { buffers: Vec::new(), bytes: 0 });
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
+    buffers: Vec::new(),
+    bytes: 0,
+});
 
 /// The snapshot buffers kept, shared by the submitting and worker threads:
 /// kept in order so a checkout is a binary search and a return an insert,
@@ -2192,7 +2195,10 @@ impl SnapshotPool {
     /// that (or 1 MiB).
     fn take(&mut self, n: usize) -> Option<Vec<u8>> {
         let most = n.saturating_mul(4).max(1 << 20);
-        let i = self.buffers.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+        let i = self
+            .buffers
+            .partition_point(|v| v.capacity() >= n)
+            .checked_sub(1)?;
         if self.buffers[i].capacity() > most {
             return None;
         }
@@ -5190,20 +5196,20 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                MERGED[4].fetch_add(1, Ordering::Relaxed);
-                return true;
-            };
-            let stale: Vec<(usize, u64)> = {
+            let Some((now, stale)) = crate::watch::with_writes(a, e, true, |now, written| {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied.at, a, e, &written)
+                let stale: Vec<(usize, u64)> = stale_pages_in(base, &copied.at, a, e, written)
                     .into_iter()
                     .filter(|&p| {
                         !has_deferred
                             || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire))
                     })
                     .map(|page| (page, copied.get(page - base).unwrap_or(0)))
-                    .collect()
+                    .collect();
+                (now, stale)
+            }) else {
+                MERGED[4].fetch_add(1, Ordering::Relaxed);
+                return true;
             };
             if stale.is_empty() {
                 continue;
@@ -5423,11 +5429,13 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(copied) = crate::watch::with_writes(from, to, true, |now, written| {
                 self.watched.store(1, Ordering::Relaxed);
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
-                let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, &subs);
+                crate::watch::with_subpages(from, to, |subs| {
+                    self.copy_stale(from, to, now, written, subs)
+                })
+            }) {
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.

@@ -1286,14 +1286,50 @@ pub(crate) fn dirty4k_kept() -> bool {
 /// done; an entry whose asking is not the one the refresh was given for its
 /// page (a later asking came between) is not used.
 pub(crate) fn subpages(start: usize, end: usize) -> Vec<(usize, u64, u64, u16)> {
+    let mut out = Vec::new();
+    subpages_into(start, end, &mut out);
+    out
+}
+
+fn subpages_into(start: usize, end: usize, out: &mut Vec<(usize, u64, u64, u16)>) {
+    out.clear();
     if !dirty4k_kept() || start >= end {
-        return Vec::new();
+        return;
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let sub = SUB_PAGES.read().unwrap_or_else(|e| e.into_inner());
-    sub.range(first..last)
-        .map(|(&p, &(asked, before, bits))| (p, asked, before, bits))
-        .collect()
+    out.extend(
+        sub.range(first..last)
+            .map(|(&p, &(asked, before, bits))| (p, asked, before, bits)),
+    );
+}
+
+/// Calls `use_pages` with the 4 KiB dirty sub-page entries in `[start, end)`,
+/// reusing a thread-local scratch buffer when `VICTORY_REFRESH_SCRATCH` is on
+/// (default).
+pub(crate) fn with_subpages<T>(
+    start: usize,
+    end: usize,
+    use_pages: impl FnOnce(&[(usize, u64, u64, u16)]) -> T,
+) -> T {
+    if refresh_scratch() {
+        thread_local! {
+            static SUBS: std::cell::RefCell<Vec<(usize, u64, u64, u16)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SUBS.with(|storage| {
+            if let Ok(mut subs) = storage.try_borrow_mut() {
+                subpages_into(start, end, &mut subs);
+                use_pages(&subs)
+            } else {
+                let subs = subpages(start, end);
+                use_pages(&subs)
+            }
+        })
+    } else {
+        let subs = subpages(start, end);
+        use_pages(&subs)
+    }
 }
 
 /// Since the start, with `VICTORY_DIRTY_4K`: stale pages a refresh could narrow
@@ -1501,6 +1537,12 @@ pub(crate) fn copy_4k_stats() -> [u64; 4] {
 /// last found it so.
 fn written_in(first: usize, last: usize) -> Vec<(usize, u64)> {
     let mut out = Vec::new();
+    written_in_into(first, last, &mut out);
+    out
+}
+
+fn written_in_into(first: usize, last: usize, out: &mut Vec<(usize, u64)>) {
+    out.clear();
     let mut page = first;
     while page < last {
         let stop = ((page / PART + 1) * PART).min(last);
@@ -1514,7 +1556,13 @@ fn written_in(first: usize, last: usize) -> Vec<(usize, u64)> {
         }
         page = stop;
     }
-    out
+}
+
+/// Whether per-thread scratch vectors are reused across write-watch queries
+/// (`VICTORY_REFRESH_SCRATCH=0` allocates a fresh Vec on every query).
+pub(crate) fn refresh_scratch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SCRATCH").is_none_or(|v| v != "0"))
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -2528,6 +2576,45 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut out = Vec::new();
+    let now = writes_into(start, end, guarded, &mut out)?;
+    Some((now, out))
+}
+
+/// Like [`writes`], but reuses a thread-local scratch buffer for the returned
+/// `(page, asking)` slice when `VICTORY_REFRESH_SCRATCH` is on (default).
+pub(crate) fn with_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    use_pages: impl FnOnce(u64, &[(usize, u64)]) -> T,
+) -> Option<T> {
+    if refresh_scratch() {
+        thread_local! {
+            static PAGES: std::cell::RefCell<Vec<(usize, u64)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        PAGES.with(|storage| {
+            if let Ok(mut pages) = storage.try_borrow_mut() {
+                let now = writes_into(start, end, guarded, &mut pages)?;
+                Some(use_pages(now, &pages))
+            } else {
+                let (now, pages) = writes(start, end, guarded)?;
+                Some(use_pages(now, &pages))
+            }
+        })
+    } else {
+        let (now, pages) = writes(start, end, guarded)?;
+        Some(use_pages(now, &pages))
+    }
+}
+
+fn writes_into(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    out: &mut Vec<(usize, u64)>,
+) -> Option<u64> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -2539,11 +2626,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         reservation::covered(&j, first, last).then_some(j.ahead_asked)
     };
     if let Some(asked) = standing {
-        return Some((asked, written_in(first, last)));
+        written_in_into(first, last, out);
+        return Some(asked);
     }
     let (first_b, last_b) = (start / BLOCK, end.div_ceil(BLOCK));
     if guarded && light() && start < end && published_all(first_b, last_b) {
-        return Some((next_asking(), written_in(first, last)));
+        written_in_into(first, last, out);
+        return Some(next_asking());
     }
     // View memory the kernel would refuse, and the caller does not ask the
     // guards (textures, which then fall back to guarded/hash tracking): no
@@ -2644,7 +2733,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if failed {
             publish(&epochs);
         }
-        Some((now, written_in(first, last)))
+        written_in_into(first, last, out);
+        Some(now)
     })
 }
 
@@ -7565,5 +7655,21 @@ mod mapping_tests {
         });
         assert_eq!(answer.recv().unwrap(), (false, true));
         drop(changing);
+    }
+
+    #[test]
+    fn reused_write_scratch_clears_and_preserves_allocation() {
+        let mut pages = Vec::with_capacity(16);
+        let original = pages.as_ptr();
+        pages.push((999_999, 1));
+        crate::watch::written_in_into(0, 0, &mut pages);
+        assert!(pages.is_empty());
+        assert_eq!(pages.as_ptr(), original);
+        let mut subs = Vec::with_capacity(16);
+        let original_subs = subs.as_ptr();
+        subs.push((999_999, 1, 0, 1));
+        crate::watch::subpages_into(0, 0, &mut subs);
+        assert!(subs.is_empty());
+        assert_eq!(subs.as_ptr(), original_subs);
     }
 }
