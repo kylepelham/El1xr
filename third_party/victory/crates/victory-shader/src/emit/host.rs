@@ -864,6 +864,7 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if data.is_empty() => {}
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
                         *param,
                         data.len() as u32,
@@ -1394,6 +1395,7 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if data.is_empty() => {}
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
