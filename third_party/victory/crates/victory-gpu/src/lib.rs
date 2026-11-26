@@ -39,6 +39,8 @@ mod heap_rounds;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod output_views;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod pacing;

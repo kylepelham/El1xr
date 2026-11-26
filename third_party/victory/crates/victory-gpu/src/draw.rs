@@ -812,7 +812,11 @@ impl State {
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         self.target_views.clear();
-        self.target_views.extend(handles.iter().map(|&h| {
+        self.target_views.extend(
+            handles
+                .iter()
+                .take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize)
+                .map(|&h| {
             let record = crate::descriptor::rtv_record(h);
             if record.is_none() {
                 once!(
@@ -821,7 +825,8 @@ impl State {
                 );
             }
             record.map(|r| r.snapshot())
-        }));
+        }),
+        );
         self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
         self.targets_set = true;
         self.record_targets(list);
@@ -834,52 +839,59 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
-        for snapshot in self.target_views.iter().flatten() {
-            let record = snapshot.restore();
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                // A typed null view (or a target without a host copy) still
-                // takes its slot: left out, the next live target would move
-                // into it and the pixel shader's outputs reach the wrong
-                // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
-                }
-                continue;
-            };
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
-        }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = self.depth_view.and_then(|snapshot| {
-            let record = snapshot.restore();
-            let texture = crate::resource::host_resource(record.resource)?;
-            self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
-            if crate::resource::depth_and_unordered(record.resource) {
-                crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
+        host.output_views(|output| {
+            let mut rtvs = Vec::new();
+            for snapshot in self
+                .target_views
+                .iter()
+                .flatten()
+                .take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize)
+            {
+                let record = snapshot.restore();
+                let Some(texture) = crate::resource::host_resource(record.resource) else {
+                    // A typed null view (or a target without a host copy) still
+                    // takes its slot: left out, the next live target would move
+                    // into it and the pixel shader's outputs reach the wrong
+                    // targets.
+                    // shortcut: a view without a description or a format has no
+                    // null view to stand for it and is left out, as before.
+                    let null = record
+                        .desc()
+                        .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                    if let Some(desc) = null {
+                        rtvs.push(output.rtv(None, Some(&desc)));
+                    }
+                    continue;
+                };
+                self.targets.push(record.resource as usize);
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                rtvs.push(output.rtv(Some(texture), record.desc().as_ref()));
             }
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let dsv = self.depth_view.and_then(|snapshot| {
+                let record = snapshot.restore();
+                let texture = crate::resource::host_resource(record.resource)?;
+                self.depth = record.resource as usize;
+                self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+                if crate::resource::depth_and_unordered(record.resource) {
+                    crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                Some(output.dsv(texture, record.depth_desc().as_ref()))
+            });
+            // SAFETY: an open list; the views live through the call.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
         });
-        // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
