@@ -38,6 +38,8 @@ pub mod frame;
 pub mod frametime;
 mod heap_pass;
 #[cfg(windows)]
+mod heap_rounds;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -90,10 +92,14 @@ mod tiles;
 #[cfg(windows)]
 pub mod titlemem;
 #[cfg(windows)]
+#[cfg(windows)]
+mod defrag;
 mod watch;
 #[cfg(windows)]
 mod windowup;
 
+#[cfg(windows)]
+pub use defrag::log_defrag_counters;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
