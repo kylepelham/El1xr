@@ -59,6 +59,10 @@
   about half the frame rate: measured about 7 to 9 fps against 14 to 17 for the default set, with 51 to 93 texture
   refusals against 296 (run auto-ram-2326). Picture first, frame rate second.
 
+.PARAMETER Mute
+  Optional. Starts the title with its Windows audio session muted (VICTORY_MUTE=1) without touching XAudio2 or game
+  timing. Set before -Override so -Override @{ VICTORY_MUTE = '0' } still wins.
+
 .NOTES
   The switch set is Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path (no PC FidelityFX DLL, no
   VICTORY_AUTO_A unless -AutoA), with the measured changes of 2026-11-25 on top (heap pass on dirty slots, copy
@@ -90,6 +94,7 @@ param(
     [ValidateSet('real', 'compare')][string]$XgMode = 'real',
     [switch]$BatchCardRehash,
     [switch]$Quality,
+    [switch]$Mute,
     [hashtable]$Override = @{}
 )
 
@@ -222,6 +227,9 @@ if ($Quality) {
     $env:VICTORY_LIST_POOL_MOST = '256'
     $env:VICTORY_LIST_POOL_MB = '256'
     $env:VICTORY_TEXTURE_STAGE_MB = '192'
+}
+if ($Mute) {
+    $env:VICTORY_MUTE = '1'
 }
 foreach ($name in $Override.Keys) {
     if ($name -notlike 'VICTORY_*') { throw "-Override takes VICTORY_* names only: '$name'." }

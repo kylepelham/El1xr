@@ -437,3 +437,24 @@ def test_precompile_warms_shaders_the_game_and_its_dlls_before_the_game(tmp_path
     attendu = " ".join(str(jeu / n) for n in ("shaders.rpf", "game_scarlett_master.exe", *FICHIERS_PRECOMPILATION[1:]))
     assert appels[1] == f"victory warm {attendu}"
     assert appels[2].startswith("victory run ")
+
+
+def test_mute_switch_sets_victory_mute_and_allows_override(tmp_path, faux_outil):
+    texte = _lanceur()
+    assert "[switch]$Mute" in texte
+    assert "VICTORY_MUTE" not in _table(texte)
+
+    fini, _, _, _ = _lancer(tmp_path / "default", faux_outil, echo=("VICTORY_MUTE",))
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert _valeurs(fini.stdout)["VICTORY_MUTE"] == "unset"
+
+    fini, _, _, _ = _lancer(tmp_path / "muted", faux_outil, options=("-Mute",), echo=("VICTORY_MUTE",))
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert _valeurs(fini.stdout)["VICTORY_MUTE"] == "1"
+
+    fini, _, _, _ = _lancer(
+        tmp_path / "override", faux_outil, echo=("VICTORY_MUTE",),
+        commande="-Mute -Override @{ VICTORY_MUTE = '0' }",
+    )
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert _valeurs(fini.stdout)["VICTORY_MUTE"] == "0"

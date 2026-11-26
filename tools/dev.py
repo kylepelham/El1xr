@@ -185,10 +185,19 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def apply_mute_default(overrides: dict[str, str], unmute: bool) -> tuple[dict[str, str], bool]:
+    merged = dict(overrides)
+    mute = not unmute
+    if mute:
+        merged.setdefault("VICTORY_MUTE", "1")
+    return merged, mute
+
+
 def build_launcher_command(
     game_dir: Path,
     diag: bool,
     overrides: dict[str, str],
+    mute: bool = False,
 ) -> list[str]:
     parts = [
         "&",
@@ -199,6 +208,8 @@ def build_launcher_command(
     ]
     if diag:
         parts.append("-Diag")
+    if mute:
+        parts.append("-Mute")
     if overrides:
         entries = "; ".join(f"{_ps_quote(k)} = {_ps_quote(v)}" for k, v in overrides.items())
         parts.extend(["-Override", f"@{{ {entries} }}"])
@@ -422,7 +433,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
         )
         return 1
 
-    cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides)
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides, mute=mute)
     with acquire_gpu_lock("bench"):
         run_timed_victory(cmd, log_path, args.seconds)
 
@@ -466,7 +478,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "VICTORY_CAPTURE_WORLD": "1",
     }
     overrides.update(user_overrides)
-    cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides)
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides, mute=mute)
     with acquire_gpu_lock(f"capture:{safe_tag}"):
         run_timed_victory(cmd, log_path, args.seconds)
 
@@ -517,6 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--seconds", type=int, default=75, help="Run duration in seconds (default: 75).")
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_bench.set_defaults(func=cmd_bench)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")
@@ -524,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--tag", help="Capture folder tag (writes to AnyXboxX-coord/dev/cap_<tag>/).")
     p_cap.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_cap.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
 
     p_scout = sub.add_parser("scout", help="Run tools/scout_ecosystem.py.")
