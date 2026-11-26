@@ -2417,3 +2417,68 @@ fn v_cmp_f_and_tru_lower_as_constant_booleans() {
         });
     }
 }
+
+/// Out-of-bounds console LDS accesses read 0 and drop writes/atomics
+/// without touching valid slots or host scratch slots.
+#[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes_and_atomics() {
+    let ds = |op: u32, addr: u32, data0: u32, vdst: u32| -> [u32; 2] {
+        [
+            0xD800_0000 | (op << 18),
+            (vdst << 24) | (data0 << 8) | addr,
+        ]
+    };
+    let mut body = vec![
+        vop1(0x001, 4, 0x80), // v_mov_b32 v4, 0
+        vop1(0x001, 5, 0xFF), // v_mov_b32 v5, literal
+        0xCAFE_BABE,
+    ];
+    body.extend_from_slice(&ds(0x0D, 4, 5, 0)); // ds_write_b32 v4, v5
+    body.extend_from_slice(&ds(0x0D, 1, 2, 0)); // ds_write_b32 v1, v2
+    body.extend_from_slice(&ds(0x36, 1, 0, 0)); // ds_read_b32 v0, v1
+    // 64 threads avoids WaveSize(32) so both hardware and WARP run it.
+    let rw_shader = build_cs(&body, 64, 512);
+    run_cases(
+        &rw_shader,
+        &[
+            [4, 0x1234_5678, 0, 0],      // in-bounds write & read
+            [512, 0xDEAD_BEEF, 0, 0],    // exact-end OOB read returns 0
+            [0x1000, 0xDEAD_BEEF, 0, 0], // far OOB read returns 0
+        ],
+        |backend, i, _, got| {
+            let want = [0x1234_5678, 0, 0][i];
+            assert_eq!(
+                got, want,
+                "{backend}: LDS read/write case {i} = {got:#x}, want {want:#x}"
+            );
+        },
+    );
+
+    // OOB write/atomic at v1 must not clobber LDS[0], and OOB ds_add_rtn_u32 returns 0.
+    // Single-thread LDS declares WaveSize(32), which WARP refuses: run on hardware.
+    let mut atomic_body = vec![
+        vop1(0x001, 4, 0x80), // v_mov_b32 v4, 0
+        vop1(0x001, 5, 0xFF), // v_mov_b32 v5, 0x1111_2222
+        0x1111_2222,
+    ];
+    atomic_body.extend_from_slice(&ds(0x0D, 4, 5, 0)); // ds_write_b32 v4, v5
+    atomic_body.extend_from_slice(&ds(0x20, 1, 2, 0)); // ds_add_rtn_u32 v0, v1, v2
+    atomic_body.extend_from_slice(&ds(0x36, 4, 0, 6)); // ds_read_b32 v6, v4 (verify LDS[0] intact)
+    atomic_body.push(vop2(0x25, 0, vgpr(0), 6)); // v_add_nc_u32 v0, v0, v6
+    let atomic_shader = build_cs(&atomic_body, 1, 512);
+    run_cases_on(
+        &atomic_shader,
+        &[
+            [0, 5, 0, 0],   // in-bounds: old=0x1111_2222, new LDS[0]=0x1111_2227 -> sum=0x2222_4449
+            [512, 5, 0, 0], // OOB: rtn=0, LDS[0] untouched=0x1111_2222 -> sum=0x1111_2222
+        ],
+        &[("hardware", false)],
+        |backend, i, _, got| {
+            let want = [0x2222_4449, 0x1111_2222][i];
+            assert_eq!(
+                got, want,
+                "{backend}: LDS atomic case {i} = {got:#x}, want {want:#x}"
+            );
+        },
+    );
+}
