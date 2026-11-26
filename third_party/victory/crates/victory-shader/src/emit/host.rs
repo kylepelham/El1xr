@@ -15,6 +15,9 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// The direct queue every draw and dispatch runs on: making one costs
+    /// more than most of the work it runs.
+    queue: std::sync::OnceLock<ID3D12CommandQueue>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -119,8 +122,27 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                queue: std::sync::OnceLock::new(),
+            })
         }
+    }
+
+    /// [`Host::queue`], made on first use.
+    fn queue(&self) -> Result<ID3D12CommandQueue, String> {
+        if let Some(queue) = self.queue.get() {
+            return Ok(queue.clone());
+        }
+        // SAFETY: a plain D3D12 call with a description that outlives it.
+        let queue: ID3D12CommandQueue = unsafe {
+            self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }
+        .map_err(err)?;
+        Ok(self.queue.get_or_init(|| queue).clone())
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -651,12 +673,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // are kept alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1040,12 +1057,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
