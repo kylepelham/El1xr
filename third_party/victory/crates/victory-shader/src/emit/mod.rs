@@ -124,9 +124,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -492,6 +492,37 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Meet sites the face-relocation compute emitted, or 0 before it is translated.
+pub fn defrag_meet_sites() -> u32 {
+    lower::meet_sites()
+}
+
+/// Shader LDS reads and writes that received their own half-meet.
+pub fn defrag_lds_sites() -> (u32, u32) {
+    lower::meet_lds_sites()
+}
+
+/// One logical wave per group (64 threads), with a validated wave32 PSO on RTX.
+fn is_scene_kernel(io: &crate::native::StageIo, digest: [u8; 16]) -> bool {
+    matches!(io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && matches!(
+            digest,
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                // CS_Visibility
+                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                // CS_Tree_BatchCull
+                | [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57]
+                // CS_Tree_BatchCull_ImposterOnly
+                | [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82]
+                // CS_TransmissionVolumetrics_Tiled
+                | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                // CS_TransmissionVolumetrics_Tiled_LocalLights
+                | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                // CS_CollisionRaytraced
+                | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
+        )
+}
+
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
 /// host; where an approximate form translates the program, the paired form instead if it
 /// does.
@@ -586,18 +617,36 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // One logical wave per group, with a wave32 PSO on RTX. The particle
+        // light-atlas shaders that reset the card are not in this list.
+        // Explicit policy wins.
+        let scene_kernel = is_scene_kernel(&native.io, c.digest);
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.
-        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        let wide_last = wide_option.as_ref().is_some_and(|v| v == "last");
+        // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
+        // divergent LDS is read and written in one region, so it only lowers
+        // once that region is taken by both halves of a wave. The other wave
+        // of the group does not wait (`with_half_meets`). Not the global switch.
+        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
+        // are dropped and a run can be compared with one where it executes.
+        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        let defrag = !defrag_off
+            && c.digest
+                == [
+                    0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
+                    0xa1, 0x23, 0xc6,
+                ];
         // `VICTORY_WAVE32_NVIDIA=1` ([`nvidia`]): a compute program of an `ACCC` container
         // stopped at a lane mask exchanged where not every lane runs gets its active-lane
         // loop taken wave-wide (a single guest wave can iterate it until both host halves are
         // done; [`widen`] checks the latch and the convergence). Unless `VICTORY_WAVE_WIDE`
         // is set: explicit policy wins.
         let driver_loop = nvidia::enabled()
-            && std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && wide_option.is_none()
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -647,7 +696,7 @@ fn emit_forms(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || defrag {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -655,7 +704,11 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop && !wide_on);
+                        let again = if defrag {
+                            lower::with_half_meets(|| widen(c, native, base, why, false))
+                        } else {
+                            widen(c, native, base, why, driver_loop && !wide_on)
+                        };
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -866,6 +919,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // One program only: two console waves, and a meet per wave instead of a group barrier.
+        crate::native::StageIo::Cs(cs)
+            if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -2710,4 +2766,35 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    #[test]
+    fn scene_kernel_matches_only_allowlisted_one_wave_computes() {
+        use crate::native::ComputeIo;
+        let cs64 = StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [8, 8, 1],
+        });
+        let cs128 = StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [128, 1, 1],
+        });
+        let vs = StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let digests = [
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1],
+            [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c],
+            [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57],
+            [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82],
+            [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90],
+            [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6],
+            [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9],
+        ];
+        for d in digests {
+            assert!(is_scene_kernel(&cs64, d));
+            assert!(!is_scene_kernel(&cs128, d));
+            assert!(!is_scene_kernel(&vs, d));
+        }
+        assert!(!is_scene_kernel(&cs64, [0u8; 16]));
+    }
 }

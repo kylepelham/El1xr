@@ -2417,3 +2417,69 @@ fn v_cmp_f_and_tru_lower_as_constant_booleans() {
         });
     }
 }
+
+/// SDWA `dst_sel:WORD_0` with `dst_unused:UNUSED_SEXT` (1) sign-extends bit 15
+/// into the upper halfword, whereas `UNUSED_PAD` (0) zero-pads it and reserved
+/// `dst_unused` (3) is refused (upstream #3124).
+#[test]
+fn sdwa_16bit_word0_sext_sign_extends_and_refuses_reserved_unused() {
+    let sdwa_ext = |dst_sel: u32, dst_unused: u32| -> u32 {
+        1u32 | (dst_sel << 8) | (dst_unused << 11) | (6 << 16)
+    };
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:{SEXT,PAD} src0_sel:DWORD
+    let sext = build_valu_cs(&[vop1(0x053, 0, 0xF9), sdwa_ext(4, 1)]);
+    let pad = build_valu_cs(&[vop1(0x053, 0, 0xF9), sdwa_ext(4, 0)]);
+
+    let inputs = [
+        [0xBC00, 0, 0, 0], // -1.0f16 -> -1i16 (0xFFFF)
+        [0xC400, 0, 0, 0], // -4.0f16 -> -4i16 (0xFFFC)
+        [0x3C00, 0, 0, 0], // +1.0f16 -> +1i16 (0x0001)
+        [0x0000, 0, 0, 0], //  0.0f16 ->  0i16 (0x0000)
+    ];
+    let want_sext = [0xFFFF_FFFFu32, 0xFFFF_FFFC, 0x0000_0001, 0x0000_0000];
+    let want_pad = [0x0000_FFFFu32, 0x0000_FFFC, 0x0000_0001, 0x0000_0000];
+    run_cases(&sext, &inputs, |backend, i, _, got| {
+        assert_eq!(got, want_sext[i], "{backend}: sdwa sext case {i}");
+    });
+    run_cases(&pad, &inputs, |backend, i, _, got| {
+        assert_eq!(got, want_pad[i], "{backend}: sdwa pad case {i}");
+    });
+
+    // Reserved dst_unused = 3 must be refused once the result is observed.
+    let bad = [
+        vop1(0x053, 0, 0xF9),
+        sdwa_ext(4, 3),
+        0x36 << 26 | 0x0D << 18, // ds_write_b32 v1, v0
+        1,
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = bad.into_iter().flat_map(u32::to_le_bytes).collect();
+    let native = crate::native::NativeProgram {
+        stage: crate::native::HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = crate::ir::build(&native.code, false, 4).unwrap();
+    let st = crate::structure::structure(&p).unwrap();
+    let io = crate::io::raise(&p, &native).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let err = super::lower::lower(&super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    assert!(err.is_err(), "reserved dst_unused=3 must be refused");
+}
