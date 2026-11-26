@@ -68,6 +68,15 @@ impl SmallRuns {
     }
 
     fn push(&mut self, from: usize, to: usize) {
+        if let Some(last) = self.spill.last_mut() {
+            if last.1 == from {
+                last.1 = to;
+                return;
+            }
+        } else if self.inline_len > 0 && self.inline[self.inline_len - 1].1 == from {
+            self.inline[self.inline_len - 1].1 = to;
+            return;
+        }
         if self.inline_len < self.inline.len() {
             self.inline[self.inline_len] = (from, to);
             self.inline_len += 1;
@@ -84,6 +93,59 @@ impl SmallRuns {
     }
 }
 
+/// Inserts a disjoint byte span `(lo, hi, stamp)` into `spans` (kept sorted
+/// and non-overlapping), merging with an adjacent span that shares `stamp`.
+fn insert_partial_span(spans: &mut Vec<(u32, u32, u64)>, lo: u32, hi: u32, stamp: u64) {
+    if lo >= hi {
+        return;
+    }
+    let pos = spans.partition_point(|&(a, _, _)| a < lo);
+    spans.insert(pos, (lo, hi, stamp));
+    if pos + 1 < spans.len()
+        && spans[pos].1 == spans[pos + 1].0
+        && spans[pos].2 == spans[pos + 1].2
+    {
+        spans[pos].1 = spans[pos + 1].1;
+        spans.remove(pos + 1);
+    }
+    if pos > 0 && spans[pos - 1].1 == spans[pos].0 && spans[pos - 1].2 == spans[pos].2 {
+        spans[pos - 1].1 = spans[pos].1;
+        spans.remove(pos);
+    }
+}
+
+/// Prunes partial spans invalidated by `write` (`stamp < write`) and returns
+/// the sorted gaps inside `[req_lo, req_hi)` not covered by remaining spans.
+fn stale_gaps_in_page(
+    spans: &mut Vec<(u32, u32, u64)>,
+    write: u64,
+    req_lo: u32,
+    req_hi: u32,
+) -> Vec<(u32, u32)> {
+    spans.retain(|&(_, _, stamp)| write <= stamp);
+    let mut gaps = Vec::new();
+    let mut cursor = req_lo;
+    for &(a, b, _) in spans.iter() {
+        if b <= cursor {
+            continue;
+        }
+        if a >= req_hi {
+            break;
+        }
+        if a > cursor {
+            gaps.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+        if cursor >= req_hi {
+            break;
+        }
+    }
+    if cursor < req_hi {
+        gaps.push((cursor, req_hi));
+    }
+    gaps
+}
+
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
 /// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
@@ -94,6 +156,10 @@ struct CopiedPages {
     /// Unused high bits in the final word are always 0.
     uncopied_bits: Vec<u64>,
     uncopied: usize,
+    /// Per page index (`page - base`) that has only been copied in part:
+    /// sorted, non-overlapping byte spans `(lo, hi, stamp)` within the 64 KiB
+    /// page that are current as of `stamp`.
+    partial: std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
 }
 
 impl CopiedPages {
@@ -108,6 +174,7 @@ impl CopiedPages {
             at: vec![0; pages],
             uncopied_bits,
             uncopied: pages,
+            partial: std::collections::HashMap::new(),
         }
     }
 
@@ -125,11 +192,35 @@ impl CopiedPages {
                 self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
             }
             *slot = now;
+            self.partial.remove(&index);
+        }
+    }
+
+    fn advance_partial(&mut self, index: usize, before: u64, now: u64) {
+        if let Some(spans) = self.partial.get_mut(&index) {
+            for (_, _, stamp) in spans.iter_mut() {
+                if *stamp >= before {
+                    *stamp = (*stamp).max(now);
+                }
+            }
+        }
+    }
+
+    fn stale_gaps(&mut self, idx: usize, write: u64, r_lo: u32, r_hi: u32) -> Vec<(u32, u32)> {
+        match self.partial.get_mut(&idx) {
+            Some(spans) => {
+                let g = stale_gaps_in_page(spans, write, r_lo, r_hi);
+                if spans.is_empty() {
+                    self.partial.remove(&idx);
+                }
+                g
+            }
+            None => vec![(r_lo, r_hi)],
         }
     }
 
     fn all_uncopied(&self) -> bool {
-        self.uncopied == self.at.len()
+        self.uncopied == self.at.len() && self.partial.is_empty()
     }
 
     #[cfg(test)]
@@ -210,6 +301,75 @@ impl CopiedPages {
     /// returns `true` (used by lazy GPU-resident write-back so `DEFERRED`
     /// pages are neither copied from title memory nor coalesced across).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_page(
+        &mut self,
+        runs: &mut SmallRuns,
+        run: &mut Option<(usize, usize)>,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        page: usize,
+        write: u64,
+    ) {
+        let idx = page - base;
+        let page_base = page * PAGE;
+        let page_lo = page_base.max(start);
+        let page_hi = (page_base + PAGE).min(end);
+        let req_lo = page_lo.max(from);
+        let req_hi = page_hi.min(to);
+        let r_lo = (req_lo - page_base) as u32;
+        let r_hi = (req_hi - page_base) as u32;
+        let full_page = req_lo == page_lo && req_hi == page_hi;
+
+        let gaps = if self.partial.is_empty() {
+            vec![(r_lo, r_hi)]
+        } else {
+            self.stale_gaps(idx, write, r_lo, r_hi)
+        };
+        if gaps.is_empty() {
+            if let Some((run_start, run_end)) = run.take() {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            if full_page {
+                self.set(idx, now);
+            }
+            return;
+        }
+        if full_page {
+            self.set(idx, now);
+        }
+        if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+            match *run {
+                Some((_, run_end)) if page < run_end => {}
+                Some((run_start, run_end)) if page == run_end => {
+                    *run = Some((run_start, page + 1));
+                }
+                Some((run_start, run_end)) => {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    *run = Some((page, page + 1));
+                }
+                None => *run = Some((page, page + 1)),
+            }
+        } else {
+            if let Some((run_start, run_end)) = run.take() {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            for &(g_lo, g_hi) in &gaps {
+                runs.push(page_base + g_lo as usize, page_base + g_hi as usize);
+            }
+        }
+        if !full_page {
+            let spans = self.partial.entry(idx).or_default();
+            for (g_lo, g_hi) in gaps {
+                insert_partial_span(spans, g_lo, g_hi, now);
+            }
+        }
+    }
+
     fn plan_stale_filtered(
         &mut self,
         base: usize,
@@ -222,6 +382,8 @@ impl CopiedPages {
         skip_idx: impl Fn(usize) -> bool,
     ) -> SmallRuns {
         let mut runs = SmallRuns::new();
+        let from = from.max(start);
+        let to = to.min(end);
         if from >= to {
             return runs;
         }
@@ -229,19 +391,6 @@ impl CopiedPages {
         let last = (to - 1) / PAGE;
         let lo = first_page - base;
         let hi = last - base;
-
-        let push_page =
-            |runs: &mut SmallRuns, run: &mut Option<(usize, usize)>, page: usize| match *run {
-                Some((_, run_end)) if page < run_end => {}
-                Some((run_start, run_end)) if page == run_end => {
-                    *run = Some((run_start, page + 1));
-                }
-                Some((run_start, run_end)) => {
-                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-                    *run = Some((page, page + 1));
-                }
-                None => *run = Some((page, page + 1)),
-            };
 
         let mut run: Option<(usize, usize)> = None;
         let w_start = if written.len() > 8 {
@@ -267,10 +416,7 @@ impl CopiedPages {
                 if skip_idx(idx) || write <= self.at[idx] {
                     continue;
                 }
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    self.set(idx, now);
-                }
-                push_page(&mut runs, &mut run, page);
+                self.plan_page(&mut runs, &mut run, base, start, end, from, to, now, page, write);
             }
             if let Some((run_start, run_end)) = run {
                 runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
@@ -296,27 +442,30 @@ impl CopiedPages {
             }
             let next_w =
                 (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
-            let idx = match (next_u, next_w) {
+            let (idx, write) = match (next_u, next_w) {
                 (Some(u), Some(w)) if u < w => {
                     next_u = self.next_uncopied(u + 1, hi);
-                    u
+                    (u, 0)
                 }
                 (Some(u), Some(w)) if w < u => {
+                    let wr = written[wi].1;
                     wi += 1;
-                    w
+                    (w, wr)
                 }
                 (Some(u), Some(_)) => {
+                    let wr = written[wi].1;
                     next_u = self.next_uncopied(u + 1, hi);
                     wi += 1;
-                    u
+                    (u, wr)
                 }
                 (Some(u), None) => {
                     next_u = self.next_uncopied(u + 1, hi);
-                    u
+                    (u, 0)
                 }
                 (None, Some(w)) => {
+                    let wr = written[wi].1;
                     wi += 1;
-                    w
+                    (w, wr)
                 }
                 (None, None) => break,
             };
@@ -324,15 +473,144 @@ impl CopiedPages {
                 continue;
             }
             let page = base + idx;
-            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                self.set(idx, now);
-            }
-            push_page(&mut runs, &mut run, page);
+            self.plan_page(&mut runs, &mut run, base, start, end, from, to, now, page, write);
         }
         if let Some((run_start, run_end)) = run {
             runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
         }
         runs
+    }
+
+    /// Sub-page planner (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) with
+    /// per-span partial-page stamps and lazy-deferred page skipping.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_subpages(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+        mut page_mask: impl FnMut(usize, u64, Option<(u64, u16)>) -> Option<u16>,
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, usize)> {
+        const KERNEL_PAGE: usize = 4096;
+        let from = from.max(start);
+        let to = to.min(end);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut writes = written.iter().peekable();
+        let mut subs = subs.iter().peekable();
+        let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
+        let last = (to - 1) / PAGE;
+        for page in from / PAGE..=last {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
+                }
+                _ => 0,
+            };
+            while subs.peek().is_some_and(|s| s.0 < page) {
+                subs.next();
+            }
+            let sub = subs
+                .peek()
+                .filter(|s| s.0 == page && s.1 == write && write != 0)
+                .map(|s| (s.2, s.3));
+            let idx = page - base;
+            if skip_idx(idx) {
+                continue;
+            }
+            let prev = self.get(idx).unwrap_or(0);
+            if prev == 0 || write > prev {
+                let page_base = page * PAGE;
+                let page_lo = page_base.max(start);
+                let page_hi = (page_base + PAGE).min(end);
+                let req_lo = page_lo.max(from);
+                let req_hi = page_hi.min(to);
+                let r_lo = (req_lo - page_base) as u32;
+                let r_hi = (req_hi - page_base) as u32;
+                let full_page = req_lo == page_lo && req_hi == page_hi;
+
+                let gaps = if self.partial.is_empty() {
+                    vec![(r_lo, r_hi)]
+                } else {
+                    self.stale_gaps(idx, write, r_lo, r_hi)
+                };
+                if gaps.is_empty() {
+                    bytes_runs.extend(run.take());
+                    if full_page {
+                        self.set(idx, now);
+                    }
+                    continue;
+                }
+                let mask = page_mask(page, prev, sub);
+                if full_page {
+                    self.set(idx, now);
+                }
+                if let Some(bits) = mask {
+                    bytes_runs.extend(run.take());
+                    let mut k = 0;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let a = k;
+                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                            k += 1;
+                        }
+                        let sub_lo = (a * KERNEL_PAGE) as u32;
+                        let sub_hi = (k * KERNEL_PAGE) as u32;
+                        for &(g_lo, g_hi) in &gaps {
+                            let lo = g_lo.max(sub_lo);
+                            let hi = g_hi.min(sub_hi);
+                            if lo < hi {
+                                bytes_runs.push((page_base + lo as usize, page_base + hi as usize));
+                                if !full_page {
+                                    insert_partial_span(
+                                        self.partial.entry(idx).or_default(),
+                                        lo,
+                                        hi,
+                                        now,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+                        extend_runs(&mut run, &mut bytes_runs, page, u16::MAX);
+                    } else {
+                        bytes_runs.extend(run.take());
+                        for &(g_lo, g_hi) in &gaps {
+                            bytes_runs.push((page_base + g_lo as usize, page_base + g_hi as usize));
+                        }
+                    }
+                    if !full_page {
+                        let spans = self.partial.entry(idx).or_default();
+                        for (g_lo, g_hi) in gaps {
+                            insert_partial_span(spans, g_lo, g_hi, now);
+                        }
+                    }
+                }
+            } else {
+                bytes_runs.extend(run.take());
+            }
+        }
+        bytes_runs.extend(run);
+        bytes_runs
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let (a, b) = (a.max(from), b.min(to));
+                (a < b).then_some((a, b))
+            })
+            .collect()
     }
 }
 
@@ -4094,6 +4372,134 @@ mod stale_tests {
             vec![(base, base + PAGE)]
         );
     }
+
+    #[test]
+    fn partial_page_refresh_skips_unchanged_and_reuploads_written_spans() {
+        let base = 0x100usize;
+        let start = base * PAGE;
+        let len = 3 * PAGE;
+        let end = start + len;
+        let mut title = vec![0xAAu8; len];
+        let mut shadow = vec![0u8; len];
+        let mut copied = CopiedPages::new(3);
+
+        // Unaligned span crossing both a 4 KiB subpage boundary and the
+        // 64 KiB boundary between page 0x100 and page 0x101.
+        let from = start + 0xF500;
+        let to = start + PAGE + 0x1300;
+        let do_refresh = |copied: &mut CopiedPages,
+                          title: &[u8],
+                          shadow: &mut [u8],
+                          now: u64,
+                          written: &[(usize, u64)]| {
+            let runs = copied.plan_stale(base, start, end, from, to, now, written);
+            let mut bytes = 0;
+            for (lo, hi) in runs.iter() {
+                shadow[lo - start..hi - start].copy_from_slice(&title[lo - start..hi - start]);
+                bytes += hi - lo;
+            }
+            bytes
+        };
+
+        // 1st refresh: copies the entire unaligned span across the boundary.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 10, &[]), to - from);
+        assert_eq!(copied.at, [0, 0, 0]);
+        assert!(!copied.all_uncopied());
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 2nd refresh with no CPU writes: skips every already-covered byte.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 11, &[]), 0);
+
+        // CPU writes to the second page only; 3rd refresh uploads only that page's covered span.
+        title[PAGE + 0x200..PAGE + 0x400].fill(0x55);
+        assert_eq!(
+            do_refresh(&mut copied, &title, &mut shadow, 13, &[(base + 1, 12)]),
+            0x1300
+        );
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 4th refresh with no new write: skips again.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 14, &[(base + 1, 12)]), 0);
+    }
+
+    #[test]
+    fn partial_page_refresh_handles_overlapping_extension_and_whole_promotion() {
+        let base = 0x200usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = CopiedPages::new(1);
+
+        // First partial refresh [0x100, 0x500).
+        let r1: Vec<_> = copied
+            .plan_stale(base, start, end, start + 0x100, start + 0x500, 10, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r1, vec![(0x100, 0x500)]);
+
+        // Extended refresh [0x100, 0x800): copies only [0x500, 0x800).
+        let r2: Vec<_> = copied
+            .plan_stale(base, start, end, start + 0x100, start + 0x800, 11, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r2, vec![(0x500, 0x800)]);
+
+        // Full-page refresh promotes to whole-page stamp and clears partial entry.
+        let r3: Vec<_> = copied
+            .plan_stale(base, start, end, start, end, 12, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r3, vec![(0, 0x100), (0x800, PAGE)]);
+        assert_eq!(copied.at[0], 12);
+        assert!(copied.partial.is_empty());
+    }
+
+    #[test]
+    fn partial_page_refresh_with_dirty4k_skips_clean_and_already_copied_subpages() {
+        let base = 0x300usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = CopiedPages::new(1);
+        copied.set(0, 5);
+
+        // Whole page was copied at 5, then written at 12 (before=4 <= 5),
+        // with only 4 KiB page 1 (0x1000..0x2000) dirty.
+        let subs = [(base, 12u64, 4u64, 1u16 << 1)];
+        let r1: Vec<_> = copied
+            .plan_stale_subpages(
+                base,
+                start,
+                end,
+                start + 0x0800,
+                start + 0x2400,
+                13,
+                &[(base, 12)],
+                &subs,
+                |_, prev, sub| sub.filter(|&(before, _)| prev != 0 && before <= prev).map(|(_, b)| b),
+                |_| false,
+            )
+            .into_iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r1, vec![(0x1000, 0x2000)]);
+
+        // Second partial refresh of the same range with no new write skips it completely.
+        let r2 = copied.plan_stale_subpages(
+            base,
+            start,
+            end,
+            start + 0x0800,
+            start + 0x2400,
+            14,
+            &[(base, 12)],
+            &subs,
+            |_, prev, sub| sub.filter(|&(before, _)| prev != 0 && before <= prev).map(|(_, b)| b),
+            |_| false,
+        );
+        assert!(r2.is_empty());
+    }
 }
 
 /// Copies of windows outside buffers let go since the start, and their
@@ -5634,35 +6040,20 @@ impl Shadow {
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
-        // with CopiedPages bitset consistency and lazy-deferred page skipping.
+        // with CopiedPages bitset consistency, partial-page stamps, and lazy-deferred skipping.
         let bytes_runs = {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let mut writes = written.iter().peekable();
-            let mut subs = subs.iter().peekable();
-            let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
-            let last = (to - 1) / PAGE;
-            for page in from / PAGE..=last {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
-                while subs.peek().is_some_and(|s| s.0 < page) {
-                    subs.next();
-                }
-                let sub = subs
-                    .peek()
-                    .filter(|s| s.0 == page && s.1 == write && write != 0)
-                    .map(|s| (s.2, s.3));
-                let idx = page - base;
-                if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
-                    continue;
-                }
-                let prev = copied.get(idx).unwrap_or(0);
-                if prev == 0 || write > prev {
-                    let mask = if four_k {
+            copied.plan_stale_subpages(
+                base,
+                start,
+                end,
+                from,
+                to,
+                now,
+                written,
+                subs,
+                |page, prev, sub| {
+                    if four_k {
                         let m = crate::watch::stale_mask(page, prev);
                         crate::watch::note_4k(m);
                         m
@@ -5672,23 +6063,11 @@ impl Shadow {
                             .map(|(_, bits)| bits);
                         crate::watch::dirty4k_count(found, narrow && found.is_some());
                         if narrow { found } else { None }
-                    };
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        copied.set(idx, now);
                     }
-                    extend_runs(&mut run, &mut bytes_runs, page, mask.unwrap_or(u16::MAX));
-                }
-            }
-            bytes_runs.extend(run);
-            bytes_runs
+                },
+                |idx| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
+            )
         };
-        let bytes_runs: Vec<(usize, usize)> = bytes_runs
-            .into_iter()
-            .filter_map(|(a, b)| {
-                let (a, b) = (a.max(from), b.min(to));
-                (a < b).then_some((a, b))
-            })
-            .collect();
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(bytes_runs.into_iter());
@@ -6216,13 +6595,15 @@ impl Shadow {
             if theirs.contains(&page) {
                 continue;
             }
-            if let Some(i) = page.checked_sub(base)
-                && let Some(held) = copied.get(i)
-                && held != 0
-                && before <= held
-            {
-                copied.set(i, now);
-                QUIET_BACK.fetch_add(1, Ordering::Relaxed);
+            if let Some(i) = page.checked_sub(base) {
+                copied.advance_partial(i, before, now);
+                if let Some(held) = copied.get(i)
+                    && held != 0
+                    && before <= held
+                {
+                    copied.set(i, now);
+                    QUIET_BACK.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
