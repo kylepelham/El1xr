@@ -1033,8 +1033,14 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<IndirectArgs>,
-    /// The host pipeline last kept by [`HostList::holds_pipeline`].
+    /// The host pipeline last kept by [`HostList::bind_pipeline`].
     kept_pipeline: std::sync::atomic::AtomicUsize,
+    /// Incremented on every deferred title write (lock-free mirror of
+    /// constant-buffer snapshot invalidations, read on every draw's table check).
+    cbv_epoch: std::sync::atomic::AtomicU64,
+    /// True only while at least one depth twin in `twins` has `writing = true`,
+    /// avoiding a `twins` mutex lock on every draw and dispatch.
+    twins_writing: std::sync::atomic::AtomicBool,
     /// (Neptune) The buffers the clamps recorded in the prelude write their
     /// records into ([`HostList::clamp_ahead`]), and whether a prelude has
     /// left each in the indirect-argument state. Kept across resets.
@@ -2799,8 +2805,6 @@ struct Deferred {
     /// Constant-buffer snapshots already copied into this list's scratch
     /// memory since the last title write (`(address, size) -> host GPU address`).
     cbv_snapshots: std::collections::HashMap<(u64, u32), u64>,
-    /// Incremented whenever a deferred title write invalidates `cbv_snapshots`.
-    cbv_epoch: u64,
     /// Pre-aggregated refresh spans per shadow (`ask_once`, `stale_under_flights`).
     refresh_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     refresh_map: std::collections::HashMap<usize, usize>,
@@ -2850,7 +2854,6 @@ impl Deferred {
         self.refreshed.clear();
         self.cbv_snapshots.clear();
         self.filled_root_cbvs.clear();
-        self.cbv_epoch += 1;
     }
 
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -4860,6 +4863,8 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 kept_pipeline: std::sync::atomic::AtomicUsize::new(0),
+                cbv_epoch: std::sync::atomic::AtomicU64::new(0),
+                twins_writing: std::sync::atomic::AtomicBool::new(false),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -7843,6 +7848,8 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .readable = false;
         self.kept_pipeline.store(0, Ordering::Relaxed);
+        self.cbv_epoch.store(0, Ordering::Relaxed);
+        self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states
@@ -7973,7 +7980,11 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        // Asked for every texture a draw reads: most have no twin.
+        // Asked for every draw's depth target and every texture write: 99%+ of
+        // textures lack the depth+UAV flags and can never have a colour twin.
+        if !crate::resource::depth_and_unordered(resource) {
+            return false;
+        }
         let Some((depth, Some(twin))) = crate::resource::host_side(resource) else {
             return false;
         };
@@ -8015,7 +8026,10 @@ impl HostList {
             // Shaders write the twin when the draw or dispatch runs: what
             // the same one reads of the depth texture is prepared before
             // (`twins_written`).
-            (true, true) => u.writing = true,
+            (true, true) => {
+                u.writing = true;
+                self.twins_writing.store(true, Ordering::Release);
+            }
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
@@ -8160,6 +8174,9 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
+        if !self.twins_writing.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
@@ -8406,7 +8423,7 @@ impl HostList {
     /// Current constant-buffer snapshot epoch of this list (incremented on
     /// every deferred title write).
     pub(crate) fn cbv_epoch(&self) -> u64 {
-        self.deferred().cbv_epoch
+        self.cbv_epoch.load(Ordering::Relaxed)
     }
 
     /// Scratch-memory snapshot of `size` bytes of title constant data at
@@ -8464,6 +8481,7 @@ impl HostList {
         self.changes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.title_write();
+        self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -8967,6 +8985,7 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.title_write();
+        self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

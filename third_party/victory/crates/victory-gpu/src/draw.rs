@@ -381,6 +381,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     bound_targets: Option<BoundTargets>,
+    /// Cached `(host_list_ptr, list_changes, depth_state)` for which all bound
+    /// render targets and depth have already been ensured into their required
+    /// host states, skipping per-draw resource locks and state-map lookups.
+    targets_ready: Option<(usize, u64, u32)>,
     host_topology: Option<u32>,
     host_viewports_set: bool,
     host_scissors_set: bool,
@@ -796,12 +800,130 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
-    pub(crate) fn reset(&mut self, pipeline: This) {
+    pub(crate) fn reset(&mut self, new_pipeline: This) {
         for (heap, index, _, _) in self.pending_shows.drain(..) {
             crate::descriptor::host::requeue_show(heap, index);
         }
-        *self = State::default();
-        self.pipeline = pipeline as usize;
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        // Exhaustive destructuring ensures every field is reset while reusing
+        // heap capacities of per-list containers across frames.
+        let Self {
+            pipeline,
+            heaps,
+            graphics,
+            compute,
+            vertex,
+            index,
+            targets,
+            depth,
+            depth_state,
+            topology,
+            topology_set,
+            target_views,
+            depth_view,
+            targets_set,
+            viewports,
+            scissors,
+            blend,
+            stencil,
+            depth_bounds,
+            window,
+            host_pipeline,
+            host_roots,
+            host_heaps,
+            bound_targets,
+            targets_ready,
+            host_topology,
+            host_viewports_set,
+            host_scissors_set,
+            host_blend_set,
+            host_stencil_set,
+            host_depth_bounds_set,
+            host_vertex,
+            host_vertex_bound,
+            host_vertex_dirty,
+            host_vb_list,
+            host_vb_list_changes,
+            host_index,
+            host_index_dirty,
+            host_ib_list,
+            host_ib_list_changes,
+            scratch_made,
+            scratch_entries,
+            scratch_selected,
+            scratch_textures,
+            fresh_tables,
+            ready_tables,
+            seen_tables,
+            dynamic,
+            root_srv_slots,
+            root_uav_slots,
+            ambient_tables,
+            pending_shows,
+            tables_gone,
+        } = self;
+        *pipeline = new_pipeline as usize;
+        *heaps = [0; 2];
+        graphics.clear();
+        compute.clear();
+        *vertex = [VertexView::default(); 32];
+        *index = IndexView::default();
+        targets.clear();
+        *depth = 0;
+        *depth_state = 0;
+        *topology = 0;
+        *topology_set = false;
+        target_views.clear();
+        *depth_view = None;
+        *targets_set = false;
+        viewports.clear();
+        scissors.clear();
+        *blend = None;
+        *stencil = None;
+        *depth_bounds = None;
+        *window = None;
+        *host_pipeline = 0;
+        *host_roots = [0; 2];
+        *host_heaps = [0; 2];
+        *bound_targets = None;
+        *targets_ready = None;
+        *host_topology = None;
+        *host_viewports_set = false;
+        *host_scissors_set = false;
+        *host_blend_set = false;
+        *host_stencil_set = false;
+        *host_depth_bounds_set = false;
+        *host_vertex = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+        *host_vertex_bound = 0;
+        *host_vertex_dirty = false;
+        *host_vb_list = 0;
+        *host_vb_list_changes = 0;
+        *host_index = None;
+        *host_index_dirty = false;
+        *host_ib_list = 0;
+        *host_ib_list_changes = 0;
+        scratch_made.clear();
+        scratch_entries.clear();
+        scratch_selected.clear();
+        scratch_textures.clear();
+        fresh_tables.clear();
+        if fresh_tables.capacity() > 4096 {
+            fresh_tables.shrink_to(1024);
+        }
+        ready_tables.clear();
+        if ready_tables.capacity() > 4096 {
+            ready_tables.shrink_to(1024);
+        }
+        seen_tables.clear();
+        if seen_tables.capacity() > 4096 {
+            seen_tables.shrink_to(1024);
+        }
+        dynamic.clear();
+        root_srv_slots.clear();
+        root_uav_slots.clear();
+        ambient_tables.clear();
+        pending_shows.clear();
+        *tables_gone = false;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -952,6 +1074,7 @@ impl State {
             if cache_on && self.bound_targets == Some(key) {
                 return;
             }
+            self.targets_ready = None;
             self.targets.clear();
             let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
             let mut rtv_len = 0usize;
@@ -1005,6 +1128,7 @@ impl State {
             return;
         }
         self.bound_targets = None;
+        self.targets_ready = None;
         self.targets.clear();
         let mut rtvs = Vec::new();
         for snapshot in self.target_views.iter().flatten() {
@@ -1137,6 +1261,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
         self.bound_targets = None;
+        self.targets_ready = None;
         self.host_topology = None;
         self.host_viewports_set = false;
         self.host_scissors_set = false;
@@ -1180,6 +1305,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
         self.bound_targets = None;
+        self.targets_ready = None;
         self.host_topology = None;
         self.host_viewports_set = false;
         self.host_scissors_set = false;
@@ -1456,17 +1582,13 @@ impl State {
                 self.host_ib_list_changes = list_changes;
             }
         }
-        const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
-            let state = if self.depth_state == DEPTH_READ {
+        // A view that writes neither plane keeps the texture readable:
+        // the depth read state, together with the shader read states
+        // if this draw's shaders read the same texture (the write state
+        // put it out of the state those views need, and a move to it
+        // and back for every such draw).
+        let depth_state = if self.depth != 0 {
+            if self.depth_state == DEPTH_READ {
                 let (tested, read) = TESTED_DEPTH.get();
                 if read && tested == self.depth {
                     DEPTH_READ | SHADER_RESOURCE
@@ -1475,8 +1597,20 @@ impl State {
                 }
             } else {
                 DEPTH_WRITE
-            };
-            crate::list::ensure_state(list, self.depth as This, state);
+            }
+        } else {
+            0
+        };
+        let now_changes = list.changes.load(Ordering::Relaxed);
+        if self.targets_ready != Some((list_ptr, now_changes, depth_state)) {
+            const RENDER_TARGET: u32 = 0x4;
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if self.depth != 0 {
+                crate::list::ensure_state(list, self.depth as This, depth_state);
+            }
+            self.targets_ready = Some((list_ptr, list.changes.load(Ordering::Relaxed), depth_state));
         }
         true
     }
@@ -5385,5 +5519,64 @@ mod tests {
         same.rtvs[0] = Some((snap1, 0xaaaa));
         same.rtv_count = 2;
         assert_ne!(a, same);
+    }
+
+    #[test]
+    fn state_reset_clears_state_while_reusing_container_capacity() {
+        let mut s = State::default();
+        s.graphics.reserve(16);
+        s.graphics.push(Root::Table(0x1234));
+        s.fresh_tables.reserve(64);
+        s.fresh_tables.insert((1, 2, 3), (4, None));
+        s.targets.push(0x9999);
+        s.depth = 0x8888;
+        s.host_pipeline = 0x7777;
+        s.host_topology = Some(4);
+        s.host_viewports_set = true;
+        s.targets_ready = Some((0x5555, 12, DEPTH_WRITE));
+        s.tables_gone = true;
+
+        let fresh_cap_before = s.fresh_tables.capacity();
+        let gfx_cap_before = s.graphics.capacity();
+        let pipe = 0x4321usize as This;
+        s.reset(pipe);
+
+        assert_eq!(s.pipeline, 0x4321);
+        assert!(s.graphics.is_empty());
+        assert!(s.fresh_tables.is_empty());
+        assert!(s.targets.is_empty());
+        assert_eq!(s.depth, 0);
+        assert_eq!(s.host_pipeline, 0);
+        assert_eq!(s.host_topology, None);
+        assert!(!s.host_viewports_set);
+        assert_eq!(s.targets_ready, None);
+        assert!(!s.tables_gone);
+        // Capacities are retained across resets to avoid per-frame reallocations.
+        assert!(s.fresh_tables.capacity() >= fresh_cap_before);
+        assert!(s.graphics.capacity() >= gfx_cap_before);
+    }
+
+    #[test]
+    fn host_list_atomic_cbv_epoch_and_twin_fast_paths() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        assert_eq!(list.cbv_epoch(), 0);
+        list.defer(|| {});
+        assert_eq!(list.cbv_epoch(), 1);
+        let mut dst = [0u8; 4];
+        let src = [1u8; 4];
+        list.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 4);
+        assert_eq!(list.cbv_epoch(), 2);
+        // Null resource takes the lock-free early return.
+        assert!(!list.twin_use(std::ptr::null(), false, true));
+        // No twin writing: twins_written takes the lock-free fast path without bumping changes.
+        let before = list.changes.load(Ordering::Relaxed);
+        list.twins_written();
+        assert_eq!(list.changes.load(Ordering::Relaxed), before);
+        list.close();
+        list.reset();
+        assert_eq!(list.cbv_epoch(), 0);
     }
 }
