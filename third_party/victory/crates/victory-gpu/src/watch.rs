@@ -54,6 +54,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+mod holes;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
 
@@ -3191,7 +3192,7 @@ fn guard_with_epochs_flags(
                     // Ordinary reservations (or when placeholder skip is disabled):
                     // reuse one VirtualQuery across the contiguous uncommitted region.
                     if block >= uncommitted_until {
-                        uncommitted_until = uncommitted_end(block);
+                        uncommitted_until = holes::uncommitted_end_cached(block);
                     }
                     if block < uncommitted_until {
                         continue;
@@ -3357,7 +3358,7 @@ fn guard_locked(
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if cursor >= uncommitted_until {
-                uncommitted_until = uncommitted_end(cursor);
+                uncommitted_until = holes::uncommitted_end_cached(cursor);
             }
             if cursor < uncommitted_until {
                 if let Some((rf, rt)) = run.take() {
@@ -3514,7 +3515,7 @@ fn guard_shared(
                 continue;
             }
             if cursor >= uncommitted_until {
-                uncommitted_until = uncommitted_end(cursor);
+                uncommitted_until = holes::uncommitted_end_cached(cursor);
             }
             if cursor < uncommitted_until {
                 if let Some((rf, rt)) = run.take() {
@@ -4952,6 +4953,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    holes::forget(at, len);
     crate::texback::remapped(at, len);
     if reservation::enabled() {
         ask_once_end();
