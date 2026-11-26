@@ -579,8 +579,19 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                    host.log_messages();
+                    // Include the first error from the shared debug queue.
+                    // Another worker may have produced it; correlation is
+                    // best-effort, not proof it belongs to this PSO.
+                    let debug_layer_first_error = host.log_messages();
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        ?debug_layer_first_error,
+                        dxil_bytes = desc.CS.BytecodeLength,
+                        root_parameters = params.len(),
+                        static_samplers = samplers.len(),
+                        "host pipeline refused"
+                    );
                     return None;
                 }
             };
