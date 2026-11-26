@@ -1,10 +1,10 @@
-// xgameruntime.dll d'AnyXboxX : le runtime GDK vu par le jeu.
+// xgameruntime.dll d'El1xr : le runtime GDK vu par le jeu.
 //
 // Sur PC, le jeu ne lie pas les API X* directement : la bibliothèque statique
 // xgameruntime.lib charge cette DLL, appelle InitializeApiImpl*, puis demande
 // chaque interface par QueryApiImpl(fournisseur, interface).
 //
-// AnyXboxX sert lui-même les interfaces de served_interfaces.inc (XTaskQueue,
+// El1xr sert lui-même les interfaces de served_interfaces.inc (XTaskQueue,
 // XAsync, XThread) quand il gère seul le runtime. Sinon, si le runtime GDK de
 // Windows est installé (Gaming Services, System32\xgameruntime.dll), les
 // demandes lui sont déléguées : le jeu fonctionne, et la trace liste chaque
@@ -169,13 +169,13 @@ HRESULT WINAPI QueryApiImpl(const GUID* provider, const GUID* iid, void** out, v
   if (provider == nullptr || iid == nullptr || out == nullptr) return E_NOINTERFACE;
   // Un seul runtime pour tout : les API de Windows (XUser, XGameSave…) prennent des
   // XAsyncBlock et des files de tâches, qu'elles ne savent lire que si elles les ont
-  // créées. AnyXboxX ne sert donc ses interfaces que lorsqu'il gère seul le runtime.
+  // créées. El1xr ne sert donc ses interfaces que lorsqu'il gère seul le runtime.
   // Décision unique : le module de Windows est-il chargé (et Initialize* lui a été relayé) ?
   const auto system = SystemFunction<QueryRoutine>("QueryApiImpl");
   if (SystemRuntime() == nullptr) {
     if (void* served = anyxboxx::ServedInterface(*provider, *iid)) {
       *out = served;  // objet statique : AddRef/Release sans effet
-      TraceQuery(provider, iid, "servie par AnyXboxX");
+      TraceQuery(provider, iid, "servie par El1xr");
       return S_OK;
     }
   }

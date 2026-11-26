@@ -1,13 +1,13 @@
-// Interface XStore du runtime GDK servie par AnyXboxX : le Microsoft Store, hors ligne.
+// Interface XStore du runtime GDK servie par El1xr : le Microsoft Store, hors ligne.
 //
 // Fournisseur {0DD112AC…}, quatre versions d'interface qui prolongent la même table
 // (méthodes 3 à 83, gdk_api_table.inc). Signatures et énumérations : en-tête public
 // XStore.h et codes d'erreur de XGameErr.h du GDK (Microsoft Learn).
 //
-// Sans Xbox Live ni boutique, AnyXboxX ne vend rien et ne contacte aucun serveur :
+// Sans Xbox Live ni boutique, El1xr ne vend rien et ne contacte aucun serveur :
 //  - un contexte (XStoreCreateContext) se crée et se ferme normalement ;
 //  - la licence du jeu est locale : valide et complète (isActive vrai, ni essai ni disque).
-//    C'est un choix assumé : un PC qui lance le jeu avec AnyXboxX n'a pas de licence
+//    C'est un choix assumé : un PC qui lance le jeu avec El1xr n'a pas de licence
 //    Store à vérifier, et la refuser empêcherait tout démarrage ;
 //  - les requêtes de produits rendent un jeu de résultats vide (aucun produit connu) ;
 //  - achat, fenêtres du Store, téléchargements et licences de paquet à acquérir échouent

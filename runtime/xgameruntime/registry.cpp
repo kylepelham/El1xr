@@ -3,7 +3,7 @@
 // xgameruntime.lib (lié dans le jeu) calcule XSystemGetDeviceType en lisant
 // HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM, valeur ConsoleMode ;
 // 0x64 donne XboxScarlettAnaconda (relevé au désassemblage du GDK 2610). Le mode
-// natif d'AnyXboxX remplace les fonctions de registre du jeu par celles-ci : seule
+// natif d'El1xr remplace les fonctions de registre du jeu par celles-ci : seule
 // cette clé est simulée, tout le reste va au vrai registre.
 #include <windows.h>
 

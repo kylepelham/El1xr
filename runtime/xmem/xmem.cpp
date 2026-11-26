@@ -1,4 +1,4 @@
-// xmem.dll d'AnyXboxX : allocateur mémoire de la console, traduit vers la mémoire du PC.
+// xmem.dll d'El1xr : allocateur mémoire de la console, traduit vers la mémoire du PC.
 //
 // Signatures relevées aux appels (pas d'en-tête public) : XMemAlloc(taille, attributs) et
 // XMemFree(pointeur, attributs), redirigées vers des crochets que le jeu peut remplacer
@@ -133,7 +133,7 @@ BOOL WINAPI XMemGetWorkingSetStatistics(int type, void*) {
   return FALSE;
 }
 
-// Outil d'AnyXboxX (pas une fonction de la console) : champs ERA d'un mot d'attributs.
+// Outil d'El1xr (pas une fonction de la console) : champs ERA d'un mot d'attributs.
 void WINAPI AnyXboxX_DecodeAllocAttributes(ULONGLONG attributes, anyxboxx::era::Fields* fields) {
   if (fields != nullptr) *fields = anyxboxx::era::Decode(attributes);
 }

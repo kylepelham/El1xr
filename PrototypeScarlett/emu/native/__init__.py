@@ -3,7 +3,7 @@ import os
 import sys
 
 if sys.platform != "win32":
-    raise ImportError("L'exécution native d'AnyXboxX demande Windows x64.")
+    raise ImportError("L'exécution native d'El1xr demande Windows x64.")
 
 from .image import NativeImage  # noqa: E402
 from .shims import adopt_command_line  # noqa: E402

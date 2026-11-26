@@ -2,13 +2,13 @@
 
 # TomBox and its continuation: what we reuse
 
-[TomBox](https://github.com/drycheetah84/TomBox) (drycheetah84) and its continuation [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later licence since 22 November 2026, MIT or Apache-2.0 before) reimplement the Xbox Series X|S platform layer in Rust. Each console DLL (`d3d12_xs`, `xg_xs`, `xmem`, `xma`…) becomes a replacement DLL there, and `tombox-xshader` translates RDNA 2 shaders to HLSL. AnyXboxX reuses their code and their published observations, and credits them; no game or console file is reused.
+[TomBox](https://github.com/drycheetah84/TomBox) (drycheetah84) and its continuation [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later licence since 22 November 2026, MIT or Apache-2.0 before) reimplement the Xbox Series X|S platform layer in Rust. Each console DLL (`d3d12_xs`, `xg_xs`, `xmem`, `xma`…) becomes a replacement DLL there, and `tombox-xshader` translates RDNA 2 shaders to HLSL. El1xr reuses their code and their published observations, and credits them; no game or console file is reused.
 
 State recorded on 21 November 2026 (commit `fef9a6e` of omonkeyz/xbox-emulator), from their files `README.md`, `docs/MILESTONES.md`, `docs/BLOCKERS.md` and `docs/DEVELOPMENT_LOG.md`.
 
 ## What they established
 
-| Area | Their state | For AnyXboxX |
+| Area | Their state | For El1xr |
 | --- | --- | --- |
 | Imported system functions (Fortnite) | 671 of 671 covered | model for our #12 and #13 |
 | Console Direct3D 12.x methods | 185 of 200, vtable slots measured | unblocks our #18 (device) and #19 (PresentX) |
@@ -20,7 +20,7 @@ State recorded on 21 November 2026 (commit `fef9a6e` of omonkeyz/xbox-emulator),
 
 ## Observations on the GTA VI 1.0.2.1 package
 
-They examined the same package that AnyXboxX studies and reach the same conclusion: it cannot be launched, the executable is missing.
+They examined the same package that El1xr studies and reach the same conclusion: it cannot be launched, the executable is missing.
 
 - 26,503 shaders, in compressed Xbox shader containers. In a sample of 4,000, all disassemble; about one third of the vertex shaders translate.
 - 8,765 mesh programs: they derived the console ABI of mesh shaders from them (`v5` = group vertex id, `s3[27:24]` = wave number, `s_sendmsg 9` to reserve the output, position exports 12, cull exports 13 to 15 and primitive exports 20).
@@ -28,32 +28,32 @@ They examined the same package that AnyXboxX studies and reach the same conclusi
 
 ## Differences in method
 
-- They work on already decrypted copies of commercial games. AnyXboxX only uses public sources (AMD and Microsoft documentation, LLVM tests) and free test programs.
-- Their checks go through title launches. AnyXboxX checks each shader translation against a reference interpreter, byte for byte, and its decoder against LLVM's encoding tests: both tools can validate their translator.
+- They work on already decrypted copies of commercial games. El1xr only uses public sources (AMD and Microsoft documentation, LLVM tests) and free test programs.
+- Their checks go through title launches. El1xr checks each shader translation against a reference interpreter, byte for byte, and its decoder against LLVM's encoding tests: both tools can validate their translator.
 
-## What AnyXboxX takes
+## What El1xr takes
 
 1. This document and [THIRD_PARTY.md](../../THIRD_PARTY.md): credits and licences.
 2. Their repository as a Git submodule (`third_party/tombox`), built with `cargo`.
-3. The launcher `anyxboxx.exe` loads their Rust DLLs for the console libraries that AnyXboxX does not cover.
+3. The launcher `anyxboxx.exe` loads their Rust DLLs for the console libraries that El1xr does not cover.
 4. Their translator `tombox-xshader`, verified by our reference interpreter on the GPU.
 
 ## Checking their decoder
 
-Their RDNA 2 disassembler (`tombox-xshader`), called from AnyXboxX's Rust bridge (`rust/anyxboxx-rdna2`), was checked against the 29,522 unique encodings of LLVM's tests by `tools/compare_tombox.py`: no wrong length, 24,831 identical encodings (84%), 4,586 opcodes missing from their table and 105 different names. Details and examples: [tombox-decoder.md](tombox-decoder.md). AnyXboxX's table, generated from LLVM, covers these missing opcodes; it can be offered to them.
+Their RDNA 2 disassembler (`tombox-xshader`), called from El1xr's Rust bridge (`rust/anyxboxx-rdna2`), was checked against the 29,522 unique encodings of LLVM's tests by `tools/compare_tombox.py`: no wrong length, 24,831 identical encodings (84%), 4,586 opcodes missing from their table and 105 different names. Details and examples: [tombox-decoder.md](tombox-decoder.md). El1xr's table, generated from LLVM, covers these missing opcodes; it can be offered to them.
 
 ## Their XMA2: their verified decoder
 
-Their `xma` crate (LGPL-2.1-or-later) is a Rust port of FFmpeg's WMA Pro / XMA decoder (`libavcodec/wmaprodec.c`). Their test `wmapro_fate_beethoven_matches_reference`, run locally with the public sample `wmapro/Beethovens_9th-1_small.wma` from FFmpeg's FATE suite and a reference PCM produced by `ffmpeg`, gives a maximum difference of 1 at 16 bits and a signal-to-noise ratio of 101.5 dB. AnyXboxX uses it in `rust/anyxboxx-audio` (`anyxboxx_xma <input.xma> <output.wav>`) for single-stream RIFF XMA2 files; no public XMA2 file has yet been used to verify the whole chain.
+Their `xma` crate (LGPL-2.1-or-later) is a Rust port of FFmpeg's WMA Pro / XMA decoder (`libavcodec/wmaprodec.c`). Their test `wmapro_fate_beethoven_matches_reference`, run locally with the public sample `wmapro/Beethovens_9th-1_small.wma` from FFmpeg's FATE suite and a reference PCM produced by `ffmpeg`, gives a maximum difference of 1 at 16 bits and a signal-to-noise ratio of 101.5 dB. El1xr uses it in `rust/anyxboxx-audio` (`anyxboxx_xma <input.xma> <output.wav>`) for single-stream RIFF XMA2 files; no public XMA2 file has yet been used to verify the whole chain.
 
 ## Device slot table of d3d12_xs (first boot, W5)
 
 Slots the title calls on the console device before its first `Close` failure, compared with TomBox's device
-table (`crates/compat/d3d12_xs/src/console_slots.rs`, 90 slots) and with what AnyXboxX serves. "Assigned" is
+table (`crates/compat/d3d12_xs/src/console_slots.rs`, 90 slots) and with what El1xr serves. "Assigned" is
 what a grep of `[n] = ...` in TomBox's `d3d12_xs/src` finds; the context of each line was read only where stated.
 Frozen by `tests/test_d3d12_device_slots.py`.
 
-| Slot | Measured role | TomBox device table | AnyXboxX |
+| Slot | Measured role | TomBox device table | El1xr |
 | --- | --- | --- | --- |
 | 8 | CreateCommandQueue (PC form) | assigned, `device_wrap.rs` | none |
 | 9 | CreateCommandAllocator | assigned, `device_wrap.rs` | none |
@@ -71,7 +71,7 @@ Frozen by `tests/test_d3d12_device_slots.py`.
 | 86 | not established | not assigned | none |
 | 127 | CreateCommittedResource3 (shape) | out of range: TomBox's device table has 90 slots | none |
 
-AnyXboxX serves no device slot: `runtime/d3d12_xs/d3d12_xs.def` exports `D3D12ConfigureVirtualMemoryX` and the
+El1xr serves no device slot: `runtime/d3d12_xs/d3d12_xs.def` exports `D3D12ConfigureVirtualMemoryX` and the
 root-signature forwarders, not `D3D12XboxCreateDevice`. The gap is the whole device proxy, not a few slots, so no
 simple correction exists. The list slots 9, 131 and 132 belong to the command-list table, which TomBox sizes at
 110 (its `vt` array has 128 entries); 131 and 132 are outside it.

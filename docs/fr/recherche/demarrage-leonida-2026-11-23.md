@@ -5,7 +5,7 @@
 État au soir du 23 novembre 2026. Cette note range les recherches du jour (Claude et Codex, sur la machine du
 mainteneur) sur le démarrage du build 1.0.2.1 sous `gta6rt` de [Leonida](https://github.com/ItsNotRexed/Leonida),
 du premier arrêt à la boucle de frames. Elle prolonge [premier-demarrage-1021.md](premier-demarrage-1021.md), qui
-s'arrête aux six premiers arrêts et à la liste de travaux d'AnyXboxX. Les projets voisins en général :
+s'arrête aux six premiers arrêts et à la liste de travaux d'El1xr. Les projets voisins en général :
 [voisins.md](voisins.md) ; les notes de Leonida sur GTA 6 : [leonida-gta6.md](leonida-gta6.md).
 
 **La règle 1 d'[AGENTS.md](../../../AGENTS.md) s'applique, plus strictement que dans la première note.** Cette note
@@ -255,7 +255,7 @@ du lancement de lines9686-rgb.
 | #6279 | restée ouverte alors que #1864 sur main produisait déjà les mêmes octets | après un changement sur main, remesurer et fermer une PR devenue redondante |
 | Travail sur le slot 55 en recouvrement | #8869 servait aussi le slot 55 | nous avons gardé le slot 55 dans #7759 et proposé l'autre PR pour le slot 81, aux mainteneurs de trancher |
 
-## 7. Ce que cela implique pour AnyXboxX
+## 7. Ce que cela implique pour El1xr
 
 Depuis la PR #109, le proxy de TomBox est servi par défaut (`runtime/build/tombox`) et fournit `d3d12_xs`, `xmem` et
 `XCRDAPI`. Tout ce qui précède dit ce que ce proxy doit encore servir, d'après les slots du démarrage chez Leonida.

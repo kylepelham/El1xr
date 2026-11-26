@@ -1,8 +1,8 @@
-// Interface XUser du runtime GDK servie par AnyXboxX : un profil local hors ligne.
+// Interface XUser du runtime GDK servie par El1xr : un profil local hors ligne.
 //
 // Le jeu voit un seul utilisateur, toujours connecté, adulte, avec tous les
 // privilèges : identifiant fixe, gamertag réglable (ANYXBOXX_GAMERTAG, défaut
-// « AnyXboxX »). Aucune connexion à Xbox Live : les jetons et fenêtres de connexion
+// « El1xr »). Aucune connexion à Xbox Live : les jetons et fenêtres de connexion
 // échouent proprement (E_NOTIMPL) ou réussissent à vide ; la photo de profil est un PNG généré.
 //
 // Objet du fournisseur {01ACD177…} : ses versions d'interface prolongent la même
@@ -50,7 +50,7 @@ constexpr size_t kMaxGamertag = 15;  // gamertag « classique »
 constexpr uint32_t kHandleMagic = 0x31555841;  // « AXU1 »
 
 const char* Gamertag() {
-  static char gamertag[kMaxGamertag + 1] = "AnyXboxX";
+  static char gamertag[kMaxGamertag + 1] = "El1xr";
   static const bool loaded = [] {
     char value[kMaxGamertag + 1] = {};
     const DWORD length = GetEnvironmentVariableA("ANYXBOXX_GAMERTAG", value, sizeof value);

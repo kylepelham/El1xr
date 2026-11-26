@@ -3,7 +3,7 @@
 //   anyxboxx.exe <jeu.exe | dossier du paquet> [--fps]
 //
 // Reprend le chargeur natif de PrototypeScarlett/emu/native : l'image est mappée à la main,
-// relogée, liée (runtime C++ d'AnyXboxX pour les DLL console, registre simulé, DXGI pour le
+// relogée, liée (runtime C++ d'El1xr pour les DLL console, registre simulé, DXGI pour le
 // compteur d'images, fonctions de chargement interceptées), protégée, ses exceptions et sa
 // TLS déclarées, puis son point d'entrée est appelé. Le runtime (xgameruntime.dll…) est
 // cherché à côté de anyxboxx.exe.
@@ -34,7 +34,7 @@ struct Game {
 Game g_game;
 
 int Fail(const wchar_t* message, DWORD error = GetLastError()) {
-  fwprintf(stderr, L"[anyxboxx] %ls (erreur %lu)\n", message, error);
+  fwprintf(stderr, L"[El1xr] %ls (erreur %lu)\n", message, error);
   return 1;
 }
 
@@ -148,7 +148,7 @@ bool IsKernelDll(const std::wstring& dll) {
          name.rfind(L"api-ms-win-core-", 0) == 0;
 }
 
-// Remplacement d'un import par AnyXboxX, ou nullptr. `game_dll` : imports d'une DLL du jeu.
+// Remplacement d'un import par El1xr, ou nullptr. `game_dll` : imports d'une DLL du jeu.
 void* Redirect(const std::wstring& dll, const char* name, bool game_dll) {
   const std::wstring module = BaseName(dll);
   if ((module == L"advapi32.dll" || module.rfind(L"api-ms-win-core-registry-", 0) == 0) && In(name, kRegistry, 4)) {
@@ -175,7 +175,7 @@ bool WritePointer(void** slot, void* value) {
   return true;
 }
 
-// DLL du jeu chargée par Windows : registre, DXGI et GetProcAddress repassent par AnyXboxX.
+// DLL du jeu chargée par Windows : registre, DXGI et GetProcAddress repassent par El1xr.
 void PatchModule(HMODULE module) {
   auto* base = reinterpret_cast<char*>(module);
   auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
@@ -218,7 +218,7 @@ HMODULE LoadDependency(const std::wstring& dll) {
     if (module != nullptr) PatchModule(module);
     return module;
   }
-  // Bibliothèque console absente d'AnyXboxX : celle de TomBox, si elle est compilée.
+  // Bibliothèque console absente d'El1xr : celle de TomBox, si elle est compilée.
   const std::wstring tombox = TomBoxFile(dll);
   if (!tombox.empty()) return LoadLibraryExW(tombox.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
   return LoadLibraryW(dll.c_str());
@@ -312,7 +312,7 @@ int BindImports() {
     }
   }
   if (!missing.empty()) {
-    fwprintf(stderr, L"[anyxboxx] imports introuvables :%ls\n", missing.c_str());
+    fwprintf(stderr, L"[El1xr] imports introuvables :%ls\n", missing.c_str());
     return 1;
   }
   return 0;
@@ -387,7 +387,7 @@ LONG WINAPI ReportFirstException(EXCEPTION_POINTERS* pointers) {
   for (const wchar_t* c = path; *c != L'\0'; ++c) {
     if (*c == L'\\' || *c == L'/') name = c + 1;
   }
-  fwprintf(stderr, L"[anyxboxx] première exception 0x%08lX : %ls+0x%llX\n", code, name,
+  fwprintf(stderr, L"[El1xr] première exception 0x%08lX : %ls+0x%llX\n", code, name,
            static_cast<unsigned long long>(address - start));
   fflush(stderr);
   return EXCEPTION_CONTINUE_SEARCH;
@@ -432,8 +432,8 @@ int wmain(int argc, wchar_t** argv) {
   g_game.folder = g_game.path.substr(0, g_game.path.find_last_of(L"\\/"));
   if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES) {
     // Paquet incomplet : le code du jeu manque, rien ne peut le remplacer.
-    fwprintf(stderr, L"[anyxboxx] exécutable du jeu absent : %ls\n", full);
-    fwprintf(stderr, L"[anyxboxx] le paquet ne contient que les données et les DLL ; "
+    fwprintf(stderr, L"[El1xr] exécutable du jeu absent : %ls\n", full);
+    fwprintf(stderr, L"[El1xr] le paquet ne contient que les données et les DLL ; "
                      L"le code du jeu est dans cet exécutable.\n");
     return 1;
   }
@@ -441,7 +441,7 @@ int wmain(int argc, wchar_t** argv) {
   g_game.measuring = GetEnvironmentVariableW(L"ANYXBOXX_FPS", value, 8) > 0 ||
                      GetEnvironmentVariableW(L"ANYXBOXX_FPS_CSV", value, 8) > 0;
 
-  // Runtime d'AnyXboxX, à côté de ce lanceur.
+  // Runtime d'El1xr, à côté de ce lanceur.
   wchar_t self[MAX_PATH];
   GetModuleFileNameW(nullptr, self, MAX_PATH);
   const std::wstring self_path = self;
