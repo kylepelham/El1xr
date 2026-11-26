@@ -2891,6 +2891,8 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2900,6 +2902,8 @@ impl State {
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.cost_title(list, "dispatch");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         match group_base(p) {
@@ -2931,6 +2935,18 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+    }
+
+    /// A GPU cost stamp before a title command (`crate::gpucost`), named by
+    /// its kind and pipeline.
+    #[cfg(feature = "diagnostics")]
+    fn cost_title(&self, list: &HostList, kind: &'static str) {
+        crate::gpucost::mark(&list.list, || {
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                Some(p) => crate::gpucost::title(kind, &p.name),
+                None => kind.into(),
+            }
+        });
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3255,11 +3271,15 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    #[cfg(feature = "diagnostics")]
+                    self.cost_title(list, "mesh");
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -3916,6 +3936,8 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -3928,6 +3950,8 @@ impl State {
             } else {
                 (vertices, first)
             };
+            #[cfg(feature = "diagnostics")]
+            self.cost_title(list, "draw");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -4032,8 +4056,12 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ran = !lost && self.prepare(list, true);
         if ran {
+            #[cfg(feature = "diagnostics")]
+            self.cost_title(list, "indexed");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -4066,6 +4094,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
@@ -4228,6 +4258,8 @@ impl State {
                 return false;
             }
             #[cfg(feature = "diagnostics")]
+            self.cost_title(list, "indirect");
+            #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 self.op_text(
                     format!("indirect kind {kind} max {max} at {arguments:#x}"),
@@ -4311,6 +4343,8 @@ impl State {
                 return false;
             }
             #[cfg(feature = "diagnostics")]
+            self.cost_title(list, "indirect");
+            #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 self.op_text(
                     format!("indirect kind {kind} max {max} at {arguments:#x}"),
@@ -4368,6 +4402,8 @@ impl State {
                     why("prepare failed");
                     return false;
                 }
+                #[cfg(feature = "diagnostics")]
+                self.cost_title(list, "indirect");
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| {
                     self.op_text(
@@ -4514,6 +4550,8 @@ impl State {
             why("prepare failed");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        self.cost_title(list, "indirect");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(

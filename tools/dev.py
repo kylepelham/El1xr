@@ -40,6 +40,7 @@ FRAME_RE = re.compile(
     r"([0-9.]+) draws/frame, dropped ([0-9.]+) without a host pipeline "
     r"\((\d+) being made\) and ([0-9.]+) indirect"
 )
+CARD_CLOCK_RE = re.compile(r"the card's clock per frame: nothing of ours queued [0-9.]+ ms \(the card about ([0-9.]+)% busy")
 DSTORAGE_RE = re.compile(r"dstorage: last [0-9.]+ s.*?mb_per_s=([0-9.]+)")
 POLICY_FILES_RE = re.compile(r"asset policy:\s*(\d+)\s+files ok")
 CARGO_PASSED_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+)\s+passed;")
@@ -252,6 +253,8 @@ def run_timed_victory(cmd: list[str], log_path: Path, seconds: int) -> tuple[boo
 
 def parse_victory_log(text: str) -> dict[str, object]:
     world_rows: list[tuple[float, float, float]] = []
+    busy_rows: list[float] = []
+    frame_ms: float | None = None
     dstorage_rates: list[float] = []
     refused = 0
     device_removed = False
@@ -272,6 +275,13 @@ def parse_victory_log(text: str) -> dict[str, object]:
             draws = float(m_frame.group(11))
             if draws >= WORLD_DRAWS_MIN:
                 world_rows.append((fps, gpu_ms, prep_ms))
+                frame_ms = float(m_frame.group(2))
+            else:
+                frame_ms = None
+        m_card = CARD_CLOCK_RE.search(line)
+        if m_card and frame_ms is not None:
+            # GPU busy: the share of the frame the card had work of ours queued.
+            busy_rows.append(frame_ms * float(m_card.group(1)) / 100.0)
         m_ds = DSTORAGE_RE.search(line)
         if m_ds:
             dstorage_rates.append(float(m_ds.group(1)))
@@ -281,12 +291,15 @@ def parse_victory_log(text: str) -> dict[str, object]:
     gpu_med = statistics.median(r[1] for r in settled) if settled else 0.0
     prep_med = statistics.median(r[2] for r in settled) if settled else 0.0
     ds_med = statistics.median(dstorage_rates) if dstorage_rates else 0.0
+    busy_settled = busy_rows[len(busy_rows) // 2 :]
+    busy_med = statistics.median(busy_settled) if busy_settled else 0.0
     return {
         "world_samples": len(world_rows),
         "fps": fps_med,
         "gpu_ms": gpu_med,
         "prep_ms": prep_med,
         "dstorage_mbs": ds_med,
+        "gpu_busy_ms": busy_med,
         "refused": refused,
         "device_removed": device_removed,
     }
@@ -358,7 +371,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("DEV bench FAIL fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0")
         return 1
 
-    cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides)
+    cmd = build_launcher_command(game_dir=game_dir, diag=args.diag, overrides=overrides)
     with acquire_gpu_lock("bench"):
         run_timed_victory(cmd, log_path, args.seconds)
 
@@ -370,6 +383,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"fps={float(stats['fps']):.1f} "
         f"gpu_ms={float(stats['gpu_ms']):.1f} "
         f"prep_ms={float(stats['prep_ms']):.1f} "
+        f"gpu_busy_ms={float(stats['gpu_busy_ms']):.1f} "
         f"dstorage_mbs={float(stats['dstorage_mbs']):.1f} "
         f"refused={int(stats['refused'])}"
     )
@@ -440,6 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--seconds", type=int, default=75, help="Run duration in seconds (default: 75).")
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_bench.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
     p_bench.set_defaults(func=cmd_bench)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")
