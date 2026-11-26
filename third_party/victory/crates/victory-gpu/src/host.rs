@@ -7936,6 +7936,8 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
+            #[cfg(feature = "diagnostics")]
+            crate::gpucost::mark(&self.list, || "ours: texture state transitions (and the setup after)");
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
@@ -8084,6 +8086,8 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&self.list, || "ours: twin copy inline (and the setup after)");
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }

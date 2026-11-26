@@ -4301,7 +4301,11 @@ impl State {
         let written = shape && list.gpu_written(arguments as usize, len as usize);
         let after_writer = written && {
             args.refresh(list, arguments, len);
+            #[cfg(feature = "diagnostics")]
+            crate::gpucost::mark(&list.list, || "ours: indirect sanitize after writer");
             let (safe, ran) = crate::indirect::sanitized(list, &args, arguments, kind);
+            #[cfg(feature = "diagnostics")]
+            crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
             if ran {
                 // The pass bound a compute pipeline and root signature of its own.
                 self.host_pipeline = 0;
@@ -4503,6 +4507,8 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                #[cfg(feature = "diagnostics")]
+                crate::gpucost::mark(&list.list, || "ours: indirect clamp in place");
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
@@ -4540,6 +4546,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

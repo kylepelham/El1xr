@@ -906,6 +906,8 @@ pub(crate) fn ensure_held_state(
     if let Some((before, state)) = list.transition_held(copy, state) {
         let barrier =
             crate::host::transition(&copy.texture, State(before as i32), State(state as i32));
+        #[cfg(feature = "diagnostics")]
+        crate::gpucost::mark(&list.list, || "ours: texture state transitions (and the setup after)");
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
