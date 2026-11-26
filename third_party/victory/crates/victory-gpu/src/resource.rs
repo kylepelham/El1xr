@@ -659,7 +659,8 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        // R8: 61..=64. A8_UNORM (65) has no typeless format and no cast to R8.
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -1278,6 +1279,25 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`alias_of`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// Whether `this` is a title texture that is alive.
 #[cfg(windows)]
 pub(crate) fn is_texture(this: This) -> bool {
@@ -1375,7 +1395,7 @@ pub(crate) fn staged_first(this: This) -> u32 {
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1419,7 +1439,11 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             .no_target
             .store(count.wrapping_add(1), std::sync::atomic::Ordering::Release);
     }
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
     found
+        .filter(|&other| crate::object::add_ref_alive(other))
+        .map(Held)
 }
 
 /// [`alias_of`]'s answer from the table of targets, held locked.
@@ -2395,7 +2419,8 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
-    slot_evict(video, idle_ms, IDLE_FRAMES);
+    slot_evict(&all, video, idle_ms, IDLE_FRAMES);
+    drop(all);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2467,8 +2492,12 @@ fn slot_need(budget: u64, used: u64, percent: u64, cap: u64) -> u64 {
 /// (`crate::host::retire`). A draw that reads a slot makes the copy again
 /// from title memory ([`hosted`]).
 #[cfg(windows)]
-fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
+fn slot_evict(
+    all: &std::collections::BTreeSet<usize>,
+    video: Option<[u64; 4]>,
+    idle_ms: u64,
+    frames: u64,
+) {
     let (Some((percent, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
     };
@@ -2476,9 +2505,15 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     if need == 0 {
         return;
     }
+    slot_evict_with(all, need, idle_ms, frames);
+}
+
+#[cfg(windows)]
+fn slot_evict_with(all: &std::collections::BTreeSet<usize>, need: u64, idle_ms: u64, frames: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut copies = Vec::new();
     let mut raws = std::collections::HashMap::new();
-    for &at in textures().iter() {
+    for &at in all.iter() {
         // SAFETY: as in `pressure_victims`.
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
@@ -3140,6 +3175,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
             targets.insert(resource.data() as u64, at);
@@ -3164,7 +3200,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -3615,6 +3653,110 @@ fn texture_at_locked(address: u64, raw: [u32; 14], kept: bool) -> Option<This> {
     Some(out)
 }
 
+/// The resource for an unordered access view of a texture placed at
+/// `address` with resource description `desc` and view format `view_format`
+/// (0: the resource's own): an existing unordered-access texture at that
+/// address when its format allows the view, else a placed unordered-access
+/// resource made on first use (starting in `UNORDERED_ACCESS` and recorded
+/// in [`TARGETS_AT`] so shader views placed at `address` find its texels
+/// through [`alias_of`]).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 {
+        own
+    } else {
+        pc_format(view_format)
+    };
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let compatible =
+                o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            if o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && compatible
+            {
+                return Some(other as This);
+            }
+        }
+    }
+    let mut r = *desc;
+    r[1] = 0;
+    r[13] = 0;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    if view_format != 0 && target_format(own) != target_format(wanted) {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own) == element(wanted) {
+            r[8] = wanted;
+        }
+    }
+    let key = loose_key(r);
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(&(address, key)) {
+        // A temporary target at this address may have replaced this texture
+        // and since been released. Restore the alias only if the slot is vacant.
+        let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::btree_map::Entry::Vacant(slot) = targets.entry(address) {
+            slot.insert(existing);
+            target_changes(address).fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        return Some(existing as This);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let uav_desc = unsafe { key.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, key), out as usize);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
 #[cfg(all(test, windows))]
 pub(crate) fn release_test_placed_texture(address: u64, desc: [u32; 14]) {
     let resource = PLACED_TEXTURES
@@ -3802,6 +3944,38 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a8_unorm_stands_outside_the_r8_family() {
+        const R8_TYPELESS: u32 = 60;
+        const A8_UNORM: u32 = 65;
+        // R8_UNORM, R8_UINT, R8_SNORM and R8_SINT cast through R8_TYPELESS.
+        for format in R8_TYPELESS..A8_UNORM {
+            assert_eq!(super::family(format), R8_TYPELESS, "format {format}");
+        }
+        // A8_UNORM does not: an R8 view of an A8 texture is refused instead
+        // of being turned into an A8 view.
+        assert_eq!(super::family(A8_UNORM), A8_UNORM);
+        assert_ne!(super::family(61), super::family(A8_UNORM));
+        // The neighbours keep their families: R16_SINT (59), R1_UNORM (66).
+        assert_eq!(super::family(59), 53);
+        assert_eq!(super::family(66), 66);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        assert!(super::alias_of(std::ptr::null()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slot_evict_does_not_reenter_textures_lock() {
+        // Holding the TEXTURES mutex while calling slot_evict_with must not
+        // deadlock (let_go_idle holds TEXTURES across the slot_evict call).
+        let all = super::textures();
+        super::slot_evict_with(&all, 1, 0, 0);
+    }
+
+    #[test]
     fn the_hdr_stand_in_follows_its_switch() {
         assert_eq!(super::parse_hdr_stand_in(None), 26);
         assert_eq!(super::parse_hdr_stand_in(Some("26")), 26);
@@ -3858,6 +4032,52 @@ mod tests {
 
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_placed_uav_is_visible_after_releasing_a_temporary_target() {
+        static TITLE_BYTES: [u8; 4096] = [0; 4096];
+        let address = TITLE_BYTES.as_ptr() as u64;
+        let srv = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 67, 1, 0, 0, 0, 0];
+        let uav = uav_texture_at(address, &srv, 42).unwrap();
+        let view = texture_at(address, &srv).unwrap();
+        assert_eq!(alias_of(view).map(|h| h.get()), Some(uav));
+
+        // The title uses the storage temporarily for a different shape.
+        let mut other = texture(8, 4, 42, 1);
+        other.flags = 4;
+        let mut target = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                address,
+                &other,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut target,
+            ),
+            S_OK
+        );
+        let mut temporary_srv = srv;
+        temporary_srv[4] = 8;
+        let temporary_view = texture_at(address, &temporary_srv).unwrap();
+        assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
+        assert_eq!(
+            alias_of(temporary_view).map(|h| h.get()),
+            Some(target),
+            "keep the active target"
+        );
+        assert_eq!(resource_release(target), 0);
+
+        // Mirror the original placed UAV again, then resolve its paired SRV.
+        assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
+        assert_eq!(
+            alias_of(view).map(|h| h.get()),
+            Some(uav),
+            "restore the cached target"
+        );
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
@@ -4347,6 +4567,71 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy (or a recording thread may), and the copy still needs it.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &source_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(
+            host_resource(held.get()).is_some(),
+            "a held source is still copyable"
+        );
+        assert!(
+            textures().contains(&(source as usize)),
+            "the held source is not freed"
+        );
+        drop(held);
+        assert!(
+            !textures().contains(&(source as usize)),
+            "the last reference frees it"
+        );
+        resource_release(view);
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
@@ -4891,11 +5176,26 @@ mod tests {
         host.execute(&[&fill]);
 
         // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane.
+        // depth plane's twin into the plane. Two lists recorded before
+        // either is submitted keep distinct shader-visible heaps: neither
+        // overwrites the other's views.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
         list.close();
+        let other = host.new_list().unwrap();
+        assert!(other.twin_use(depth, true, true));
+        other.twins_written();
+        other.close();
+        let first = list.kept_shader_heaps();
+        let second = other.kept_shader_heaps();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first[0], second[0],
+            "recorded passes share descriptor storage"
+        );
+        drop((first, second, other));
         host.execute(&[&list]);
 
         // The draws: a triangle over the target at the depth of a class,

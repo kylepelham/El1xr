@@ -1,7 +1,7 @@
 //! (Neptune) Discord Rich Presence while a title runs: "Playing Grand Theft Auto VI" with
 //! the time played, through the Discord client's own pipe on this PC (`\\.\pipe\discord-ipc-N`).
 //! Nothing goes over the network from here, and nothing happens if Discord is not running.
-//! Off unless asked for (AnyXboxX): `VICTORY_DISCORD=1` turns it on; `VICTORY_DISCORD_APP`
+//! Off unless asked for (El1xr): `VICTORY_DISCORD=1` turns it on; `VICTORY_DISCORD_APP`
 //! names another application id.
 //! The picture is the application's Rich Presence art asset named `logo`.
 
@@ -42,7 +42,7 @@ fn connect(application: &str, started: u64) -> Option<std::fs::File> {
             continue;
         }
         let activity = format!(
-            r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{},"activity":{{"details":"Neptune (VIctory Edit.)","state":"In game","timestamps":{{"start":{started}}},"assets":{{"large_image":"logo","large_text":"Grand Theft Auto VI"}}}}}},"nonce":"neptune-{started}"}}"#,
+            r#"{{"cmd":"SET_ACTIVITY","args":{{"pid":{},"activity":{{"details":"El1xr (VIctory)","state":"In game","timestamps":{{"start":{started}}},"assets":{{"large_image":"logo","large_text":"Grand Theft Auto VI"}}}}}},"nonce":"neptune-{started}"}}"#,
             std::process::id()
         );
         if pipe.write_all(&frame(1, &activity)).is_ok() && answer(&mut pipe).is_ok() {
@@ -68,7 +68,7 @@ pub fn start() {
         loop {
             // Held while it answers; looked for again if Discord was closed or is started later.
             if let Some(mut pipe) = connect(&application, started) {
-                eprintln!("Neptune: Discord Rich Presence set");
+                eprintln!("El1xr: Discord Rich Presence set");
                 let mut byte = [0u8; 1];
                 while pipe.read(&mut byte).is_ok_and(|n| n > 0) {}
             }

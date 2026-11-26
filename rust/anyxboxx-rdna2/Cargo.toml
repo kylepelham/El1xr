@@ -2,7 +2,7 @@
 name = "anyxboxx-rdna2"
 version = "0.1.0"
 edition = "2021"
-description = "Passerelle vers le décodeur RDNA 2 de TomBox (tombox-xshader) pour le confronter à AnyXboxX."
+description = "Passerelle vers le décodeur RDNA 2 de TomBox (tombox-xshader) pour le confronter à El1xr."
 license = "GPL-3.0-or-later"
 
 [[bin]]

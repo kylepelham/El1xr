@@ -1,4 +1,4 @@
-// Interface XPersistentLocalStorage servie par AnyXboxX : un dossier du PC par jeu.
+// Interface XPersistentLocalStorage servie par El1xr : un dossier du PC par jeu.
 //
 // Fournisseur {F4FAF4D4…}, interface {41A4E10C…}, méthodes 3 à 8 (gdk_api_table.inc).
 // La taille annoncée est celle du <PersistentLocalStorage><SizeMB> du MicrosoftGame.config.

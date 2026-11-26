@@ -267,6 +267,7 @@ mod tests {
     impl Drop for Memory {
         fn drop(&mut self) {
             title_memory_remapped(self.0, self.1 * PAGE);
+            before_virtual_free(self.0, self.1 * PAGE);
             assert_ne!(unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) }, 0);
         }
     }

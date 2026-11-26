@@ -1,8 +1,10 @@
-# AnyXboxX — emulatore Xbox Series X (prototipo)
+# El1xr — emulatore Xbox Series X (prototipo)
 
 [![Discord](https://img.shields.io/badge/Discord-AnyXboxX-5865F2?logo=discord&logoColor=white)](https://discord.gg/TcX42vRyPU)
 
 [English](../../README.md) · [Français](README.fr.md) · [Español](README.es.md) · [Deutsch](README.de.md) · **Italiano** · [Português](README.pt-BR.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Русский](README.ru.md)
+
+**El1xr** è il progetto di Bone/Nevaa, un fork di [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) basato su [VIctory](https://github.com/Marvisak/VIctory). Vedi [Riconoscimenti](#riconoscimenti).
 
 > [!NOTE]
 > **A che punto siamo (25/11/2026)**
@@ -28,11 +30,11 @@
 > - Requisiti: la tua copia del gioco, una GPU NVIDIA o AMD con SM 6.6 e mesh shader, Rust. Nessun file del gioco in questo repository.
 > - Come avviarlo: [docs/running-gta6.md](../running-gta6.md).
 
-AnyXboxX carica eseguibili Xbox GDK (formato PE32+ x86-64) ed esegue il loro codice con Unicorn. Le funzioni di sistema della console sono sostituite da un runtime C++ in modalità nativa e da codice Python nella macchina isolata (emulazione ad alto livello, come WinDurango o Wine). Il programma si presenta come una Xbox Series X: `XSystemGetDeviceType` restituisce `XboxScarlettAnaconda`.
+El1xr carica eseguibili Xbox GDK (formato PE32+ x86-64) ed esegue il loro codice con Unicorn. Le funzioni di sistema della console sono sostituite da un runtime C++ in modalità nativa e da codice Python nella macchina isolata (emulazione ad alto livello, come WinDurango o Wine). Il programma si presenta come una Xbox Series X: `XSystemGetDeviceType` restituisce `XboxScarlettAnaconda`.
 
 ## Obiettivo e stato
 
-AnyXboxX è specializzato in una sola build: **Grand Theft Auto VI per Xbox Series, versione 1.0.2.1**. Viene tradotto solo ciò che serve a questo gioco (le funzioni di sistema che importa, gli shader e i metodi Direct3D 12.x che usa). Altri giochi saranno provati quando questa traduzione sarà completa. Il progetto si appoggia a [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 o successiva), che punta alla stessa build: è copiato in `third_party/victory`, a partire dal fork `fxceless/victory-fork` (GPL-3.0) al commit `7b0f736`. Grazie a Marvisak e agli autori di quelle pull request, citati uno per uno in [THIRD_PARTY.md](../../THIRD_PARTY.md).
+El1xr è specializzato in una sola build: **Grand Theft Auto VI per Xbox Series, versione 1.0.2.1**. Viene tradotto solo ciò che serve a questo gioco (le funzioni di sistema che importa, gli shader e i metodi Direct3D 12.x che usa). Altri giochi saranno provati quando questa traduzione sarà completa. Il progetto si appoggia a [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 o successiva), che punta alla stessa build: è copiato in `third_party/victory`, a partire dal fork `fxceless/victory-fork` (GPL-3.0) al commit `7b0f736`. Grazie a Marvisak e agli autori di quelle pull request, citati uno per uno in [THIRD_PARTY.md](../../THIRD_PARTY.md).
 
 > [!IMPORTANT]
 > **Il gioco non è giocabile.** Lo stato attuale è nel riquadro in cima a questa pagina. Questo repository non contiene file del gioco, chiavi o eseguibili e non spiega come ottenerli.
@@ -51,7 +53,7 @@ Rigenerare: `scarlett.py --carte <cartella del pacchetto> docs/images/carte-avan
 - **Istruzioni della GPU: 86%.** Gli shader di un gioco per console sono compilati per la GPU RDNA 2 della Series X. 1.285 delle 1.490 codifiche RDNA 2 girano nell'interprete di riferimento, e il ricompilatore RDNA 2 → DXIL disegna già un primo vertex shader e pixel shader con D3D12.
 - **Funzioni di sistema: 66%** delle 1 337 funzioni importate dalle DLL del pacchetto di prova sono risolte in modalità isolata.
 - **DLL proprie della console**: `xmem.dll` (4/4) e `d3d12_xs.dll` (2/2) sono tradotte per le funzioni che il pacchetto usa. D3D12.X (dispositivo e interfacce `ID3D12*`) è servito dalla `d3d12_xs.dll` di TomBox, non ancora provato con un gioco.
-- **Runtime GDK: 210 delle 396 funzioni** sono scritte in AnyXboxX, in C++: la coda di attività (`XTaskQueue`, `XAsync`, `XThread`), l'utente (`XUser`, un profilo locale offline), l'identità Xbox Series X (`XSystem`, Title ID, analisi, funzionalità del runtime), i salvataggi (`XGameSave`, `XGameSaveFiles`, `XPersistentLocalStorage`) il pacchetto del gioco (`XPackage`), lo Store offline (`XStore`) e, offline, inviti, attivazioni e segnalazioni di errore (`XGameInvite`, `XGameActivation`, `XGameProtocol`, `XError`), oltre allo stato HDR reale e alla connettività di rete del PC (`XDisplayTryEnableHdrMode`, `XNetworkingGetConnectivityHint`). Entrano in gioco quando AnyXboxX gestisce il runtime da solo: senza Gaming Services, oppure con `ANYXBOXX_SYSTEM_RUNTIME=0`. Se il runtime GDK di Windows è presente, serve tutte le interfacce, coda di attività compresa, perché le sue API accettano solo le proprie code. La traccia (`ANYXBOXX_TRACE=1`) nomina ogni interfaccia richiesta.
+- **Runtime GDK: 210 delle 396 funzioni** sono scritte in El1xr, in C++: la coda di attività (`XTaskQueue`, `XAsync`, `XThread`), l'utente (`XUser`, un profilo locale offline), l'identità Xbox Series X (`XSystem`, Title ID, analisi, funzionalità del runtime), i salvataggi (`XGameSave`, `XGameSaveFiles`, `XPersistentLocalStorage`) il pacchetto del gioco (`XPackage`), lo Store offline (`XStore`) e, offline, inviti, attivazioni e segnalazioni di errore (`XGameInvite`, `XGameActivation`, `XGameProtocol`, `XError`), oltre allo stato HDR reale e alla connettività di rete del PC (`XDisplayTryEnableHdrMode`, `XNetworkingGetConnectivityHint`). Entrano in gioco quando El1xr gestisce il runtime da solo: senza Gaming Services, oppure con `ANYXBOXX_SYSTEM_RUNTIME=0`. Se il runtime GDK di Windows è presente, serve tutte le interfacce, coda di attività compresa, perché le sue API accettano solo le proprie code. La traccia (`ANYXBOXX_TRACE=1`) nomina ogni interfaccia richiesta.
 
 Il grafico viene rigenerato con `scarlett.py --traduction <cartella del pacchetto> docs/images/traduction.svg`.
 
@@ -85,25 +87,25 @@ I due giochi di prova girano senza sincronizzazione verticale: circa 11 700 f/s 
 | Più moduli collegati nella stessa macchina: DLL del pacchetto, ordinali, reindirizzamenti, rilocazione in caso di conflitto | ✅ fatto |
 | `GetModuleHandle`, `GetProcAddress`, `LoadLibrary`, `RtlPcToFileHeader` | ✅ fatto |
 | 16/16 DLL di un pacchetto Scarlett inizializzate con le loro dipendenze, 0 chiamate non emulate | ✅ fatto |
-| Gioco di test libero `SimpleTriangle` compilato: l'avvio C e l'inizializzazione GDK funzionano in AnyXboxX | ✅ fatto |
-| Esecuzione nativa in stile Wine (`--natif`): **SimpleTriangle viene mostrato**, runtime GDK fornito da AnyXboxX | ✅ fatto |
+| Gioco di test libero `SimpleTriangle` compilato: l'avvio C e l'inizializzazione GDK funzionano in El1xr | ✅ fatto |
+| Esecuzione nativa in stile Wine (`--natif`): **SimpleTriangle viene mostrato**, runtime GDK fornito da El1xr | ✅ fatto |
 | Secondo gioco di prova libero, `testgdk` di SDL3: **funziona in modalità nativa** (finestra, sprite, audio) | ✅ fatto |
 | Avvio isolato di un pacchetto o di un exe (`--lancer`) con l'elenco delle chiamate da emulare | ✅ fatto |
 | Runtime C++ (`runtime/`): `xgameruntime.dll`, `xmem.dll`, `d3d12_xs.dll` precaricate in modalità nativa e servite a tutte le DLL del gioco | ✅ fatto |
 | `xmem.dll`: `XMemAlloc`, `XMemFree` con `XALLOC_ATTRIBUTES` decodificati (layout ERA: memoria heap e grafica, allineamento), hook, `XMemVirtualQuery` (flag della memoria grafica) | ✅ fatto |
 | `d3d12_xs.dll`: serializzazione delle root signature, reindirizzata al D3D12 del PC | ✅ fatto |
 | Tabella delle 396 funzioni GDK: interfaccia e numero di metodo, estratti da `xgameruntime.lib` (`tools/gdk_interfaces.py`) | ✅ fatto |
-| `XTaskQueue`, `XAsync`, `XThread` servite da AnyXboxX: testgdk funziona senza il runtime di Windows | ✅ fatto |
+| `XTaskQueue`, `XAsync`, `XThread` servite da El1xr: testgdk funziona senza il runtime di Windows | ✅ fatto |
 | Altre interfacce GDK: delegate al runtime GDK di Windows, nominate dalla traccia | 🟡 in corso |
 | 1600+ test automatizzati | ✅ fatto |
 | D3D12.X: `D3D12XboxCreateDevice`, interfacce `ID3D12*` della console e `DXGIXPresentArray`, forniti dalla `d3d12_xs.dll` in Rust di TomBox (MIT, 48 export implementati, compilata con `tools/build_tombox.py d3d12_xs`, caricata con `ANYXBOXX_D3D12_XS=<percorso>`); non testabile qui senza un eseguibile console | 🟡 in corso |
-| Librerie console di TomBox (Rust, GPL-3.0) per ciò che manca ad AnyXboxX: `xg_xs` (layout delle texture, 23 export) e `xmem` completo (38 export), con `ANYXBOXX_TOMBOX_DIR=<cartella>`; compilate con `tools/build_tombox.py xg_xs xmem` | 🟡 in corso |
+| Librerie console di TomBox (Rust, GPL-3.0) per ciò che manca ad El1xr: `xg_xs` (layout delle texture, 23 export) e `xmem` completo (38 export), con `ANYXBOXX_TOMBOX_DIR=<cartella>`; compilate con `tools/build_tombox.py xg_xs xmem` | 🟡 in corso |
 | `XUser` offline: profilo locale sempre connesso, gamertag configurabile (`ANYXBOXX_GAMERTAG`), accesso di testgdk riuscito | ✅ fatto |
 | Identità Xbox Series X: tipo di console (valore di registro `ConsoleMode` simulato, anche nelle DLL del gioco), `XSystem`, Title ID letto da `MicrosoftGame.config`, analisi «Xbox Series X» | ✅ fatto |
 | Mappa dell'avanzamento: una casella per funzione (`--carte`) | ✅ fatto |
 | Controller (`GameInput`) e audio (`XAudio2`): stessa API su console e su PC, collegati alle DLL di Windows in modalità nativa | ✅ fatto |
 | Resoconto Markdown degli import mancanti per DLL e delle chiamate non emulate (`--lancer … --md rapport.md`) | ✅ fatto |
-| Strumento di primo avvio di un eseguibile console: inventario, fornitore di ogni import (pacchetto, AnyXboxX, TomBox, Windows, mancante), esecuzioni isolate, esecuzione nativa facoltativa; rapporto fuori dal repository: `python tools/jour_j.py <pacchetto> [--natif]` ([guida](../day-one.md), in francese) | ✅ fatto |
+| Strumento di primo avvio di un eseguibile console: inventario, fornitore di ogni import (pacchetto, El1xr, TomBox, Windows, mancante), esecuzioni isolate, esecuzione nativa facoltativa; rapporto fuori dal repository: `python tools/jour_j.py <pacchetto> [--natif]` ([guida](../day-one.md), in francese) | ✅ fatto |
 | Contatore di fotogrammi (`--fps`) e banco di prova delle prestazioni con verdetto «60 f/s costanti» e curva (`--banc-perf`) | ✅ fatto |
 | Salvataggi `XGameSave` (contenitori, blob, quota, lettura asincrona) e archiviazione locale persistente, sul disco del PC (`%LOCALAPPDATA%\AnyXboxX\<TitleId>`, oppure `ANYXBOXX_SAVE_DIR`) | ✅ fatto |
 | `XPackage`: pacchetto installato in locale (identificativo, lingua, blocchi pronti, montaggio sulla cartella del gioco) | ✅ fatto |
@@ -114,12 +116,12 @@ I due giochi di prova girano senza sincronizzazione verticale: circa 11 700 f/s 
 | Operandi del disassembler RDNA 2 identici al testo di LLVM: scalari e VOP1/VOPC 100%, DS 100%, EXP 100%, SMEM 96,5% (il massimo: LLVM scrive le altre codifiche in due modi) | ✅ fatto |
 | Primi vertex e pixel shader RDNA 2 disegnati con D3D12 (`anyxboxx_gpu_run.exe --draw`): ogni vertice e ogni pixel identici all'interprete di riferimento, sulla GPU e con WARP | ✅ fatto |
 | Texture negli shader RDNA 2 ricompilati: descrittori T#/S# e `image_sample` (2D, texel più vicino, wrap o clamp-to-edge, 8_8_8_8_UNORM e 32_32_32_32_FLOAT), identici all'interprete di riferimento sulla GPU e con WARP, compreso un pixel shader con texture; layout dei descrittori da Leonida e Mesa | ✅ fatto |
-| Secondo traduttore RDNA 2 → SPIR-V (Vulkan): quello di Leonida (GPL-3.0), copiato senza modifiche in `third_party/leonida/` e alimentato dal disassembler di AnyXboxX, senza `llvm-mc`; vertex, pixel e compute shader; 51 dei 52 shader della console contenuti in `XboxBvhBuilder.dll` del pacchetto vengono tradotti, misura locale con `tools/fssm_mesure.py` (`scarlett.py --rdna2 <shader.bin> --spirv ps`) | 🟡 in corso |
+| Secondo traduttore RDNA 2 → SPIR-V (Vulkan): quello di Leonida (GPL-3.0), copiato senza modifiche in `third_party/leonida/` e alimentato dal disassembler di El1xr, senza `llvm-mc`; vertex, pixel e compute shader; 51 dei 52 shader della console contenuti in `XboxBvhBuilder.dll` del pacchetto vengono tradotti, misura locale con `tools/fssm_mesure.py` (`scarlett.py --rdna2 <shader.bin> --spirv ps`) | 🟡 in corso |
 | TomBox aggiornato all'ultima versione (D3D12.X: 194 metodi su 200 secondo il loro conteggio) e 4 altre librerie della console compilate e servite da `ANYXBOXX_TOMBOX_DIR`: `d3d12_x` (ESRAM), `XAudio2_9` (voci XMA), `xapu`, `xgs12`; `tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 in corso |
 | Conversione del DXIL della console in DXIL del PC (`dxil-ms-xb2` → `dxil-ms-dx`, senza passare per HLSL): lo strumento di Xbox2Windows (MIT), copiato senza modifiche con il suo test in `third_party/xbox2windows/`; `python third_party/xbox2windows/tools/dxil_retarget.py <ingresso> <uscita>` o `--pe <gioco.exe>` | ✅ fatto |
 | Controlli delle pull request: lint e allineamento degli 9 README (righe, immagini, numero di test) a ogni pull request | ✅ fatto |
 | Texture console in Rust: decodifica BC7 e de-tiling GFX10 `SW_4K_S` portati da Xbox2Windows (MIT), digest di riferimento riprodotti; `anyxboxx_texture bc7 <blocchi.bin> <l> <a> <uscita.png> [--4k-s]` | 🟡 in corso |
-| Altre interfacce GDK scritte da AnyXboxX (`XGameUi`, `XNetworking`…) | ⏳ da fare |
+| Altre interfacce GDK scritte da El1xr (`XGameUi`, `XNetworking`…) | ⏳ da fare |
 | Ricompilatore di shader RDNA 2 → DXIL: primi programmi tradotti in HLSL, compilati in DXIL ed eseguiti sulla GPU del PC con D3D12 (`--hlsl`, `anyxboxx_gpu_run.exe`, WARP senza GPU), memoria identica a un interprete di riferimento wave32 che esegue 1.285 codifiche su 1.490 (scalari, VOP1/VOP2/VOPC/VOP3/VOP3P, memoria: SMEM, LDS, GLOBAL, MUBUF/MTBUF con limiti V# e formati tipizzati, atomiche, salti, divergenza con `exec`); un primo vertex shader e pixel shader (export EXP, interpolazione VINTRP) disegnati con D3D12, identici vertice per vertice e pixel per pixel: `scarlett.py --rdna2 <shader.bin> --executer` | 🟡 in corso |
 | Programmi di calcolo wave64 su GPU con wave da 32 lane (#70): ogni wave da 64 lane gira come un gruppo di 64 thread (maschere e letture di lane tramite memoria groupshared, senza `WaveSize`), memoria identica all'interprete di riferimento in wave64 su una RTX (wave da 32 lane) e con WARP; DPP e confronti SDWA ancora rifiutati per nome | 🟡 in corso |
 | Cache degli shader: shader tradotti compilati una sola volta in DXIL, poi ripresi dal disco (1,4 ms) o dalla memoria (0,8 ms) invece di dxc (22 ms); `%LOCALAPPDATA%\AnyXboxX\shader-cache` o `ANYXBOXX_SHADER_CACHE`, dimensione limitata | 🟡 in corso |
@@ -167,9 +169,9 @@ Il programma dimostrativo compilato è `PrototypeScarlett/demo.pe`; il suo codic
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
 ```
 
-![SimpleTriangle avviato da AnyXboxX in modalità nativa](../images/simpletriangle-anyxboxx.png)
+![SimpleTriangle avviato da El1xr in modalità nativa](../images/simpletriangle-anyxboxx.png)
 
-AnyXboxX carica l'eseguibile stesso e lo esegue direttamente sul processore, come Wine. Il runtime Xbox (`xgameruntime.dll`) è fornito da AnyXboxX; la finestra e DirectX 12 sono quelli del PC. **Attenzione: in modalità nativa il programma non è isolato.** Riserva questa modalità ai programmi di fiducia; `--rapport` e `--banc` restano isolati in Unicorn. `ANYXBOXX_TRACE=1` mostra le chiamate intercettate. Dettagli: [docs/test-game.md](../test-game.md).
+El1xr carica l'eseguibile stesso e lo esegue direttamente sul processore, come Wine. Il runtime Xbox (`xgameruntime.dll`) è fornito da El1xr; la finestra e DirectX 12 sono quelli del PC. **Attenzione: in modalità nativa il programma non è isolato.** Riserva questa modalità ai programmi di fiducia; `--rapport` e `--banc` restano isolati in Unicorn. `ANYXBOXX_TRACE=1` mostra le chiamate intercettate. Dettagli: [docs/test-game.md](../test-game.md).
 
 ## Avviare un pacchetto in modalità isolata
 
@@ -177,7 +179,7 @@ AnyXboxX carica l'eseguibile stesso e lo esegue direttamente sul processore, com
 .\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --lancer <dossier du paquet ou fichier .exe> [dossiers de DLL…]
 ```
 
-Con una cartella, AnyXboxX legge `MicrosoftGame.Config`, prende l'eseguibile dichiarato per `Scarlett` e lo avvia nella macchina isolata (Unicorn): il programma non tocca il PC. Il resoconto indica prima gli import non risolti, poi le chiamate non emulate, dalla più frequente alla più rara: è l'elenco di lavoro per completare l'emulatore. Se l'eseguibile manca, il messaggio lo nomina. Con `--md rapport.md`, lo stesso resoconto viene scritto in Markdown, con gli import mancanti raggruppati per DLL.
+Con una cartella, El1xr legge `MicrosoftGame.Config`, prende l'eseguibile dichiarato per `Scarlett` e lo avvia nella macchina isolata (Unicorn): il programma non tocca il PC. Il resoconto indica prima gli import non risolti, poi le chiamate non emulate, dalla più frequente alla più rara: è l'elenco di lavoro per completare l'emulatore. Se l'eseguibile manca, il messaggio lo nomina. Con `--md rapport.md`, lo stesso resoconto viene scritto in Markdown, con gli import mancanti raggruppati per DLL.
 
 ## Analizzare un programma
 
@@ -199,7 +201,7 @@ Il rapporto elenca le funzioni importate, la percentuale già emulata e le funzi
 
 ## Architettura
 
-![Schema dei moduli di AnyXboxX](../images/architecture.svg)
+![Schema dei moduli di El1xr](../images/architecture.svg)
 
 | Modulo | Ruolo |
 |---|---|
@@ -210,7 +212,7 @@ Il rapporto elenca le funzioni importate, la percentuale già emulata e le funzi
 | `emu/report.py` | rapporto di compatibilità |
 | `emu/modules.py` | carica le DLL del pacchetto, collega le importazioni, ordina le inizializzazioni |
 | `emu/bench.py` | banco di prova su una cartella di moduli |
-| `emu/native/` | esecuzione nativa in stile Wine: caricatore, importazioni reali, runtime GDK di AnyXboxX |
+| `emu/native/` | esecuzione nativa in stile Wine: caricatore, importazioni reali, runtime GDK di El1xr |
 | `scarlett.py` | interfaccia Tkinter e riga di comando |
 
 Per aggiungere una funzione, decora un gestore in `emu/hle/`:
@@ -226,9 +228,9 @@ def XSystemGetDeviceType(c):
 - [Architettura hardware della Xbox Series X](../research/xbox-series-x-architecture.md): CPU Zen 2, GPU RDNA 2, memoria, Velocity Architecture, sicurezza.
 - [Emulatori e livelli di compatibilità esistenti](../research/state-of-the-art.md): WinDurango, XWine1, Xenia, strumenti XVD.
 - [Note di reverse engineering sul pacchetto Scarlett studiato](../research/package/README.md) (scritte da Codex): tabelle RDS5/ETPF, intestazioni RPF, organizzazione del pacchetto.
-- [TomBox e la sua prosecuzione](../research/tombox.md): DLL console in Rust, Direct3D 12.x, traduttore di shader RDNA 2, ciò che AnyXboxX riprende (MIT, citato).
-- [Xbox2Windows](../research/xbox2windows.md): ricerca sulla ricompilazione statica; BC7 e tiling GFX10 ripresi da AnyXboxX (MIT, citato).
-- [Primo avvio dell'eseguibile 1.0.2.1](../research/first-boot-1021.md): arresti misurati con `gta6rt` di Leonida in ordine, le pull request di Leonida che li trattano, elenco dei lavori per AnyXboxX.
+- [TomBox e la sua prosecuzione](../research/tombox.md): DLL console in Rust, Direct3D 12.x, traduttore di shader RDNA 2, ciò che El1xr riprende (MIT, citato).
+- [Xbox2Windows](../research/xbox2windows.md): ricerca sulla ricompilazione statica; BC7 e tiling GFX10 ripresi da El1xr (MIT, citato).
+- [Primo avvio dell'eseguibile 1.0.2.1](../research/first-boot-1021.md): arresti misurati con `gta6rt` di Leonida in ordine, le pull request di Leonida che li trattano, elenco dei lavori per El1xr.
 
 ## Test
 
@@ -243,8 +245,15 @@ Il ramo `main` è protetto: ogni contributo passa da una pull request revisionat
 
 Discussione, aiuto e report di test: [Discord](https://discord.gg/TcX42vRyPU)
 
+## Riconoscimenti
+
+- **El1xr**: Bone/Nevaa.
+- **VIctory**: Marvisak e i suoi contributori ([VIctory](https://github.com/Marvisak/VIctory), GPL-3.0 o successiva), e gli autori dei fork da cui è assemblato, tra cui Neptune (VIctory Edit.) di Traffic & zm0kie.
+- **AnyXboxX**: Looper_Salty e i suoi contributori ([AnyXboxX](https://github.com/LooperSalty/AnyXboxX)), il progetto di cui El1xr è un fork.
+- Tutti gli altri componenti e autori sono citati in [THIRD_PARTY.md](../../THIRD_PARTY.md).
+
 ## Licenza
 
-AnyXboxX è distribuito con licenza [GNU GPL 3.0 o successiva](../../LICENSE). Le parti di terzi mantengono la propria licenza: il modulo `Task` di libHttpClient (MIT, `runtime/third_party/libhttpclient-task`) e le tabelle RDNA 2 generate dai test di codifica pubblici di LLVM (Apache 2.0 con eccezione LLVM, `PrototypeScarlett/emu/rdna2_ops.py` e `rdna2_shapes.py`).
+El1xr è distribuito con licenza [GNU GPL 3.0 o successiva](../../LICENSE). Le parti di terzi mantengono la propria licenza: il modulo `Task` di libHttpClient (MIT, `runtime/third_party/libhttpclient-task`) e le tabelle RDNA 2 generate dai test di codifica pubblici di LLVM (Apache 2.0 con eccezione LLVM, `PrototypeScarlett/emu/rdna2_ops.py` e `rdna2_shapes.py`).
 
 Componenti di terzi e crediti: [THIRD_PARTY.md](../../THIRD_PARTY.md).

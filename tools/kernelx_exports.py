@@ -1,7 +1,7 @@
 """Redirections de kernelx.dll (noyau de la Xbox) vers kernel32 et kernelbase du PC.
 
 Les binaires console importent kernelx.dll là où un programme PC importe
-kernel32.dll : pour toutes les fonctions communes, le kernelx.dll d'AnyXboxX
+kernel32.dll : pour toutes les fonctions communes, le kernelx.dll d'El1xr
 redirige vers celle de Windows. Les fonctions propres à la console sont écrites
 à part (runtime/kernelx/kernelx.cpp), au fur et à mesure que les rapports
 (`scarlett.py --lancer … --md`) les révèlent.

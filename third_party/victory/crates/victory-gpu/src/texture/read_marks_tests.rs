@@ -103,16 +103,16 @@ fn a_placed_texture_finds_a_target_made_at_its_memory_later() {
     }
     let at = title_memory(1 << 16);
     let placed = crate::resource::texture_at(at, &RGBA8_64).unwrap();
-    assert_eq!(crate::resource::alias_of(placed), None);
-    assert_eq!(crate::resource::alias_of(placed), None, "the answer kept");
+    assert!(crate::resource::alias_of(placed).is_none());
+    assert!(crate::resource::alias_of(placed).is_none(), "the answer kept");
     let target = texture_at(at, RENDER_TARGET);
     assert_eq!(
-        crate::resource::alias_of(placed),
+        crate::resource::alias_of(placed).map(|held| held.get()),
         Some(target),
         "the target made since"
     );
     release(target);
-    assert_eq!(crate::resource::alias_of(placed), None, "the target gone");
+    assert!(crate::resource::alias_of(placed).is_none(), "the target gone");
     crate::resource::release_test_placed_texture(at, RGBA8_64);
 }
 

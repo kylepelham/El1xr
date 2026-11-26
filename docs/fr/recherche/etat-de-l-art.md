@@ -23,11 +23,11 @@ Aucun émulateur public sérieux ne lance des jeux Xbox Series X|S. Les projets 
 
 - [xvdtool](https://github.com/emoose/xvdtool) et [XvdTool.Streaming](https://github.com/LukeFZ/XvdTool.Streaming) : lecture des conteneurs XVD/XVC. Le déchiffrement exige des clés absentes de ces dépôts.
 - [Qiling](https://github.com/qilingframework/qiling) : émulation de binaires sur Unicorn, avec chargeur PE et API Windows (GPL-2.0).
-- [Speakeasy](https://github.com/mandiant/speakeasy) : émulation d'API Windows pour l'analyse de logiciels malveillants (MIT). Modèle direct pour la page HLE d'AnyXboxX.
+- [Speakeasy](https://github.com/mandiant/speakeasy) : émulation d'API Windows pour l'analyse de logiciels malveillants (MIT). Modèle direct pour la page HLE d'El1xr.
 - [Documentation GDK](https://learn.microsoft.com/gaming/gdk/) : signatures publiques de `XSystemGetDeviceType`, `XGameRuntimeInitialize`, `XTaskQueue*`, etc.
 - [Wiki Xbox One Research](https://xboxoneresearch.github.io/wiki/) : formats XVD, système de fichiers, sécurité.
 
-## Ce qu'AnyXboxX en a retenu
+## Ce qu'El1xr en a retenu
 
 | Idée | Source | Mise en œuvre |
 |---|---|---|
@@ -39,6 +39,6 @@ Aucun émulateur public sérieux ne lance des jeux Xbox Series X|S. Les projets 
 
 ## Mise à jour du 21 novembre 2026
 
-- [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator), suite de [TomBox](https://github.com/drycheetah84/TomBox) (Rust, GPL-3.0 ou ultérieure depuis le 22 novembre 2026, MIT ou Apache-2.0 avant) : DLL console de remplacement, Direct3D 12.x console, traducteur de shaders RDNA 2. Fortnite y atteint le salon Battle Royale. Détails et reprise dans AnyXboxX : [tombox.md](tombox.md).
+- [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator), suite de [TomBox](https://github.com/drycheetah84/TomBox) (Rust, GPL-3.0 ou ultérieure depuis le 22 novembre 2026, MIT ou Apache-2.0 avant) : DLL console de remplacement, Direct3D 12.x console, traducteur de shaders RDNA 2. Fortnite y atteint le salon Battle Royale. Détails et reprise dans El1xr : [tombox.md](tombox.md).
 - [xodus-gaming/xgameruntime](https://github.com/xodus-gaming/xgameruntime) (C++, LGPL-2.1) : réimplémentation libre de `xgameruntime.dll` pour Wine, issue de WineGDK (archivé le 13 novembre 2026).
 - WinDurango (Xbox One, LGPL-3.0) reste actif ; XWine1 n'a toujours pas de dépôt public.

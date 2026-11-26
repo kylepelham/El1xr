@@ -252,21 +252,38 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
+        const FLIP_INTERVAL: Duration = Duration::from_millis(5);
         assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        let (start, first) = {
+            let c = clock();
+            let c = c.as_ref().expect("interval set");
+            (c.start, c.first)
+        };
+        let deadline = |tick: u64| start + FLIP_INTERVAL * tick.saturating_sub(first) as u32;
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
+        let flips: Vec<(u64, bool)> = (0..4)
             .map(|_| {
                 let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+                let previous = LAST[2].load(Ordering::Relaxed);
                 assert_eq!(
                     wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
                     S_OK
                 );
-                LAST[2].load(Ordering::Relaxed)
+                // Asked after the tick following the last flip had passed (the test
+                // thread was descheduled): the wait ends at once on the tick that
+                // passed, a later one. Only a wait that ended after that can have.
+                let late = Instant::now() >= deadline(previous + 2);
+                (LAST[2].load(Ordering::Relaxed), late)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        assert!(
+            flips
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0 + 1 || (w[1].1 && w[1].0 > w[0].0)),
+            "{flips:?}"
+        );
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
-        assert!(tick > flips[3]);
+        assert!(tick > flips[3].0);
     }
 }

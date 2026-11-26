@@ -2,7 +2,7 @@
 
 # First launch of a console executable
 
-Steps to follow once the package executable (for example `game_scarlett_master.exe`) is available. Everything runs from the AnyXboxX root.
+Steps to follow once the package executable (for example `game_scarlett_master.exe`) is available. Everything runs from the El1xr root.
 
 ## 1. Prepare (once)
 
@@ -23,7 +23,7 @@ python tools/jour_j.py ..
 The tool:
 
 - inventories the executable: SHA-256 hash, headers, sections, TLS and imports;
-- tells, for each imported function, who provides it: the package, AnyXboxX, TomBox, Windows or nobody;
+- tells, for each imported function, who provides it: the package, El1xr, TomBox, Windows or nobody;
 - runs `--rapport` and `--lancer`, which execute the program in Unicorn, isolated from the PC.
 
 The report is written to `%LOCALAPPDATA%\AnyXboxX\jour-j\<date>\rapport.md`, outside the repository: it names functions of the game and must not be versioned.
@@ -42,10 +42,10 @@ The native report lists pipeline state objects (PSOs) from TomBox's sampled crea
 
 ### What the Windows host must provide
 
-Native mode binds some imports to Windows itself, not to AnyXboxX. When one is missing, `anyxboxx.exe` stops before the entry point and names it (`dll!function` or `dll!#ordinal`).
+Native mode binds some imports to Windows itself, not to El1xr. When one is missing, `anyxboxx.exe` stops before the entry point and names it (`dll!function` or `dll!#ordinal`).
 
-- **GameInput** (`GameInput.dll!#1`). The title imports `GameInputCreate` by ordinal 1, as the GameInput library of the GDK links it. AnyXboxX does not serve it on purpose: the host's GameInput runtime gives the real controllers, and every GameInput runtime supports the v0 interface that this `GameInputCreate` creates ([GameInputCreate](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/functions/gameinputcreate), [API versions](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/input/overviews/input-version-interop)). Recent Windows versions include it (`System32\GameInput.dll`); if it is missing, install the redistributable with `winget install Microsoft.GameInput` ([GameInput NuGet](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/input/overviews/input-nuget)).
-- **Windows API sets and libraries with no console counterpart in AnyXboxX**: `api-ms-win-core-psm-appnotify-*` (`RegisterAppStateChangeNotification` and `RegisterAppConstrainedChangeNotification`, called right after the GDK start-up), `ext-ms-win-rtcore-ntuser-*`, Media Foundation (`MFPlat.dll`) and Winsock (`WS2_32.dll`, imported by ordinal). The 1.0.2.1 executable was only measured on Windows 11, where all of them resolve. Windows decides per device which API set contracts exist, whatever their `api-` or `ext-` prefix ([Windows API sets](https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets)), and the N editions of Windows ship without Media Foundation until the [Media Feature Pack](https://support.microsoft.com/windows/media-feature-pack-for-windows-n-8622b390-4ce6-43c9-9b42-549e5328e407) is installed. Use a recent Windows 11 that is not an N edition, or install that pack.
+- **GameInput** (`GameInput.dll!#1`). The title imports `GameInputCreate` by ordinal 1, as the GameInput library of the GDK links it. El1xr does not serve it on purpose: the host's GameInput runtime gives the real controllers, and every GameInput runtime supports the v0 interface that this `GameInputCreate` creates ([GameInputCreate](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/functions/gameinputcreate), [API versions](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/input/overviews/input-version-interop)). Recent Windows versions include it (`System32\GameInput.dll`); if it is missing, install the redistributable with `winget install Microsoft.GameInput` ([GameInput NuGet](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/input/overviews/input-nuget)).
+- **Windows API sets and libraries with no console counterpart in El1xr**: `api-ms-win-core-psm-appnotify-*` (`RegisterAppStateChangeNotification` and `RegisterAppConstrainedChangeNotification`, called right after the GDK start-up), `ext-ms-win-rtcore-ntuser-*`, Media Foundation (`MFPlat.dll`) and Winsock (`WS2_32.dll`, imported by ordinal). The 1.0.2.1 executable was only measured on Windows 11, where all of them resolve. Windows decides per device which API set contracts exist, whatever their `api-` or `ext-` prefix ([Windows API sets](https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets)), and the N editions of Windows ship without Media Foundation until the [Media Feature Pack](https://support.microsoft.com/windows/media-feature-pack-for-windows-n-8622b390-4ce6-43c9-9b42-549e5328e407) is installed. Use a recent Windows 11 that is not an N edition, or install that pack.
 
 ## 4. After the diagnosis
 

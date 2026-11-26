@@ -186,8 +186,6 @@ pub(super) enum F {
     FillBytes,
     TexturesUs,
     Textures,
-    AfterUs,
-    After,
     TotalUs,
 }
 
@@ -220,15 +218,10 @@ pub(super) fn fills(us: u64, bytes: usize) {
     add(F::FillBytes, bytes as u64);
 }
 
-/// `textures` refreshed in `refreshed_us`, then `after` callbacks, `us` in all.
-pub(super) fn textures(textures: usize, refreshed_us: u64, after: usize, us: u64) {
-    if textures == 0 && after == 0 {
-        return;
-    }
+/// `textures` refreshed in `us`.
+pub(super) fn textures(textures: usize, us: u64) {
     add(F::Textures, textures as u64);
-    add(F::TexturesUs, refreshed_us);
-    add(F::After, after as u64);
-    add(F::AfterUs, us - refreshed_us);
+    add(F::TexturesUs, us);
 }
 
 /// Runs the flush that ends a submission's preparing, counted apart from
@@ -254,8 +247,7 @@ pub(super) fn log(frames: f64) {
             "batch flush per frame, {name}: {:.1} flushes of {:.0} copies, {:.2} ms in all; asking ahead {:.2} ms; \
              refreshes {:.2} ms ({:.1} passes, {:.0} tasks of them {:.0} pieces of long refreshes, {:.2} ms busy \
              on all threads, the longest task {:.2} ms over {:.2} MB, the longest pass {:.2} ms, a copy alone \
-             at the end {:.2} ms, {:.1} MB copied); fills {:.2} ms ({:.0}, {:.2} MB); textures {:.2} ms ({:.0}); \
-             after textures {:.2} ms ({:.0})",
+             at the end {:.2} ms, {:.1} MB copied); fills {:.2} ms ({:.0}, {:.2} MB); textures {:.2} ms ({:.0})",
             per(F::Flushes),
             per(F::Copies),
             ms(F::TotalUs),
@@ -275,8 +267,6 @@ pub(super) fn log(frames: f64) {
             per(F::FillBytes) / (1 << 20) as f64,
             ms(F::TexturesUs),
             per(F::Textures),
-            ms(F::AfterUs),
-            per(F::After),
         );
     }
 }
