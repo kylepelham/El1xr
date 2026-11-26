@@ -510,6 +510,45 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host heap (keyed by monotonic [`HostHeap::id`]): the host copy and
+/// range each slot's buffer view reads, kept from pass to pass by
+/// [`State::heap_buffers`].
+type PickedRanges = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, PickedRanges>>> =
+    std::sync::Mutex::new(None);
+
+/// Called when the title heap is destroyed, after the shader-heap registry
+/// lock is released. Drop cached resource references outside the cache lock.
+pub(crate) fn forget_heap_ranges(id: u64) {
+    let ranges = RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|heaps| heaps.remove(&id));
+    drop(ranges);
+}
+
+#[cfg(test)]
+#[test]
+fn heap_range_cache_forgets_dropped_heap() {
+    // IDs are allocated monotonically from 1. Reserve synthetic high IDs.
+    let id = u64::MAX - 1;
+    let other = u64::MAX - 2;
+    {
+        let mut ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = ranges.get_or_insert_with(Default::default);
+        heaps.insert(id, PickedRanges::new(false));
+        heaps.insert(other, PickedRanges::new(false));
+    }
+    forget_heap_ranges(id);
+    {
+        let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = ranges.as_ref().unwrap();
+        assert!(!heaps.contains_key(&id));
+        assert!(heaps.contains_key(&other));
+    }
+    forget_heap_ranges(other);
+}
 /// Monotonic lifetime count of [`State::heap_buffers`] passes (never reset by
 /// stats logging), used for boot-vs-gameplay budget cutoffs.
 static HEAP_BUFFER_PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1793,9 +1832,6 @@ impl State {
         // before its memory had a host copy is only made then.
         // Which slots are looked at is `crate::heap_pass` (the full sweep every
         // 16 passes unless `VICTORY_HEAP_PASS_DIRTY=1`).
-        type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> =
-            std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let heaps = kept.get_or_insert_with(Default::default);
         let forgotten = crate::descriptor::take_forgotten();
@@ -1803,8 +1839,8 @@ impl State {
             picked.note_forgotten(forgotten.as_deref());
         }
         let ranges = heaps
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
+            .entry(host.id())
+            .or_insert_with(|| PickedRanges::new(crate::heap_pass::full_pass()));
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
         // Always take dirty pages (including on pass 0) so `buffer_written`
