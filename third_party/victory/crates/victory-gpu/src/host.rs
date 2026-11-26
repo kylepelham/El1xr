@@ -2012,8 +2012,37 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = SEED + thread.x;
+    uint at = lo + thread.x * 16u;
+    // Eight loads at once: one after the other, each waits for memory.
     [loop]
-    for (uint at = lo + thread.x * 16u; at < hi; at += 1024u) {
+    for (; at + 7168u < hi; at += 8192u) {
+        uint4 v0 = now.Load4(at + 0u);
+        uint4 v1 = now.Load4(at + 1024u);
+        uint4 v2 = now.Load4(at + 2048u);
+        uint4 v3 = now.Load4(at + 3072u);
+        uint4 v4 = now.Load4(at + 4096u);
+        uint4 v5 = now.Load4(at + 5120u);
+        uint4 v6 = now.Load4(at + 6144u);
+        uint4 v7 = now.Load4(at + 7168u);
+        h = (h ^ v0) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v1) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v2) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v3) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v4) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v5) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v6) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v7) * STEP;
+        h = h.yzwx ^ (h >> 15);
+    }
+    [loop]
+    for (; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * STEP;
         h = h.yzwx ^ (h >> 15);
     }
