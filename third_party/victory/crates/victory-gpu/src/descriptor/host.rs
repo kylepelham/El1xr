@@ -1323,15 +1323,28 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
+        // Sampler heaps always back the full 2,048 hardware limit and reserve
+        // slot 2,047 as a permanent null point sampler so `umin(index, 2047)`
+        // in `victory-shader` never reads past smaller title sampler heaps.
+        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            SAMPLERS - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            let fitted = count.min(SAMPLERS - 1);
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -6190,5 +6203,24 @@ mod dynamic_bits_tests {
         assert_eq!(got, Some(fill_b));
         heap.release(heap.id(), fill_a, heap.dynamic - 17);
         heap.release(heap.id(), fill_b, 16);
+    }
+
+    /// Every host sampler heap backs all 2,048 hardware descriptors and
+    /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
+    /// `victory-shader` never reads past smaller title sampler heaps.
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        let Some(small) = super::HostHeap::new(true, 16) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(small.count, 16);
+        let Some(full) = super::HostHeap::new(true, 2048) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(full.count, 2047);
     }
 }
