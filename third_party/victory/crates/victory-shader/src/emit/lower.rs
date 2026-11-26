@@ -44,6 +44,10 @@ mod float64;
 #[path = "permlane.rs"]
 mod permlane;
 
+/// Uniform first-lane value proof across split wave64 halves.
+#[path = "uniform_lane.rs"]
+mod uniform_lane;
+
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
@@ -7603,9 +7607,16 @@ impl<'a> Lower<'a> {
                 // The console's first active lane can be in the other host half. A
                 // wave-uniform source already has the same value in both halves.
                 let alike = match v.src.first() {
-                    Some(&Operand::Vector { reg, .. }) => inst
-                        .read(Reg::V(reg))
-                        .is_some_and(|x| self.uniform.contains(&x)),
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)).is_some_and(|x| {
+                        self.uniform.contains(&x)
+                            || uniform_lane::value_uniform(
+                                self.x.p,
+                                self.x.st,
+                                self.cur_ir,
+                                x,
+                                &mut HashSet::new(),
+                            ) == uniform_lane::Uniform::Yes
+                    }),
                     _ => true,
                 };
                 if self.pair_first_lane && !alike {
