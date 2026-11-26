@@ -4662,6 +4662,30 @@ mod indirect_signature_tests;
 /// once and kept for good. Each thread remembers the last one it asked
 /// for: the title's threads ask for the same few, and the lock and the
 /// object's reference count were shared by all of them.
+/// Look up `key` in `cache`, calling `create` outside the cache mutex on a miss
+/// and re-checking under the lock before storing the entry.
+fn cached_command_signature<K: Copy + Eq, T, V: Copy>(
+    cache: &std::sync::Mutex<Vec<(K, V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<T>,
+    store: impl FnOnce(T) -> V,
+) -> Option<V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, value)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(value);
+        }
+    }
+    let created = create()?;
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, value)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(value);
+    }
+    let value = store(created);
+    made.push((key, value));
+    Some(value)
+}
+
 fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
     type Made = ((u32, u32), &'static ID3D12CommandSignature);
     thread_local! {
@@ -4671,38 +4695,39 @@ fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignat
         return Some(s);
     }
     static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&m) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        LAST.set(Some(m));
-        return Some(m.1);
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let m = ((kind, stride), &*Box::leak(Box::new(signature?)));
-    made.push(m);
-    LAST.set(Some(m));
-    Some(m.1)
+    let signature = cached_command_signature(
+        &MADE,
+        (kind, stride),
+        || {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: stride,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &argument,
+                NodeMask: 0,
+            };
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a description of one argument; no root arguments.
+            let result = unsafe {
+                crate::host::host()?.device.CreateCommandSignature(
+                    &desc,
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+            };
+            if let Err(e) = result {
+                once!(error = %e, kind, stride, "host command signature refused");
+                return None;
+            }
+            signature
+        },
+        |sig| &*Box::leak(Box::new(sig)),
+    )?;
+    LAST.set(Some(((kind, stride), signature)));
+    Some(signature)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -5042,5 +5067,81 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn command_signature_cache_creates_outside_lock() {
+        let cache: Arc<Mutex<Vec<((u32, u32), usize)>>> =
+            Arc::new(Mutex::new(vec![((1, 16), 101)]));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let cache_bg = Arc::clone(&cache);
+        let entered_bg = Arc::clone(&entered);
+        let release_bg = Arc::clone(&release);
+        let handle = std::thread::spawn(move || {
+            cached_command_signature(
+                &cache_bg,
+                (2, 20),
+                || {
+                    entered_bg.wait();
+                    release_bg.wait();
+                    Some(202usize)
+                },
+                |v| v,
+            )
+        });
+
+        // Wait until the background thread is inside `create` for key (2, 20).
+        entered.wait();
+        // A concurrent cache hit must succeed immediately without blocking on `create`.
+        let hit = cached_command_signature(&cache, (1, 16), || -> Option<usize> {
+            panic!("cache hit must not call create")
+        }, |v| v);
+        assert_eq!(hit, Some(101));
+
+        release.wait();
+        assert_eq!(handle.join().unwrap(), Some(202));
+        assert_eq!(cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn command_signature_cache_deduplicates_concurrent_miss() {
+        let cache: Arc<Mutex<Vec<(u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(Barrier::new(2));
+        let stored = Arc::new(AtomicUsize::new(0));
+
+        let mut threads = Vec::new();
+        for id in 1..=2usize {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            let stored = Arc::clone(&stored);
+            threads.push(std::thread::spawn(move || {
+                cached_command_signature(
+                    &cache,
+                    7u32,
+                    || {
+                        barrier.wait();
+                        Some(id * 10)
+                    },
+                    |v| {
+                        stored.fetch_add(1, Ordering::Relaxed);
+                        v
+                    },
+                )
+            }));
+        }
+        let a = threads.remove(0).join().unwrap();
+        let b = threads.remove(0).join().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(stored.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.lock().unwrap().len(), 1);
     }
 }
