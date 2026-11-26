@@ -3903,6 +3903,14 @@ mod tests {
         assert_eq!(family(66), 66);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        // A shader resource view of no resource has no aliasing source:
+        // alias_of must return None for a null pointer and not dereference it.
+        assert!(alias_of(std::ptr::null()).is_none());
+    }
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
