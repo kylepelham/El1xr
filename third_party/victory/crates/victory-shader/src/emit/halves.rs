@@ -284,8 +284,20 @@ impl<'a> Lower<'a> {
     /// as zero, so the test is on the exponent bits rather than a float
     /// compare (whose result would depend on the host's denormal mode).
     pub(super) fn legacy_mul(&mut self, a: V, b: V) -> V {
+        let a_bits = self.s.m.const_f32(a);
+        let b_bits = self.s.m.const_f32(b);
+        if a_bits.is_some_and(|bits| (bits & 0x7F80_0000) == 0)
+            || b_bits.is_some_and(|bits| (bits & 0x7F80_0000) == 0)
+        {
+            return self.s.m.f32(0);
+        }
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        // x * x never pairs zero with inf/NaN; ±0.0 and subnormals both square
+        // to +0.0, and ±inf / NaN preserve IEEE-754 semantics.
+        if a == b || (a_bits.is_some() && b_bits.is_some()) {
+            return m;
+        }
         let exp = self.s.m.i32(0x7F80_0000);
         let izero = self.s.m.i32(0);
         let is_zero = |l: &mut Self, v: V| {
@@ -293,9 +305,15 @@ impl<'a> Lower<'a> {
             let e = l.s.m.bin(c, Bin::And, bits, exp);
             l.s.m.cmp(c, pred::EQ, e, izero)
         };
-        let az = is_zero(self, a);
-        let bz = is_zero(self, b);
-        let z = self.s.m.bin(c, Bin::Or, az, bz);
+        let z = match (a_bits.is_some(), b_bits.is_some()) {
+            (true, false) => is_zero(self, b),
+            (false, true) => is_zero(self, a),
+            _ => {
+                let az = is_zero(self, a);
+                let bz = is_zero(self, b);
+                self.s.m.bin(c, Bin::Or, az, bz)
+            }
+        };
         let zero = self.s.m.f32(0);
         self.s.m.select(c, z, zero, m)
     }
@@ -303,6 +321,13 @@ impl<'a> Lower<'a> {
     /// `x` with a subnormal flushed to the zero of its sign; every other
     /// value as it is.
     pub(super) fn ftz(&mut self, x: V) -> V {
+        if let Some(bits) = self.s.m.const_f32(x) {
+            return if (bits & 0x7F80_0000) == 0 {
+                self.s.m.f32(bits & 0x8000_0000)
+            } else {
+                x
+            };
+        }
         let c = self.cur;
         let bits = self.as_int(x);
         let exp = self.s.m.i32(0x7F80_0000);
@@ -321,13 +346,36 @@ impl<'a> Lower<'a> {
     /// the legacy rule that a zero factor makes the product +0 whatever the
     /// other factor is (an infinity or no number too).
     pub(super) fn legacy_fmad(&mut self, a: V, b: V, acc: V) -> V {
-        let (a, b, acc) = (self.ftz(a), self.ftz(b), self.ftz(acc));
+        let a_bits = self.s.m.const_f32(a);
+        let b_bits = self.s.m.const_f32(b);
         let c = self.cur;
+        if a_bits.is_some_and(|bits| (bits & 0x7F80_0000) == 0)
+            || b_bits.is_some_and(|bits| (bits & 0x7F80_0000) == 0)
+        {
+            let acc = self.ftz(acc);
+            let zero = self.s.m.f32(0);
+            return self.s.m.bin(c, Bin::Add, zero, acc);
+        }
+        if a == b {
+            let a = self.ftz(a);
+            let acc = self.ftz(acc);
+            return self.fmad(a, a, acc);
+        }
+        let (a, b, acc) = (self.ftz(a), self.ftz(b), self.ftz(acc));
         let fused = self.fmad(a, b, acc);
+        if a_bits.is_some() && b_bits.is_some() {
+            return fused;
+        }
         let zero = self.s.m.f32(0);
-        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
-        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
-        let z = self.s.m.bin(c, Bin::Or, az, bz);
+        let z = match (a_bits.is_some(), b_bits.is_some()) {
+            (true, false) => self.s.m.cmp(c, pred::OEQ, b, zero),
+            (false, true) => self.s.m.cmp(c, pred::OEQ, a, zero),
+            _ => {
+                let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+                let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+                self.s.m.bin(c, Bin::Or, az, bz)
+            }
+        };
         // +0 + acc: the sign of a zero addend comes out of the addition.
         let sum = self.s.m.bin(c, Bin::Add, zero, acc);
         self.s.m.select(c, z, sum, fused)

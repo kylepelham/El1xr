@@ -324,6 +324,16 @@ impl Module {
         let t = self.float();
         self.constant(t, Const::Float(bits))
     }
+    /// If `v` is a float constant, returns its raw IEEE-754 bits.
+    pub fn const_f32(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(bits),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
     }

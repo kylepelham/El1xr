@@ -2384,6 +2384,95 @@ fn legacy_multiply_adds_fuse_their_product_and_flush_their_sources() {
     }
 }
 
+/// Squaring and constant zero/non-zero fast paths in `legacy_mul` and
+/// `legacy_fmad` must stay bit-exact across +0.0, -0.0, subnormals, ±inf,
+/// NaN, and normal floats (fxceless/victory-fork PR #1386).
+#[test]
+fn legacy_square_and_const_fastpaths_match_full_semantics() {
+    let f = f32::to_bits;
+    // v_mul_legacy_f32 v0, v1, v1 (VOP2 op 0x07)
+    let mul_sq = build_valu_cs(&[vop2(0x07, 0, vgpr(1), 1)]);
+    // v_mul_legacy_f32 v0, 0.0, v1 (inline constant 0.0 = 0x80)
+    let mul_zero = build_valu_cs(&[vop2(0x07, 0, 0x80, 1)]);
+    // v_mul_legacy_f32 v0, 2.0, v1 (inline constant 2.0 = 0xf4)
+    let mul_two = build_valu_cs(&[vop2(0x07, 0, 0xf4, 1)]);
+    // v_mad_legacy_f32 v0, v1, v1, v2 (VOP3 op 0x140)
+    let mad_sq = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(1), vgpr(2)));
+    // v_mad_legacy_f32 v0, 0.0, v1, v2
+    let mad_zero = build_valu_cs(&vop3(0x140, 0, 0x80, vgpr(1), vgpr(2)));
+
+    let sq_cases = [
+        [0x0000_0000, 0x0000_0000, 0, 0], // +0.0
+        [0x8000_0000, 0x8000_0000, 0, 0], // -0.0: (-0)*(-0) = +0.0, +0 + (-0) = +0.0
+        [0x0000_0001, 0x3f80_0000, 0, 0], // +subnormal -> +0.0
+        [0x8000_0001, 0x8000_0000, 0, 0], // -subnormal -> +0.0, +0 + (-0) = +0.0
+        [f(3.0), f(2.0), 0, 0],           // normal
+        [f(-2.5), f(1.25), 0, 0],         // negative normal
+        [0x7f80_0000, f(1.0), 0, 0],      // +inf -> +inf
+        [0xff80_0000, f(1.0), 0, 0],      // -inf -> +inf
+        [0x7fc0_0000, f(1.0), 0, 0],      // qNaN -> NaN
+    ];
+    let want_mul_sq = [
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        f(9.0),
+        f(6.25),
+        0x7f80_0000,
+        0x7f80_0000,
+        0x7fc0_0000,
+    ];
+    let want_mad_sq = [
+        0x0000_0000,
+        0x0000_0000,
+        f(1.0),
+        0x0000_0000,
+        f(11.0),
+        f(7.5),
+        0x7f80_0000,
+        0x7f80_0000,
+        0x7fc0_0000,
+    ];
+    run_cases(&mul_sq, &sq_cases, |backend, i, _, got| {
+        if i == 8 {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: mul_sq NaN");
+        } else {
+            assert_eq!(got, want_mul_sq[i], "{backend}: mul_sq case {i}");
+        }
+    });
+    run_cases(&mad_sq, &sq_cases, |backend, i, _, got| {
+        if i == 8 {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: mad_sq NaN");
+        } else {
+            assert_eq!(got, want_mad_sq[i], "{backend}: mad_sq case {i}");
+        }
+    });
+    let zero_cases = [
+        [0x7f80_0000, 0x8000_0000, 0, 0], // 0 * +inf = +0, +0 + (-0) = +0
+        [0x7fc0_0000, f(3.5), 0, 0],      // 0 * NaN = +0, +0 + 3.5 = 3.5
+        [f(-4.0), 0x0000_0001, 0, 0],     // 0 * -4 = +0, +0 + ftz(subnormal) = +0
+    ];
+    run_cases(&mul_zero, &zero_cases, |backend, i, _, got| {
+        assert_eq!(got, 0x0000_0000, "{backend}: mul_zero case {i}");
+    });
+    let want_mad_zero = [0x0000_0000, f(3.5), 0x0000_0000];
+    run_cases(&mad_zero, &zero_cases, |backend, i, _, got| {
+        assert_eq!(got, want_mad_zero[i], "{backend}: mad_zero case {i}");
+    });
+    let two_cases = [
+        [0x0000_0000, 0, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [0x0000_0001, 0, 0, 0],
+        [f(3.5), 0, 0, 0],
+        [0x7f80_0000, 0, 0, 0],
+    ];
+    let want_mul_two = [0x0000_0000, 0x0000_0000, 0x0000_0000, f(7.0), 0x7f80_0000];
+    run_cases(&mul_two, &two_cases, |backend, i, _, got| {
+        assert_eq!(got, want_mul_two[i], "{backend}: mul_two case {i}");
+    });
+}
+
 /// `v_cmp_f_{f32,f16}` and `v_cmp_tru_{f32,f16}` are constant false/true
 /// regardless of operands (even NaNs). Lowering them as `fcmp false`/`fcmp true`
 /// causes WARP to remove the D3D12 device at dispatch; lowering them as constant
