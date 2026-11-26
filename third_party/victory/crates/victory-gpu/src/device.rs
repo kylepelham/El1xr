@@ -346,6 +346,19 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Device method 0x128 (`GetDeviceRemovedReason`): reports the host device's
+/// removal status instead of returning `E_NOTIMPL` on a healthy device.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: the host owns the live device while its removal status is queried.
+        if let Err(error) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return error.code().0;
+        }
+    }
+    S_OK
+}
+
 /// Device method 0x1c8 asks for a pipeline state. The description is
 /// still unknown. Keep the first samples so its layout can be identified.
 extern "system" fn unknown_pipeline(
@@ -423,6 +436,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -575,5 +589,12 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn device_removed_reason_reports_ok_on_healthy_device() {
+        let this = super::device();
+        let method = slot::<extern "system" fn(This) -> HRESULT>(this, 0x128);
+        assert_eq!(method(this), S_OK);
     }
 }

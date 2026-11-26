@@ -659,7 +659,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -4997,7 +4997,10 @@ mod tests {
         let second = other.kept_shader_heaps();
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        assert_ne!(first[0], second[0], "recorded passes share descriptor storage");
+        assert_ne!(
+            first[0], second[0],
+            "recorded passes share descriptor storage"
+        );
         drop((first, second, other));
         host.execute(&[&list]);
 
@@ -5252,5 +5255,13 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn a8_unorm_stays_out_of_r8_typeless_family() {
+        assert_eq!(family(65), 65);
+        for fmt in 60..=64 {
+            assert_eq!(family(fmt), 60);
+        }
     }
 }
