@@ -4132,6 +4132,7 @@ pub(crate) fn relay_hand_back_for_test(
 /// per frame since the last one.
 fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
+    crate::heap_rounds::line(frames);
     if !late() {
         return;
     }
@@ -7129,6 +7130,14 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        let mut heap_rounds = crate::heap_rounds::Rounds::NONE;
+        if late
+            && crate::heap_rounds::on()
+            && crate::descriptor::async_sync_on()
+            && runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed))
+        {
+            heap_rounds = crate::heap_rounds::Rounds::start();
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -7147,6 +7156,7 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+            heap_rounds.wrote();
         }
         let needs_heap_sync = runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed));
         let async_heap_sync = needs_heap_sync && crate::descriptor::async_sync_on();
@@ -7174,22 +7184,22 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
-        let heap_sync_ticket = if async_heap_sync {
+        if async_heap_sync {
             // Overlap `sync_heaps()` on `victory-heap-sync` with submission
             // preparation (`ask_once`, `stale_flights`, `run_deferred`,
             // `batch.flush`, `take_snapshots`, `card_before`); waited for
-            // right before `ExecuteCommandLists`.
-            Some(crate::descriptor::sync_heaps_start())
+            // right before `ExecuteCommandLists` (asked already with
+            // `crate::heap_rounds`).
+            if !heap_rounds.asked() {
+                heap_rounds = crate::heap_rounds::Rounds::start();
+            }
         } else if needs_heap_sync {
             // The slots that waited for a texture's host copy, before the
             // lists that may read them run.
             let t_wait = std::time::Instant::now();
             crate::descriptor::make_waiting();
             PREP_PARTS[1].fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
-            None
-        } else {
-            None
-        };
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -7207,7 +7217,6 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
-        let mut did_settle = false;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -7254,7 +7263,7 @@ impl Host {
                     let settling = std::time::Instant::now();
                     self.settle(&mut submitted, WHY_STALE);
                     settled += settling.elapsed();
-                    did_settle = true;
+                    heap_rounds.wrote();
                     let t_ask2 = std::time::Instant::now();
                     crate::watch::ask_once(&ranges);
                     PREP_PARTS[2].fetch_add(t_ask2.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7268,17 +7277,15 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                did_settle = true;
+                heap_rounds.wrote();
             }
         }
         let t_def = std::time::Instant::now();
         let flush_one_before = PREP_PARTS[4].load(Ordering::Relaxed);
-        let mut wrote_heap = false;
         for list in runs {
-            let (list_wrote_heap, uploads) =
-                list.run_deferred(&mut batch, heap_sync_ticket.is_some());
+            let (list_wrote_heap, uploads) = list.run_deferred(&mut batch, heap_rounds.asked());
             if list_wrote_heap {
-                wrote_heap = true;
+                heap_rounds.wrote();
             }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(&uploads) {
@@ -7314,7 +7321,7 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
-            did_settle = true;
+            heap_rounds.wrote();
         }
         let t_card = std::time::Instant::now();
         let (card, mut card_order) = self.card_before(runs, flown);
@@ -7328,12 +7335,8 @@ impl Host {
             lists.push(Some(check));
         }
         PREP_PARTS[8].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
-        if let Some(ticket) = heap_sync_ticket {
-            let t_heaps = std::time::Instant::now();
-            crate::descriptor::sync_heaps_wait(ticket);
-            if wrote_heap || did_settle {
-                crate::descriptor::sync_heaps();
-            }
+        let t_heaps = std::time::Instant::now();
+        if heap_rounds.wait() {
             PREP_PARTS[0].fetch_add(t_heaps.elapsed().as_micros() as u64, Ordering::Relaxed);
             // The slots that waited for a texture's host copy, before the
             // lists that may read them run.
