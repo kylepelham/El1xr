@@ -2323,4 +2323,5 @@ mod tests {
         sync_heaps_wait(t2);
         assert!(!overlaps_shader_heap(0, 0));
     }
+
 }
