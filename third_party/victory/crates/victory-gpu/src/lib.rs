@@ -43,6 +43,8 @@ mod pixels;
 #[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
+mod scratch_spare;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod cores;

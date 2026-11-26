@@ -595,7 +595,43 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// A render target or depth view's values, kept for replaying a list after
+/// a cut: the resource as an integer (like `draw::State`), never the address
+/// of descriptor storage the title may rewrite. The caller still owns the
+/// resource's lifetime, as with the command first recorded.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct RtvSnapshot {
+    tag: u32,
+    described: u32,
+    resource: usize,
+    desc: [u32; 6],
+}
+
+#[cfg(windows)]
+impl RtvSnapshot {
+    pub(crate) fn restore(self) -> RtvRecord {
+        RtvRecord {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as This,
+            desc: self.desc,
+        }
+    }
+}
+
 impl RtvRecord {
+    /// The values of this view ([`RtvSnapshot`]).
+    #[cfg(windows)]
+    pub(crate) fn snapshot(self) -> RtvSnapshot {
+        RtvSnapshot {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as usize,
+            desc: self.desc,
+        }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1718,6 +1754,29 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// A view's snapshot keeps the values it had when taken, whatever is
+    /// written to the record afterwards.
+    #[cfg(windows)]
+    #[test]
+    fn render_target_snapshot_preserves_original_descriptor_words() {
+        let mut record = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [24, 4, 0, 0, 0, 0],
+        };
+        let snapshot = record.snapshot();
+        record.desc[0] = 26;
+        record.resource = 0x2000usize as This;
+        let restored = snapshot.restore();
+        assert_eq!(restored.tag, record.tag);
+        assert_eq!(restored.described, record.described);
+        assert_eq!(restored.desc[0], 24);
+        assert_eq!(restored.resource as usize, 0x1000);
+        assert_eq!(record.desc[0], 26);
+        assert_eq!(record.resource as usize, 0x2000);
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

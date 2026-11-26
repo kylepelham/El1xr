@@ -1134,20 +1134,12 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
-/// shortcut: a view must last until its list has run; with one or two
-/// passes a frame the ring is far from coming round.
-const PLANE_VIEWS: u32 = 256;
-
-/// What the pass draws with: the heap of its views of twins, and per kind
-/// of twin (16-bit steps or floats) and depth format the root signature
-/// and pipeline, made when first needed (`None`: the host refused).
+/// Per kind of twin (16-bit steps or floats) and depth format, the pass's
+/// root signature and pipeline, made when first needed (`None`: the host
+/// refused). Its views of twins belong to each recorded pass instead
+/// ([`record_plane_pass`]): a list may be submitted late or more than once,
+/// so a ring shared by every list cannot safely come round.
 struct PlanePass {
-    views: ID3D12DescriptorHeap,
-    cpu: usize,
-    gpu: u64,
-    step: u32,
-    next: AtomicU32,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
 }
 
@@ -1161,32 +1153,9 @@ unsafe impl Send for PlanePass {}
 unsafe impl Sync for PlanePass {}
 
 fn plane_pass() -> Option<&'static PlanePass> {
-    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
-        unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
-            Some(PlanePass {
-                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
-                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
-                views,
-                next: AtomicU32::new(0),
-                made: Mutex::default(),
-            })
-        }
-    })
-    .as_ref()
+    static PASS: OnceLock<PlanePass> = OnceLock::new();
+    host()?;
+    Some(PASS.get_or_init(|| PlanePass { made: Mutex::default() }))
 }
 
 /// Views of present planes drawn over the first one ([`Host::present`]): a
@@ -1468,10 +1437,11 @@ impl PlanePass {
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
 fn record_plane_pass(
-    list: &ID3D12GraphicsCommandList,
+    owner: &HostList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
 ) {
+    let list = &owner.list;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
     };
@@ -1489,9 +1459,42 @@ fn record_plane_pass(
     let Some((root, pipeline)) = pass.pipeline(steps, format) else {
         return;
     };
+    let count = u32::from(of.DepthOrArraySize) * u32::from(of.MipLevels);
+    if count == 0 {
+        return;
+    }
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: plain heap creation. One view per subresource, and the list
+    // keeps the heap until its reset, through every submission of it.
+    let views: ID3D12DescriptorHeap = match unsafe {
+        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    } {
+        Ok(heap) => heap,
+        Err(e) => {
+            tracing::error!(error = %e, count, "no descriptor heap for the depth plane pass");
+            return;
+        }
+    };
+    owner.keep(&views);
+    owner.keep(depth);
+    owner.keep(plane);
+    // SAFETY: a live heap, an open list.
+    let (base_cpu, base_gpu, step) = unsafe {
+        list.SetDescriptorHeaps(&[Some(views.clone())]);
+        (
+            views.GetCPUDescriptorHandleForHeapStart().ptr,
+            views.GetGPUDescriptorHandleForHeapStart().ptr,
+            host.device.GetDescriptorHandleIncrementSize(kind),
+        )
+    };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+            let slot = slice * u32::from(of.MipLevels) + mip;
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -1521,17 +1524,16 @@ fn record_plane_pass(
             let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
+                ptr: base_cpu + slot as usize * step as usize,
             };
             let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
+                ptr: base_gpu + u64::from(slot) * u64::from(step),
             };
             // SAFETY: an open list; a slot of our heap; live resources and
             // objects (the pass's own live as long as the process).
             unsafe {
                 host.device
                     .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
@@ -1760,8 +1762,6 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1813,15 +1813,18 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more, and its size: one kept
+/// ([`SPARE`], `crate::scratch_spare::take_kept`) or a new one.
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
+        if let Some((chunk, size)) = kept {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
@@ -1829,15 +1832,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
-        buffer,
-        data: data as usize,
-        gpu,
-    })
+    Some((Chunk { buffer, data: data as usize, gpu }, size))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past
+/// `crate::scratch_spare::spare_most` and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -1848,7 +1848,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, crate::scratch_spare::spare_most())
             } else {
                 Some(chunk)
             };
@@ -2823,7 +2823,7 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that the
     /// list's shaders write, copied when the list closes.
-    back_wanted: Vec<usize>,
+    back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels are tiled into title memory once the list
     /// has run.
     texture_backs: Vec<crate::texback::Back>,
@@ -3255,6 +3255,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// The title memory its texture copy-backs write ([`crate::texback`]).
+    tex_back: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -3270,6 +3272,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    tex_back: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -6569,6 +6572,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.tex_back.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -6797,7 +6801,8 @@ impl Host {
                 written,
                 sent.back
                     .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.tex_back.iter().copied()),
             );
             *flying += order.len();
             *target = *submitted;
@@ -6809,6 +6814,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                tex_back: sent.tex_back,
             }));
             items.extend(
                 sent.writes
@@ -6859,7 +6865,8 @@ impl Host {
                 written,
                 sent.back
                     .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.tex_back.iter().copied()),
             );
             *flying += 1;
             *target = *submitted;
@@ -6871,6 +6878,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                tex_back: sent.tex_back,
             }));
             items.extend(
                 sent.writes
@@ -7322,10 +7330,15 @@ impl Host {
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
+            let tex_back = runs
+                .iter()
+                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .collect();
             let sent = Sent {
                 number: this_submission,
                 card,
                 back,
+                tex_back,
                 writes,
             };
             working(was_working);
@@ -8040,7 +8053,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(self, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -8107,10 +8120,8 @@ impl HostList {
         if !crate::texback::wanted(resource) {
             return;
         }
-        let mut deferred = self.deferred();
-        if !deferred.back_wanted.contains(&(resource as usize)) {
-            deferred.back_wanted.push(resource as usize);
-        }
+        let wanted = &mut self.deferred().back_wanted;
+        crate::texback::want(wanted, resource as usize, || crate::texback::Target::new(resource));
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
@@ -8118,13 +8129,9 @@ impl HostList {
     fn textures_back(&self) {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for resource in wanted {
-            let resource = resource as crate::object::This;
-            let Some(copy) = crate::resource::host_copy(resource) else {
-                continue;
-            };
-            self.settle(&copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);
             }
         }
@@ -8698,7 +8705,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8732,7 +8739,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8871,6 +8878,18 @@ impl HostList {
     /// the indirect clamp's own is kept once.
     pub(crate) fn holds_pipeline(&self, pipeline: usize) -> bool {
         self.kept_pipeline.swap(pipeline, Ordering::Relaxed) == pipeline
+    }
+
+    /// The shader-visible descriptor heaps the list keeps (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_shader_heaps(&self) -> Vec<ID3D12DescriptorHeap> {
+        self.deferred().kept.iter()
+            .filter_map(|object| object.cast::<ID3D12DescriptorHeap>().ok())
+            .filter(|heap| {
+                // SAFETY: a live descriptor heap.
+                unsafe { heap.GetDesc() }.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+            })
+            .collect()
     }
 
     /// Keeps `object` alive until the list is reset.
