@@ -90,6 +90,16 @@ fn retired() -> &'static Mutex<Vec<(u64, Retired)>> {
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started so far ([`STARTED`]).
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished so far ([`FINISHED`]).
+pub(crate) fn submissions_finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Submissions started and not finished yet: lists the card may still be
 /// running, which read the view heap's slots as they run.
 pub(crate) fn submissions_in_flight() -> u64 {
@@ -10710,6 +10720,7 @@ impl Meter {
                 );
             }
         }
+        crate::draw::bind_split_line(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =

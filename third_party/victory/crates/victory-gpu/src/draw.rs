@@ -553,6 +553,61 @@ fn heap_range_cache_forgets_dropped_heap() {
 /// stats logging), used for boot-vs-gameplay budget cutoffs.
 static HEAP_BUFFER_PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds of [`State::bind`] since the last frame line, on all
+/// threads: the whole of it, then its parts: the early texture pass,
+/// descriptor tables, title memory by address; and the binds counted
+/// (`VICTORY_BIND_SPLIT=0`: not timed).
+pub(crate) static BIND_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether [`BIND_NS`] is kept (`VICTORY_BIND_SPLIT`, on unless `0`).
+pub(crate) fn bind_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_SPLIT").is_none_or(|v| v != "0"))
+}
+
+/// Adds the time from its start to its drop to [`BIND_NS`]`[part]`.
+struct BindLap(Option<(usize, std::time::Instant)>);
+
+impl BindLap {
+    #[inline]
+    fn start(part: usize) -> Self {
+        BindLap(bind_split().then(|| (part, std::time::Instant::now())))
+    }
+}
+
+impl Drop for BindLap {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((part, began)) = self.0 {
+            BIND_NS[part].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if part == 0 {
+                BIND_NS[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// With the frame line: [`BIND_NS`] per frame over `frames`, taken.
+pub(crate) fn bind_split_line(frames: f64) {
+    if !bind_split() {
+        return;
+    }
+    let v: [u64; 5] = std::array::from_fn(|i| BIND_NS[i].swap(0, Ordering::Relaxed));
+    if v[4] == 0 {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1e6 / frames;
+    tracing::info!(
+        "binding draws and dispatches per frame (VICTORY_BIND_SPLIT=0: not timed): {:.0} binds {:.1} ms (all threads), of          them the early texture pass {:.1} ms, descriptor tables {:.1} ms, title memory by address {:.1} ms, the rest (root          views and their refreshes, the heap pass, state) {:.1} ms",
+        v[4] as f64 / frames,
+        ms(v[0]),
+        ms(v[1]),
+        ms(v[2]),
+        ms(v[3]),
+        ms(v[0].saturating_sub(v[1] + v[2] + v[3]))
+    );
+}
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
@@ -1319,9 +1374,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _whole = BindLap::start(0);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        {
+            let _lap = BindLap::start(1);
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1385,14 +1444,17 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            self.tables(
-                list,
-                &t.used,
-                &t.host.root_indexed_views,
-                &t.host.half_views,
-                compute,
-                &mut made,
-            );
+            {
+                let _lap = BindLap::start(2);
+                self.tables(
+                    list,
+                    &t.used,
+                    &t.host.root_indexed_views,
+                    &t.host.half_views,
+                    compute,
+                    &mut made,
+                );
+            }
             STORES.set(true);
             if list.take_plane_clobbered() {
                 self.scratch_made = made;
@@ -1418,7 +1480,11 @@ impl State {
                 .root_srvs
                 .contains(&victory_shader::emit::SLOT_MEMORY)
             {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let ready = {
+                    let _lap = BindLap::start(3);
+                    self.memory_ready(list, compute, writes)
+                };
+                let Some(ready) = ready else {
                     self.scratch_made = made;
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
