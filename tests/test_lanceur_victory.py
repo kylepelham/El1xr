@@ -38,6 +38,7 @@ REGLAGES = {
     "VICTORY_CLAMP_AFTER_WRITER": "1", "VICTORY_WAVE32_NVIDIA": "1", "VICTORY_REUSE_ROOT_CBV": "1",
     "VICTORY_TEXTURE_PREPARE_THREADS": "4", "VICTORY_WATCH_RESERVATION": "1",
     "VICTORY_PORT_CBV": "1", "VICTORY_DIRTY_4K": "1", "VICTORY_PORT_GUARD": "1",
+    "VICTORY_ASYNC_SUBMIT": "1",
 }
 # -Quality, par-dessus la table (lu dans le bloc `if ($Quality)` du lanceur).
 QUALITE = {
