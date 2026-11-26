@@ -91,6 +91,8 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -831,6 +833,30 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
 fn sets_pops_packer(i: &Inst) -> bool {
     matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
         && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == 25)
+}
+
+/// The title's barrier retains its memory fences even when group sync
+/// would wait for a host wave that never visits it. Explicit overrides
+/// keep their old meanings; automatic mode is a targeted compatibility
+/// workaround for narrow-wave hosts and is restricted to single-console-wave
+/// groups (`group_threads <= console_wave`), so multi-console-wave groups
+/// never lose cross-wave synchronization.
+pub(super) fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    group_threads: Option<u32>,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let single_console_wave = group_threads.is_some_and(|t| t <= console_wave);
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && single_console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -2172,6 +2198,8 @@ impl<'a> Lower<'a> {
             half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -5083,17 +5111,17 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
+                let setting = super::group_sync();
+                let divergent = self.fence_only.contains(&b);
+                let group_threads = self.s.threads.map(|t| t.iter().product());
+                let mode = barrier_mode(
+                    setting,
+                    host_max_wave(),
+                    self.wave(),
+                    group_threads,
+                    divergent,
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
