@@ -3815,6 +3815,7 @@ fn relay_wait_inner(why: usize, holds_submitted: bool, done: impl Fn(&Line) -> b
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    let _hitch = crate::hitch::span(crate::hitch::Phase::CardWait);
     let was_working = holds_submitted && working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -9397,6 +9398,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let _hitch = crate::hitch::span(crate::hitch::Phase::Copies);
         let copies = self.ops.take();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.

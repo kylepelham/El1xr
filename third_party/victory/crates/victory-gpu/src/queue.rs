@@ -708,6 +708,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -1017,6 +1018,7 @@ type Named = Option<(usize, Option<usize>)>;
 
 /// [`present`], when its turn has come.
 fn present_now(named: Named) {
+    let _hitch = crate::hitch::span(crate::hitch::Phase::Present);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -1036,6 +1038,7 @@ fn present_now(named: Named) {
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::hitch::presented(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
