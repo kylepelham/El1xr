@@ -6275,7 +6275,6 @@ mod dynamic_bits_tests {
         heap.release(heap.id(), fill_b, 16);
     }
 
-<<<<<<< HEAD
     /// Every host sampler heap backs all 2,048 hardware descriptors and
     /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
     /// `victory-shader` never reads past smaller title sampler heaps.
@@ -6293,7 +6292,8 @@ mod dynamic_bits_tests {
         // SAFETY: live heap query.
         assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
         assert_eq!(full.count, 2047);
-=======
+    }
+
     #[test]
     fn show_prefilled_widens_texture2d_view_to_level_zero() {
         use windows::Win32::Graphics::Direct3D12::{
@@ -6337,7 +6337,6 @@ mod dynamic_bits_tests {
         let t2 = unsafe { untouched.Anonymous.Texture2D };
         assert_eq!(t2.MostDetailedMip, 4);
         assert_eq!(t2.MipLevels, 5);
->>>>>>> exp/next
     }
 
     /// Placed unordered texture views (2D and 3D) mirror onto host unordered
