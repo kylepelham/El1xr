@@ -5270,6 +5270,8 @@ impl Shadow {
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
+            crate::refresh_prof::add(crate::refresh_prof::P::BusyCalls, 1);
+            crate::refresh_prof::add(crate::refresh_prof::P::BusyPieces, busy.len() as u64 + 1);
             let (mut at, mut bytes) = (from, 0);
             for &(a, e) in &busy {
                 if a > at {
@@ -5293,6 +5295,10 @@ impl Shadow {
         to: usize,
         skip_busy: &[(usize, usize)],
     ) -> usize {
+        use crate::refresh_prof::{P, add, time};
+        add(P::Calls, 1);
+        add(P::Span, (to - from) as u64);
+        let lazy = std::time::Instant::now();
         // Detect any overlapping OTHER shadow's deferred pages WITHOUT flushing
         // or unprotecting them: marking those pages stale (`copied = 0`) makes
         // `copy_stale` -> `copy` -> `host::copy_mapped` read their fresh GPU
@@ -5318,14 +5324,18 @@ impl Shadow {
         {
             self.lazy_prepare_update(from, to, skip_busy);
         }
+        time(P::LazyUs, lazy);
         let w = self.watched.load(Ordering::Relaxed);
         if w != NOT_WATCHED {
+            let asking = std::time::Instant::now();
             if w == 1 {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 let clean =
                     crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at);
                 drop(copied);
                 if clean {
+                    add(P::CleanCalls, 1);
+                    time(P::CleanUs, asking);
                     self.refresh_check(from, to);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -5336,11 +5346,17 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asked = crate::watch::writes(from, to, true);
+            add(P::AskCalls, 1);
+            time(P::AskUs, asking);
+            if let Some((now, written)) = asked {
                 self.watched.store(1, Ordering::Relaxed);
+                let stale = std::time::Instant::now();
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
                 let copied = self.copy_stale(from, to, now, &written, &subs);
+                time(P::StaleUs, stale);
+                add(P::StaleBytes, copied as u64);
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
@@ -5366,6 +5382,7 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let whole = std::time::Instant::now();
         let bytes = if self.deferred_count.load(Ordering::Acquire) > 0 {
             self.copy_unwatched_skipping_deferred(from, to)
         } else if !in_wide() && to - from >= 1 << 20 && wide_threads() > 1 {
@@ -5383,6 +5400,9 @@ impl Shadow {
         } else {
             self.copy(from, to)
         };
+        add(P::WholeCalls, 1);
+        add(P::WholeBytes, bytes as u64);
+        time(P::WholeUs, whole);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);

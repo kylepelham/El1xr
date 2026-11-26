@@ -73,6 +73,8 @@ mod ramline;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod refresh_prof;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;
