@@ -56,7 +56,7 @@ fn only_readbacks_for_changed_allocations_are_invalidated() {
 fn a_stale_wanted_texture_is_taken_again_in_place() {
     // (owner, fresh, generation)
     let mut wanted: Vec<(usize, bool, u32)> = Vec::new();
-    let mut want = |owner: usize, generation: u32, wanted: &mut Vec<(usize, bool, u32)>| {
+    let want = |owner: usize, generation: u32, wanted: &mut Vec<(usize, bool, u32)>| {
         want_in(wanted, |t| t.0 == owner, |t| t.1, || Some((owner, true, generation)));
     };
     want(7, 1, &mut wanted);
