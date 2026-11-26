@@ -73,6 +73,8 @@ mod ramline;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod submit_chunk;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;

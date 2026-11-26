@@ -4284,7 +4284,7 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// [0] sync_heaps, [1] make_waiting, [2] ask_once, [3] stale_flights,
 /// [4] run_flush_one, [5] run_other, [6] batch_flush, [7] snapshots,
 /// [8] card_before, [9] exec_submit.
-static PREP_PARTS: [std::sync::atomic::AtomicU64; 10] =
+pub(crate) static PREP_PARTS: [std::sync::atomic::AtomicU64; 10] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
@@ -6770,6 +6770,21 @@ impl Host {
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        use crate::submit_chunk as chunk;
+        let sizes = chunk::chunk_sizes(order.len(), chunk::first_chunk());
+        match chunk::split(lists, &order, &sizes) {
+            Ok(chunks) => {
+                chunk::cut(chunks.len());
+                for (lists, order) in chunks {
+                    self.execute_late_one(lists, order);
+                }
+            }
+            Err(lists) => self.execute_late_one(lists, order),
+        }
+    }
+
+    /// [`Host::execute_late`] for one flight (a chunk of a submission).
+    fn execute_late_one(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         tick();
         if order.is_empty() {
             crate::list::recycle(lists, &order);
@@ -7139,6 +7154,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        let parts_before = crate::submit_chunk::parts();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -7318,10 +7334,9 @@ impl Host {
                 .flat_map(|l| l.deferred().writes.clone())
                 .collect();
             PREP_PARTS[9].fetch_add(t_exec.elapsed().as_micros() as u64, Ordering::Relaxed);
-            SUBMISSION_US[0].fetch_add(
-                (prepared - started).saturating_sub(settled).as_micros() as u64,
-                Ordering::Relaxed,
-            );
+            let prep_us = (prepared - started).saturating_sub(settled).as_micros() as u64;
+            SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
+            crate::submit_chunk::prepared(runs.len(), prep_us, &parts_before);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -10635,6 +10650,7 @@ impl Meter {
         }
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::submit_chunk::line(frames);
         crate::watch::reservation_line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
