@@ -40,6 +40,11 @@ FRAME_RE = re.compile(
     r"([0-9.]+) draws/frame, dropped ([0-9.]+) without a host pipeline "
     r"\((\d+) being made\) and ([0-9.]+) indirect"
 )
+PACING_RE = re.compile(
+    r"frame pacing: (\d+) frames in [0-9.]+ s \([0-9.]+ fps\), frame time p50 ([0-9.]+) ms "
+    r"p95 ([0-9.]+) ms p99 ([0-9.]+) ms max ([0-9.]+) ms, (\d+) over 50 ms, (\d+) over 100 ms, "
+    r"present interval sd ([0-9.]+) ms jitter ([0-9.]+) ms; ([0-9.]+) draws/frame"
+)
 DSTORAGE_RE = re.compile(r"dstorage: last [0-9.]+ s.*?mb_per_s=([0-9.]+)")
 POLICY_FILES_RE = re.compile(r"asset policy:\s*(\d+)\s+files ok")
 CARGO_PASSED_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+)\s+passed;")
@@ -54,6 +59,7 @@ REFUSED_PATTERNS = (
     "host root signature refused",
 )
 WORLD_DRAWS_MIN = 100.0
+LOADING_P50_MS = 100.0
 BUILD_GRACE_SECS = 600.0
 
 
@@ -250,8 +256,44 @@ def run_timed_victory(cmd: list[str], log_path: Path, seconds: int) -> tuple[boo
         return timed_out, proc.returncode if proc.returncode is not None else -1
 
 
+def parse_pacing_line(line: str) -> dict[str, float] | None:
+    """The figures of one `frame pacing:` line (victory-gpu `pacing.rs`), or None."""
+    m = PACING_RE.search(line)
+    if not m:
+        return None
+    keys = ("frames", "p50", "p95", "p99", "max", "over50", "over100", "sd", "jitter", "draws")
+    return {k: float(v) for k, v in zip(keys, m.groups())}
+
+
+def summarize_pacing(windows: list[dict[str, float]]) -> dict[str, float]:
+    """Settled world windows: median p50/p99/sd/jitter, the worst frame, and the frames over
+    50 and 100 ms (hitches) summed. Settled is after the last world window whose median frame
+    is over LOADING_P50_MS (the world still streaming in), or the later half of the world
+    windows when that leaves fewer than two."""
+    world = [w for w in windows if w["draws"] >= WORLD_DRAWS_MIN]
+    loading = [i for i, w in enumerate(world) if w["p50"] > LOADING_P50_MS]
+    settled = world[loading[-1] + 1 :] if loading else world
+    if len(settled) < 2:
+        settled = world[len(world) // 2 :] if len(world) >= 4 else world
+    if not settled:
+        return {
+            "p50_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0, "sd_ms": 0.0, "jitter_ms": 0.0,
+            "over50": 0, "hitches": 0,
+        }
+    return {
+        "p50_ms": statistics.median(w["p50"] for w in settled),
+        "p99_ms": statistics.median(w["p99"] for w in settled),
+        "max_ms": max(w["max"] for w in settled),
+        "sd_ms": statistics.median(w["sd"] for w in settled),
+        "jitter_ms": statistics.median(w["jitter"] for w in settled),
+        "over50": int(sum(w["over50"] for w in settled)),
+        "hitches": int(sum(w["over100"] for w in settled)),
+    }
+
+
 def parse_victory_log(text: str) -> dict[str, object]:
     world_rows: list[tuple[float, float, float]] = []
+    pacing_windows: list[dict[str, float]] = []
     dstorage_rates: list[float] = []
     refused = 0
     device_removed = False
@@ -272,6 +314,9 @@ def parse_victory_log(text: str) -> dict[str, object]:
             draws = float(m_frame.group(11))
             if draws >= WORLD_DRAWS_MIN:
                 world_rows.append((fps, gpu_ms, prep_ms))
+        pacing = parse_pacing_line(line)
+        if pacing:
+            pacing_windows.append(pacing)
         m_ds = DSTORAGE_RE.search(line)
         if m_ds:
             dstorage_rates.append(float(m_ds.group(1)))
@@ -289,6 +334,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "dstorage_mbs": ds_med,
         "refused": refused,
         "device_removed": device_removed,
+        **summarize_pacing(pacing_windows),
     }
 
 
@@ -355,7 +401,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError) as exc:
         ensure_coord_dirs()
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
-        print("DEV bench FAIL fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0")
+        print(
+            "DEV bench FAIL fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0 "
+            "p50_ms=0.0 p99_ms=0.0 max_ms=0.0 sd_ms=0.0 jitter_ms=0.0 over50=0 hitches=0"
+        )
         return 1
 
     cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides)
@@ -371,7 +420,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"gpu_ms={float(stats['gpu_ms']):.1f} "
         f"prep_ms={float(stats['prep_ms']):.1f} "
         f"dstorage_mbs={float(stats['dstorage_mbs']):.1f} "
-        f"refused={int(stats['refused'])}"
+        f"refused={int(stats['refused'])} "
+        f"p50_ms={float(stats['p50_ms']):.1f} "
+        f"p99_ms={float(stats['p99_ms']):.1f} "
+        f"max_ms={float(stats['max_ms']):.1f} "
+        f"sd_ms={float(stats['sd_ms']):.1f} "
+        f"jitter_ms={float(stats['jitter_ms']):.1f} "
+        f"over50={int(stats['over50'])} "
+        f"hitches={int(stats['hitches'])}"
     )
     return 0 if ok else 1
 

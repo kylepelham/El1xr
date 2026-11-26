@@ -39,6 +39,8 @@ mod host;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod pacing;
+#[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
 mod screenshot;
