@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Ecosystem intelligence & watcher tool for GTA VI Xbox-on-PC (VIctory) development.
+"""El1xr ecosystem intelligence & watcher tool for GTA VI Xbox-on-PC (VIctory) development.
 
 Zero-dependency Python 3 standard-library tool that discovers and monitors top
 VIctory-based forks and related Xbox-on-PC ports from live trackers
 (gta6-pc-race & PortWatch VI) plus a built-in priority seed list, deep-scans
-recent commits, pull requests, and READMEs concurrently with ETag caching,
-categorizes developments into actionable engineering buckets, cross-checks
-against the local repository to separate [NEW] from [LIKELY ALREADY HAVE], and
-persists seen state outside the git tree.
+recent commits, active branches, pull requests, and READMEs concurrently with
+ETag caching, categorizes developments into actionable engineering buckets,
+cross-checks against the local El1xr repository to separate [NEW] from
+[LIKELY ALREADY HAVE], and persists seen state outside the git tree.
 
 Usage:
     python tools/scout_ecosystem.py --once --top 15
@@ -44,8 +44,8 @@ from typing import Any
 # Constants & Configuration
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.1.0"
-USER_AGENT = f"victory-ecosystem-scout/{SCRIPT_VERSION}"
+SCRIPT_VERSION = "1.2.0"
+USER_AGENT = f"el1xr-victory-scout/{SCRIPT_VERSION}"
 
 GTA6_PC_RACE_JSON_URL = "https://raw.githubusercontent.com/vuyp/gta6-pc-race/main/src/data.json"
 GTA6_PC_RACE_HTML_URL = "https://vuyp.github.io/gta6-pc-race/"
@@ -57,42 +57,57 @@ DEFAULT_STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "vi
 DEFAULT_STATE_PATH = DEFAULT_STATE_DIR / "state.json"
 DEFAULT_OUT_DIR = DEFAULT_STATE_DIR / "reports"
 
-# Built-in priority seed list of top Victory-based forks (always prioritized)
+# Built-in priority seed list of top VIctory-based forks (always prioritized)
 PRIORITY_SEEDS: tuple[str, ...] = (
+    "stellarr-studio/kelvaroq",
+    "uiliannn/VItoriaBr",
     "Belobug/VIctory-Belobug-AMD",
-    "DexNom/VIctory",
-    "Zettrox/ztrx",
-    "DoubleGhosty/cool_fox",
-    "realblastex/flamingo",
-    "TaynanGT/Vice-Tay",
     "avatarmanz/VIctory-7900XTX",
     "fxceless/victory-fork",
+    "DoubleGhosty/cool_fox",
+    "TaynanGT/Vice-Tay",
+    "DexNom/VIctory",
+    "realblastex/flamingo",
     "LooperSalty/AnyXboxX",
-    "PastiiJay/klbf-lab",
-    "edsuuu/VI-BR-PORT",
-    "fablinoo/kelvaroq",
+    "Marvisak/VIctory",
+    "Peppacodes/playablegames-peppa",
 )
 
 # Extra non-default branches to query explicitly in addition to the default branch
 EXTRA_BRANCHES: dict[str, tuple[str, ...]] = {
-    "belobug/victory-belobug-amd": ("rx9070xt",),
+    "belobug/victory-belobug-amd": ("rx9070xt", "a-publier"),
+    "peppacodes/playablegames-peppa": ("nvidia/overnight", "nvidia/renderer-ports", "nvidia/4080-recipe"),
 }
+
+# Repos whose full active branch list is queried dynamically via GitHub API
+ALL_ACTIVE_BRANCHES_REPOS: frozenset[str] = frozenset({
+    "belobug/victory-belobug-amd",
+})
 
 # High-signal ecosystem repos also worth tracking if trackers are temporarily unreachable
 FALLBACK_SEEDS: tuple[str, ...] = (
+    "stellarr-studio/kelvaroq",
+    "uiliannn/VItoriaBr",
     "Belobug/VIctory-Belobug-AMD",
-    "DexNom/VIctory",
-    "Zettrox/ztrx",
-    "DoubleGhosty/cool_fox",
-    "realblastex/flamingo",
-    "TaynanGT/Vice-Tay",
     "avatarmanz/VIctory-7900XTX",
     "fxceless/victory-fork",
+    "DoubleGhosty/cool_fox",
+    "TaynanGT/Vice-Tay",
+    "DexNom/VIctory",
+    "realblastex/flamingo",
     "LooperSalty/AnyXboxX",
-    "trustno1-coder/VIctory-NVIDIA",
-    "uiliannn/VItoriaBr",
-    "vitutu1/victory-perf",
     "Marvisak/VIctory",
+    "Peppacodes/playablegames-peppa",
+    "Dolberthi/neptune-dolberth-nvidia-8gb",
+    "JozefDeTremmerie/CCS03",
+    "bolado-dev/mandy-port",
+    "Linox-IDK/LNX-victory",
+    "3cvil/M1LK",
+    "lepotane/VIctory-leonida",
+    "trustno1-coder/VIctory-NVIDIA",
+    "vitutu1/victory-perf",
+    "PastiiJay/klbf-lab",
+    "edsuuu/VI-BR-PORT",
     "LoverCatys/ruff-lab",
     "proneonn/Vertex",
     "Fayberr/Victory-United",
@@ -960,9 +975,11 @@ def _is_victory_related(text_parts: list[str]) -> bool:
         kw in blob
         for kw in (
             "victory",
+            "el1xr",
             "klbf-lab",
             "vice-tay",
             "kelvaroq",
+            "stellarr",
             "vi-br-port",
             "marvis",
             "cgbj",
@@ -978,6 +995,15 @@ def _is_victory_related(text_parts: list[str]) -> bool:
             "belobug",
             "dexnom",
             "fxceless",
+            "avatarmanz",
+            "peppa",
+            "mandy-port",
+            "ccs03",
+            "m1lk",
+            "dolberth",
+            "lnx-victory",
+            "lumen",
+            "lepotane",
         )
     )
 
@@ -1118,8 +1144,12 @@ def discover_repos(
         if "portwatch-vi" not in prof.sources:
             prof.sources.append("portwatch-vi")
         prof.portwatch_tier = eff.get("tier") or prof.portwatch_tier
-        if eff.get("branch") and not prof.default_branch:
-            prof.default_branch = str(eff["branch"])
+        pw_branch = str(eff.get("branch") or "").strip()
+        if pw_branch:
+            if not prof.default_branch:
+                prof.default_branch = pw_branch
+            if pw_branch.lower() not in {"main", "master"} and pw_branch not in prof.extra_branches:
+                prof.extra_branches.append(pw_branch)
         if isinstance(eff.get("gpu"), list):
             for g in eff["gpu"]:
                 if isinstance(g, str) and g not in prof.gpu:
@@ -1151,19 +1181,22 @@ def discover_repos(
         if _is_victory_related([prof.repo, prof.name, prof.kind, based_str, str(eff.get("summary", ""))]):
             prof.is_victory_fork = True
 
-    # 4. Merge high-substance Victory candidates from PortWatch VI
+    # 4. Auto-discover all public repos listed in PortWatch VI candidates
     for cand in pw_candidates:
+        if not isinstance(cand, dict):
+            continue
         slug = normalize_repo_slug(cand.get("repo"))
         if not slug:
             continue
         desc = str(cand.get("description") or "")
-        substance = safe_float(cand.get("substance")) or 0.0
-        if substance < 60 or not _is_victory_related([slug, str(cand.get("name") or ""), desc]):
-            continue
         prof = get_or_create(slug, str(cand.get("name") or ""))
         if "portwatch-candidate" not in prof.sources:
             prof.sources.append("portwatch-candidate")
-        prof.is_victory_fork = True
+        if _is_victory_related([slug, str(cand.get("name") or ""), desc]):
+            prof.is_victory_fork = True
+        cand_branch = str(cand.get("branch") or "").strip()
+        if cand_branch and cand_branch.lower() not in {"main", "master"} and cand_branch not in prof.extra_branches:
+            prof.extra_branches.append(cand_branch)
         if not prof.kind and desc:
             prof.kind = truncate_one_line(desc, 140)
         if cand.get("pushedAt") and not prof.pushed_at:
@@ -1432,7 +1465,20 @@ def scan_repo(
     new_seen_prs: dict[str, str] = {}
     now_ts = time.time()
 
-    # 1. Fetch latest commits (default branch + any configured extra branches)
+    # 1. Dynamically discover all active non-default branches for configured repos
+    if repo.lower() in ALL_ACTIVE_BRANCHES_REPOS:
+        b_url = f"https://api.github.com/repos/{repo}/branches?per_page=30"
+        _, b_data, _ = client.get_json(b_url, is_github_api=True)
+        if isinstance(b_data, list):
+            default_br = (profile.default_branch or "main").lower()
+            for entry in b_data:
+                if not isinstance(entry, dict):
+                    continue
+                br_name = str(entry.get("name") or "").strip()
+                if br_name and br_name.lower() != default_br and br_name not in profile.extra_branches:
+                    profile.extra_branches.append(br_name)
+
+    # 2. Fetch latest commits (default branch + any configured/discovered extra branches)
     branch_queries: list[tuple[str, str]] = [
         ("", f"https://api.github.com/repos/{repo}/commits?per_page={commits_limit}"),
     ]
@@ -1761,7 +1807,7 @@ def render_markdown_briefing(
     already_items = [it for it in filtered_items if it.local_status != "NEW"]
 
     lines: list[str] = []
-    lines.append("# GTA VI / VIctory Ecosystem Intelligence Briefing")
+    lines.append("# El1xr — GTA VI / VIctory Ecosystem Intelligence Briefing")
     lines.append("")
     lines.append(
         f"- **Generated:** `{report['generated_utc']}` | "
@@ -1770,7 +1816,7 @@ def render_markdown_briefing(
         f"(reqs: {meta['requests_made']}, 304 cache hits: {meta['cache_hits_304']})"
     )
     lines.append(
-        f"- **Local Repo:** `{meta['local_repo']}` "
+        f"- **Local El1xr Repo:** `{meta['local_repo']}` "
         f"(HEAD `{meta['local_head_sha'][:7]}` — {truncate_one_line(meta['local_head_subject'], 70)}; "
         f"{meta['local_env_vars_count']} `VICTORY_*` vars indexed)"
     )
@@ -2195,7 +2241,7 @@ def resolve_default_local_repo() -> Path:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scout_ecosystem.py",
-        description="Intelligent ecosystem intelligence & watcher for GTA VI Xbox-on-PC (VIctory) ports.",
+        description="El1xr ecosystem intelligence & watcher for GTA VI Xbox-on-PC (VIctory) ports.",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -2218,8 +2264,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top",
         type=int,
-        default=15,
-        help="Number of top repositories to deep-scan (default: 15).",
+        default=18,
+        help="Number of top repositories to deep-scan (default: 18).",
     )
     parser.add_argument(
         "--commits",
