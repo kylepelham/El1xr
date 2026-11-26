@@ -2622,7 +2622,13 @@ impl State {
         let took = now
             .saturating_sub(PASSED.swap(now, Ordering::Relaxed))
             .max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // (`took` is since the last pass, of any heap and list: several a
+        // frame, so this was often 256 frames; `VICTORY_TEXTURE_LOOK_MS`
+        // counts by the frame's time.)
+        let most = match look_ms() {
+            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
+            None => (4000 / took).clamp(16, 256),
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -5380,6 +5386,7 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+<<<<<<< HEAD
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5579,4 +5586,43 @@ mod tests {
         list.reset();
         assert_eq!(list.cbv_epoch(), 0);
     }
+=======
+/// The longest wait, in milliseconds, between two looks at a texture slot
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
+/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
+/// ... frames up to it.
+fn look_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&ms| ms > 0)?;
+        tracing::info!(
+            ms,
+            "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)"
+        );
+        Some(ms)
+    })
+}
+
+/// The milliseconds of a frame lately (a mean over the last frames), from
+/// the pass's frame number and clock.
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    use std::sync::Mutex;
+    static LAST: Mutex<(u64, u64, f64)> = Mutex::new((0, 0, 50.0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_frame, was_ms, mean) = *last;
+    if frame > was_frame {
+        if was_frame != 0 {
+            let each = now.saturating_sub(was_ms) as f64 / (frame - was_frame) as f64;
+            last.2 = mean * 0.9 + each.clamp(1.0, 2000.0) * 0.1;
+        }
+        last.0 = frame;
+        last.1 = now;
+    }
+    (last.2 as u64).max(1)
+>>>>>>> exp/next
 }
