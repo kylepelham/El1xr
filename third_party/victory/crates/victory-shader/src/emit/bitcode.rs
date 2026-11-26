@@ -232,6 +232,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// A block that was closed by a meet: later instructions aimed at it belong in the continuation.
+    redirect: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -427,7 +429,23 @@ impl Module {
         }
     }
 
+    fn follow(&self, mut block: usize) -> usize {
+        for _ in 0..64 {
+            match self.redirect.get(&block) {
+                Some(&next) if next != block => block = next,
+                _ => break,
+            }
+        }
+        block
+    }
+
+    /// Instructions aimed at `from` after this belong in `to` (a meet closed `from`).
+    pub fn continues(&mut self, from: usize, to: usize) {
+        self.redirect.insert(from, to);
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.follow(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
