@@ -48,7 +48,7 @@ mod permlane;
 /// module so it shares the emitter's state.
 #[path = "half_meet.rs"]
 mod half_meet;
-pub(super) use half_meet::{half_meets, with_half_meets};
+pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_meets};
 
 #[path = "halves.rs"]
 mod halves;
@@ -2032,11 +2032,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        if self.meet.enabled {
-            // The meet slots start at zero, then the wave counter, both before any thread leaves.
-            self.zero_meet_slots();
-            let _ = self.wave_base();
-        }
+        self.init_half_meet();
         self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2092,6 +2088,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.meet.lds_run = None;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -2191,6 +2188,7 @@ impl<'a> Lower<'a> {
         if let Some(what) = self.meet.refuse {
             return Err(Stop::Fail(ShaderError::Unsupported { offset: 0, what }));
         }
+        self.meet.record_counts();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -5112,7 +5110,7 @@ impl<'a> Lower<'a> {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten. A group of two
             // console waves meets only the halves of the wave that reached this block.
-            self.cur = self.order_waves(self.cur, self.reached_by_group());
+            self.lds_access_meet(name);
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -11023,6 +11021,7 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
+                self.flush_meet_totals();
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.
                     let t = self.s.m.bool(true);

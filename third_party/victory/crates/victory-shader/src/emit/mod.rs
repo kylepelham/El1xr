@@ -124,9 +124,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -492,6 +492,16 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Meet sites the face-relocation compute emitted, or 0 before it is translated.
+pub fn defrag_meet_sites() -> u32 {
+    lower::meet_sites()
+}
+
+/// Shader LDS reads and writes that received their own half-meet.
+pub fn defrag_lds_sites() -> (u32, u32) {
+    lower::meet_lds_sites()
+}
+
 /// One logical wave per group (64 threads), with a validated wave32 PSO on RTX.
 fn is_scene_kernel(io: &crate::native::StageIo, digest: [u8; 16]) -> bool {
     matches!(io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
@@ -621,11 +631,15 @@ fn emit_forms(
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
         // of the group does not wait (`with_half_meets`). Not the global switch.
-        let defrag = c.digest
-            == [
-                0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1,
-                0x23, 0xc6,
-            ];
+        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
+        // are dropped and a run can be compared with one where it executes.
+        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        let defrag = !defrag_off
+            && c.digest
+                == [
+                    0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
+                    0xa1, 0x23, 0xc6,
+                ];
         // `VICTORY_WAVE32_NVIDIA=1` ([`nvidia`]): a compute program of an `ACCC` container
         // stopped at a lane mask exchanged where not every lane runs gets its active-lane
         // loop taken wave-wide (a single guest wave can iterate it until both host halves are

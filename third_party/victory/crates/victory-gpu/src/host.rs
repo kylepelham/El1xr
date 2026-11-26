@@ -39,7 +39,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     pub(crate) fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -10909,6 +10909,7 @@ impl Meter {
                 gpu_pct = self.gpu_pct,
                 ram_mb = self.ram_mb
             );
+            crate::defrag::log_progress();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
