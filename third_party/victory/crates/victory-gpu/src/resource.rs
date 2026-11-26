@@ -659,7 +659,8 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        // R8: 61..=64. A8_UNORM (65) has no typeless format and no cast to R8.
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -2418,7 +2419,8 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
-    slot_evict(video, idle_ms, IDLE_FRAMES);
+    slot_evict(&all, video, idle_ms, IDLE_FRAMES);
+    drop(all);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2490,8 +2492,12 @@ fn slot_need(budget: u64, used: u64, percent: u64, cap: u64) -> u64 {
 /// (`crate::host::retire`). A draw that reads a slot makes the copy again
 /// from title memory ([`hosted`]).
 #[cfg(windows)]
-fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
+fn slot_evict(
+    all: &std::collections::BTreeSet<usize>,
+    video: Option<[u64; 4]>,
+    idle_ms: u64,
+    frames: u64,
+) {
     let (Some((percent, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
     };
@@ -2499,9 +2505,15 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     if need == 0 {
         return;
     }
+    slot_evict_with(all, need, idle_ms, frames);
+}
+
+#[cfg(windows)]
+fn slot_evict_with(all: &std::collections::BTreeSet<usize>, need: u64, idle_ms: u64, frames: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut copies = Vec::new();
     let mut raws = std::collections::HashMap::new();
-    for &at in textures().iter() {
+    for &at in all.iter() {
         // SAFETY: as in `pressure_victims`.
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
@@ -3828,6 +3840,38 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a8_unorm_stands_outside_the_r8_family() {
+        const R8_TYPELESS: u32 = 60;
+        const A8_UNORM: u32 = 65;
+        // R8_UNORM, R8_UINT, R8_SNORM and R8_SINT cast through R8_TYPELESS.
+        for format in R8_TYPELESS..A8_UNORM {
+            assert_eq!(super::family(format), R8_TYPELESS, "format {format}");
+        }
+        // A8_UNORM does not: an R8 view of an A8 texture is refused instead
+        // of being turned into an A8 view.
+        assert_eq!(super::family(A8_UNORM), A8_UNORM);
+        assert_ne!(super::family(61), super::family(A8_UNORM));
+        // The neighbours keep their families: R16_SINT (59), R1_UNORM (66).
+        assert_eq!(super::family(59), 53);
+        assert_eq!(super::family(66), 66);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        assert!(super::alias_of(std::ptr::null()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slot_evict_does_not_reenter_textures_lock() {
+        // Holding the TEXTURES mutex while calling slot_evict_with must not
+        // deadlock (let_go_idle holds TEXTURES across the slot_evict call).
+        let all = super::textures();
+        super::slot_evict_with(&all, 1, 0, 0);
+    }
+
+    #[test]
     fn the_hdr_stand_in_follows_its_switch() {
         assert_eq!(super::parse_hdr_stand_in(None), 26);
         assert_eq!(super::parse_hdr_stand_in(Some("26")), 26);
@@ -4997,7 +5041,10 @@ mod tests {
         let second = other.kept_shader_heaps();
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        assert_ne!(first[0], second[0], "recorded passes share descriptor storage");
+        assert_ne!(
+            first[0], second[0],
+            "recorded passes share descriptor storage"
+        );
         drop((first, second, other));
         host.execute(&[&list]);
 
