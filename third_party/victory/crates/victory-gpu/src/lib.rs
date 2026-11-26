@@ -96,8 +96,12 @@ mod texture;
 #[cfg(windows)]
 pub mod titlemem;
 #[cfg(windows)]
+#[cfg(windows)]
+mod defrag;
 mod watch;
 
+#[cfg(windows)]
+pub use defrag::log_defrag_counters;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
