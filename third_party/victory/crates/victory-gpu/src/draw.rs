@@ -3681,11 +3681,18 @@ impl State {
                 let entry = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        if crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size))
-                                .filter(|s| s.in_place())
-                            {
-                                Some(shadow) => {
+                        let in_place = crate::port_cbv::in_place_on();
+                        let copies = crate::port_cbv::copies_on();
+                        if in_place || copies {
+                            let shadow = crate::shadow::find(address, u64::from(size));
+                            let choice = crate::port_cbv::table_use(
+                                in_place,
+                                copies,
+                                shadow.is_some(),
+                                shadow.as_ref().is_some_and(|s| s.in_place()),
+                            );
+                            match (choice, shadow) {
+                                (crate::port_cbv::TableUse::InPlace, Some(shadow)) => {
                                     if host.constant_raw_at(
                                         index,
                                         &shadow.buffer,
@@ -3697,7 +3704,20 @@ impl State {
                                     }
                                     crate::port_cbv::copied(false);
                                 }
-                                None => crate::port_cbv::copied(true),
+                                (crate::port_cbv::TableUse::HostCopy, Some(shadow)) => {
+                                    if host.constant_raw_at(
+                                        index,
+                                        &shadow.buffer,
+                                        shadow.gpu(address),
+                                        size,
+                                    ) {
+                                        shadow.refresh(list, address, u64::from(size));
+                                        crate::port_cbv::in_copy(size);
+                                        continue;
+                                    }
+                                    crate::port_cbv::copied(false);
+                                }
+                                _ => crate::port_cbv::copied(true),
                             }
                         }
                         if crate::port_cbv::on() {
