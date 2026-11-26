@@ -27,3 +27,25 @@ fn readback_buffer_pool_reuses_across_rounds() {
         "expected readback buffer pool reuse across {ROUNDS} rounds, got {allocs} D3D12 allocations"
     );
 }
+
+/// Only the copy-backs whose allocation changed are invalidated: a remap
+/// touches those it overlaps, a texture made at an address the one there,
+/// a release its owner's.
+#[test]
+fn only_readbacks_for_changed_allocations_are_invalidated() {
+    use std::sync::atomic::Ordering;
+    let first = track(91, 0x1000, 0x2000);
+    let next = track(92, 0x2000, 0x3000);
+    let far = track(93, 0x4000, 0x5000);
+
+    remapped(0x0f00, 0x200);
+    assert!(!first.valid.load(Ordering::Acquire));
+    assert!(next.valid.load(Ordering::Acquire));
+    replaced(0x2000);
+    assert!(!next.valid.load(Ordering::Acquire));
+    assert!(far.valid.load(Ordering::Acquire));
+
+    released(93);
+    assert!(!far.valid.load(Ordering::Acquire));
+    assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+}

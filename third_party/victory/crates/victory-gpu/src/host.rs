@@ -2826,7 +2826,7 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3], usize, u64)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that the
     /// list's shaders write, copied when the list closes.
-    back_wanted: Vec<usize>,
+    back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels are tiled into title memory once the list
     /// has run.
     texture_backs: Vec<crate::texback::Back>,
@@ -3258,6 +3258,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// The title memory its texture copy-backs write ([`crate::texback`]).
+    tex_back: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -3273,6 +3275,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    tex_back: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -6572,6 +6575,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.tex_back.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -6800,7 +6804,8 @@ impl Host {
                 written,
                 sent.back
                     .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.tex_back.iter().copied()),
             );
             *flying += order.len();
             *target = *submitted;
@@ -6812,6 +6817,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                tex_back: sent.tex_back,
             }));
             items.extend(
                 sent.writes
@@ -6862,7 +6868,8 @@ impl Host {
                 written,
                 sent.back
                     .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied()),
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.tex_back.iter().copied()),
             );
             *flying += 1;
             *target = *submitted;
@@ -6874,6 +6881,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                tex_back: sent.tex_back,
             }));
             items.extend(
                 sent.writes
@@ -7325,10 +7333,15 @@ impl Host {
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
+            let tex_back = runs
+                .iter()
+                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .collect();
             let sent = Sent {
                 number: this_submission,
                 card,
                 back,
+                tex_back,
                 writes,
             };
             working(was_working);
@@ -8111,8 +8124,10 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.contains(&(resource as usize)) {
-            deferred.back_wanted.push(resource as usize);
+        if !deferred.back_wanted.iter().any(|t| t.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
         }
     }
 
@@ -8121,13 +8136,9 @@ impl HostList {
     fn textures_back(&self) {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for resource in wanted {
-            let resource = resource as crate::object::This;
-            let Some(copy) = crate::resource::host_copy(resource) else {
-                continue;
-            };
-            self.settle(&copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);
             }
         }
