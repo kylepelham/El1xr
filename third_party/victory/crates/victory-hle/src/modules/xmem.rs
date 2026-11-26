@@ -1148,13 +1148,18 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
 /// (the title passes 0 for addresses to clear).
 ///
 /// The physical state is taken once for the call; the remapping lock per
-/// address, for that address alone ([`changing`]). Taken once for the whole
-/// call it was held up to 1.95 s (run mem-W3a), and every texture refresh
-/// waited; taken per page when it covered all title memory, each page
-/// waited for every in-place read under way and the refreshes queued behind
-/// each (run amd-F). Each address is mapped on its own:
-/// addresses that follow one another can lie in different placeholders,
-/// which one view cannot span (run amd-H: error 487, and the title stopped).
+/// run of addresses that follow one another, for that run alone
+/// ([`changing`]). Taken once for the whole call it was held up to 1.95 s
+/// (run mem-W3a), and every texture refresh waited; taken per page when it
+/// covered all title memory, each page waited for every in-place read under
+/// way and the refreshes queued behind each (run amd-F).
+///
+/// Such a run is unmapped at once, and its consecutive slices of one
+/// section mapped as one view ([`map_scattered`]): page by page, each page
+/// inside a view of several took the whole view away and mapped what stays
+/// of it again. Addresses that follow one another can lie in different
+/// placeholders, which one view cannot span (run amd-H: error 487, and the
+/// title stopped): there each page is mapped on its own ([`map_run`]).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -1166,16 +1171,166 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    let want = |i: usize| pages.map(|p| p[i]).filter(|&p| p != 0);
     let _call = Call::begin();
     let mut physical = physical();
-    for (i, &address) in addresses.iter().enumerate() {
-        let page = pages.map(|p| &p[i..=i]).filter(|p| p[0] != 0);
-        if !map_pages(&mut physical, address as usize, 1, page) {
+    let mut i = 0;
+    while i < n {
+        let base = addresses[i] as usize;
+        let run = if scatter_runs() {
+            scatter_run(&physical, addresses, &want, i)
+        } else {
+            1
+        };
+        let done = if run == 1 {
+            let page = want(i);
+            map_pages(
+                &mut physical,
+                base,
+                1,
+                page.as_ref().map(std::slice::from_ref),
+            )
+        } else {
+            let wanted: Vec<Option<usize>> = (i..i + run).map(want).collect();
+            map_scattered(&mut physical, base, &wanted)
+        };
+        if !done {
             return 0;
         }
+        i += run;
     }
     1
 }
+
+/// How many entries of a scatter from `i` on are one run: addresses that
+/// follow one another page by page, each with a known page or none. An
+/// unknown page ends a run (alone, it fails as before, after what precedes
+/// it is done).
+fn scatter_run(
+    physical: &Physical,
+    addresses: &[*mut c_void],
+    want: &impl Fn(usize) -> Option<usize>,
+    i: usize,
+) -> usize {
+    let known = |k: usize| want(k).is_none_or(|p| physical.pages.contains_key(&p));
+    if !known(i) {
+        return 1;
+    }
+    let base = addresses[i] as usize;
+    let mut run = 1;
+    while i + run < addresses.len()
+        && run
+            .checked_mul(PAGE)
+            .and_then(|off| base.checked_add(off))
+            .is_some_and(|at| at == addresses[i + run] as usize)
+        && known(i + run)
+    {
+        run += 1;
+    }
+    run
+}
+
+/// [`map_pages`] for a run of a scatter: `want[k]` (a page, or none to
+/// unmap) at `base + k` pages. Pages there already at either end are left
+/// as they are, as `map_pages` leaves them; the rest of the run is unmapped
+/// once, then mapped one view per run of consecutive slices of one section.
+fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    WORK[7].fetch_add(want.len() as u64, Relaxed);
+    let mode = remap_same();
+    let there = |physical: &Physical, k: usize| {
+        let at = base + k * PAGE;
+        mode != 0
+            && match want[k] {
+                Some(page) => shows(physical, at, &[page]),
+                None => shows_nothing(physical, at, PAGE),
+            }
+    };
+    let mut lo = 0;
+    while lo < want.len() && there(physical, lo) {
+        lo += 1;
+    }
+    let mut hi = want.len();
+    while hi > lo && there(physical, hi - 1) {
+        hi -= 1;
+    }
+    for k in (0..lo).chain(hi..want.len()) {
+        if want[k].is_some() {
+            WORK[8].fetch_add(1, Relaxed);
+            if mode == 1 {
+                victory_gpu::kernel_will_write(base + k * PAGE, PAGE);
+            }
+        } else {
+            WORK[9].fetch_add(1, Relaxed);
+        }
+    }
+    if lo == hi {
+        return true;
+    }
+    SCATTER[0].fetch_add((hi - lo) as u64, Relaxed);
+    SCATTER[1].fetch_add(1, Relaxed);
+    let (start, len) = (base + lo * PAGE, (hi - lo) * PAGE);
+    let _changing = changing(physical, start, len);
+    unmap(physical, start, len);
+    let mut k = lo;
+    while k < hi {
+        let Some(page) = want[k] else {
+            k += 1;
+            continue;
+        };
+        let Some(first) = physical.pages.get(&page).cloned() else {
+            tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+            return false;
+        };
+        let run = 1 + want[k + 1..hi]
+            .iter()
+            .zip(1..)
+            .take_while(|&(page, j)| {
+                page.and_then(|p| physical.pages.get(&p)).is_some_and(|s| {
+                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + j
+                })
+            })
+            .count();
+        if !map_run(physical, base + k * PAGE, run, first) {
+            return false;
+        }
+        k += run;
+    }
+    true
+}
+
+/// Maps `n` slices from `first` on at `base`: one view where the run lies
+/// in one placeholder, else (error 487, nothing changed) one view per page.
+fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool {
+    if n > 1 {
+        match map_view(physical, base, n * PAGE, first.clone(), true) {
+            Ok(()) => return true,
+            Err(None) => return false,
+            Err(Some(_)) => {
+                SCATTER[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    (0..n).all(|k| {
+        let slice = Slice {
+            index: first.index + k,
+            section: first.section.clone(),
+        };
+        map(physical, base + k * PAGE, PAGE, slice)
+    })
+}
+
+/// (Neptune) Whether a scatter maps a run of addresses at once
+/// (`VICTORY_SCATTER_RUNS=0`: page by page, as before).
+fn scatter_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line ([`work_line`]): pages of scatters mapped or unmapped
+/// as runs, those runs, pages of them mapped one by one at placeholder
+/// edges, and views made with no commit (their pages committed already).
+static SCATTER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
@@ -1361,8 +1516,9 @@ fn work_line() {
     }
     *last = Some(now);
     let w = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| WORK[i].swap(0, Relaxed));
+    let s = [0, 1, 2, 3].map(|i| SCATTER[i].swap(0, Relaxed));
     tracing::info!(
-        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already)",
+        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already); scatters: {:.0} pages in {:.0} runs ({:.0} mapped one by one at placeholder edges); {:.0} views made with their pages committed already",
         w[0] as f64 / secs,
         w[1] as f64 / 1e3 / secs,
         w[2] as f64 / secs,
@@ -1374,6 +1530,10 @@ fn work_line() {
         w[9] as f64 / secs,
         w[4] as f64 / secs,
         w[10] as f64 / secs,
+        s[0] as f64 / secs,
+        s[1] as f64 / secs,
+        s[2] as f64 / secs,
+        s[3] as f64 / secs,
     );
 }
 
@@ -1474,8 +1634,34 @@ fn remap_time_line() {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    match map_view(physical, base, len, slice, true) {
+        Ok(()) => true,
+        Err(error) => {
+            if let Some(error) = error {
+                tracing::warn!(
+                    address = format_args!("{base:#x}"),
+                    len,
+                    %error,
+                    "mapping physical pages failed (not a placeholder?)"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// [`map`], saying nothing: the host's error if no view could be made
+/// there (nothing changed then), none if committing failed (said already).
+/// `fresh`: the slices are new at these addresses; else they are what
+/// [`unmap`] took away there a moment ago, which the shown pages still list.
+fn map_view(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    fresh: bool,
+) -> Result<(), Option<std::io::Error>> {
     let made = std::time::Instant::now();
-    let _made = Made(made);
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     // SAFETY: splits the placeholder around the range (failing harmlessly
@@ -1500,25 +1686,29 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         )
     };
     if view.Value as usize != base {
-        tracing::warn!(
-            address = format_args!("{base:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "mapping physical pages failed (not a placeholder?)"
-        );
-        return false;
+        return Err(Some(std::io::Error::last_os_error()));
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let n = len / PAGE;
+    // A section's pages committed through one view are committed in every
+    // view of it (test `a_page_committed_through_one_view_is_committed_in_another`).
+    if slice.section.all_committed(slice.index, n) {
+        SCATTER[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return Err(None);
+        }
+        slice.section.mark_committed(slice.index, n);
     }
-    slice.section.mark_touched(slice.index, len / PAGE);
+    let _made = Made(made);
+    slice.section.mark_touched(slice.index, n);
     #[cfg(feature = "diagnostics")]
     remap_time(3, began);
     #[cfg(feature = "diagnostics")]
     let books = std::time::Instant::now();
-    // New contents, read-write: the GPU side's copies no longer guard it.
+    // New contents, read-write: the GPU side's copies no longer guard it
+    // (what `unmap` maps again too: its protection is the view's, anew).
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(
@@ -1527,15 +1717,17 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         slice.section.handle as usize,
         (slice.index * PAGE) as u64,
     );
-    for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        shown.push(base + k * PAGE);
+    if fresh {
+        for k in 0..n {
+            let shown = physical.shown.entry(slice.key(k)).or_default();
+            shown.push(base + k * PAGE);
+        }
     }
     victory_gpu::titlemem::title_range(base, len, victory_gpu::titlemem::VIEW);
     physical.views.insert(base, (len, slice));
     #[cfg(feature = "diagnostics")]
     remap_time(4, books);
-    true
+    Ok(())
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1619,15 +1811,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        for k in 0..size / PAGE {
-            if let std::collections::hash_map::Entry::Occupied(mut o) =
-                physical.shown.entry(slice.key(k))
-            {
-                o.get_mut().retain(|&shown| shown != at + k * PAGE);
-                if o.get().is_empty() {
-                    o.remove();
-                }
-            }
+        // Only the pages taken away stop being shown; what stays of the
+        // view is mapped again where it was, showing the same.
+        let (lo, hi) = (base.max(at) - at, end.min(at + size) - at);
+        for k in lo / PAGE..hi.div_ceil(PAGE) {
+            unshow(physical, &slice, k, at + k * PAGE);
         }
         victory_gpu::titlemem::title_range_free(at);
         victory_gpu::title_memory_remapped(at, size);
@@ -1648,11 +1836,39 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             std::sync::atomic::Ordering::Relaxed,
         );
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map_again(physical, at, base - at, slice.clone());
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map_again(physical, end, at + size - end, Slice { index, ..slice });
+        }
+    }
+}
+
+/// `slice`'s page `k` is no longer shown at `address`.
+fn unshow(physical: &mut Physical, slice: &Slice, k: usize, address: usize) {
+    if let std::collections::hash_map::Entry::Occupied(mut o) = physical.shown.entry(slice.key(k)) {
+        o.get_mut().retain(|&shown| shown != address);
+        if o.get().is_empty() {
+            o.remove();
+        }
+    }
+}
+
+/// What stays of a view [`unmap`] took away, mapped again where it was. If
+/// that fails, its pages are shown there no more.
+fn map_again(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
+    if let Err(error) = map_view(physical, base, len, slice.clone(), false) {
+        if let Some(error) = error {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                %error,
+                "mapping physical pages failed (not a placeholder?)"
+            );
+        }
+        for k in 0..len / PAGE {
+            unshow(physical, &slice, k, base + k * PAGE);
         }
     }
 }
@@ -2357,6 +2573,202 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A reservation of `n` 64 KiB pages, as titles make them for mapping.
+    fn reserve(n: usize) -> *mut c_void {
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        at
+    }
+
+    /// The views over `[base, base + n pages)`: first page and pages.
+    fn views_in(base: *mut c_void, n: usize) -> Vec<(usize, usize)> {
+        let base = base as usize;
+        physical()
+            .views
+            .range(base..base + n * PAGE)
+            .map(|(at, (len, _))| ((at - base) / PAGE, len / PAGE))
+            .collect()
+    }
+
+    /// The test `map_view` counts on to map a section's pages without a
+    /// commit of their own: what one view of a `SEC_RESERVE` section
+    /// commits, every other view of it shows committed, a view mapped over
+    /// a placeholder as `map_view` maps them included.
+    #[test]
+    fn a_page_committed_through_one_view_is_committed_in_another() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        if on_wine() {
+            return; // sections are committed whole there
+        }
+        // SAFETY: a section of two pages, views of it and a placeholder of
+        // our own, written only where committed; all released at the end.
+        unsafe {
+            let handle = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                (2 * PAGE) as u32,
+                std::ptr::null(),
+            );
+            assert!(!handle.is_null());
+            let view = || MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value;
+            let (a, b) = (view(), view());
+            assert!(!a.is_null() && !b.is_null() && a != b);
+            assert_eq!(query(b).host.State, MEM_RESERVE);
+            assert!(commit(a as usize, PAGE));
+            a.cast::<u8>().write(0x5a);
+            assert_eq!(query(b).host.State, MEM_COMMIT);
+            assert_eq!(query(b.byte_add(PAGE)).host.State, MEM_RESERVE);
+            assert_eq!(b.cast::<u8>().read(), 0x5a);
+            b.cast::<u8>().add(1).write(7);
+            assert_eq!(a.cast::<u8>().add(1).read(), 7);
+            let placeholder = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!placeholder.is_null());
+            let c = MapViewOfFile3(
+                handle,
+                GetCurrentProcess(),
+                placeholder,
+                0,
+                PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+            .Value;
+            assert_eq!(c, placeholder);
+            assert_eq!(query(c).host.State, MEM_COMMIT);
+            assert_eq!(c.cast::<u8>().read(), 0x5a);
+            c.cast::<u8>().add(2).write(9);
+            assert_eq!(b.cast::<u8>().add(2).read(), 9);
+            for at in [a, b, c] {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at });
+            }
+            CloseHandle(handle);
+        }
+    }
+
+    /// Pages committed once (by a title view, or by a write of our own)
+    /// show committed and writable in a view mapped later, with no commit.
+    #[test]
+    fn a_view_of_pages_committed_already_is_readable_and_writable() {
+        let (pages, written) = (allocate(2), allocate(1));
+        let section = physical().pages[&pages[0]].section.clone();
+        let (a, b) = (reserve(2), reserve(3));
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert!(section.all_committed(0, 2));
+        // SAFETY: mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(3);
+            a.byte_add(PAGE).cast::<u8>().write(4);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        assert!(write_physical(&written, 0, &[1, 2, 3]));
+        let third = b.wrapping_byte_add(2 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(third, 1, written.as_ptr()), third);
+        for k in 0..3 {
+            assert_eq!(query(b.wrapping_byte_add(k * PAGE)).host.State, MEM_COMMIT);
+        }
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 3);
+            assert_eq!(b.byte_add(PAGE).cast::<u8>().read(), 4);
+            assert_eq!(third.cast::<u8>().add(2).read(), 3);
+            b.cast::<u8>().add(5).write(9);
+            third.cast::<u8>().add(7).write(8);
+        }
+        assert_eq!(page_bytes(pages[0])[5], 9);
+        assert_eq!(page_bytes(written[0])[7], 8);
+        assert_eq!(XMemMapPhysicalPages(b, 3, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, written.as_ptr()), 1);
+    }
+
+    /// A scatter of consecutive slices at consecutive addresses is one
+    /// view; unmapping the middle of it in one call keeps both ends, bytes
+    /// and shown pages; a run across placeholders is mapped page by page.
+    #[test]
+    fn a_scatter_maps_a_run_as_one_view() {
+        let pages = allocate(8);
+        let a = reserve(8);
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let addresses: Vec<*mut c_void> = (0..8).map(at).collect();
+        let scatter = |from: usize, wanted: &[usize]| {
+            XMemMapPhysicalPagesScatter(addresses[from..].as_ptr(), wanted.len(), wanted.as_ptr())
+        };
+        assert_eq!(scatter(0, &pages), 1);
+        assert_eq!(views_in(a, 8), [(0, 8)]);
+        for k in 0..8 {
+            // SAFETY: mapped read-write.
+            unsafe { at(k).cast::<u8>().write(10 + k as u8) };
+        }
+        // SAFETY: read only where mapped.
+        let read = |k: usize| unsafe { at(k).cast::<u8>().read() };
+        let shown = |page: usize| {
+            let physical = physical();
+            let key = physical.pages[&page].key(0);
+            physical.shown.get(&key).cloned().unwrap_or_default()
+        };
+
+        assert_eq!(scatter(2, &[0; 4]), 1);
+        assert_eq!(views_in(a, 8), [(0, 2), (6, 2)]);
+        for k in 2..6 {
+            assert_eq!(query(at(k)).host.State, MEM_RESERVE);
+            assert!(shown(pages[k]).is_empty());
+        }
+        assert_eq!([read(0), read(1), read(6), read(7)], [10, 11, 16, 17]);
+        for k in [0, 1, 6, 7] {
+            assert_eq!(shown(pages[k]), [at(k) as usize], "page {k}");
+        }
+
+        // Back into the hole, one placeholder: one view.
+        assert_eq!(scatter(2, &pages[2..6]), 1);
+        assert_eq!(views_in(a, 8), [(0, 2), (2, 4), (6, 2)]);
+        assert_eq!((2..6).map(read).collect::<Vec<_>>(), [12, 13, 14, 15]);
+
+        // All of it again over three placeholders: a page each.
+        assert_eq!(scatter(0, &[0; 8]), 1);
+        assert!(views_in(a, 8).is_empty());
+        assert_eq!(scatter(0, &pages), 1);
+        assert_eq!(views_in(a, 8), (0..8).map(|k| (k, 1)).collect::<Vec<_>>());
+        assert_eq!(
+            (0..8).map(read).collect::<Vec<_>>(),
+            (10..18).collect::<Vec<_>>()
+        );
+
+        // Pages there already at the start are left; the rest swapped.
+        assert_eq!(scatter(0, &[pages[0], pages[1], pages[3], pages[2]]), 1);
+        assert_eq!((0..4).map(read).collect::<Vec<_>>(), [10, 11, 13, 12]);
+        assert_eq!(shown(pages[3]), [at(2) as usize]);
+        assert_eq!(shown(pages[2]), [at(3) as usize]);
+
+        // An unknown page fails the call after what comes before it.
+        assert_eq!(scatter(0, &[0, 0, 0x10, 0]), 0);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(read(3), 12, "after the unknown page: as it was");
+
+        assert_eq!(scatter(0, &[0; 8]), 1);
+        assert!(views_in(a, 8).is_empty());
+        assert!(pages.iter().all(|&p| shown(p).is_empty()));
+        assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
     }
 
     #[test]
