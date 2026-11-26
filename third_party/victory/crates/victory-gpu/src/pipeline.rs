@@ -719,7 +719,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_skip_hashes(value: &str) -> std::collections::HashSet<String> {
     value
         .split(',')
         .map(str::trim)
@@ -740,7 +740,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
@@ -1064,8 +1064,13 @@ mod tests {
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
-            ["0123456789abcdef", "0011223344556677"]
+            super::parse_skip_hashes(
+                " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677, 0123456789abcdef,"
+            ),
+            std::collections::HashSet::from([
+                "0123456789abcdef".to_owned(),
+                "0011223344556677".to_owned(),
+            ])
         );
     }
 
