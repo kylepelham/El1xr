@@ -740,12 +740,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -1907,6 +1911,23 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+    }
+
     /// Two placed views alike but for the words their kind does not use
     /// (the padding after the component mapping, the union's unused tail)
     /// are one record; a used word still tells them apart.
@@ -2308,20 +2329,4 @@ mod tests {
         assert!(!overlaps_shader_heap(0, 0));
     }
 
-    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
-    /// later read does not see the previous view.
-    #[test]
-    fn null_cbv_clears_a_stale_view() {
-        let null = std::ptr::null();
-        let slots = [0u64; 2 * 4];
-        let a = slots.as_ptr() as u64;
-        create_cbv(null, &[0x1000, 1, 256, 0], a);
-        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
-        create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
-        create_srv(null, null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0, None)));
-        create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
-    }
 }

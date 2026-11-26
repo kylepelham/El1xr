@@ -2180,3 +2180,223 @@ fn permlane16_and_x16_honor_inactive_source_lanes_fi_and_bound_ctrl() {
         "ran on the hardware device: v_permlane16 and v_permlanex16 honored EXEC, fi, and bound_ctrl in wave32 and paired wave64"
     );
 }
+
+#[test]
+fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+    for writes in [false, true] {
+        let fence = 8 | if writes { 2 } else { 0 };
+        for (host, console, threads, divergent, waits) in [
+            (32, 64, Some(64), true, false),
+            (32, 64, Some(64), false, true),
+            (32, 64, Some(128), true, true),
+            (32, 64, None, true, true),
+            (64, 64, Some(64), true, true),
+            (32, 32, Some(32), true, true),
+            (0, 64, Some(64), true, true),
+        ] {
+            assert_eq!(
+                lower::barrier_mode(3, host, console, threads, divergent, writes),
+                fence | u32::from(waits),
+            );
+        }
+        assert_eq!(
+            lower::barrier_mode(0, 32, 64, Some(64), false, writes),
+            fence
+        );
+        assert_eq!(
+            lower::barrier_mode(1, 64, 64, Some(64), true, writes),
+            fence
+        );
+        assert_eq!(
+            lower::barrier_mode(1, 32, 64, Some(64), false, writes),
+            fence | 1
+        );
+        assert_eq!(
+            lower::barrier_mode(2, 32, 64, Some(64), true, writes),
+            fence | 1
+        );
+    }
+}
+
+#[test]
+fn automatic_barrier_flags_reach_the_emitted_shader() {
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    let divergent = [
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz past the barrier
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut divergent32 = divergent;
+    divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+    divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+    for (body, wave64, threads, host, expected) in [
+        (&divergent[..], true, 64, 32, 8),
+        (&divergent[..], true, 128, 32, 9),
+        (&divergent[..], true, 64, 64, 9),
+        (&divergent32[..], false, 64, 32, 9),
+        (&[0xBF8A_0000][..], true, 64, 32, 9),
+    ] {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [threads, 1, 1],
+            }),
+            code: body
+                .iter()
+                .copied()
+                .chain([S_ENDPGM])
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        };
+        let p = ir::build(&native.code, wave64, native.vgprs).expect("IR");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+        let io = io::raise(&p, &native).expect("IO");
+        let old_wave = lower::TEST_HOST_WAVE.replace(Some(host));
+        let old_mode = super::TEST_GROUP_SYNC.replace(Some(3));
+        let shader = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(old_wave);
+        super::TEST_GROUP_SYNC.set(old_mode);
+        let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+        assert_eq!(shader.barrier_modes, vec![expected]);
+    }
+}
+
+/// A barrier entered by only part of a console wave must complete on a
+/// wave32 GPU without disabling uniform barriers or translation-added sync.
+#[test]
+fn an_automatic_barrier_inside_a_lane_branch_runs_on_narrow_hardware() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz over the barrier
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0293, // v_mov_b32 v0, 19
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, true, native.vgprs).expect("ir::build");
+    let old_mode = super::TEST_GROUP_SYNC.replace(Some(3));
+    let shader = lowered(&native, &p, &HashSet::new());
+    super::TEST_GROUP_SYNC.set(old_mode);
+    let shader = shader.expect("lower divergent barrier");
+    if let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        let mut dxil = shader.dxil.clone();
+        validator.validate(&mut dxil).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let mut waves =
+        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a plain feature query on the live device.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+            .expect("host wave capabilities");
+    }
+    if waves.WaveLaneCountMax >= 64 || waves.WaveLaneCountMax == 0 {
+        eprintln!("no narrow-wave hardware device; not run");
+        return;
+    }
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("pipeline on narrow-wave hardware");
+    for below in [1, 10, 32, 33, 64] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("divergent barrier dispatch completes");
+        assert_eq!(out[0][0], 19, "{below} lanes enter the barrier");
+    }
+    eprintln!(
+        "ran automatic divergent barriers on hardware (max wave {}): 1, 10, 32, 33 and 64 active lanes",
+        waves.WaveLaneCountMax
+    );
+}
+
+#[test]
+fn a_first_lane_read_of_a_uniform_scan_carries_across_the_halves() {
+    // A per-console-wave scan: the low half and the high half share the
+    // scalar running sum and read the same LDS dword, so the first-lane
+    // value is the same in both and needs no group barrier (which a group
+    // of four console waves could not reach together anyway).
+    let words = [
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0010, // s_cbranch_execz label_0015 (word 21)
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBF82_0000, // s_branch label_0009 (word 9)
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E10_0210, // v_mov_b32 v8, s16
+        0xD8D8_0000,
+        0x0800_0008, // ds_read_b32 v8, v8
+        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF6, // s_cbranch_scc1 label_0009
+        0xE070_0000,
+        0x8002_0800, // buffer_store_dword v8, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = native_with(&words, true, 256, 256);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let old_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = lowered(&native, &p, &HashSet::new());
+    lower::TEST_HOST_WAVE.set(old_wave);
+    let shader = shader.expect("uniform first-lane scan should lower on wave32");
+    if let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+    }
+}
