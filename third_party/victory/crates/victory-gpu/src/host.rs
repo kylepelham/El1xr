@@ -3681,7 +3681,7 @@ pub(crate) fn settle_for_fence() {
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
-fn land() {
+pub(crate) fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
@@ -6802,7 +6802,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        crate::land_aside::after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
