@@ -49,3 +49,22 @@ fn only_readbacks_for_changed_allocations_are_invalidated() {
     assert!(!far.valid.load(Ordering::Acquire));
     assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
 }
+
+/// A texture written twice in a list is wanted once; if its allocation
+/// changed between the writes, the stale target is taken again in place.
+#[test]
+fn a_stale_wanted_texture_is_taken_again_in_place() {
+    // (owner, fresh, generation)
+    let mut wanted: Vec<(usize, bool, u32)> = Vec::new();
+    let mut want = |owner: usize, generation: u32, wanted: &mut Vec<(usize, bool, u32)>| {
+        want_in(wanted, |t| t.0 == owner, |t| t.1, || Some((owner, true, generation)));
+    };
+    want(7, 1, &mut wanted);
+    want(7, 2, &mut wanted);
+    assert_eq!(wanted, vec![(7, true, 1)], "a fresh target is kept");
+    wanted[0].1 = false;
+    want(7, 3, &mut wanted);
+    assert_eq!(wanted, vec![(7, true, 3)], "a stale target is replaced in place");
+    want(8, 4, &mut wanted);
+    assert_eq!(wanted, vec![(7, true, 3), (8, true, 4)]);
+}

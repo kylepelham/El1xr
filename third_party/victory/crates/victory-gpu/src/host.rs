@@ -8123,12 +8123,8 @@ impl HostList {
         if !crate::texback::wanted(resource) {
             return;
         }
-        let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|t| t.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
-        }
+        let wanted = &mut self.deferred().back_wanted;
+        crate::texback::want(wanted, resource as usize, || crate::texback::Target::new(resource));
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied

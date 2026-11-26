@@ -172,6 +172,38 @@ impl Target {
     }
 }
 
+/// A list's shaders write title texture `owner`: its [`Target`] joins
+/// `wanted` once. One already there whose allocation changed since (the
+/// memory reused or remapped between two writes of the list) is taken
+/// again in its place; kept, the copy-back would be dropped at the close.
+pub(crate) fn want(wanted: &mut Vec<Target>, owner: usize, make: impl FnOnce() -> Option<Target>) {
+    want_in(
+        wanted,
+        |t| t.owner() == owner,
+        |t| t.ticket.valid.load(Ordering::Acquire),
+        make,
+    );
+}
+
+fn want_in<T>(
+    wanted: &mut Vec<T>,
+    same: impl Fn(&T) -> bool,
+    fresh: impl Fn(&T) -> bool,
+    make: impl FnOnce() -> Option<T>,
+) {
+    let at = wanted.iter().position(same);
+    if at.is_some_and(|i| fresh(&wanted[i])) {
+        return;
+    }
+    let Some(target) = make() else {
+        return;
+    };
+    match at {
+        Some(i) => wanted[i] = target,
+        None => wanted.push(target),
+    }
+}
+
 /// Pooled D3D12 read-back buffer reused across texture copy-backs so repeated
 /// ocean/heightmap readbacks do not call `CreateCommittedResource` every frame.
 struct ReadbackBuffer {
