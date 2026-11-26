@@ -15,8 +15,9 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
-    /// The direct queue every draw and dispatch runs on: making one costs
-    /// more than most of the work it runs.
+    /// The direct queue every test draw and dispatch runs on: making one
+    /// costs more than most of the work it runs.
+    #[cfg(test)]
     queue: std::sync::OnceLock<ID3D12CommandQueue>,
 }
 
@@ -124,11 +125,15 @@ impl Host {
             }
             Ok(Host {
                 device,
+                #[cfg(test)]
                 queue: std::sync::OnceLock::new(),
             })
         }
     }
+}
 
+#[cfg(test)]
+impl Host {
     /// [`Host::queue`], made on first use.
     fn queue(&self) -> Result<ID3D12CommandQueue, String> {
         if let Some(queue) = self.queue.get() {
@@ -144,7 +149,9 @@ impl Host {
         .map_err(err)?;
         Ok(self.queue.get_or_init(|| queue).clone())
     }
+}
 
+impl Host {
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
