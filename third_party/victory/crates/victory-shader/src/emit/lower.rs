@@ -52,6 +52,100 @@ pub(crate) use halves::nan_scrub;
 use halves::{all_lane_blocks, lane_constant_masks, lane_scalars, lds_meetings, whole_masks};
 pub(super) use halves::{branches_around, lane_uniform};
 
+/// Out-of-range mip zeroing and console dimension shapes for `image_get_resinfo`:
+/// - when `mip_to_check` >= level count, all three sizes (including layer count) become 0 while
+///   the level count survives;
+/// - with `console_shape`, depth is 0 for non-array 1D/2D, 1D arrays report layers in both y
+///   and z, and cube maps report 6 faces.
+pub(super) fn resinfo_sizes(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    kind: u32,
+    dimensions: [V; 4],
+    mip_to_check: Option<V>,
+    console_shape: bool,
+) -> [V; 4] {
+    let [width, height, depth, levels] = dimensions;
+    let zero = m.i32(0);
+    let one = m.i32(1);
+    let mut sizes = match kind {
+        1 => [width, one, if console_shape { zero } else { one }],
+        2 => [width, height, if console_shape { zero } else { one }],
+        3 => [width, height, zero],
+        5 => [width, height, if console_shape { m.i32(6) } else { one }],
+        6 => [width, height, if console_shape { height } else { one }],
+        _ => [width, height, depth],
+    };
+    if let Some(mip) = mip_to_check {
+        let exists = m.cmp(block, pred::IULT, mip, levels);
+        for size in &mut sizes {
+            *size = m.select(block, exists, *size, zero);
+        }
+    }
+    let levels = if matches!(kind, 3 | 8) { one } else { levels };
+    [sizes[0], sizes[1], sizes[2], levels]
+}
+
+/// D16 resource queries pack selected integer sizes into consecutive 16-bit
+/// halves (low half first). An odd trailing component leaves its upper half 0.
+pub(super) fn packed_resinfo(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    components: &[V],
+) -> Vec<V> {
+    let mask = m.i32(0xffff);
+    let shift = m.i32(16);
+    components
+        .chunks(2)
+        .map(|pair| {
+            let low = m.bin(block, Bin::And, pair[0], mask);
+            if let Some(&upper) = pair.get(1) {
+                let high = m.bin(block, Bin::Shl, upper, shift);
+                m.bin(block, Bin::Or, low, high)
+            } else {
+                low
+            }
+        })
+        .collect()
+}
+
+/// Each packed mesh primitive index uses 9 bits in a 10-bit field; bit 9 is
+/// reserved and counting it can cull a valid primitive.
+fn primitive_index_mask(nine_bits: bool) -> u32 {
+    if nine_bits { 0x1ff } else { 0x3ff }
+}
+
+/// Marks the raw page-window UAV globally coherent when a compute shader uses
+/// cache coherence flags (`glc`/`slc`/`dlc`), memory atomics or cache
+/// invalidations (`VICTORY_COMPUTE_WINDOW_COHERENCE=1`).
+fn window_properties<'a>(
+    compute: bool,
+    instructions: impl Iterator<Item = (&'a str, &'a Fields)>,
+) -> u32 {
+    const RAW_UAV: u32 = 0x100b;
+    const GLOBALLY_COHERENT: u32 = 1 << 14;
+    if compute {
+        for (name, fields) in instructions {
+            let invalidates = matches!(
+                name,
+                "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv"
+            );
+            let needs_visibility = match fields {
+                Fields::Buffer { cache, .. }
+                | Fields::Flat { cache, .. }
+                | Fields::Smem { cache, .. } => {
+                    cache.glc || cache.slc || cache.dlc || name.contains("_atomic_")
+                }
+                _ => false,
+            };
+            if invalidates || needs_visibility {
+                return RAW_UAV | GLOBALLY_COHERENT;
+            }
+        }
+    }
+    RAW_UAV
+}
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -208,6 +302,7 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    window_properties: u32,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
@@ -867,6 +962,13 @@ impl<'a> Lower<'a> {
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        static COHERENCE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_COMPUTE_WINDOW_COHERENCE").is_some_and(|v| v == "1")
+        });
+        let window_properties = window_properties(
+            matches!(x.native.io, StageIo::Cs(_)) && *COHERENCE,
+            insts().map(|i| (i.name(), &i.fields)),
+        );
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1137,6 +1239,7 @@ impl<'a> Lower<'a> {
             });
         Lower {
             s,
+            window_properties,
             x,
             bad,
             lane_fail: HashMap::new(),
@@ -2844,7 +2947,9 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let h = self
+            .s
+            .heap_handle(c, slot, false, true, (self.window_properties, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -9282,7 +9387,13 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        static MSAA_INFO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_RESINFO_MSAA").is_none_or(|v| v != "0")
+        });
+        let ms_info = *dim >= 6 && name == "image_get_resinfo" && *MSAA_INFO;
         let (kind, coords) = match dim {
+            6 if ms_info => (3, 2),
+            7 if ms_info => (8, 3),
             0 => (1, 1),
             1 => (2, 2),
             2 => (4, 3),
@@ -9518,36 +9629,65 @@ impl<'a> Lower<'a> {
             _ => return Err(name),
         };
         if op == 72 {
-            // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            static BOUNDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_MIP_BOUNDS").is_none_or(|v| v != "0")
+            });
+            static SHAPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_SHAPE").is_none_or(|v| v != "0")
+            });
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            if ms_info && uav {
+                return Err("a multisampled UAV");
+            }
+            let requested = if !ms_info && (!uav || *BOUNDS) {
+                Some(addr_val(self, 0)?)
+            } else {
+                None
+            };
+            let mip = if uav || ms_info {
                 self.s.m.undef(self.s.t.i32)
             } else {
-                addr_val(self, 0)?
+                requested.unwrap()
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-            let one = self.s.m.i32(1);
-            let present = match kind {
-                1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
-                _ => [true, true, true, true],
-            };
+            let dimensions = std::array::from_fn(|i| {
+                if uav && i == 3 {
+                    self.s.m.i32(1)
+                } else {
+                    self.s.m.extract(c, d, i as u32)
+                }
+            });
+            let sizes = resinfo_sizes(
+                &mut self.s.m,
+                c,
+                kind,
+                dimensions,
+                requested.filter(|_| *BOUNDS),
+                *SHAPE,
+            );
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
-            for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
-                    one
-                } else {
-                    self.s.m.extract(c, d, ch)
-                };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            static PACK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_D16").is_none_or(|v| v != "0")
+            });
+            let channels = sizes
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ch, size)| (dmask >> ch & 1 != 0).then_some(size));
+            if *d16 && *PACK {
+                let packed = packed_resinfo(&mut self.s.m, c, &channels.collect::<Vec<_>>());
+                for (k, x) in packed.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            } else {
+                for (k, x) in channels.enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
             }
             return Ok(());
         }
@@ -10896,8 +11036,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        static NINE_BITS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_MESH_PRIM_9BIT").is_none_or(|v| v != "0")
+        });
+        let mask = self.s.m.i32(primitive_index_mask(*NINE_BITS));
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let shift = self.s.m.i32(10 * k as u32);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -11927,5 +12071,59 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn primitive_index_padding_is_independent_for_all_three_vertices() {
+        let packed = 0x201 | (0x302 << 10) | (0x3ff << 20);
+        let decode = |nine| {
+            [0, 10, 20].map(|shift: u32| (packed >> shift) & super::primitive_index_mask(nine))
+        };
+        assert_eq!(decode(true), [1, 258, 511]);
+        assert_eq!(decode(false), [513, 770, 1023]);
+    }
+
+    #[test]
+    fn only_compute_windows_with_cross_group_visibility_are_coherent() {
+        use super::window_properties;
+        use crate::gfx10::{Fields, Operand};
+        let read = |glc| Fields::Smem {
+            data: None,
+            base: Operand::Const(0),
+            offset: 0,
+            soffset: Operand::Const(0),
+            cache: crate::gfx10::Cache {
+                glc,
+                ..Default::default()
+            },
+        };
+        for (name, fields, expected) in [
+            ("s_load_dword", read(false), 0x100b),
+            ("s_load_dword", read(true), 0x500b),
+            ("s_atomic_add", read(false), 0x500b),
+            ("buffer_gl1_inv", Fields::Sopp { imm: 0 }, 0x500b),
+            ("s_barrier", Fields::Sopp { imm: 0 }, 0x100b),
+        ] {
+            assert_eq!(
+                window_properties(true, [(name, &fields)].into_iter()),
+                expected
+            );
+            assert_eq!(
+                window_properties(false, [(name, &fields)].into_iter()),
+                0x100b
+            );
+        }
+    }
+
+    #[test]
+    fn resinfo_shapes_and_d16_packing_produce_expected_ir() {
+        let mut s = super::Shader::new(false);
+        let entry = s.entry;
+        let dims = [s.m.i32(64), s.m.i32(32), s.m.i32(4), s.m.i32(5)];
+        let mip = s.m.i32(6);
+        let out = super::resinfo_sizes(&mut s.m, entry, 5, dims, Some(mip), true);
+        assert_eq!(out[3], dims[3], "level count survives mip bounds");
+        let packed = super::packed_resinfo(&mut s.m, entry, &out[..3]);
+        assert_eq!(packed.len(), 2, "three components pack into two dwords");
     }
 }

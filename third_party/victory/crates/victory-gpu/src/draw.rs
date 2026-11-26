@@ -841,6 +841,52 @@ impl State {
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
+    fn bind_heaps(&mut self, list: &HostList) {
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them.
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            if !heaps.is_empty() {
+                list.note_heap_bind();
+            }
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+    }
+
+    /// A clear consumes a descriptor at execution. Keep its translated copy
+    /// in the bound heap until this recording retires.
+    pub(crate) fn clear_slot(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        view: &View,
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let address = self.heaps[0];
+        if address == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(address as This);
+        let index = heap.index(gpu)?;
+        if heap.handle(index)? != gpu || crate::descriptor::view(gpu).as_ref() != Some(view) {
+            return None;
+        }
+        let host = heap.host()?;
+        let slot = host.dynamic(1)?;
+        self.dynamic.push((address, host.id(), slot, 1));
+        self.bind_heaps(list);
+        Some((host.cpu(slot), host.gpu_handle(slot)))
+    }
+
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
         set(self.roots(compute), slot, Root::View(address));
     }
@@ -1369,25 +1415,7 @@ impl State {
         if list.take_plane_clobbered() {
             self.replay(list);
         }
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            if !heaps.is_empty() {
-                list.note_heap_bind();
-            }
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {

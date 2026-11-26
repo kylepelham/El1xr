@@ -2942,7 +2942,7 @@ impl HostHeap {
         true
     }
 
-    fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub(crate) fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
@@ -4429,7 +4429,10 @@ fn constant_raw_view(
 /// views, or `None` if it cannot. A buffer view made now also reports the
 /// host copy it reads ([`BufferCopy`]), so that the pass that mirrors it
 /// ([`HostHeap::mirror_heap_buffer`]) need not look the copy up again.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<BufferCopy>)> {
+pub(crate) fn make(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<(Kept, Option<BufferCopy>)> {
     let host = host()?;
     let device = &host.device;
     match view {
