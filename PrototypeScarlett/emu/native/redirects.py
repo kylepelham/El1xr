@@ -1,4 +1,4 @@
-"""Fonctions système du jeu redirigées vers le runtime C++ d'AnyXboxX.
+"""Fonctions système du jeu redirigées vers le runtime C++ d'El1xr.
 
 xgameruntime.lib, lié dans le jeu et ses DLL, décide du type de console en lisant
 le registre (HKLM\\...\\CurrentVersion\\OEM, valeur ConsoleMode). Ces lectures sont
@@ -32,10 +32,10 @@ def _is_registry_dll(dll):
 
 
 def redirect(runtime, dll, function, loader=None):
-    """Adresse de remplacement de `dll!function` (runtime C++ ou chargeur d'AnyXboxX), ou 0.
+    """Adresse de remplacement de `dll!function` (runtime C++ ou chargeur d'El1xr), ou 0.
 
     `loader` : fonctions du chargeur (shims) données aux DLL du jeu, pour que leurs
-    GetProcAddress dynamiques passent aussi par AnyXboxX (ex. SDL3 et DXGI).
+    GetProcAddress dynamiques passent aussi par El1xr (ex. SDL3 et DXGI).
     """
     if loader is not None and function == "GetProcAddress" and family(dll) == "kernel":
         return loader["GetProcAddress"]

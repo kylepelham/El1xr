@@ -4,7 +4,7 @@ Le programme de test refait ce que fait le chargeur de xgameruntime.lib lié dan
 GetModuleFileNameW(NULL), nom de fichier remplacé par « xgameruntime.dll », chargement par
 chemin complet (mode local, 0xA00) puis par nom (0x800), six GetProcAddress, appel des
 initialiseurs avec les bits d'options 2, 4 et 8. Le titre est dans un autre dossier que le
-runtime : AnyXboxX doit quand même lui servir son propre xgameruntime.dll.
+runtime : El1xr doit quand même lui servir son propre xgameruntime.dll.
 """
 import os
 import subprocess

@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-  Builds (cargo skips the work when current) and launches VIctory (third_party/victory, Neptune base) on the user's own
-  game folder.
+  El1xr launcher (Bone/Nevaa): builds (cargo skips the work when current) and launches VIctory (third_party/victory,
+  Neptune base) on the user's own game folder.
 
 .PARAMETER GameDir
   Folder of the game package (kept outside this repository). It must contain game_scarlett_master.exe.
@@ -59,6 +59,10 @@
   about half the frame rate: measured about 7 to 9 fps against 14 to 17 for the default set, with 51 to 93 texture
   refusals against 296 (run auto-ram-2326). Picture first, frame rate second.
 
+.PARAMETER Mute
+  Optional. Starts the title with its Windows audio session muted (VICTORY_MUTE=1) without touching XAudio2 or game
+  timing. Set before -Override so -Override @{ VICTORY_MUTE = '0' } still wins.
+
 .NOTES
   The switch set is Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path (no PC FidelityFX DLL, no
   VICTORY_AUTO_A unless -AutoA), with the measured changes of 2026-11-25 on top (heap pass on dirty slots, copy
@@ -90,6 +94,7 @@ param(
     [ValidateSet('real', 'compare')][string]$XgMode = 'real',
     [switch]$BatchCardRehash,
     [switch]$Quality,
+    [switch]$Mute,
     [hashtable]$Override = @{}
 )
 
@@ -100,7 +105,7 @@ $victory = Join-Path $repo 'third_party\victory'
 $manifest = Join-Path $victory 'Cargo.toml'
 
 if (-not (Test-Path -LiteralPath $manifest)) {
-    throw "third_party/victory/Cargo.toml is missing: this copy of AnyXboxX is incomplete."
+    throw "third_party/victory/Cargo.toml is missing: this copy of El1xr is incomplete."
 }
 
 $gameExe = Join-Path $GameDir 'game_scarlett_master.exe'
@@ -122,6 +127,7 @@ if ($useDiag) {
 
 # Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a pull that changes
 # third_party/victory (an old victory.exe would ignore the settings the new tree reads).
+Write-Host 'El1xr by Bone/Nevaa, running on VIctory (Marvisak and contributors).'
 Write-Host "Building VIctory ($(if ($useDiag) { 'diag profile, diagnostics feature' } else { 'release' }))..."
 # Windows PowerShell 5.1 wraps redirected native stderr (`2>`) in NativeCommandError, which
 # $ErrorActionPreference = 'Stop' turns into a terminating error on benign warnings; rely on $LASTEXITCODE.
@@ -192,6 +198,7 @@ if (-not $NoTunedSettings) {
         VICTORY_HEAP_PASS_DIRTY          = '1'         # the heap pass looks only at slots marked since its last pass
         VICTORY_COPY_COALESCE            = '1024'      # changed runs up to 1024 bytes apart go up as one range
         VICTORY_REAPER                   = '1'         # drop released host D3D12 objects on a background reaper thread
+        VICTORY_ASYNC_SUBMIT             = '1'         # submissions prepared on a thread of ours; the title's call returns at once
         VICTORY_GUARD_HOT                = '0'         # keep page guards active on hot view memory blocks
         VICTORY_AMBIENT                  = '0.8'       # ambient diffuse light level (RTX visual fix)
         VICTORY_AMBIENT_AIR              = '1.5'       # ambient air/sky multiplier (RTX visual fix)
@@ -221,6 +228,9 @@ if ($Quality) {
     $env:VICTORY_LIST_POOL_MOST = '256'
     $env:VICTORY_LIST_POOL_MB = '256'
     $env:VICTORY_TEXTURE_STAGE_MB = '192'
+}
+if ($Mute) {
+    $env:VICTORY_MUTE = '1'
 }
 foreach ($name in $Override.Keys) {
     if ($name -notlike 'VICTORY_*') { throw "-Override takes VICTORY_* names only: '$name'." }

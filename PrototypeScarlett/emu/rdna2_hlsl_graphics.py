@@ -15,7 +15,7 @@ HELPERS = "\n".join((ALU_HELPERS, rdna2_hlsl_wide.HELPERS, rdna2_hlsl_div.HELPER
 ACTIVE = "((s[126] >> lane) & 1u) != 0"
 FINISH = "pc = END_PC; break;"
 
-COMMON = """// Généré par AnyXboxX (emu/rdna2_hlsl_graphics.py) : {stage} RDNA 2 recompilé en HLSL.
+COMMON = """// Généré par El1xr (emu/rdna2_hlsl_graphics.py) : {stage} RDNA 2 recompilé en HLSL.
 #define END_PC 0xFFFFFFFFu
 RWByteAddressBuffer g_memory : register(u0);
 

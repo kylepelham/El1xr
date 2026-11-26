@@ -26,7 +26,7 @@ def test_report_names_who_provides_each_import(tmp_path, runtime_dir):
     text = jour_j.report(package, tmp_path / "sortie")
     assert "# Premier lancement : game.exe" in text and "SHA-256" in text
     assert "| `inconnu.dll` | 1 |" in text and "`inconnu.dll` manquantes : `Rien`" in text
-    assert "| `xmem.dll` | 1 | 0 | 1 |" in text                 # servi par AnyXboxX
+    assert "| `xmem.dll` | 1 | 0 | 1 |" in text                 # servi par El1xr
     assert "| `kernel32.dll` | 1 | 0 | 0 | 0 | 1 | 0 |" in text  # servi par Windows
     assert "## Analyse isolée (--rapport)" in text and "## Lancement isolé dans Unicorn (--lancer)" in text
 

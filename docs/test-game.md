@@ -2,7 +2,7 @@
 
 # Test game: SimpleTriangle
 
-A legal test game that already runs at 100 % on PC, to compare native behavior with AnyXboxX's. Measurements from 21 November 2026.
+A legal test game that already runs at 100 % on PC, to compare native behavior with El1xr's. Measurements from 21 November 2026.
 
 ## Why this one
 
@@ -15,22 +15,22 @@ A legal test game that already runs at 100 % on PC, to compare native behavior w
 
 ![SimpleTriangleDesktop running natively on PC](images/simpletriangle-natif.png)
 
-## In AnyXboxX, native mode: the triangle is displayed
+## In El1xr, native mode: the triangle is displayed
 
-![SimpleTriangleDesktop loaded and launched by AnyXboxX in native mode](images/simpletriangle-anyxboxx.png)
+![SimpleTriangleDesktop loaded and launched by El1xr in native mode](images/simpletriangle-anyxboxx.png)
 
 ```powershell
 python PrototypeScarlett\scarlett.py --natif <...>\x64\Release\SimpleTriangleDesktop.exe
 ```
 
-AnyXboxX maps the executable into memory itself, applies the relocations, declares its exception table (`.pdata`), binds its imports, then runs it directly on the processor. This is the approach of Wine and WinDurango.
+El1xr maps the executable into memory itself, applies the relocations, declares its exception table (`.pdata`), binds its imports, then runs it directly on the processor. This is the approach of Wine and WinDurango.
 
-- **Served by AnyXboxX**: `xgameruntime.dll`. The game loads it with `LoadLibraryExW`, and AnyXboxX intercepts this load to provide its own GDK runtime (`InitializeApiImplEx2`, `QueryApiImpl`…). It also intercepts `GetModuleHandle`, `GetModuleFileName` and `GetProcAddress`, so that the game sees itself and not `python.exe`.
+- **Served by El1xr**: `xgameruntime.dll`. The game loads it with `LoadLibraryExW`, and El1xr intercepts this load to provide its own GDK runtime (`InitializeApiImplEx2`, `QueryApiImpl`…). It also intercepts `GetModuleHandle`, `GetModuleFileName` and `GetProcAddress`, so that the game sees itself and not `python.exe`.
 - **Served by Windows**: the window (`USER32`), DirectX 12 (`d3d12`, `dxgi`) and the Visual C++ CRT. For this PC version of the game, these calls are already the PC's. For a Series X binary, `d3d12_xs.dll` (D3D12.X) and `kernelx.dll` will also need to be translated.
 - **Security**: in native mode, the program is not isolated and has the user's rights. This mode is reserved for trusted programs. `--rapport` and `--banc` stay inside Unicorn, isolated.
 - **Diagnosis**: `ANYXBOXX_TRACE=1` prints every DLL load, `GetProcAddress` and intercepted `QueryApiImpl`.
 
-## In AnyXboxX, isolated mode (Unicorn)
+## In El1xr, isolated mode (Unicorn)
 
 | Game step | State |
 |---|---|
@@ -47,8 +47,8 @@ Imported functions: 202, of which **157 resolved (77.7 %)**: 75 emulated in Pyth
 
 ## What the test taught
 
-1. **On PC, the GDK goes through an internal interface.** The game does not link `XGameRuntimeInitialize` directly: `xgameruntime.lib` loads `xgameruntime.dll`, then asks for `QueryApiImpl`, `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`, `XErrorReport` and `UninitializeApiImpl` through `GetProcAddress`. Each `X*` API then gets an interface through `QueryApiImpl`. AnyXboxX accepts the initialization and does not provide any interface yet.
-2. **The Visual C++ DLLs are not in the game folder on PC**, unlike a console package. Their folder must be given to AnyXboxX.
+1. **On PC, the GDK goes through an internal interface.** The game does not link `XGameRuntimeInitialize` directly: `xgameruntime.lib` loads `xgameruntime.dll`, then asks for `QueryApiImpl`, `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`, `XErrorReport` and `UninitializeApiImpl` through `GetProcAddress`. Each `X*` API then gets an interface through `QueryApiImpl`. El1xr accepts the initialization and does not provide any interface yet.
+2. **The Visual C++ DLLs are not in the game folder on PC**, unlike a console package. Their folder must be given to El1xr.
 3. **A missing function that returns a pointer crashes** at address `0x80004001`. Tracing made it possible to emulate each function in the order the game needs it.
 
 ## Reproduce
@@ -67,7 +67,7 @@ Then:
 2. Run `Kits\DirectXTK12\Src\Shaders\CompileShaders.cmd dxil` with its full path.
 3. Build `SimpleTriangleDesktop.sln` as `Release|x64`, with `-p:PlatformToolset=v145` under VS 2026.
 
-Analysis in AnyXboxX, with the folder of the Visual C++ DLLs as the second argument:
+Analysis in El1xr, with the folder of the Visual C++ DLLs as the second argument:
 
 ```powershell
 python PrototypeScarlett\scarlett.py --rapport <...>\x64\Release\SimpleTriangleDesktop.exe "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC\<version>\x64\Microsoft.VC145.CRT"
@@ -77,23 +77,23 @@ python PrototypeScarlett\scarlett.py --rapport <...>\x64\Release\SimpleTriangleD
 
 Measurements from 21 November 2026. `testgdk` is the GDK demo program of [SDL3](https://github.com/libsdl-org/SDL) (zlib license): sprites, sound, the controller and the `XUser` sign-in. It goes through `SDL3.dll`, which loads `xgameruntime.dll` itself with `LoadLibrary`.
 
-![testgdk launched by AnyXboxX in native mode](images/testgdk-natif.png)
+![testgdk launched by El1xr in native mode](images/testgdk-natif.png)
 
 | Mode | Result |
 |---|---|
-| Native (`--natif`) | ✅ window, sprites and sound. `XUserAddAsync` fails cleanly (`E_NOINTERFACE`): AnyXboxX does not yet provide the `XUser` interface behind `QueryApiImpl`. |
+| Native (`--natif`) | ✅ window, sprites and sound. `XUserAddAsync` fails cleanly (`E_NOINTERFACE`): El1xr does not yet provide the `XUser` interface behind `QueryApiImpl`. |
 | Isolated (`--lancer`) | C and SDL startup pass; stops on the window and text (`USER32`, `GDI32`), not emulated in isolated mode. |
 
 Two fixes were needed in native mode:
 
-1. **Command line**: the game read Python's (`python scarlett.py --natif …`) and took it for its own arguments. AnyXboxX rewrites in place the buffers of `GetCommandLineW` and `GetCommandLineA`, which the CRT and all DLLs re-read, even those loaded by Windows.
-2. **Current folder**: the game opens `icon.png` with a relative path. AnyXboxX changes into the game's folder before launching it.
+1. **Command line**: the game read Python's (`python scarlett.py --natif …`) and took it for its own arguments. El1xr rewrites in place the buffers of `GetCommandLineW` and `GetCommandLineA`, which the CRT and all DLLs re-read, even those loaded by Windows.
+2. **Current folder**: the game opens `icon.png` with a relative path. El1xr changes into the game's folder before launching it.
 
 In isolated mode, `GetCommandLineW/A`, `CommandLineToArgvW` and `GetEnvironmentStringsW` are now emulated.
 
 ### With the C++ runtime
 
-Since the runtime moved to C++ (`runtime/`), `xgameruntime.dll` is preloaded in the process: **all** the game's DLLs go through AnyXboxX, including `SDL3.dll`, which Windows loads itself. The interfaces that AnyXboxX does not write yet are delegated to Windows' GDK runtime. Trace (`ANYXBOXX_TRACE=1`) over 10 seconds of play:
+Since the runtime moved to C++ (`runtime/`), `xgameruntime.dll` is preloaded in the process: **all** the game's DLLs go through El1xr, including `SDL3.dll`, which Windows loads itself. The interfaces that El1xr does not write yet are delegated to Windows' GDK runtime. Trace (`ANYXBOXX_TRACE=1`) over 10 seconds of play:
 
 | Interface requested (`QueryApiImpl`) | Calls | Served by |
 |---|---|---|
@@ -101,7 +101,7 @@ Since the runtime moved to C++ (`runtime/`), `xgameruntime.dll` is preloaded in 
 | `{01ACD177-91F9-4763-A38E-CCBB55CE32E0}` | 4 | Windows |
 | `{973A344E-24BF-4D0F-8457-56C534892B29}` / `{2549F142-6419-4A06-97B5-931AAB7C2F34}` | 1 | Windows |
 
-The task queue is requested thousands of times per second: this path must stay in native code. It is now written in AnyXboxX, in C++: **testgdk runs without Windows' runtime** (`ANYXBOXX_SYSTEM_RUNTIME=0`), and the `XUser` sign-in succeeds with AnyXboxX's offline local profile (gamertag settable through `ANYXBOXX_GAMERTAG`). When Windows' runtime is present, it serves all the interfaces, task queue included: its APIs (`XUser`…) can only read the queues they created.
+The task queue is requested thousands of times per second: this path must stay in native code. It is now written in El1xr, in C++: **testgdk runs without Windows' runtime** (`ANYXBOXX_SYSTEM_RUNTIME=0`), and the `XUser` sign-in succeeds with El1xr's offline local profile (gamertag settable through `ANYXBOXX_GAMERTAG`). When Windows' runtime is present, it serves all the interfaces, task queue included: its APIs (`XUser`…) can only read the queues they created.
 
 Build: SDL3's `VisualC-GDK` still targets `Gaming.Desktop.x64`, which is absent from GDK 2610. This platform must be replaced with `x64` in the projects, `_GAMING_DESKTOP` added along with the GDK's `include`/`lib` folders (`windows\include`, `windows\lib\x64`), then `tests\testgdk\testgdk.vcxproj` built as `Release|x64` with `-p:PlatformToolset=v145` and `-p:SolutionDir=<…>\VisualC-GDK\`.
 

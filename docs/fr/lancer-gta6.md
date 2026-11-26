@@ -1,6 +1,6 @@
 > English: [running-gta6.md](../running-gta6.md)
 
-# Lancer GTA VI (build Xbox Series 1.0.2.1) avec AnyXboxX
+# Lancer GTA VI (build Xbox Series 1.0.2.1) avec El1xr
 
 Ce guide explique comment installer et lancer le projet, et tout ce qu'il faut installer pour refaire nos essais sur le build Xbox Series 1.0.2.1 de GTA VI, jusqu'au point où nous en sommes : la première cinématique. Il ne fournit pas le jeu et n'explique pas comment l'obtenir : vous apportez votre propre copie. Ne mettez jamais de fichier du jeu dans ce dépôt et ne les joignez à aucune issue.
 
@@ -182,7 +182,7 @@ Le lanceur ne pose plus `VICTORY_RELAY` : l'essai jugé le meilleur l'avait coup
 
 ## Épinglage précédent : fork `7b0f736` (24 novembre, nuit)
 
-`third_party/victory` pointe vers `fxceless/victory-fork` au commit `7b0f736` (« Shader tests: recognise the software adapter from the device's own adapter »). Il était d'abord épinglé sur `d279e69` (« Make host pipeline waits configurable and prewarm pending requests (#1) », contribué par ZazaJr24) ; `7b0f736` ajoute `e9765a7` (« Fix the device loss introduced by the wave64 update ») et `004bf69`. Les commits plus récents, à partir de `1684989`, ne sont pas pris : le mainteneur les a jugés en régression. Ce fork n'est pas un fork GitHub rattaché à VIctory ; sa licence est GPL-3.0, compatible avec AnyXboxX (GPL-3.0 ou ultérieure). Il remplace notre ancienne intégration `anyxboxx/stable`.
+`third_party/victory` pointe vers `fxceless/victory-fork` au commit `7b0f736` (« Shader tests: recognise the software adapter from the device's own adapter »). Il était d'abord épinglé sur `d279e69` (« Make host pipeline waits configurable and prewarm pending requests (#1) », contribué par ZazaJr24) ; `7b0f736` ajoute `e9765a7` (« Fix the device loss introduced by the wave64 update ») et `004bf69`. Les commits plus récents, à partir de `1684989`, ne sont pas pris : le mainteneur les a jugés en régression. Ce fork n'est pas un fork GitHub rattaché à VIctory ; sa licence est GPL-3.0, compatible avec El1xr (GPL-3.0 ou ultérieure). Il remplace notre ancienne intégration `anyxboxx/stable`.
 
 Mesuré par le mainteneur le 2026-11-24 (i7-13700KF + RTX 4070 SUPER, Windows 11) en lançant notre propre copie du build 1.0.2.1, d'après le journal de VIctory de l'essai (fréquence d'images et compteurs de dessins tels que le programme les affiche), contre notre ancienne intégration `last` :
 
@@ -281,7 +281,7 @@ Variable ajoutée au tableau ci-dessus (diagnostic, build `diag`) :
 3. Visual Studio 2022 ou 2026 Build Tools avec la charge « Développement Desktop en C++ » (MSVC).
 4. Windows SDK 10.0.26100 (fournit `dxc`).
 5. Optionnel : la fonctionnalité Windows « Graphics Tools » (couche de débogage D3D12, utile seulement pour `VICTORY_D3D12_DEBUG`).
-6. Python 3.12, seulement pour la suite de tests d'AnyXboxX (voir Tests).
+6. Python 3.12, seulement pour la suite de tests d'El1xr (voir Tests).
 
 Récupérer le code (VIctory est inclus) :
 
@@ -402,7 +402,7 @@ Les branches `anyxboxx/stable` et `anyxboxx/essai` de `LooperSalty/victory` ne s
 cargo test -p victory-gpu -p victory-shader --manifest-path third_party/victory/Cargo.toml
 ```
 
-AnyXboxX lui-même (voir la section Setup d'[AGENTS.md](../../AGENTS.md)) :
+El1xr lui-même (voir la section Setup d'[AGENTS.md](../../AGENTS.md)) :
 
 ```powershell
 py -3.12 -m venv .venv
@@ -413,4 +413,4 @@ py -3.12 -m venv .venv
 
 ## Où signaler un problème
 
-Ouvrez une issue sur [AnyXboxX](https://github.com/LooperSalty/AnyXboxX/issues) ou sur [VIctory](https://github.com/Marvisak/VIctory/issues) (l'issue #264 regroupe les blocages GPU sur NVIDIA). Décrivez le symptôme, votre GPU et votre pilote, et les lignes utiles de `crashes.log`. Ne joignez jamais de fichier du jeu.
+Ouvrez une issue sur [AnyXboxX, le projet d'origine d'El1xr](https://github.com/LooperSalty/AnyXboxX/issues) ou sur [VIctory](https://github.com/Marvisak/VIctory/issues) (l'issue #264 regroupe les blocages GPU sur NVIDIA). Décrivez le symptôme, votre GPU et votre pilote, et les lignes utiles de `crashes.log`. Ne joignez jamais de fichier du jeu.

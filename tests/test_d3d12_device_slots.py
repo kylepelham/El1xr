@@ -1,8 +1,8 @@
 """Table des slots du périphérique D3D12.X mesurés sur l'exécutable 1.0.2.1 (note de premier démarrage, W5).
 
 La table compare, pour chaque slot que le titre appelle avant le premier « Close » en échec, ce que TomBox
-assigne dans sa table de périphérique (crates/compat/d3d12_xs, 90 slots, DEVICE_SLOTS) et ce qu'AnyXboxX sert.
-AnyXboxX ne sert aucun slot de périphérique : d3d12_xs.def n'exporte ni D3D12XboxCreateDevice ni de table.
+assigne dans sa table de périphérique (crates/compat/d3d12_xs, 90 slots, DEVICE_SLOTS) et ce qu'El1xr sert.
+El1xr ne sert aucun slot de périphérique : d3d12_xs.def n'exporte ni D3D12XboxCreateDevice ni de table.
 Le test fige cet état : toute nouvelle implémentation doit mettre à jour la table et la note.
 """
 from pathlib import Path
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEF_FILE = ROOT / "runtime" / "d3d12_xs" / "d3d12_xs.def"
 TOMBOX_DEVICE_SLOTS = 90  # DEVICE_SLOTS dans TomBox crates/compat/d3d12_xs/src/console_slots.rs
 
-# slot, rôle mesuré (note, section 4), statut dans TomBox (grep des affectations `[n] = ...`), servi par AnyXboxX
+# slot, rôle mesuré (note, section 4), statut dans TomBox (grep des affectations `[n] = ...`), servi par El1xr
 DEVICE_SLOTS = (
     (8, "CreateCommandQueue (forme PC)", "assigné : create_command_queue_x (device_wrap.rs)", False),
     (9, "CreateCommandAllocator", "assigné : create_command_allocator_x (device_wrap.rs)", False),

@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-Lance les tests GPU d'AnyXboxX sur un adaptateur et écrit un rapport Markdown par carte (issue #70).
+Lance les tests GPU d'El1xr sur un adaptateur et écrit un rapport Markdown par carte (issue #70).
 
 .DESCRIPTION
 L'adaptateur est celui que choisit anyxboxx_gpu_run.exe : par défaut le premier adaptateur de DXGI,
@@ -145,7 +145,7 @@ $windows = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $commit = try { (Invoke-Tool -FilePath 'git' -Arguments 'rev-parse', 'HEAD' -Timeout 30000).Out.Trim() } catch { '' }
 
 $report = [System.Collections.Generic.List[string]]::new()
-$report.Add("## Rapport GPU d'AnyXboxX")
+$report.Add("## Rapport GPU d'El1xr")
 $report.Add('')
 $report.Add("Commit : $(if ($commit) { $commit } else { 'inconnu' })")
 $report.Add("Windows : $($windows.CurrentBuildNumber).$($windows.UBR)")

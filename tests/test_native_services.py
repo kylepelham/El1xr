@@ -2,7 +2,7 @@
 
 GameInput (manettes, clavier, souris) et XAudio2 sont importés par ordinal 1
 (GameInputCreate, XAudio2Create) par les DLL du jeu, comme sur PC : le chargeur
-natif d'AnyXboxX les lie aux DLL de Windows, sans traduction.
+natif d'El1xr les lie aux DLL de Windows, sans traduction.
 """
 import ctypes
 import sys

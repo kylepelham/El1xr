@@ -1,4 +1,4 @@
-// kernelx.dll d'AnyXboxX : le noyau de la Xbox, traduit vers celui du PC.
+// kernelx.dll d'El1xr : le noyau de la Xbox, traduit vers celui du PC.
 //
 // Les binaires console importent kernelx.dll à la place de kernel32.dll. Toutes les
 // fonctions communes sont redirigées vers kernel32/kernelbase de Windows par

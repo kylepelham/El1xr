@@ -3,7 +3,7 @@
     python tools/jour_j.py <dossier du paquet | jeu.exe> [--natif] [--sortie <dossier>] [--duree <s>]
 
 1. Inventaire statique de l'exécutable (empreinte, en-têtes, sections, TLS, imports).
-2. Pour chaque fonction importée, qui la fournit : le paquet, AnyXboxX, TomBox, Windows ou personne.
+2. Pour chaque fonction importée, qui la fournit : le paquet, El1xr, TomBox, Windows ou personne.
 3. Analyse isolée (`scarlett.py --rapport`) et lancement isolé dans Unicorn (`--lancer --md`).
 4. Avec --natif seulement : lancement réel par anyxboxx.exe avec les DLL de TomBox. Le code du jeu
    s'exécute alors sur ce PC sans isolation ; réservé aux exécutables dont on connaît la provenance.
@@ -32,7 +32,7 @@ SCARLETT = ROOT / "PrototypeScarlett" / "scarlett.py"
 RUNTIME = Path(os.environ.get("ANYXBOXX_RUNTIME") or ROOT / "runtime" / "build" / "bin")
 TOMBOX = Path(os.environ.get("ANYXBOXX_TOMBOX_DIR") or ROOT / "third_party" / "tombox" / "target" / "release")
 SYSTEM32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-PROVIDERS = ("paquet", "AnyXboxX", "TomBox", "Windows")
+PROVIDERS = ("paquet", "El1xr", "TomBox", "Windows")
 MISSING = "manquant"
 MAX_LISTED = 25
 ISOLATED_TIMEOUT = 600
@@ -55,7 +55,7 @@ def _exports(path):
 
 
 def _dll_folders(package):
-    return {"paquet": package, "AnyXboxX": RUNTIME, "TomBox": TOMBOX, "Windows": SYSTEM32}
+    return {"paquet": package, "El1xr": RUNTIME, "TomBox": TOMBOX, "Windows": SYSTEM32}
 
 
 def provider(dll, function, folders):

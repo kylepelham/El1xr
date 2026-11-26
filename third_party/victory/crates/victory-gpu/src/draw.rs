@@ -14,6 +14,37 @@ mod texture_read_tests;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Direct dispatches of CS_DefragHeap_ComputeRelocations, the groups they named,
+/// and indirect dispatches whose group count is not known here.
+static DEFRAG_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static DEFRAG_GROUPS: AtomicU64 = AtomicU64::new(0);
+static DEFRAG_INDIRECT: AtomicU64 = AtomicU64::new(0);
+
+const DEFRAG_HASH: &str = "02384a60fda6f2d0";
+
+pub(crate) fn defrag_counts() -> (u64, u64, u64) {
+    (
+        DEFRAG_DISPATCHES.load(Ordering::Relaxed),
+        DEFRAG_GROUPS.load(Ordering::Relaxed),
+        DEFRAG_INDIRECT.load(Ordering::Relaxed),
+    )
+}
+
+fn note_defrag(p: &HostPipeline, groups: Option<u64>) {
+    let Some(stage) = p.stages.first() else {
+        return;
+    };
+    if stage.shader.hash != DEFRAG_HASH {
+        return;
+    }
+    if let Some(groups) = groups {
+        DEFRAG_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        DEFRAG_GROUPS.fetch_add(groups, Ordering::Relaxed);
+    } else {
+        DEFRAG_INDIRECT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -277,11 +308,13 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
-    /// viewports, the scissors, the blend factor and the stencil reference.
+    /// whether a topology was set, the values of the render target and
+    /// depth views as they were when set (the title may rewrite their
+    /// descriptors before a cut), the viewports, the scissors, the blend
+    /// factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<Option<crate::descriptor::RtvSnapshot>>,
+    depth_view: Option<crate::descriptor::RtvSnapshot>,
     targets_set: bool,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
@@ -326,9 +359,9 @@ pub(crate) struct State {
     /// contents another had takes that one's host slots, and only its own title slots'
     /// notes are made here.
     seen_tables: std::collections::HashSet<(u64, u32, u64)>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity,
+    /// first, count; given back when the list has run, is reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -809,23 +842,32 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
-        self.targets.clear();
-        let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
+        self.target_views.clear();
+        self.target_views.extend(handles.iter().map(|&h| {
+            let record = crate::descriptor::rtv_record(h);
+            if record.is_none() {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
-                continue;
-            };
+            }
+            record.map(|r| r.snapshot())
+        }));
+        self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
+        self.targets_set = true;
+        self.record_targets(list);
+    }
+
+    /// Makes the host views from the values kept when the title set the
+    /// targets, not from descriptor slots it may have rewritten since.
+    fn record_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        self.targets.clear();
+        let mut rtvs = Vec::new();
+        for snapshot in self.target_views.iter().flatten() {
+            let record = snapshot.restore();
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -848,7 +890,8 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_view.and_then(|snapshot| {
+            let record = snapshot.restore();
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
@@ -942,8 +985,7 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.record_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -962,10 +1004,8 @@ impl State {
     /// none); root arguments, vertex and index buffers are set by every
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// given back when the title's list is reset. The render target views
+    /// are made again from the values kept when the title set them.
     pub(crate) fn replay(&mut self, list: &HostList) {
         // AscilCH #742: only scratch-backed tables expire at a cut.
         self.fresh_tables.retain(|_, (_, epoch)| epoch.is_none());
@@ -983,8 +1023,7 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.record_targets(list);
         } else {
             // Unbind any DSV left active by an internal pass so it cannot remain
             // bound as a writable DSV when transitioned to SHADER_RESOURCE.
@@ -1496,6 +1535,17 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MEET {
+                    if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list) {
+                        // SAFETY: an open list; the buffer lives for the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -1613,7 +1663,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1689,7 +1739,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2902,6 +2952,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        note_defrag(p, Some(u64::from(x) * u64::from(y) * u64::from(z)));
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -3703,7 +3754,7 @@ impl State {
             TABLES[2].fetch_add(1, Ordering::Relaxed);
             TABLES[3].fetch_add(u64::from(n), Ordering::Relaxed);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4507,7 +4558,13 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                let bound = self.bind(list, p, true);
+                if bound {
+                    note_defrag(p, None);
+                }
+                bound
+            }
             _ => false,
         };
         if !ran {
@@ -4721,7 +4778,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             // One lookup of the host copy (and twin) for the upload, the
             // twin and the state: each lookup takes the texture's lock, and
             // the copy's flags are kept, not asked of the driver.

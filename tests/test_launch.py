@@ -64,7 +64,7 @@ def test_markdown_report_groups_missing_imports_by_dll(tmp_path):
     lines = []
     assert launch.run(folder, (), log=lines.append, markdown=report) == 0
     text = report.read_text(encoding="utf-8")
-    assert text.startswith("# Rapport AnyXboxX : game.exe")
+    assert text.startswith("# Rapport El1xr : game.exe")
     assert "| d3d12_xs.dll | 2 | D3D12XboxCreateDevice, D3D12XboxSetProcessDebugFlags |" in text
     assert "| kernelx.dll | 1 | XMemAllocPhysical |" in text
     assert "| d3d12_xs.dll!D3D12XboxCreateDevice | 1 |" in text      # appel non émulé et sa fréquence

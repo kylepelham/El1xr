@@ -1,4 +1,4 @@
-// Table des interfaces servies par AnyXboxX (served_interfaces.inc) et IUnknown commun.
+// Table des interfaces servies par El1xr (served_interfaces.inc) et IUnknown commun.
 #include <windows.h>
 
 #include <cstdio>

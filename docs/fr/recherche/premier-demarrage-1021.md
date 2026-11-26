@@ -46,9 +46,9 @@ implémentation complète ni une ABI correcte.
 | --- | --- | --- |
 | `gta6rt --dry-run` de Leonida | shim 52, hôte Windows 432, module du paquet 72, **non implémentés 31** (code 0) | mesuré, Codex |
 | Leonida, table statique | même répartition, avec 30 non implémentés : `XMemTransferMemory` est servi par le source mais signalé absent par un ancien binaire local | mesuré, Claude |
-| Outil de couverture d'AnyXboxX | paquet 209, AnyXboxX 6, TomBox 15, Windows 341, **manquants 16** (9 `AcpHal`, 5 `chad`, `DStorageGetFactory`, `XGSuggestSwizzleMode`) | mesuré, Codex |
+| Outil de couverture d'El1xr | paquet 209, El1xr 6, TomBox 15, Windows 341, **manquants 16** (9 `AcpHal`, 5 `chad`, `DStorageGetFactory`, `XGSuggestSwizzleMode`) | mesuré, Codex |
 
-Les 16 d'AnyXboxX et les 31 de Leonida ne sont pas comparables : AnyXboxX compte les DLL de TomBox comme
+Les 16 d'El1xr et les 31 de Leonida ne sont pas comparables : El1xr compte les DLL de TomBox comme
 disponibles (via `ANYXBOXX_TOMBOX_DIR`) et tous les ensembles d'API Windows comme servis.
 
 Imports sans implémentation chez Leonida (31) :
@@ -65,9 +65,9 @@ Imports sans implémentation chez Leonida (31) :
 
 Un import absent se lie à un thunk qui renvoie 0 et n'écrit aucun pointeur de sortie.
 
-Où en est AnyXboxX pour les mêmes imports (lecture de `runtime/` et des crates TomBox, sans lancement) :
+Où en est El1xr pour les mêmes imports (lecture de `runtime/` et des crates TomBox, sans lancement) :
 
-| Groupe | `runtime/` d'AnyXboxX | DLL TomBox (`ANYXBOXX_TOMBOX_DIR`) | Statut |
+| Groupe | `runtime/` d'El1xr | DLL TomBox (`ANYXBOXX_TOMBOX_DIR`) | Statut |
 | --- | --- | --- | --- |
 | `xmem` | `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault`, crochets, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` | `XMemVirtualAlloc`, pages physiques, scatter, `XMemIsToolsMemAvailable`, `XMemTransferMemory` | symboles lus ; comportement sur les formes de la section 4 non testé |
 | `d3d12_xs` | quatre redirections de signatures racine vers `d3d12.dll` | `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX` | symboles lus |
@@ -139,7 +139,7 @@ constantes sont passées par valeur ; rien n'indique que ce soient des tailles o
 
 KkelebekK (Linux, Wine 11.21, Leonida #6910, 2026-11-23) est allé plus loin avec des bouche-trous locaux et a
 numéroté ses propres arrêts de 13 à 26. Leur numérotation n'est pas la nôtre. Nous ne gardons que ce qui concerne
-AnyXboxX.
+El1xr.
 
 | Leur arrêt | Forme | Pertinence |
 | --- | --- | --- |
@@ -178,26 +178,26 @@ La seconde famille (plus tard) demande `XMemVirtualAlloc(0, taille, 0x20402000, 
 74 du device (`+0x250`) et le slot 8 du device (`+0x40`), chacun testé en signe avec `int3` en cas d'échec. Pour
 le mot d'attributs `0x20402000`, un retour NULL ne doit jamais arriver.
 
-## 5. Ce que cela implique pour AnyXboxX
+## 5. Ce que cela implique pour El1xr
 
 Ordre de travail, d'après les arrêts mesurés. Les éléments « supposé » demandent un test avant qu'on s'appuie
 dessus.
 
 | # | Travail | Base mesurée | Statut de la base |
 | --- | --- | --- | --- |
-| W1 | **Fait, PR #107.** **Comportement de `xmem` sur les formes réelles.** Ajouter un test synthétique (règle 4, aucun fichier du jeu) qui appelle le `xmem` chargé par AnyXboxX, le nôtre ou celui de TomBox, avec les mots de `XMemVirtualAlloc` mesurés (attributs `0x20401000`, `0x20402000`, `0x20406000`, `0x20003000`, `0x42000` ; `r9` dans `0x3`, `0x7`, `0x21`, `0x23`, `0x27`, `0x183`, `0x283` ; protections listées plus haut) et avec le triplet de pages physiques (`0x280`/`0x380`, nombre entrée/sortie, tableau de PFN de 8 octets, pointeur mappé). Jamais de NULL pour `0x20402000` | arrêts 2, 3 ; table des appels du front | formes mesurées ; comportement de la DLL TomBox inconnu |
+| W1 | **Fait, PR #107.** **Comportement de `xmem` sur les formes réelles.** Ajouter un test synthétique (règle 4, aucun fichier du jeu) qui appelle le `xmem` chargé par El1xr, le nôtre ou celui de TomBox, avec les mots de `XMemVirtualAlloc` mesurés (attributs `0x20401000`, `0x20402000`, `0x20406000`, `0x20003000`, `0x42000` ; `r9` dans `0x3`, `0x7`, `0x21`, `0x23`, `0x27`, `0x183`, `0x283` ; protections listées plus haut) et avec le triplet de pages physiques (`0x280`/`0x380`, nombre entrée/sortie, tableau de PFN de 8 octets, pointeur mappé). Jamais de NULL pour `0x20402000` | arrêts 2, 3 ; table des appels du front | formes mesurées ; comportement de la DLL TomBox inconnu |
 | W2 | **Fait, PR #107.** `runtime/xmem` ne sert lui-même aucun des sept imports manquants (`XMemVirtualAlloc`, trois appels de pages physiques, scatter, `XMemIsToolsMemAvailable`, `XMemTransferMemory`). Décider : continuer à compter sur TomBox, ou les écrire en C++ avec le décodeur ERA, et le dire dans [tombox.md](tombox.md) | section 2 | mesuré |
 | W3 | **Fait, PR #107.** `XMemAlloc(0x60000, 0xf0814000)` : vérifier que le décodeur ERA de `runtime/xmem/era_heap.cpp` ne refuse pas ce mot (« mémoire physique refusée » renvoie NULL, que le titre traite comme une branche d'erreur) | site d'appel statique | décodage de ce mot supposé |
-| W4 | **Fait, PR #107.** `D3D12ConfigureVirtualMemoryX` : le `d3d12_xs` d'AnyXboxX ne l'exporte pas (TomBox l'exporte et rejette une description NULL par `E_INVALIDARG`). Tester une description non nulle dont le deuxième champ de 32 bits dérive d'une taille, attendre `S_OK` | arrêt 1 | forme mesurée ; sens du champ supposé |
+| W4 | **Fait, PR #107.** `D3D12ConfigureVirtualMemoryX` : le `d3d12_xs` d'El1xr ne l'exporte pas (TomBox l'exporte et rejette une description NULL par `E_INVALIDARG`). Tester une description non nulle dont le deuxième champ de 32 bits dérive d'une taille, attendre `S_OK` | arrêt 1 | forme mesurée ; sens du champ supposé |
 | W5 | **Résolu en réutilisant TomBox (section 6).** **Table des slots du device.** Comparer les slots que le titre emploie avant le premier échec de `Close` (8, 9, 16, 26, 36, 41, 48, 49, 57, 61, 73, 74, 79, 86, 127, et les slots 9, 131, 132 de la liste) avec le `d3d12_xs` de TomBox (194 méthodes sur 200 revendiquées). Résultat : un tableau slot, forme, couvert ou non, dans [tombox.md](tombox.md) | sections 3 et 4 | slots mesurés ; couverture TomBox non comparée |
 | W6 | **Non fait : demande d'abord le proxy de liste console (Leonida #7076), voir section 6.** Liste de commandes console : établir ce que sont les slots 131 et 132 de la liste, à partir de l'ABI de liste console de TomBox, avant d'écrire une enveloppe. Ne pas donner une liste PC brute au titre | arrêts 5, 6 | sens des slots inconnu |
-| W7 | **Fait, cette PR : `XCRDAPI.dll` minimal.** **`DStorageGetFactory`** manque chez AnyXboxX et TomBox. Une `XCRDAPI.dll` minimale doit écrire le pointeur de sortie, rendre 0, et exposer la méthode à `+0x40` rendant un HRESULT non négatif ; les lectures de fichier peuvent répondre `E_NOTIMPL` comme le fait #4348. #4348 de Leonida est en GPL-3.0, réutilisable avec crédit (règle 2) | statique, arrêt 24 | mesuré |
+| W7 | **Fait, cette PR : `XCRDAPI.dll` minimal.** **`DStorageGetFactory`** manque chez El1xr et TomBox. Une `XCRDAPI.dll` minimale doit écrire le pointeur de sortie, rendre 0, et exposer la méthode à `+0x40` rendant un HRESULT non négatif ; les lectures de fichier peuvent répondre `E_NOTIMPL` comme le fait #4348. #4348 de Leonida est en GPL-3.0, réutilisable avec crédit (règle 2) | statique, arrêt 24 | mesuré |
 | W8 | **Bloqué, voir section 6.** **`xg_xs`** : `XGSuggestSwizzleMode` manque. `XGCreateTextureComputer` doit rendre un objet dont le slot 8 existe même s'il n'écrit aucune donnée tuilée, et aucun stub ne doit laisser un pointeur de sortie non écrit. `anyxboxx-texture` (SW_4K_S) est le moteur naturel | arrêt 22 (KkelebekK) | mesuré par d'autres |
 | W9 | **Fait, cette PR : `tests/test_gdk_boot.py` ; type de retour gardé, voir section 7.** `xgameruntime` : `XErrorReport` est exporté avec un retour `void` (`runtime/xgameruntime/xgameruntime.def`) ; le titre ne teste que le pointeur, donc cela paraît sans effet. Ajouter un test du lanceur : les six noms de `GetProcAddress` se résolvent, les bits d'options `2`, `4`, `8` sont acceptés, et `xgameruntime.dll` se charge par chemin complet quand l'exécutable du jeu est dans un autre dossier | étapes 6 à 8 | innocuité du type de retour supposée |
 | W10 | **Fait, cette PR : voir section 7.** `ConsoleMode` : `runtime/xgameruntime/registry.cpp` sert `0x64`, qui se convertit en 7 et passe le test du titre. Garder un test qui fige `0x64`, et la variante `RegOpenKeyW` (celle du titre) | étape 9 | mesuré et cohérent |
 | W11 | **Fait, cette PR : nouveaux threads vérifiés ; les threads antérieurs à l'installation ne reçoivent pas la raison 2, comme sous Windows, voir section 7.** **TLS** : vérifier qu'`anyxboxx_tls.dll` appelle le callback 1 du titre avec la raison 2 pour chaque thread, existant ou nouveau, et que l'indice du fichier est écrasé. Le bloc (5 248 octets) tient dans la capacité de 256 Kio | étape 4 | taille mesurée ; couverture des threads non testée |
 | W12 | **Observabilité.** Le lanceur natif n'a aucun gestionnaire pour `0x80000003` : un `int3` du titre finit en simple code de sortie (arrêt 0). Ajouter un gestionnaire vectoriel qui journalise l'adresse du premier `int3` ou de la première exception et le module, pour qu'un bisect donne un arrêt et non un code de sortie | arrêt 0 | mesuré |
-| W13 | **Fait, cette PR : dépendance à l'hôte documentée dans [jour-j.md](../jour-j.md), pas de shim, voir section 7.** `GameInput.dll!#1` : AnyXboxX n'a pas de shim GameInput. L'unique appelant du titre se lie à la DLL de l'hôte. Choisir : servir l'ordinal 1 depuis le lanceur, ou documenter la dépendance à l'hôte | statique | mesuré ; version d'ABI non vérifiée |
+| W13 | **Fait, cette PR : dépendance à l'hôte documentée dans [jour-j.md](../jour-j.md), pas de shim, voir section 7.** `GameInput.dll!#1` : El1xr n'a pas de shim GameInput. L'unique appelant du titre se lie à la DLL de l'hôte. Choisir : servir l'ordinal 1 depuis le lanceur, ou documenter la dépendance à l'hôte | statique | mesuré ; version d'ABI non vérifiée |
 | W14 | Audio (`chad` 5, `xapu` 5 chez TomBox, `AcpHal` 9) : manquant, mais non établi comme bloquant au démarrage, la chaîne d'appels étant indirecte. À traiter après W1 à W8 | section 2 | supposé |
 | W15 | **Fait, cette PR : noté dans [jour-j.md](../jour-j.md), section 3.** Imports propres à l'hôte : `api-ms-win-core-psm-appnotify-*`, `ext-ms-win-rtcore-ntuser-*`, MFPlat, WS2_32 par ordinal. Le mode natif dépend d'un hôte Windows récent ; le noter dans [jour-j.md](../jour-j.md) | section 2 | mesuré sur Windows 11 seulement |
 | W16 | **Non fait : aucune source publique, voir section 7.** `__XMemAllocationHooks__` : le titre exporte un symbole de données qu'aucun source de Leonida ne lit. Si `XMemAlloc*` se comporte mal, vérifier si le runtime de la console le lit par `GetProcAddress` sur l'exécutable | table d'exports | rôle supposé |
@@ -208,14 +208,14 @@ W6 n'ont besoin que des sources de TomBox. Aucun ne demande de relire le jeu.
 ## 6. Résultats de W5 à W8 (cette PR)
 
 - **W5.** La table des slots de périphérique est dans [tombox.md](tombox.md), figée par `tests/test_d3d12_device_slots.py`.
-  AnyXboxX ne servait aucun slot de périphérique. **Résolu en réutilisant TomBox**, sans écrire de proxy :
+  El1xr ne servait aucun slot de périphérique. **Résolu en réutilisant TomBox**, sans écrire de proxy :
   `tools/build_tombox.py` compile le `d3d12_xs` de TomBox (64 exports, proxy du périphérique vers le D3D12 de l'hôte),
   que `runtime/build/tombox` sert désormais par défaut. `tests/test_tombox_native.py` obtient un périphérique via
   `D3D12XboxCreateDevice` (IID_ID3D12Device, WARP ou GPU). La même exécution vérifie W1 (`XMemVirtualAlloc` avec
   `0x20402000` ne rend jamais NULL) et la sortie de `DStorageGetFactory` (W5), par le `xmem` et le `XCRDAPI` de TomBox.
   Restent les nôtres, absents de TomBox : `xgameruntime`, `kernelx`, `anyxboxx_tls`, et l'export `XMemGetAllocationHooks`
   de xmem, que TomBox n'a pas (aucun import ne l'utilise dans l'analyse statique du titre ; à proposer en amont).
-- **W6.** Non fait. Les slots 131 et 132 appartiennent à une liste de commandes console, qu'AnyXboxX n'a pas ; le proxy
+- **W6.** Non fait. Les slots 131 et 132 appartiennent à une liste de commandes console, qu'El1xr n'a pas ; le proxy
   de liste (Leonida #7076) vient d'abord. Quand il existera, ces slots journaliseront leurs arguments et rendront
   `E_NOTIMPL` (le titre ignore leurs résultats), jamais 0.
 - **W7.** `runtime/xcrdapi/` compile `XCRDAPI.dll`. `DStorageGetFactory` écrit une factory à la disposition console
@@ -235,7 +235,7 @@ W6 n'ont besoin que des sources de TomBox. Aucun ne demande de relire le jeu.
   runtime et sans `xgameruntime.dll` à côté, et rejoue les étapes 6 à 8 : `GetModuleFileNameW(NULL)` avec le nom de
   fichier remplacé par `xgameruntime.dll`, `LoadLibraryExW` de ce chemin complet avec `0xA00`, puis du nom seul avec
   `0x800`, les six `GetProcAddress`, et les trois `Initialize*` avec les deux constantes et les options `2 | 4 | 8`.
-  Les deux chargements doivent rendre le même module d'AnyXboxX, les six noms doivent se résoudre, et chaque
+  Les deux chargements doivent rendre le même module d'El1xr, les six noms doivent se résoudre, et chaque
   initialiseur doit rendre `S_OK`. Le même programme tourne sous `anyxboxx.exe` et sous le mode natif Python. Sans
   la redirection par chemin complet, le premier chargement échoue et le résultat tombe à 0 (vérifié en mutant le shim
   Python). L'ordre des arguments des initialiseurs (constantes dans `rcx`, `rdx`, options dans `r8`) est supposé ; nos
@@ -263,7 +263,7 @@ W6 n'ont besoin que des sources de TomBox. Aucun ne demande de relire le jeu.
   indice (chacun de quatre threads lit le marqueur), et avec la raison 3 à sa sortie. Avec l'appel de raison 2
   d'`anyxboxx_tls.dll` mis en commentaire, le test des nouveaux threads échoue (mutation du runtime C++, recompilé).
   Aucun changement C++ n'a été nécessaire.
-  Deux threads ne reçoivent pas la raison 2 d'AnyXboxX, volontairement. Le thread qui installe l'image reçoit
+  Deux threads ne reçoivent pas la raison 2 d'El1xr, volontairement. Le thread qui installe l'image reçoit
   `DLL_PROCESS_ATTACH`, comme Windows le donne au thread principal d'un exécutable ; le démarrage du CRT MSVC du titre
   appelle ensuite lui-même son callback TLS dynamique avec `DLL_THREAD_ATTACH` pour ce thread (`exe_common.inl` et
   `tlsdyn.cpp` dans les sources du CRT livrées avec Visual Studio). Un thread né avant l'installation reçoit le modèle

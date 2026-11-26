@@ -1,8 +1,8 @@
-"""Fonctions du chargeur de modules qu'AnyXboxX substitue en exécution native.
+"""Fonctions du chargeur de modules qu'El1xr substitue en exécution native.
 
 LoadLibrary, GetProcAddress, GetModuleHandle et GetModuleFileName : le jeu chargé
 à la main doit se voir lui-même et non python.exe, et `xgameruntime.dll` doit être
-celui d'AnyXboxX (runtime C++, voir runtime.py) et non celui de Windows.
+celui d'El1xr (runtime C++, voir runtime.py) et non celui de Windows.
 """
 import ctypes
 import os
@@ -50,7 +50,7 @@ class Shims:
         if self.trace:
             self.log(f"[trace] LoadLibrary {name}")
         if _is_runtime(name):
-            self.log(f"[natif] {name} → runtime GDK d'AnyXboxX (Xbox Series X)")
+            self.log(f"[natif] {name} → runtime GDK d'El1xr (Xbox Series X)")
             return self.runtime_handle
         return real()
 
@@ -78,7 +78,7 @@ class Shims:
                 return self.runtime.export(redirects.EXPORT_PREFIX + label)   # compteur d'images
             address = win32.GetProcAddress(module, name)
             if not address and self.runtime.owns(module):
-                self.log(f"[natif] {label} pas encore fourni par le runtime d'AnyXboxX")
+                self.log(f"[natif] {label} pas encore fourni par le runtime d'El1xr")
                 win32.SetLastError(win32.ERROR_PROC_NOT_FOUND)
             return address
         return PROC(get_proc)
