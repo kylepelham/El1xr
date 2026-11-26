@@ -293,7 +293,7 @@ def test_launcher_defaults_are_the_measured_fast_set(tmp_path, faux_outil):
         "VICTORY_ASK_QUIET": "8",
         "VICTORY_RELAY_WIDE_MERGE": "1", "VICTORY_TEXTURE_NO_WAIT": "1", "VICTORY_VIEWS_REMADE_QUIET": "0",
         "VICTORY_BVH_NO_HIT": "1", "VICTORY_WAVE_WIDE": "unset",
-        "VICTORY_PORT_CONSTANTS": "unset", "VICTORY_PORT_CBV": "unset", "VICTORY_REAPER": "1", "VICTORY_GUARD_HOT": "0",
+        "VICTORY_PORT_CONSTANTS": "unset", "VICTORY_PORT_CBV": "1", "VICTORY_REAPER": "1", "VICTORY_GUARD_HOT": "0",
         "VICTORY_CACHE_CORES": "unset",
         "VICTORY_AMBIENT": "0.8", "VICTORY_AMBIENT_AIR": "1.5", "VICTORY_AMBIENT_MOST": "1.2",
         "VICTORY_NAN_SCRUB": "1", "VICTORY_SHOW_AFTER": "1", "VICTORY_THREAD_TICKET": "0",
