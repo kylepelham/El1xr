@@ -4649,6 +4649,31 @@ mod indirect_signature_tests;
 /// once and kept for good. Each thread remembers the last one it asked
 /// for: the title's threads ask for the same few, and the lock and the
 /// object's reference count were shared by all of them.
+/// Looks up `key` in `cache`, calling `create` outside the mutex on a miss
+/// so slow driver `CreateCommandSignature` calls never block other recording
+/// threads on the cache lock.
+fn cached_command_signature<K: Copy + Eq, V: 'static>(
+    cache: &std::sync::Mutex<Vec<(K, &'static V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<V>,
+) -> Option<&'static V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, s)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(s);
+        }
+    }
+    let created = create()?;
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, s)) = made.iter().find(|(k, _)| *k == key) {
+        drop(created);
+        return Some(s);
+    }
+    let leaked: &'static V = Box::leak(Box::new(created));
+    made.push((key, leaked));
+    Some(leaked)
+}
+
 fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
     type Made = ((u32, u32), &'static ID3D12CommandSignature);
     thread_local! {
@@ -4658,38 +4683,34 @@ fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignat
         return Some(s);
     }
     static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&m) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        LAST.set(Some(m));
-        return Some(m.1);
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let m = ((kind, stride), &*Box::leak(Box::new(signature?)));
-    made.push(m);
-    LAST.set(Some(m));
-    Some(m.1)
+    let s = cached_command_signature(&MADE, (kind, stride), || {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        signature
+    })?;
+    LAST.set(Some(((kind, stride), s)));
+    Some(s)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

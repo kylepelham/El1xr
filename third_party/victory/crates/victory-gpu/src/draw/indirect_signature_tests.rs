@@ -38,3 +38,32 @@ fn a_list_holds_the_pipeline_it_last_kept_until_its_reset() {
     list.reset();
     assert!(!list.holds_pipeline(1));
 }
+
+#[test]
+fn command_signature_cache_creates_outside_lock() {
+    use std::sync::{Arc, Barrier, Mutex};
+    static EXISTING: u32 = 100;
+    let cache: Arc<Mutex<Vec<(u32, &'static u32)>>> = Arc::new(Mutex::new(vec![(1u32, &EXISTING)]));
+    let in_create = Arc::new(Barrier::new(2));
+    let proceed = Arc::new(Barrier::new(2));
+
+    let cache_bg = Arc::clone(&cache);
+    let in_create_bg = Arc::clone(&in_create);
+    let proceed_bg = Arc::clone(&proceed);
+    let handle = std::thread::spawn(move || {
+        cached_command_signature(&cache_bg, 2, || {
+            in_create_bg.wait();
+            proceed_bg.wait();
+            Some(200u32)
+        })
+    });
+
+    // Wait until the worker is inside `create`, then verify another thread
+    // can still read an existing key from `cache` without blocking.
+    in_create.wait();
+    assert_eq!(cached_command_signature(&cache, 1, || unreachable!()).copied(), Some(100));
+    proceed.wait();
+
+    assert_eq!(handle.join().unwrap().copied(), Some(200));
+    assert_eq!(cached_command_signature(&cache, 2, || unreachable!()).copied(), Some(200));
+}
