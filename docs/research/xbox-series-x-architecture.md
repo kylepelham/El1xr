@@ -2,7 +2,7 @@
 
 # Xbox Series X architecture
 
-Research done on 21 November 2026 to guide the development of AnyXboxX. Every fact carries its source. **Verified** means the page was read. **To confirm** means the fact comes from a search snippet or a secondary source.
+Research done on 21 November 2026 to guide the development of El1xr. Every fact carries its source. **Verified** means the page was read. **To confirm** means the fact comes from a search snippet or a secondary source.
 
 ## Hardware
 
@@ -33,13 +33,13 @@ Differences found between sources: 3.6 or 3.66 GHz with SMT; 15.3 or 15.4 billio
 - **Hypervisor**: an adapted Hyper-V separates a host system, a "system" partition (interface, applications) and an exclusive partition for the game [VT, to confirm].
 - **XVD/XVC containers**: signed header, data encrypted with AES-XTS; the content key (CIK) is itself protected by a distribution key (ODK) [XVD, verified].
 
-## What this means for AnyXboxX
+## What this means for El1xr
 
 1. **CPU**: the game runs as native x86-64. Unicorn is enough for a prototype; a playable emulator would run the code directly on the PC processor, like Wine.
 2. **GPU**: this is most of the work. D3D12.X calls must be translated to Direct3D 12 or Vulkan, without public documentation to rely on.
 3. **Memory**: the two bandwidth zones (10 + 6 GiB) do not need to be reproduced; a single heap is enough.
 4. **Storage**: DirectStorage and BCPack can be emulated in software, at the cost of longer load times.
-5. **Content**: game packages are encrypted with keys that only the console holds. AnyXboxX therefore only runs unencrypted programs, such as its demo.
+5. **Content**: game packages are encrypted with keys that only the console holds. El1xr therefore only runs unencrypted programs, such as its demo.
 
 ## Sources
 

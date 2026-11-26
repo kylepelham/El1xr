@@ -45,7 +45,7 @@ def markdown_report(exe, report, missing_calls, outcome):
     for name in report.missing:
         dll, _, function = name.partition("!")
         by_dll.setdefault(dll, []).append(function)
-    lines = [f"# Rapport AnyXboxX : {exe.name}", "",
+    lines = [f"# Rapport El1xr : {exe.name}", "",
              f"Imports : {report.total} · résolus : {report.coverage:.1f} % · {outcome}", "",
              "## Imports non résolus, par DLL", "", "| DLL | Nombre | Fonctions |", "|---|---|---|"]
     for dll, functions in sorted(by_dll.items(), key=lambda item: (-len(item[1]), item[0].lower())):

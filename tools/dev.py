@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Developer CLI for AnyXboxX / VIctory builds, tests, policy checks, benchmarks, and captures.
+"""Developer CLI for El1xr / VIctory builds, tests, policy checks, benchmarks, and captures.
 
 Full command output is saved under E:/Gta6/AnyXboxX-coord/dev/ and every command prints a single
 concise final summary line: `DEV <cmd> PASS|FAIL key=value ...`.
@@ -18,6 +18,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+import dev_gate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -41,10 +43,13 @@ FRAME_RE = re.compile(
     r"\((\d+) being made\) and ([0-9.]+) indirect"
 )
 CARD_CLOCK_RE = re.compile(r"the card's clock per frame: nothing of ours queued [0-9.]+ ms \(the card about ([0-9.]+)% busy")
+PACING_RE = re.compile(
+    r"frame pacing: (\d+) frames in [0-9.]+ s \([0-9.]+ fps\), frame time p50 ([0-9.]+) ms "
+    r"p95 ([0-9.]+) ms p99 ([0-9.]+) ms max ([0-9.]+) ms, (\d+) over 50 ms, (\d+) over 100 ms, "
+    r"present interval sd ([0-9.]+) ms jitter ([0-9.]+) ms; ([0-9.]+) draws/frame"
+)
 DSTORAGE_RE = re.compile(r"dstorage: last [0-9.]+ s.*?mb_per_s=([0-9.]+)")
 POLICY_FILES_RE = re.compile(r"asset policy:\s*(\d+)\s+files ok")
-CARGO_PASSED_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+)\s+passed;")
-PYTEST_PASSED_RE = re.compile(r"\b(\d+)\s+passed\b")
 ALERT_LEVEL_RE = re.compile(r"\b(WARN|ERROR)\b")
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 
@@ -55,6 +60,7 @@ REFUSED_PATTERNS = (
     "host root signature refused",
 )
 WORLD_DRAWS_MIN = 100.0
+LOADING_P50_MS = 100.0
 BUILD_GRACE_SECS = 600.0
 
 
@@ -180,10 +186,19 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def apply_mute_default(overrides: dict[str, str], unmute: bool) -> tuple[dict[str, str], bool]:
+    merged = dict(overrides)
+    mute = not unmute
+    if mute:
+        merged.setdefault("VICTORY_MUTE", "1")
+    return merged, mute
+
+
 def build_launcher_command(
     game_dir: Path,
     diag: bool,
     overrides: dict[str, str],
+    mute: bool = False,
 ) -> list[str]:
     parts = [
         "&",
@@ -194,6 +209,8 @@ def build_launcher_command(
     ]
     if diag:
         parts.append("-Diag")
+    if mute:
+        parts.append("-Mute")
     if overrides:
         entries = "; ".join(f"{_ps_quote(k)} = {_ps_quote(v)}" for k, v in overrides.items())
         parts.extend(["-Override", f"@{{ {entries} }}"])
@@ -251,10 +268,46 @@ def run_timed_victory(cmd: list[str], log_path: Path, seconds: int) -> tuple[boo
         return timed_out, proc.returncode if proc.returncode is not None else -1
 
 
+def parse_pacing_line(line: str) -> dict[str, float] | None:
+    """The figures of one `frame pacing:` line (victory-gpu `pacing.rs`), or None."""
+    m = PACING_RE.search(line)
+    if not m:
+        return None
+    keys = ("frames", "p50", "p95", "p99", "max", "over50", "over100", "sd", "jitter", "draws")
+    return {k: float(v) for k, v in zip(keys, m.groups())}
+
+
+def summarize_pacing(windows: list[dict[str, float]]) -> dict[str, float]:
+    """Settled world windows: median p50/p99/sd/jitter, the worst frame, and the frames over
+    50 and 100 ms (hitches) summed. Settled is after the last world window whose median frame
+    is over LOADING_P50_MS (the world still streaming in), or the later half of the world
+    windows when that leaves fewer than two."""
+    world = [w for w in windows if w["draws"] >= WORLD_DRAWS_MIN]
+    loading = [i for i, w in enumerate(world) if w["p50"] > LOADING_P50_MS]
+    settled = world[loading[-1] + 1 :] if loading else world
+    if len(settled) < 2:
+        settled = world[len(world) // 2 :] if len(world) >= 4 else world
+    if not settled:
+        return {
+            "p50_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0, "sd_ms": 0.0, "jitter_ms": 0.0,
+            "over50": 0, "hitches": 0,
+        }
+    return {
+        "p50_ms": statistics.median(w["p50"] for w in settled),
+        "p99_ms": statistics.median(w["p99"] for w in settled),
+        "max_ms": max(w["max"] for w in settled),
+        "sd_ms": statistics.median(w["sd"] for w in settled),
+        "jitter_ms": statistics.median(w["jitter"] for w in settled),
+        "over50": int(sum(w["over50"] for w in settled)),
+        "hitches": int(sum(w["over100"] for w in settled)),
+    }
+
+
 def parse_victory_log(text: str) -> dict[str, object]:
     world_rows: list[tuple[float, float, float]] = []
     busy_rows: list[float] = []
     frame_ms: float | None = None
+    pacing_windows: list[dict[str, float]] = []
     dstorage_rates: list[float] = []
     refused = 0
     device_removed = False
@@ -282,6 +335,9 @@ def parse_victory_log(text: str) -> dict[str, object]:
         if m_card and frame_ms is not None:
             # GPU busy: the share of the frame the card had work of ours queued.
             busy_rows.append(frame_ms * float(m_card.group(1)) / 100.0)
+        pacing = parse_pacing_line(line)
+        if pacing:
+            pacing_windows.append(pacing)
         m_ds = DSTORAGE_RE.search(line)
         if m_ds:
             dstorage_rates.append(float(m_ds.group(1)))
@@ -302,6 +358,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "gpu_busy_ms": busy_med,
         "refused": refused,
         "device_removed": device_removed,
+        **summarize_pacing(pacing_windows),
     }
 
 
@@ -333,19 +390,34 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
+    return f"DEV {cmd} {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+
 def cmd_test(args: argparse.Namespace) -> int:
-    cargo_cmd = ["cargo", "test", "--manifest-path", str(VICTORY_MANIFEST)]
-    if args.crate:
-        cargo_cmd.extend(["-p", args.crate])
-    steps = [
-        ("cargo test", cargo_cmd, REPO_ROOT),
-        ("cargo xtask policy", ["cargo", "xtask", "policy"], VICTORY_DIR),
-        ("pytest", [sys.executable, "-m", "pytest"], REPO_ROOT),
-    ]
-    ok, outputs = run_logged_steps(steps, DEV_DIR / "test.log")
-    cargo_passed = sum(int(m.group(1)) for m in CARGO_PASSED_RE.finditer(outputs.get("cargo test", "")))
-    pytest_passed = sum(int(m.group(1)) for m in PYTEST_PASSED_RE.finditer(outputs.get("pytest", "")))
-    print(f"DEV test {'PASS' if ok else 'FAIL'} passed={cargo_passed + pytest_passed}")
+    ensure_coord_dirs()
+    ok, _build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate)
+    print(_dev_line("test", ok, fields))
+    return 0 if ok else 1
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """The merge gate: every workspace test, policy and pytest, and no compiler warning."""
+    ensure_coord_dirs()
+    runs = max(1, args.runs)
+    walls: list[str] = []
+    fields: dict[str, str] = {}
+    ok = True
+    for _ in range(runs):
+        ok, build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None)
+        ok = ok and not build.warnings
+        walls.append(fields["wall_s"])
+        if not ok:
+            break
+    fields["runs"] = f"{len(walls)}/{runs}"
+    if runs > 1:
+        fields["walls_s"] = ",".join(walls)
+    print(_dev_line("gate", ok, fields))
     return 0 if ok else 1
 
 
@@ -368,10 +440,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError) as exc:
         ensure_coord_dirs()
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
-        print("DEV bench FAIL fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0")
+        print(
+            "DEV bench FAIL fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0 "
+            "p50_ms=0.0 p99_ms=0.0 max_ms=0.0 sd_ms=0.0 jitter_ms=0.0 over50=0 hitches=0"
+        )
         return 1
 
-    cmd = build_launcher_command(game_dir=game_dir, diag=args.diag, overrides=overrides)
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    cmd = build_launcher_command(game_dir=game_dir, diag=args.diag, overrides=overrides, mute=mute)
     with acquire_gpu_lock("bench"):
         run_timed_victory(cmd, log_path, args.seconds)
 
@@ -385,7 +461,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"prep_ms={float(stats['prep_ms']):.1f} "
         f"gpu_busy_ms={float(stats['gpu_busy_ms']):.1f} "
         f"dstorage_mbs={float(stats['dstorage_mbs']):.1f} "
-        f"refused={int(stats['refused'])}"
+        f"refused={int(stats['refused'])} "
+        f"p50_ms={float(stats['p50_ms']):.1f} "
+        f"p99_ms={float(stats['p99_ms']):.1f} "
+        f"max_ms={float(stats['max_ms']):.1f} "
+        f"sd_ms={float(stats['sd_ms']):.1f} "
+        f"jitter_ms={float(stats['jitter_ms']):.1f} "
+        f"over50={int(stats['over50'])} "
+        f"hitches={int(stats['hitches'])}"
     )
     return 0 if ok else 1
 
@@ -409,7 +492,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "VICTORY_CAPTURE_WORLD": "1",
     }
     overrides.update(user_overrides)
-    cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides)
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides, mute=mute)
     with acquire_gpu_lock(f"capture:{safe_tag}"):
         run_timed_victory(cmd, log_path, args.seconds)
 
@@ -432,7 +516,7 @@ def cmd_scout(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev.py",
-        description="AnyXboxX / VIctory developer CLI with single-line DEV summaries.",
+        description="El1xr / VIctory developer CLI with single-line DEV summaries.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -443,9 +527,15 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--both", action="store_true", help="Build both release and diag profiles.")
     p_build.set_defaults(func=cmd_build)
 
-    p_test = sub.add_parser("test", help="Run cargo tests, cargo xtask policy, and pytest.")
-    p_test.add_argument("--crate", help="Limit cargo test to a single workspace crate (-p).")
+    p_test = sub.add_parser(
+        "test", help="Build, then run every workspace test binary, cargo xtask policy and pytest at once."
+    )
+    p_test.add_argument("--crate", help="Limit cargo tests to a single workspace crate (-p).")
     p_test.set_defaults(func=cmd_test)
+
+    p_gate = sub.add_parser("gate", help="Merge gate: `test` over the whole workspace, failing on any warning.")
+    p_gate.add_argument("--runs", type=int, default=1, help="Run it this many times in a row (default: 1).")
+    p_gate.set_defaults(func=cmd_gate)
 
     p_policy = sub.add_parser("policy", help="Run cargo xtask policy.")
     p_policy.set_defaults(func=cmd_policy)
@@ -455,6 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_bench.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
+    p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_bench.set_defaults(func=cmd_bench)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")
@@ -462,6 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--tag", help="Capture folder tag (writes to AnyXboxX-coord/dev/cap_<tag>/).")
     p_cap.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_cap.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
 
     p_scout = sub.add_parser("scout", help="Run tools/scout_ecosystem.py.")

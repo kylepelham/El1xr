@@ -86,13 +86,13 @@ def not_implemented_functions(sources=RUNTIME_SOURCES):
 
 def gdk_runtime_area(table=RUNTIME_SOURCES / "gdk_api_table.inc",
                      served=RUNTIME_SOURCES / "served_interfaces.inc", sources=RUNTIME_SOURCES):
-    """Fonctions X* du GDK écrites par AnyXboxX : interface servie (et non par Windows), sans stub."""
+    """Fonctions X* du GDK écrites par El1xr : interface servie (et non par Windows), sans stub."""
     apis = API_LINE.findall(Path(table).read_text(encoding="utf-8"))
     stubs = not_implemented_functions(sources)
     served_keys = set((p.upper(), i.upper()) for p, i in SERVED_LINE.findall(Path(served).read_text(encoding="utf-8")))
     interfaces = {(provider, iid) for _, provider, iid, _ in apis}
     done = sum((provider, iid) in served_keys and name not in stubs for name, provider, iid, _ in apis)
-    return Area("GDK runtime functions served by AnyXboxX", done, len(apis),
+    return Area("GDK runtime functions served by El1xr", done, len(apis),
                 f"{len(served_keys & interfaces)}/{len(interfaces)} interfaces (used when the Windows "
                 "GDK runtime is off)")
 

@@ -47,6 +47,14 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     vop3_mod(op, vdst, src0, src1, src2, 0, 0, 0, false)
 }
 
+/// VOP3P `op vdst, src0, src1, src2` (default opsel_hi: high halves for second element).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | (3 << 27),
+    ]
+}
+
 /// VOP3 `op vdst, src0, src1, src2` with explicit `abs`, `neg`, `omod`, `clamp`.
 #[allow(clippy::too_many_arguments)]
 const fn vop3_mod(
@@ -2416,4 +2424,322 @@ fn v_cmp_f_and_tru_lower_as_constant_booleans() {
             );
         });
     }
+}
+
+/// Out-of-bounds console LDS accesses read 0 and drop writes/atomics
+/// without touching valid slots or host scratch slots.
+#[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes_and_atomics() {
+    let ds = |op: u32, addr: u32, data0: u32, vdst: u32| -> [u32; 2] {
+        [
+            0xD800_0000 | (op << 18),
+            (vdst << 24) | (data0 << 8) | addr,
+        ]
+    };
+    let mut body = vec![
+        vop1(0x001, 4, 0x80), // v_mov_b32 v4, 0
+        vop1(0x001, 5, 0xFF), // v_mov_b32 v5, literal
+        0xCAFE_BABE,
+    ];
+    body.extend_from_slice(&ds(0x0D, 4, 5, 0)); // ds_write_b32 v4, v5
+    body.extend_from_slice(&ds(0x0D, 1, 2, 0)); // ds_write_b32 v1, v2
+    body.extend_from_slice(&ds(0x36, 1, 0, 0)); // ds_read_b32 v0, v1
+    // 64 threads avoids WaveSize(32) so both hardware and WARP run it.
+    let rw_shader = build_cs(&body, 64, 512);
+    run_cases(
+        &rw_shader,
+        &[
+            [4, 0x1234_5678, 0, 0],      // in-bounds write & read
+            [512, 0xDEAD_BEEF, 0, 0],    // exact-end OOB read returns 0
+            [0x1000, 0xDEAD_BEEF, 0, 0], // far OOB read returns 0
+        ],
+        |backend, i, _, got| {
+            let want = [0x1234_5678, 0, 0][i];
+            assert_eq!(
+                got, want,
+                "{backend}: LDS read/write case {i} = {got:#x}, want {want:#x}"
+            );
+        },
+    );
+
+    // OOB write/atomic at v1 must not clobber LDS[0], and OOB ds_add_rtn_u32 returns 0.
+    // Single-thread LDS declares WaveSize(32), which WARP refuses: run on hardware.
+    let mut atomic_body = vec![
+        vop1(0x001, 4, 0x80), // v_mov_b32 v4, 0
+        vop1(0x001, 5, 0xFF), // v_mov_b32 v5, 0x1111_2222
+        0x1111_2222,
+    ];
+    atomic_body.extend_from_slice(&ds(0x0D, 4, 5, 0)); // ds_write_b32 v4, v5
+    atomic_body.extend_from_slice(&ds(0x20, 1, 2, 0)); // ds_add_rtn_u32 v0, v1, v2
+    atomic_body.extend_from_slice(&ds(0x36, 4, 0, 6)); // ds_read_b32 v6, v4 (verify LDS[0] intact)
+    atomic_body.push(vop2(0x25, 0, vgpr(0), 6)); // v_add_nc_u32 v0, v0, v6
+    let atomic_shader = build_cs(&atomic_body, 1, 512);
+    run_cases_on(
+        &atomic_shader,
+        &[
+            [0, 5, 0, 0],   // in-bounds: old=0x1111_2222, new LDS[0]=0x1111_2227 -> sum=0x2222_4449
+            [512, 5, 0, 0], // OOB: rtn=0, LDS[0] untouched=0x1111_2222 -> sum=0x1111_2222
+        ],
+        &[("hardware", false)],
+        |backend, i, _, got| {
+            let want = [0x2222_4449, 0x1111_2222][i];
+            assert_eq!(
+                got, want,
+                "{backend}: LDS atomic case {i} = {got:#x}, want {want:#x}"
+            );
+        },
+    );
+}
+
+/// A 32-bit literal in a signed 64-bit operand is sign-extended (an
+/// unsigned one's is zero-extended): -100 compared with `v[1:2]`, and
+/// shifted by `s_ashr_i64`.
+#[test]
+fn signed_64_bit_operands_sign_extend_their_literal() {
+    const MINUS_100: u32 = -100_i32 as u32;
+    let check = |name: &str, body: &[u32], cases: &[([u32; 4], u32)]| {
+        let shader = build_valu_cs(body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    };
+    // v_cmp_*_i64 s6, v[1:2], -100 (VOP3, literal src1), then
+    // v_cndmask_b32 v0, 0, 1, s6.
+    let compare = |op: u16| {
+        let [a, b] = vop3(op, 6, vgpr(1), 255, 0);
+        let [c, d] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        [a, b, MINUS_100, c, d]
+    };
+    // An i64 as the two input dwords of `v[1:2]`.
+    let pair = |n: i64| [n as u32, (n >> 32) as u32, 0, 0];
+    let eq = [(pair(-100), 1), ([MINUS_100, 0, 0, 0], 0), (pair(0), 0)];
+    check("v_cmp_eq_i64", &compare(0x0A2), &eq);
+    let lt = [(pair(-200), 1), (pair(-50), 0), (pair(0), 0)];
+    check("v_cmp_lt_i64", &compare(0x0A1), &lt);
+    // s_ashr_i64 s[6:7], -100, 4; v_mov_b32 v0, s7: the high dword.
+    let ashr = [sop2(0x23, 6, 255, 0x84), MINUS_100, vop1(0x001, 0, sgpr(7))];
+    check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
+}
+
+#[test]
+fn packed_dot_products_and_clamps_execute_cleanly() {
+    let [iw0, iw1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_i8_shader = build_valu_cs(&[iw0, iw1]);
+    let inputs = [[0x0403_0201u32, 0x0504_0302u32, 10u32, 0]];
+    run_cases(&dot4_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_i32_i8 got {got}, want 50");
+    });
+
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
+    let d4c_copy = vop1(0x001, 0, vgpr(3));
+    let d4c = (0x0Du32 << 25) | (2u32 << 9) | (vgpr(1) as u32);
+    let dot4c_i8_shader = build_valu_cs(&[d4c_copy, d4c]);
+    run_cases(&dot4c_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4c_i32_i8 got {got}, want 50");
+    });
+
+    let [uw0, uw1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_u8_shader = build_valu_cs(&[uw0, uw1]);
+    run_cases(&dot4_u8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_u32_u8 got {got}, want 50");
+    });
+
+    // opsel_hi / opsel swapping the halves of s0 on v_dot4_u32_u8 (opsel=0b001, opsel_hi=0b110)
+    let mut u8_op = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    u8_op[0] |= 1 << 11;
+    u8_op[1] = (u8_op[1] & !(3 << 27)) | (2 << 27);
+    let dot4_u8_opsel_shader = build_valu_cs(&u8_op);
+    run_cases(&dot4_u8_opsel_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 42, "{backend}: v_dot4_u32_u8 opsel got {got}, want 42");
+    });
+
+    let [d2i_w0, d2i_w1] = vop3p(0x014, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_i16_shader = build_valu_cs(&[d2i_w0, d2i_w1]);
+    run_cases(
+        &dot2_i16_shader,
+        &[[0x0003_FFFEu32, 0xFFFB_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFF3, "{backend}: v_dot2_i32_i16 got {got:#x}");
+        },
+    );
+
+    let [d2u_w0, d2u_w1] = vop3p(0x015, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_u16_shader = build_valu_cs(&[d2u_w0, d2u_w1]);
+    run_cases(
+        &dot2_u16_shader,
+        &[[0x0003_0002u32, 0x0005_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 33, "{backend}: v_dot2_u32_u16 got {got}, want 33");
+        },
+    );
+
+    let [d8u_w0, d8u_w1] = vop3p(0x019, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot8_u4_shader = build_valu_cs(&[d8u_w0, d8u_w1]);
+    run_cases(
+        &dot8_u4_shader,
+        &[[0x1111_1111u32, 0x2222_2222u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 26, "{backend}: v_dot8_u32_u4 got {got}, want 26");
+        },
+    );
+
+    // Signed nibbles: -1 * 7 in every lane plus 100, and -8 * -8 in every lane.
+    let [d8i_w0, d8i_w1] = vop3p(0x018, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot8_i4_shader = build_valu_cs(&[d8i_w0, d8i_w1]);
+    run_cases(
+        &dot8_i4_shader,
+        &[
+            [0xFFFF_FFFFu32, 0x7777_7777u32, 100u32, 0],
+            [0x8888_8888u32, 0x8888_8888u32, 0u32, 0],
+        ],
+        |backend, i, _inp, got| {
+            let want = [44, 512][i];
+            assert_eq!(got, want, "{backend}: v_dot8_i32_i4 case {i} got {got}, want {want}");
+        },
+    );
+
+    let [mut d2f_w0, d2f_w1] = vop3p(0x013, 0, vgpr(1), vgpr(2), vgpr(3));
+    let d2f_in = [[0x4000_3C00u32, 0x4400_4200u32, 5.0f32.to_bits(), 0]];
+    let dot2_f16_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2_f32_f16 got {got:#x}");
+    });
+    d2f_w0 |= 1 << 15;
+    let dot2_f16_clamp_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_clamp_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 1.0f32.to_bits(), "{backend}: v_dot2_f32_f16 clamp got {got:#x}");
+    });
+
+    // VOP2 v_dot2c_f32_f16 v3, v1, v2 (opcode 0x02): 1.0*3.0 + 2.0*4.0 + 5.0 = 16.0
+    let d2c = (0x02u32 << 25) | (3u32 << 17) | ((2u32) << 9) | (vgpr(1) as u32);
+    let copy_v3_v0 = vop1(0x001, 0, vgpr(3));
+    let dot2c_f16_shader = build_valu_cs(&[d2c, copy_v3_v0]);
+    run_cases(&dot2c_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2c_f32_f16 got {got:#x}");
+    });
+
+    // Clamped integer dot products saturate instead of wrapping.
+    let [mut cu_w0, cu_w1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    cu_w0 |= 1 << 15;
+    let clamp_u8_shader = build_valu_cs(&[cu_w0, cu_w1]);
+    run_cases(
+        &clamp_u8_shader,
+        &[[0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFF0u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFFFu32, "{backend}: v_dot4_u32_u8 clamp got {got:#x}");
+        },
+    );
+
+    let [mut ci_w0, ci_w1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    ci_w0 |= 1 << 15;
+    let clamp_i8_shader = build_valu_cs(&[ci_w0, ci_w1]);
+    let ci_in = [
+        [0x7F7F_7F7Fu32, 0x7F7F_7F7Fu32, 0x7FFF_FFF0u32, 0],
+        [0x7F7F_7F7Fu32, 0xFFFF_FFFFu32, 0x8000_0010u32, 0],
+    ];
+    run_cases(&clamp_i8_shader, &ci_in, |backend, i, _inp, got| {
+        let want = if i == 0 { 0x7FFF_FFFFu32 } else { 0x8000_0000u32 };
+        assert_eq!(got, want, "{backend}: v_dot4_i32_i8 clamp case {i} got {got:#x}");
+    });
+}
+
+#[test]
+fn scalar_quad_masks_pack_nibbles_and_set_scc() {
+    let pack_words = |opcode: u32| {
+        [
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
+            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
+            sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
+            sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
+            vop1(1, 0, sgpr(16)),      // v_mov_b32 v0, s16
+        ]
+    };
+    let cases = [
+        ([0, 0, 0, 0], [0, 0]),
+        ([0x8000_0420, 0x0100_0001, 0, 0], [0x1_0086, 0x1_4186]),
+        ([0, 0x8000_0000, 0, 0], [0, 0x1_8000]),
+        ([u32::MAX, u32::MAX, 0, 0], [0x1_00ff, 0x1_ffff]),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (wide, opcode) in [0x2c, 0x2d].into_iter().enumerate() {
+        let shader = build_valu_cs(&pack_words(opcode));
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1[wide], "{backend}, opcode {opcode:#x}");
+        });
+    }
+    let high = build_valu_cs(&[
+        0xBE90_2D00, // s_quadmask_b64 s[16:17], s[0:1]
+        vop1(1, 0, sgpr(17)),
+    ]);
+    run_cases(&high, &inputs, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: high dword");
+    });
+}
+
+/// SDWA `dst_sel:WORD_0` with `dst_unused:UNUSED_SEXT` (1) sign-extends bit 15
+/// into the upper halfword, whereas `UNUSED_PAD` (0) zero-pads it and reserved
+/// `dst_unused` (3) is refused (upstream #3124).
+#[test]
+fn sdwa_16bit_word0_sext_sign_extends_and_refuses_reserved_unused() {
+    let sdwa_ext = |dst_sel: u32, dst_unused: u32| -> u32 {
+        1u32 | (dst_sel << 8) | (dst_unused << 11) | (6 << 16)
+    };
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:{SEXT,PAD} src0_sel:DWORD
+    let sext = build_valu_cs(&[vop1(0x053, 0, 0xF9), sdwa_ext(4, 1)]);
+    let pad = build_valu_cs(&[vop1(0x053, 0, 0xF9), sdwa_ext(4, 0)]);
+
+    let inputs = [
+        [0xBC00, 0, 0, 0], // -1.0f16 -> -1i16 (0xFFFF)
+        [0xC400, 0, 0, 0], // -4.0f16 -> -4i16 (0xFFFC)
+        [0x3C00, 0, 0, 0], // +1.0f16 -> +1i16 (0x0001)
+        [0x0000, 0, 0, 0], //  0.0f16 ->  0i16 (0x0000)
+    ];
+    let want_sext = [0xFFFF_FFFFu32, 0xFFFF_FFFC, 0x0000_0001, 0x0000_0000];
+    let want_pad = [0x0000_FFFFu32, 0x0000_FFFC, 0x0000_0001, 0x0000_0000];
+    run_cases(&sext, &inputs, |backend, i, _, got| {
+        assert_eq!(got, want_sext[i], "{backend}: sdwa sext case {i}");
+    });
+    run_cases(&pad, &inputs, |backend, i, _, got| {
+        assert_eq!(got, want_pad[i], "{backend}: sdwa pad case {i}");
+    });
+
+    // Reserved dst_unused = 3 must be refused once the result is observed.
+    let bad = [
+        vop1(0x053, 0, 0xF9),
+        sdwa_ext(4, 3),
+        0x36 << 26 | 0x0D << 18, // ds_write_b32 v1, v0
+        1,
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = bad.into_iter().flat_map(u32::to_le_bytes).collect();
+    let native = crate::native::NativeProgram {
+        stage: crate::native::HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = crate::ir::build(&native.code, false, 4).unwrap();
+    let st = crate::structure::structure(&p).unwrap();
+    let io = crate::io::raise(&p, &native).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let err = super::lower::lower(&super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    assert!(err.is_err(), "reserved dst_unused=3 must be refused");
 }

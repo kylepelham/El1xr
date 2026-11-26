@@ -1,9 +1,9 @@
-"""Runtime C++ d'AnyXboxX (dossier runtime/) : les DLL qui remplacent celles de la console.
+"""Runtime C++ d'El1xr (dossier runtime/) : les DLL qui remplacent celles de la console.
 
 Chaque DLL est préchargée par son chemin complet. Windows retrouve ensuite un
 module déjà chargé par son nom de base : toute DLL du jeu, même chargée par
 Windows lui-même, qui demande `xmem.dll` ou `xgameruntime.dll` reçoit celle
-d'AnyXboxX.
+d'El1xr.
 """
 import ctypes
 import logging
@@ -68,7 +68,7 @@ def missing_tombox():
 
 
 def _dll_path(folder, name):
-    """Chemin d'une DLL du runtime : ANYXBOXX_D3D12_XS, puis TomBox si elle sert plus, puis AnyXboxX."""
+    """Chemin d'une DLL du runtime : ANYXBOXX_D3D12_XS, puis TomBox si elle sert plus, puis El1xr."""
     alternative = os.environ.get(D3D12_OVERRIDE) if name == "d3d12_xs.dll" else None
     if alternative:
         return Path(alternative).resolve()
@@ -91,13 +91,13 @@ class Runtime:
         self.handles = dict(handles)
         absent = missing_tombox()
         if absent:
-            log.warning("DLL de TomBox absentes de %s (%s) : AnyXboxX sert ses propres DLL. Compilez-les : %s",
+            log.warning("DLL de TomBox absentes de %s (%s) : El1xr sert ses propres DLL. Compilez-les : %s",
                         tombox_dir(), ", ".join(absent), BUILD_COMMAND)
 
     @staticmethod
     def _load(path):
         if not path.is_file():
-            raise ValueError(f"Runtime C++ d'AnyXboxX introuvable ({path}). Compilez-le : {BUILD_HINT}")
+            raise ValueError(f"Runtime C++ d'El1xr introuvable ({path}). Compilez-le : {BUILD_HINT}")
         handle = win32.LoadLibraryExW(str(path), None, SAFE_SEARCH)
         if not handle:
             raise ValueError(f"Chargement de {path} impossible (erreur {ctypes.get_last_error()}).")
@@ -111,7 +111,7 @@ class Runtime:
         return module in self.handles.values()
 
     def export(self, function, dll="xgameruntime.dll"):
-        """Adresse d'un export propre à AnyXboxX dans une DLL du runtime (0 si absent)."""
+        """Adresse d'un export propre à El1xr dans une DLL du runtime (0 si absent)."""
         return win32.GetProcAddress(self.handles[dll],
                                     ctypes.c_char_p(function.encode())) or 0
 

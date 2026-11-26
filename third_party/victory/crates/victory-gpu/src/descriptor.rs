@@ -537,7 +537,7 @@ fn changed_slots(
 /// Gives back a list's dynamic slots in batches by heap, taking `SHADER_HEAPS`
 /// and each host heap's dynamic lock once per contiguous run of the same heap.
 #[cfg(windows)]
-pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
+pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
     if entries.is_empty() {
         return;
     }
@@ -545,17 +545,19 @@ pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
     let mut batch: Vec<(u32, u32)> = Vec::new();
     let mut i = 0;
     while i < entries.len() {
-        let heap = entries[i].0;
+        let (heap, id) = (entries[i].0, entries[i].1);
         batch.clear();
-        while i < entries.len() && entries[i].0 == heap {
-            batch.push((entries[i].1, entries[i].2));
+        while i < entries.len() && (entries[i].0, entries[i].1) == (heap, id) {
+            batch.push((entries[i].2, entries[i].3));
             i += 1;
         }
+        // A heap whose address a new one took since keeps the new host
+        // heap's identity: `release_many` leaves its slots alone.
         if heaps.iter().any(|&(_, _, h)| h == heap)
             // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
             && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
         {
-            host.release_many(&batch);
+            host.release_many(id, &batch);
         }
     }
 }
@@ -593,7 +595,43 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// A render target or depth view's values, kept for replaying a list after
+/// a cut: the resource as an integer (like `draw::State`), never the address
+/// of descriptor storage the title may rewrite. The caller still owns the
+/// resource's lifetime, as with the command first recorded.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct RtvSnapshot {
+    tag: u32,
+    described: u32,
+    resource: usize,
+    desc: [u32; 6],
+}
+
+#[cfg(windows)]
+impl RtvSnapshot {
+    pub(crate) fn restore(self) -> RtvRecord {
+        RtvRecord {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as This,
+            desc: self.desc,
+        }
+    }
+}
+
 impl RtvRecord {
+    /// The values of this view ([`RtvSnapshot`]).
+    #[cfg(windows)]
+    pub(crate) fn snapshot(self) -> RtvSnapshot {
+        RtvSnapshot {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as usize,
+            desc: self.desc,
+        }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -697,12 +735,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -1412,11 +1454,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1717,6 +1767,29 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// A view's snapshot keeps the values it had when taken, whatever is
+    /// written to the record afterwards.
+    #[cfg(windows)]
+    #[test]
+    fn render_target_snapshot_preserves_original_descriptor_words() {
+        let mut record = RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as This,
+            desc: [24, 4, 0, 0, 0, 0],
+        };
+        let snapshot = record.snapshot();
+        record.desc[0] = 26;
+        record.resource = 0x2000usize as This;
+        let restored = snapshot.restore();
+        assert_eq!(restored.tag, record.tag);
+        assert_eq!(restored.described, record.described);
+        assert_eq!(restored.desc[0], 24);
+        assert_eq!(restored.resource as usize, 0x1000);
+        assert_eq!(record.desc[0], 26);
+        assert_eq!(record.resource as usize, 0x2000);
+    }
+
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
     #[repr(C)]
@@ -1831,6 +1904,23 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// Two placed views alike but for the words their kind does not use
@@ -2233,4 +2323,5 @@ mod tests {
         sync_heaps_wait(t2);
         assert!(!overlaps_shader_heap(0, 0));
     }
+
 }

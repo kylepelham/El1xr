@@ -1,5 +1,5 @@
 // Journal du runtime : toujours pour les messages du jeu, sur demande (ANYXBOXX_TRACE=1)
-// pour le détail des appels. Écrit sur stderr, partagé avec AnyXboxX.
+// pour le détail des appels. Écrit sur stderr, partagé avec El1xr.
 #pragma once
 
 #include <windows.h>

@@ -1,4 +1,4 @@
-// Interface XGameSave (et XGameSaveFiles) servie par AnyXboxX : sauvegardes sur le disque du PC.
+// Interface XGameSave (et XGameSaveFiles) servie par El1xr : sauvegardes sur le disque du PC.
 //
 // Fournisseur {704C3F58…}, interface {1BFFF3AF…}, méthodes 3 à 32 (gdk_api_table.inc).
 // Signatures et codes d'erreur : en-têtes publics XGameSave.h et XGameSaveFiles.h.

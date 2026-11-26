@@ -2100,7 +2100,7 @@ mod tests {
     /// runs 71 and 74).
     #[test]
     fn a_read_in_place_never_meets_the_gap_of_a_remapping() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let mut pages = [0usize; 3];
         let mut n = 3;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
@@ -2117,28 +2117,33 @@ mod tests {
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reads = std::sync::Arc::new(AtomicU64::new(0));
         let reader = {
-            let stop = stop.clone();
+            let (stop, reads) = (stop.clone(), reads.clone());
             std::thread::spawn(move || {
-                let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let _reading = victory_gpu::title_memory_reading();
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.
                     assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
-                    reads += 1;
+                    reads.fetch_add(1, Ordering::Relaxed);
                 }
-                reads
             })
         };
+        // The reader is under way before the remappings begin (on a busy
+        // machine it may otherwise first run after the last of them).
+        while reads.load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
         for _ in 0..2000 {
             // The same pages at the same address: the view goes and comes
             // back, with the same bytes.
             assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
         }
         stop.store(true, Ordering::Relaxed);
-        assert!(reader.join().expect("the reader never faulted") > 0);
+        reader.join().expect("the reader never faulted");
+        assert!(reads.load(Ordering::Relaxed) > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }

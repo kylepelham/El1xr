@@ -4,7 +4,7 @@
 
 État au 23 novembre 2026, commit amont `561b65a832`. Leonida ([ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida), GPL-3.0) recompile statiquement le build Xbox Series 1.0.2.1 pour Windows : le code x86-64 du jeu tourne nativement, le logiciel système de la console est réimplémenté, les shaders RDNA 2 sont traduits en SPIR-V pour Vulkan. Le dépôt ne contient ni le jeu, ni clé, ni exécutable.
 
-Depuis le 23 novembre, AnyXboxX vise d'abord à faire tourner ce build : nous contribuons à Leonida et nous reprenons leurs travaux, en gardant AnyXboxX comme projet générique.
+Depuis le 23 novembre, El1xr vise d'abord à faire tourner ce build : nous contribuons à Leonida et nous reprenons leurs travaux, en gardant El1xr comme projet générique.
 
 ## Ce que nous récupérons
 
@@ -25,7 +25,7 @@ Leur chemin critique et les méthodes D3D12 encore ouvertes sont suivis dans leu
 
 ## Fonctions GDK : comparaison des deux runtimes
 
-La comparaison se fait par recherche de noms, sans compilation, donc les nombres sont approximatifs. AnyXboxX déclare 396 méthodes (`runtime/xgameruntime/gdk_api_table.inc`) et en implémente environ 170. Leonida nomme environ 310 fonctions dans `runtime/shims/xgameruntime*.cpp` et en implémente environ 190. Aucun import de l'exécutable n'a été mesuré : leur `docs/runtime_imports.md` ne liste que les familles que lient les DLL du paquet (XAsync, XTaskQueue, XUser, XStore, XGameSave, XPackage, XGameUi).
+La comparaison se fait par recherche de noms, sans compilation, donc les nombres sont approximatifs. El1xr déclare 396 méthodes (`runtime/xgameruntime/gdk_api_table.inc`) et en implémente environ 170. Leonida nomme environ 310 fonctions dans `runtime/shims/xgameruntime*.cpp` et en implémente environ 190. Aucun import de l'exécutable n'a été mesuré : leur `docs/runtime_imports.md` ne liste que les familles que lient les DLL du paquet (XAsync, XTaskQueue, XUser, XStore, XGameSave, XPackage, XGameUi).
 
 **Implémentées chez nous, absentes ou bouchons chez eux** (pistes de contribution) :
 

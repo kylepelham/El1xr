@@ -1,4 +1,4 @@
-"""AnyXboxX — prototype d'émulateur Xbox Series X (interface et ligne de commande)."""
+"""El1xr — prototype d'émulateur Xbox Series X (interface et ligne de commande)."""
 import os
 from pathlib import Path
 import sys
@@ -21,7 +21,7 @@ FRAME_MS = 33
 DEMO = HERE / "demo.pe"
 XBOX_SERIES_X = 7
 ERRORS = (ValueError, OSError, ET.ParseError, pefile.PEFormatError, UcError)
-TITLE = "AnyXboxX — Xbox Series X emulator (prototype)"
+TITLE = "El1xr — Xbox Series X emulator (prototype)"
 
 
 def resolve_target(path):
@@ -150,7 +150,7 @@ NATIVE_WARNING = ("ATTENTION : en mode --natif, le programme s'exécute directem
 
 def run_native(target, extra_dirs=()):
     """Exécution façon Wine : le code tourne sur le processeur, les imports Xbox sont servis
-    par AnyXboxX et le reste par Windows. Le processus se termine avec le jeu."""
+    par El1xr et le reste par Windows. Le processus se termine avec le jeu."""
     print(NATIVE_WARNING, file=sys.stderr)
     try:
         from emu import native
@@ -176,7 +176,7 @@ def print_translation(package, svg_path=None):
         areas = (*overview, *areas)
         print(translation.table(areas))
         if svg_path is not None:
-            svg_path.write_text(translation.svg(areas, "AnyXboxX: Xbox Series X translation progress"),
+            svg_path.write_text(translation.svg(areas, "El1xr: Xbox Series X translation progress"),
                                 encoding="utf-8")
         return 0
     except (OSError, ValueError) as error:

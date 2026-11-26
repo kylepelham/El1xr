@@ -100,7 +100,7 @@ def test_context_opens_for_the_local_user_or_for_nobody(runtime_dir):
         assert create(owner, ctypes.byref(context)) == S_OK and context.value
         api.method(CLOSE_CONTEXT, None, P)(context)
     assert create(user, None) == E_INVALIDARG
-    unknown = ctypes.create_string_buffer(16)         # pas un handle XUser d'AnyXboxX
+    unknown = ctypes.create_string_buffer(16)         # pas un handle XUser d'El1xr
     assert create(ctypes.addressof(unknown), ctypes.byref(P())) == E_INVALIDARG
 
 

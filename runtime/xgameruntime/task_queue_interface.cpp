@@ -1,4 +1,4 @@
-// Interface XTaskQueue / XAsync / XThread du runtime GDK, servie par AnyXboxX.
+// Interface XTaskQueue / XAsync / XThread du runtime GDK, servie par El1xr.
 //
 // Le jeu (xgameruntime.lib) obtient l'objet par QueryApiImpl, puis appelle la
 // méthode n° k avec this suivi des arguments de la fonction publique (vérifié

@@ -52,7 +52,7 @@ HRESULT Subscribe(void*, void*, void* callback, RegistrationToken* token) noexce
 }
 bool Unsubscribe(RegistrationToken token, bool) noexcept { return Registry().Remove(token); }
 
-// --- XError : rappel du jeu et options (aucun arrêt forcé sous AnyXboxX) ----------------
+// --- XError : rappel du jeu et options (aucun arrêt forcé sous El1xr) ----------------
 using ErrorCallback = bool(CALLBACK*)(HRESULT, const char*, void*);
 
 struct ErrorState {

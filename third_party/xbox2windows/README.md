@@ -13,5 +13,5 @@ revient aux contributeurs de Xbox2Windows.
 | `tests/dxil_retarget_check.py`, `tests/shader_probe_check.py` | leur test : modules DXIL fabriqués en mémoire, contrôles positifs et négatifs ; le second sert au contrôle sur GPU |
 
 Utilisation : `python third_party/xbox2windows/tools/dxil_retarget.py <entrée.dxbc> <sortie.dxbc>`, ou
-`--pe <jeu.exe> --output-dir <dossier>` sur un exécutable console. AnyXboxX lance leur test dans sa suite
+`--pe <jeu.exe> --output-dir <dossier>` sur un exécutable console. El1xr lance leur test dans sa suite
 (`tests/test_dxil_retarget.py`). Pour mettre à jour : recopier ces fichiers depuis un commit plus récent.

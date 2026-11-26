@@ -76,7 +76,7 @@ def test_dxgi_is_redirected_only_when_measuring(tmp_path, runtime_dir, monkeypat
 
 @pytest.mark.skipif(sys.platform != "win32", reason="exécution native sous Windows")
 def test_game_dlls_get_anyxboxx_get_proc_address(tmp_path, runtime_dir):
-    """SDL3.dll charge DXGI par GetProcAddress : ses appels doivent passer par AnyXboxX."""
+    """SDL3.dll charge DXGI par GetProcAddress : ses appels doivent passer par El1xr."""
     import ctypes
 
     from emu.native import NativeImage
