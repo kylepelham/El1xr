@@ -23,6 +23,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod alloc_backoff;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod draw;
@@ -43,7 +45,13 @@ mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod cores;
+#[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
+#[cfg(windows)]
+mod port_cbv;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -83,8 +91,10 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
+pub use shadow::LazyAccessHold;
+#[cfg(windows)]
 pub use watch::{
     Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
     title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
-    written_through_view,
+    writing_hold as kernel_will_write_hold, written_through_view,
 };

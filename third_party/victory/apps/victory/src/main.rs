@@ -193,19 +193,19 @@ enum Console {
 /// (Neptune) Diagnostics builds: the redistributable D3D12 runtime and debug layer in `D3D12\`
 /// beside the executable are used if they are there (`build.rs` exports these two; the
 /// version is the middle number of the package's, 1.620.2).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "diagnostics", victory_agility_sdk))]
 #[unsafe(no_mangle)]
 #[used]
 pub static D3D12SDKVersion: u32 = 620;
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "diagnostics", victory_agility_sdk))]
 #[repr(transparent)]
 pub struct SdkPath(*const u8);
 // SAFETY: a pointer to a constant string.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "diagnostics", victory_agility_sdk))]
 unsafe impl Sync for SdkPath {}
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "diagnostics", victory_agility_sdk))]
 #[unsafe(no_mangle)]
 #[used]
 pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());

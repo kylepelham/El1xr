@@ -110,6 +110,14 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
+    // VICTORY_UPSCALER; each off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -255,7 +263,10 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
-                    victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
+                    victory_hle::runtime::set_image_size(
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

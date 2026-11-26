@@ -12,14 +12,14 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is 12 s per title frame and kind, a window the
-//! recording threads wait in together ([`DEFAULT_WAIT_MS`]); it was half
-//! a second. A pass the title runs only once and whose pipeline takes
-//! longer is lost: while a world loads the title dispatches the passes
-//! that unpack its models once. With a budget set below the defaults, a
-//! frame may wait longer for a pipeline while a run's loading allowance
-//! lasts ([`frame_budget`]), and never for one the driver has held for
-//! long ([`held_too_long`]).
+//! The default gameplay budget is 25 ms per title frame for graphics and
+//! 200 ms for compute, a window the recording threads wait in together
+//! ([`DEFAULT_WAIT_MS`], [`DEFAULT_WAIT_COMPUTE_MS`]). A pass the title
+//! runs only once and whose pipeline takes longer would be lost while a
+//! world loads (when the title dispatches the passes that unpack its
+//! models once): a frame may wait longer for a pipeline while a run's
+//! loading allowance lasts ([`frame_budget`]), and never for one the
+//! driver has held for long ([`held_too_long`]).
 //! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
 //! loading waits only).
 
@@ -76,7 +76,8 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
 fn too_dear(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let out =
+        *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 
@@ -111,7 +112,13 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let left_out = left_out(&shaders);
         Pending {
             shaders,
@@ -134,7 +141,10 @@ impl Pending {
     /// Whether the host's driver has been at it for longer than a frame
     /// waits for ([`held_too_long`]).
     fn slow(&self) -> bool {
-        self.begun.get().is_some_and(|at| held_too_long(at.elapsed(), self.computes(), wait_budget()))
+        let compute = self.computes();
+        self.begun
+            .get()
+            .is_some_and(|at| held_too_long(at.elapsed(), compute, wait_budget(compute)))
     }
 
     fn make(&self) {
@@ -152,10 +162,10 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some(p.left_out.map_or_else(
-            || format!("being made {:?}", p.shaders),
-            str::to_owned,
-        )),
+        None => Some(
+            p.left_out
+                .map_or_else(|| format!("being made {:?}", p.shaders), str::to_owned),
+        ),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -172,38 +182,51 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
+/// Waiting allowed per title frame, over all threads, by kind.
+fn wait_budget(compute: bool) -> Duration {
     #[cfg(test)]
     if let Some(budget) = TEST_BUDGET.get() {
         return budget;
     }
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
+    static BUDGET: OnceLock<(Duration, Duration)> = OnceLock::new();
+    let (graphics, compute_budget) = *BUDGET.get_or_init(|| {
+        let override_ms = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_WAIT_MS);
-        tracing::info!(millis, "host pipeline wait budget per frame, per kind");
-        Duration::from_millis(millis)
-    })
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let graphics = override_ms.unwrap_or(DEFAULT_WAIT_MS);
+        let compute_ms = override_ms.unwrap_or(DEFAULT_WAIT_COMPUTE_MS);
+        tracing::info!(
+            graphics,
+            compute = compute_ms,
+            "host pipeline wait budget per frame, per kind (ms)"
+        );
+        (
+            Duration::from_millis(graphics),
+            Duration::from_millis(compute_ms),
+        )
+    });
+    if compute { compute_budget } else { graphics }
 }
 
-/// The default of [`wait_budget`]: the picture before frame rate. A frame
-/// waits for pipelines still being made rather than drop their draws and
-/// dispatches, up to 12 s for each kind (graphics, compute), the threads
-/// together ([`Sharing::Window`]). At worst a frame then waits 24 s, both
-/// kinds' windows used up one after the other, under the title's GPU
-/// watchdog, which ends a run whose frame takes more than 30 s (decision
-/// 0007). Only a pipeline still not made after its frame's window loses
-/// that frame's draws. `VICTORY_PIPELINE_WAIT_MS=500` waits as before.
-const DEFAULT_WAIT_MS: u64 = 12_000;
+/// The default gameplay base budgets of [`wait_budget`]: short enough that
+/// mid-gameplay shader compiles do not freeze frames (and that
+/// [`held_too_long`] stays active), while loading frames still wait up to
+/// [`LOADING_FRAME`] / [`LOADING_FRAME_COMPUTE`] while
+/// [`loading_allowance`] lasts. Setting `VICTORY_PIPELINE_WAIT_MS` overrides
+/// both kinds to that value (for example `VICTORY_PIPELINE_WAIT_MS=12000`
+/// restores a 12 s window for both).
+const DEFAULT_WAIT_MS: u64 = 25;
+const DEFAULT_WAIT_COMPUTE_MS: u64 = 200;
 
 /// The title's GPU watchdog: one frame of more than this ends the run.
 const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
 
 // Both kinds' windows, one after the other, stay under the watchdog.
-const _: () = assert!(2 * DEFAULT_WAIT_MS < TITLE_WATCHDOG.as_millis() as u64);
+const _: () =
+    assert!(DEFAULT_WAIT_MS + DEFAULT_WAIT_COMPUTE_MS < TITLE_WATCHDOG.as_millis() as u64);
+const _: () = assert!(
+    LOADING_FRAME.as_millis() + LOADING_FRAME_COMPUTE.as_millis() < TITLE_WATCHDOG.as_millis()
+);
 
 #[cfg(test)]
 thread_local! {
@@ -239,7 +262,11 @@ fn loading_allowance() -> Duration {
 /// the run's allowance for that kind lasts (`spent` of it gone) up to
 /// [`LOADING_FRAME`] or [`LOADING_FRAME_COMPUTE`].
 fn frame_budget(base: Duration, compute: bool, allowance: Duration, spent: Duration) -> Duration {
-    let loading = if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME };
+    let loading = if compute {
+        LOADING_FRAME_COMPUTE
+    } else {
+        LOADING_FRAME
+    };
     base.max(loading.min(allowance.saturating_sub(spent)))
 }
 
@@ -323,7 +350,13 @@ pub(crate) fn early(p: &Arc<Pending>) {
 /// waited (run fork-essentials).
 fn shared_budget() -> Sharing {
     static ON: OnceLock<Sharing> = OnceLock::new();
-    *ON.get_or_init(|| sharing_from(std::env::var("VICTORY_PIPELINE_WAIT_SHARED").ok().as_deref()))
+    *ON.get_or_init(|| {
+        sharing_from(
+            std::env::var("VICTORY_PIPELINE_WAIT_SHARED")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// How the threads that wait in one frame count its budget for one kind
@@ -367,16 +400,26 @@ struct FrameWait {
 
 impl FrameWait {
     const fn new() -> FrameWait {
-        FrameWait { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, since: None }
+        FrameWait {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        }
     }
 
     /// A thread is to wait in `frame` at `now`: how long it may.
     fn begin(&mut self, sharing: Sharing, frame: u64, budget: Duration, now: Instant) -> Duration {
         if self.frame != frame {
-            *self = FrameWait { frame, ..FrameWait::new() };
+            *self = FrameWait {
+                frame,
+                ..FrameWait::new()
+            };
         }
         if sharing == Sharing::Window {
-            let open = self.since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            let open = self
+                .since
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
             let left = budget.saturating_sub(self.spent + open);
             if !left.is_zero() {
                 if self.waiting == 0 {
@@ -396,7 +439,14 @@ impl FrameWait {
     /// The thread that [`begin`](Self::begin) gave `left` (more than
     /// nothing) in `frame` has waited `waited`, and stops at `now`. A frame
     /// that began meanwhile has its own budget.
-    fn end(&mut self, sharing: Sharing, frame: u64, left: Duration, waited: Duration, now: Instant) {
+    fn end(
+        &mut self,
+        sharing: Sharing,
+        frame: u64,
+        left: Duration,
+        waited: Duration,
+        now: Instant,
+    ) {
         if self.frame != frame {
             return;
         }
@@ -417,23 +467,31 @@ impl FrameWait {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let base = wait_budget();
+    let compute = p.computes();
+    let base = wait_budget(compute);
     if base.is_zero() || p.slow() {
         return;
     }
     // What was waited past the base budget since the start, in
     // milliseconds, by kind (others, compute).
     static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let compute = p.computes();
     let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
+    let budget = frame_budget(
+        base,
+        compute,
+        loading_allowance(),
+        Duration::from_millis(past.load(Ordering::Relaxed)),
+    );
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now), by kind.
     static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
     let frame_wait = &FRAMES[usize::from(compute)];
     let sharing = shared_budget();
     let started = Instant::now();
-    let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
+    let left = frame_wait
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin(sharing, frame, budget, started);
     if left.is_zero() {
         return;
     }
@@ -446,12 +504,24 @@ fn wait(p: &Pending, frame: u64) {
         }
         // Woken now and then to see whether it has become a slow one.
         let rest = rest.min(Duration::from_millis(250));
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
-    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
+    past.fetch_add(
+        waited.saturating_sub(base).as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(
+        sharing,
+        frame,
+        left,
+        waited,
+        Instant::now(),
+    );
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -522,7 +592,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
         }
         AVAILABLE.notify_one();
     }
@@ -538,12 +611,13 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 12) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 12));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -559,7 +633,7 @@ fn workers() -> bool {
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            save_library_async();
                         }
                     }
                 });
@@ -588,12 +662,76 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    save_library_async();
+}
+
+/// Guards [`save_library_async`] so at most one background save runs at once.
+static LIBRARY_SAVING: AtomicBool = AtomicBool::new(false);
+/// `crate::host::now_ms().max(1)` of the last background save spawn/completion
+/// (0: none yet), matching `library::save`'s 20 s interval so worker threads do
+/// not spawn redundant threads between saves.
+static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Runs `super::library::save(false)` on a dedicated low-priority background
+/// thread so pipeline workers never stall for hundreds of milliseconds
+/// serialising and renaming a ~1 GiB+ pipeline library (`ID3D12PipelineLibrary1`
+/// lives in a `'static` `OnceLock` and `Library` is `Send + Sync`; `save`
+/// writes to `.tmp`, atomically renames over the cache file, and logs on
+/// completion).
+fn save_library_async() {
+    const SAVE_EVERY_MS: u64 = 20_000;
+    if LIBRARY_SAVING.load(Ordering::Acquire) {
+        return;
+    }
+    let now = crate::host::now_ms().max(1);
+    let last = LAST_SAVE_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SAVE_EVERY_MS {
+        return;
+    }
+    if LIBRARY_SAVING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let now = crate::host::now_ms().max(1);
+    let last = LAST_SAVE_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SAVE_EVERY_MS {
+        LIBRARY_SAVING.store(false, Ordering::Release);
+        return;
+    }
+    LAST_SAVE_MS.store(now, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name("victory-library-save".into())
+        .spawn(|| {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    LAST_SAVE_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
+                    LIBRARY_SAVING.store(false, Ordering::Release);
+                }
+            }
+            let _guard = Guard;
+            // Below both title threads and pipeline compile workers.
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            }
+            super::library::save(false);
+        });
+    if let Err(e) = spawned {
+        LIBRARY_SAVING.store(false, Ordering::Release);
+        tracing::warn!(error = %e, "could not spawn pipeline library save thread");
+    }
 }
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long, sharing_from};
+    use super::{
+        FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long,
+        sharing_from,
+    };
     use std::time::{Duration, Instant};
 
     /// Two threads ask for pipelines still being made in one frame, the
@@ -605,21 +743,56 @@ mod loading_tests {
     #[test]
     fn two_threads_in_one_frame_both_wait_inside_the_window() {
         let sharing = sharing_from(None);
-        let (budget, t0, ms) = (Duration::from_secs(12), Instant::now(), Duration::from_millis(1));
+        let (budget, t0, ms) = (
+            Duration::from_secs(12),
+            Instant::now(),
+            Duration::from_millis(1),
+        );
         let mut w = FrameWait::new();
         let a = w.begin(sharing, 7, budget, t0);
         let b = w.begin(sharing, 7, budget, t0 + ms);
         assert_eq!(a, budget);
-        assert_eq!(b, budget - ms, "the second thread drops its pipeline at once: {sharing:?} gives it {b:?}");
+        assert_eq!(
+            b,
+            budget - ms,
+            "the second thread drops its pipeline at once: {sharing:?} gives it {b:?}"
+        );
         // Both made after 2 s: 2 s of the window gone.
-        w.end(sharing, 7, a, Duration::from_secs(2), t0 + Duration::from_secs(2));
-        w.end(sharing, 7, b, Duration::from_secs(2) - ms, t0 + Duration::from_secs(2));
-        assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(5)), Duration::from_secs(10));
+        w.end(
+            sharing,
+            7,
+            a,
+            Duration::from_secs(2),
+            t0 + Duration::from_secs(2),
+        );
+        w.end(
+            sharing,
+            7,
+            b,
+            Duration::from_secs(2) - ms,
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(
+            w.begin(sharing, 7, budget, t0 + Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
         // That thread waits out the rest: the window is used up.
-        w.end(sharing, 7, Duration::from_secs(10), Duration::from_secs(10), t0 + Duration::from_secs(15));
-        assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(16)), Duration::ZERO);
+        w.end(
+            sharing,
+            7,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            t0 + Duration::from_secs(15),
+        );
+        assert_eq!(
+            w.begin(sharing, 7, budget, t0 + Duration::from_secs(16)),
+            Duration::ZERO
+        );
         // The next frame.
-        assert_eq!(w.begin(sharing, 8, budget, t0 + Duration::from_secs(17)), budget);
+        assert_eq!(
+            w.begin(sharing, 8, budget, t0 + Duration::from_secs(17)),
+            budget
+        );
     }
 
     /// `VICTORY_PIPELINE_WAIT_SHARED=reserve`, the default before the
@@ -635,7 +808,10 @@ mod loading_tests {
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
         w.end(Sharing::PerThread, 1, budget, Duration::from_secs(3), t0);
-        assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), Duration::from_secs(9));
+        assert_eq!(
+            w.begin(Sharing::PerThread, 1, budget, t0),
+            Duration::from_secs(9)
+        );
         assert_eq!(sharing_from(Some("0")), Sharing::PerThread);
         assert_eq!(sharing_from(Some("reserve")), Sharing::Reserve);
     }
@@ -646,14 +822,33 @@ mod loading_tests {
     #[test]
     fn a_frame_waits_longer_while_the_loading_allowance_lasts() {
         let (base, allowance) = (Duration::from_millis(500), Duration::from_secs(120));
-        assert_eq!(frame_budget(base, false, allowance, Duration::ZERO), LOADING_FRAME);
-        assert_eq!(frame_budget(base, true, allowance, Duration::ZERO), LOADING_FRAME_COMPUTE);
+        assert_eq!(
+            frame_budget(base, false, allowance, Duration::ZERO),
+            LOADING_FRAME
+        );
+        assert_eq!(
+            frame_budget(base, true, allowance, Duration::ZERO),
+            LOADING_FRAME_COMPUTE
+        );
         // 1 s of the allowance left: 1 s.
-        assert_eq!(frame_budget(base, true, allowance, Duration::from_secs(119)), Duration::from_secs(1));
+        assert_eq!(
+            frame_budget(base, true, allowance, Duration::from_secs(119)),
+            Duration::from_secs(1)
+        );
         // Spent: the frame budget, as before.
-        assert_eq!(frame_budget(base, true, allowance, Duration::from_secs(130)), base);
-        assert_eq!(frame_budget(base, false, Duration::ZERO, Duration::ZERO), base, "VICTORY_PIPELINE_GATE_S=0");
-        assert_eq!(frame_budget(Duration::from_secs(20), true, allowance, Duration::ZERO), Duration::from_secs(20));
+        assert_eq!(
+            frame_budget(base, true, allowance, Duration::from_secs(130)),
+            base
+        );
+        assert_eq!(
+            frame_budget(base, false, Duration::ZERO, Duration::ZERO),
+            base,
+            "VICTORY_PIPELINE_GATE_S=0"
+        );
+        assert_eq!(
+            frame_budget(Duration::from_secs(20), true, allowance, Duration::ZERO),
+            Duration::from_secs(20)
+        );
     }
 
     /// No frame waits for a pipeline the driver has held past 10 s

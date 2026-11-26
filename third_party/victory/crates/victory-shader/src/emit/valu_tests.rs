@@ -181,6 +181,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -343,7 +344,11 @@ fn f64_arithmetic_and_conversions_are_ieee() {
     for (body, inputs, want) in cases {
         let shader = build_valu_cs(body);
         run_cases(&shader, &[inputs], |backend, _, _, got| {
-            assert_eq!(f32::from_bits(got), want, "{backend}: {body:08x?} on {inputs:08x?}");
+            assert_eq!(
+                f32::from_bits(got),
+                want,
+                "{backend}: {body:08x?} on {inputs:08x?}"
+            );
         });
     }
 }
@@ -381,14 +386,19 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
             let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
             // Cross-lane code declares WaveSize(32), which WARP's pipeline
             // creation refuses: hardware only.
-            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
-                let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
-                assert_eq!(
-                    got, want,
-                    "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
-                    selectors[i]
-                );
-            });
+            run_cases_on(
+                &shader,
+                &inputs,
+                &[("hardware", false)],
+                |backend, i, inp, got| {
+                    let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
+                    assert_eq!(
+                        got, want,
+                        "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
+                        selectors[i]
+                    );
+                },
+            );
         }
     }
 }
@@ -1068,7 +1078,10 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
     ];
-    let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let u16_in: Vec<[u32; 4]> = u16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_u16, &u16_in, |backend, i, inp, got| {
         let want = u16_cases[i].1;
         assert_eq!(
@@ -1086,15 +1099,18 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-        (0xFC00, 0x8000),       // -inf -> -32768
-        (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xFC00, 0x8000),           // -inf -> -32768
+        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),            // NaN -> 0
-        (0x57BC, 123),          // 123.75 -> 123
-        (0x78E2, 0x7FFF),       // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),       // +inf -> 32767
+        (0x7E00, 0),                // NaN -> 0
+        (0x57BC, 123),              // 123.75 -> 123
+        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),           // +inf -> 32767
     ];
-    let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let i16_in: Vec<[u32; 4]> = i16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
         let want = i16_cases[i].1;
         assert_eq!(
@@ -1285,7 +1301,10 @@ const DS_SUB_RTN_U32: u8 = 0x21;
 
 /// `buffer_store_dword v<data>, v<addr>, s[8:11], 0 offen offset:<offset>`.
 const fn store_at(data: u8, addr: u8, offset: u16) -> [u32; 2] {
-    [0xE070_1000 | offset as u32, 0x8002_0000 | (data as u32) << 8 | addr as u32]
+    [
+        0xE070_1000 | offset as u32,
+        0x8002_0000 | (data as u32) << 8 | addr as u32,
+    ]
 }
 
 /// One console wave of 32 threads takes slots off an LDS counter as the title's
@@ -1300,7 +1319,10 @@ const fn store_at(data: u8, addr: u8, offset: u16) -> [u32; 2] {
 fn lds_subtractions_get_a_pipeline_and_stay_atomic() {
     const INIT: u32 = 1_000_000;
     const S1: u32 = 0x100;
-    for (op, negate, what) in [(DS_ADD_RTN_U32, true, "ds_add_rtn_u32 of 0 - x"), (DS_SUB_RTN_U32, false, "ds_sub_rtn_u32")] {
+    for (op, negate, what) in [
+        (DS_ADD_RTN_U32, true, "ds_add_rtn_u32 of 0 - x"),
+        (DS_SUB_RTN_U32, false, "ds_sub_rtn_u32"),
+    ] {
         let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0: the counter's address
         body.extend(ds(DS_WRITE_B32, 0, 5, 1)); // the counter = s0 (every thread the same)
         body.push(S_BARRIER);
@@ -1346,7 +1368,10 @@ fn lds_subtractions_get_a_pipeline_and_stay_atomic() {
         order.sort_unstable_by(|a, b| b.cmp(a));
         let mut counter = INIT;
         for (old, x) in order {
-            assert_eq!(old, counter, "{what}: the thread taking {x} found {old}, the counter stood at {counter}");
+            assert_eq!(
+                old, counter,
+                "{what}: the thread taking {x} found {old}, the counter stood at {counter}"
+            );
             counter -= x;
         }
         assert_eq!(got[0], counter, "{what}: the counter at the end");
@@ -1488,7 +1513,8 @@ fn v_cvt_f32_f64_matches_ieee754() {
             );
         } else {
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "{backend}: v_cvt_f32_f64({x} / {:#018x}) = {got:#010x}, want {want:#010x}",
                 x.to_bits(),
             );
@@ -1518,7 +1544,8 @@ fn v_cvt_f32_f64_matches_ieee754() {
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
-    let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
+    let v_mov_dpp8 =
+        |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
     let v_mov_row_mirror = |vdst: u8, vsrc: u8| {
         [
             vop1(0x001, vdst, 0xFA),
@@ -1624,6 +1651,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1676,5 +1704,716 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 want.to_bits(),
             );
         }
+    }
+}
+/// A program that moves a typed buffer's 16-bit channels
+/// (`buffer_load_format_d16_xyzw` from the table's first view,
+/// `buffer_store_format_d16_xyzw` to its second) names both places for the
+/// host (`HostShader::half_views`) and moves every pattern as it is through
+/// unsigned views: half floats, the not-a-number ones among them, and
+/// plain 16-bit integers (the title keeps both in such buffers; the
+/// network that moves its faces reads indices this way). A program that
+/// moves no halves names nothing.
+#[test]
+fn halves_go_through_a_table_as_they_are_and_name_their_views() {
+    use super::host::Stride;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_D16_XYZW: u32 = 0x83;
+    const STORE_D16_XYZW: u32 = 0x87;
+    const THREADS: u32 = 32;
+    // The table's second descriptor, 0x20 bytes on.
+    let mut second = s_load_dwordx4(12, 4);
+    second[1] |= 0x20;
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&second);
+    // v[1:2] = first[thread] (four halves), second[thread] = v[1:2].
+    words.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    words.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    words.push(S_ENDPGM);
+    let view = |kind: ResourceType, table_offset_dwords: u32| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: table_offset_dwords / 8,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 8)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [THREADS, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    // A raw store through the same table: no halves, nothing named.
+    assert!(build_valu_cs(&[]).half_views.is_empty());
+
+    // Four halves a thread: numbers, both zeros, subnormals, infinities,
+    // not-a-numbers of both signs, and integers past the largest number's
+    // pattern, as indices are.
+    const SPECIAL: [u16; 16] = [
+        0x0000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x7bff, 0x7c00, 0x7c01, 0x7e00, 0x7fff, 0x8000,
+        0x8001, 0xbc00, 0xfc00, 0xfc01, 0xffff,
+    ];
+    let halves: Vec<u16> = (0..4 * THREADS as usize)
+        .map(|i| match i {
+            0..16 => SPECIAL[i],
+            _ => (i as u16).wrapping_mul(0x0203).wrapping_add(0x7b00),
+        })
+        .collect();
+    let data: Vec<u32> = halves
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | u32::from(pair[1]) << 16)
+        .collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8),
+                        },
+                        View::HalfUintUav(THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            out[0], data,
+            "{label}: the halves stored are the halves loaded"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// The places a program that moves halves names are the descriptors it
+/// loads, not the start of the range their used-resource entry describes:
+/// with one entry for a range from dword 0, a load at byte 0x20 names
+/// dword 8 (a host view there in a 16-bit float format is the one shown
+/// as its unsigned twin). A descriptor picked at run time (the load's
+/// offset in an SGPR) names nothing and keeps the float path: which slot
+/// it reads, and in which format, is known only then.
+#[test]
+fn half_places_are_the_descriptors_the_program_loads() {
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_D16_XYZW: u32 = 0x83;
+    const STORE_D16_XYZW: u32 = 0x87;
+    let lowered = |words: &[u32]| {
+        let range = |kind: ResourceType, table_offset_dwords: u32| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: table_offset_dwords / 8,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            // One entry for a range of views from dword 0, one at 16.
+            used: vec![range(ResourceType::Srv, 0), range(ResourceType::Uav, 16)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower")
+    };
+    // `s_load_dwordx4 s[dst:dst+3], s[4:5], offset` (soffset null), or with
+    // the offset in `soffset` instead.
+    let at = |dst: u8, offset: u32| {
+        let mut w = s_load_dwordx4(dst, 4);
+        w[1] |= offset;
+        w
+    };
+    let picked = |dst: u8, soffset: u8| {
+        let mut w = s_load_dwordx4(dst, 4);
+        w[1] = u32::from(soffset) << 25;
+        w
+    };
+    let mut fixed = vec![s_mov_b32(5, 0x80)];
+    fixed.extend_from_slice(&at(8, 0x20));
+    fixed.extend_from_slice(&at(12, 0x40));
+    fixed.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    fixed.push(S_ENDPGM);
+    assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    // The load's offset in s20, from the first lane's thread index
+    // (`v_readfirstlane_b32 s20, v0`): picked at run time. The pick may land
+    // on the store's place too, so no place of that table is named: the d16
+    // accesses there take the float path, as before half views.
+    let mut runtime = vec![s_mov_b32(5, 0x80), vop1(0x02, 20, vgpr(0))];
+    runtime.extend_from_slice(&picked(8, 20));
+    runtime.extend_from_slice(&at(12, 0x40));
+    runtime.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
+    runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
+    runtime.push(S_ENDPGM);
+    assert!(lowered(&runtime).half_views.is_empty());
+}
+
+/// A format load of whole dwords (`buffer_load_format_x`, not d16) whose
+/// result the program only reads one half of as a half float
+/// (`v_cvt_f32_f16`) is moving 16-bit integers: the head program reads the
+/// face network's output so, from an `R16_UINT` view. It names its view for
+/// the host and loads the integer: 0x3c00 comes through as 1.0. Used as a
+/// whole float instead (`v_add_f32`), the load stays a float load and names
+/// nothing; so does a load of halves beside a load of the same view read as
+/// a whole float (a view of numbers the program also picks one half float
+/// out of, as hundreds of the title's pixel programs do).
+#[test]
+fn a_format_load_read_as_halves_loads_the_integer() {
+    use super::host::Stride;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_FORMAT_X: u32 = 0x00;
+    const V_CVT_F32_F16: u16 = 0x0B;
+    const V_ADD_F32: u8 = 0x03;
+    let lowered = |body: &[u32]| {
+        let view = |kind: ResourceType, table_offset_dwords: u32, stride: u32| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: table_offset_dwords / 8,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let mut second = s_load_dwordx4(12, 4);
+        second[1] |= 0x20;
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(&second);
+        // `body` leaves v2, stored raw.
+        words.extend_from_slice(body);
+        words.extend_from_slice(&buffer_store_dword(2, 12, 0));
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![view(ResourceType::Srv, 0, 4), view(ResourceType::Uav, 8, 0)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+            half_views: l.half_views,
+        }
+    };
+    // v1 = first[v0] (one channel).
+    let load = mubuf_idxen(LOAD_FORMAT_X, 1, 0, 8);
+    let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
+    let as_halves = lowered(&[&load[..], &[half]].concat());
+    assert_eq!(as_halves.half_views, [(1, 0)]);
+    let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
+    assert!(as_float.half_views.is_empty());
+    // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.
+    let mut beside = load.to_vec();
+    beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+    beside.push(half);
+    beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+    assert!(lowered(&beside).half_views.is_empty());
+    // Behind a branch, as the head program has it: where the lanes meet
+    // again the loaded value goes on through a phi, and a later write of
+    // v1 under EXEC reads it only to keep it in the lanes it leaves alone.
+    const SAVE_EXEC: u32 = 0xBE90_037E; // s_mov_b32 s16, exec_lo
+    const ONLY_LANE_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec_lo, 0, v0
+    const SKIP_3: u32 = 0xBF88_0003; // s_cbranch_execz over the next 3 words
+    const RESTORE_EXEC: u32 = 0xBEFE_0310; // s_mov_b32 exec_lo, s16
+    let zero = vop1(0x01, 2, 128); // v_mov_b32 v2, 0
+    let rewrite = vop1(0x01, 1, 128); // v_mov_b32 v1, 0
+    let branched = lowered(
+        &[
+            &[zero, SAVE_EXEC, ONLY_LANE_0, SKIP_3][..],
+            &load,
+            &[
+                half,
+                RESTORE_EXEC,
+                SAVE_EXEC,
+                ONLY_LANE_0,
+                rewrite,
+                RESTORE_EXEC,
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(branched.half_views, [(1, 0)]);
+    // A d16 load names its place where it is the only access there...
+    const LOAD_FORMAT_D16_X: u32 = 0x80;
+    let d16 = mubuf_idxen(LOAD_FORMAT_D16_X, 1, 0, 8);
+    let d16_alone = lowered(&[&d16[..], &[half]].concat());
+    assert_eq!(d16_alone.half_views, [(1, 0)]);
+    // ...and not beside a whole float read through the same place, which
+    // would see the unsigned twin: v2 = half(d16 v1) + v3.
+    let mut d16_beside = d16.to_vec();
+    d16_beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+    d16_beside.push(half);
+    d16_beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+    assert!(lowered(&d16_beside).half_views.is_empty());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&as_halves, &branched, &d16_alone] {
+            let mut dxil = shader.dxil.clone();
+            v.validate(&mut dxil).expect("DXIL validation failed");
+        }
+    }
+    // Element 0 of an R16_UINT buffer holds the half 1.0 (0x3c00).
+    let data = [0x0000_3c00u32, 0];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (name, shader) in [("straight", &as_halves), ("branched", &branched)] {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Format(DXGI_FORMAT_R16_UINT, 2),
+                            },
+                            View::RawUav(1),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0][0],
+                1.0f32.to_bits(),
+                "{label}, {name}: the half read as an integer's bits"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+/// `v_fmac_f32` in the VOP3 encoding takes `neg[2]` (`-acc`) and `abs[2]` (`|acc|`) on its
+/// accumulator, the destination register (upstream #3158). The rows are measured on RDNA2
+/// (gfx1031, IEEE mode off, f32 denormals flushed) as published by the AnyPS5 project
+/// (`VFmacF32AccumulatorModifiers.cpp`, 85129d854d); a NaN is compared as any NaN, as hosts
+/// give NaNs bits of their own.
+#[test]
+fn v_fmac_f32_takes_the_accumulator_modifiers() {
+    // ([a, b, acc], with neg[2], with abs[2])
+    const ROWS: [([u32; 3], u32, u32); 16] = [
+        (
+            [0x3F80_0000, 0x4000_0000, 0x3F80_0000],
+            0x3F80_0000,
+            0x4040_0000,
+        ),
+        (
+            [0x3F80_0000, 0x4000_0000, 0xBF80_0000],
+            0x4040_0000,
+            0x4040_0000,
+        ),
+        (
+            [0x4000_0000, 0x4040_0000, 0xC0C0_0000],
+            0x4140_0000,
+            0x4140_0000,
+        ),
+        (
+            [0x4000_0000, 0xC040_0000, 0xC0C0_0000],
+            0x0000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0000, 0xBF80_0000, 0x0000_0000],
+            0x8000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0000, 0xBF80_0000, 0x8000_0000],
+            0x0000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x7F80_0000],
+            0xFF80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0xFF80_0000],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x7F80_0000, 0x3F80_0000, 0xFF80_0000],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x7FC0_0001],
+            0xFFC0_0001,
+            0x7FC0_0001,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0xFFA0_0000],
+            0x7FA0_0000,
+            0x7FA0_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x0000_0001],
+            0x3F80_0000,
+            0x3F80_0000,
+        ),
+        (
+            [0x0080_0000, 0x3F80_0000, 0x8080_0001],
+            0x0100_0000,
+            0x0100_0000,
+        ),
+        (
+            [0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000],
+            0x4000_0000,
+            0x4000_0000,
+        ),
+        (
+            [0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0xBF80_0000, 0x4000_0000, 0x4000_0000],
+            0xC080_0000,
+            0x0000_0000,
+        ),
+    ];
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let cases: Vec<[u32; 4]> = ROWS
+        .iter()
+        .map(|&([a, b, acc], _, _)| [a, b, acc, 0])
+        .collect();
+    for (label, abs, neg) in [("neg[2]", 0, 4), ("abs[2]", 4, 0)] {
+        // v_mov_b32 v5, v3; v_fmac_f32 v5, v1, v2 (VOP3, the modifier on src2); v_mov_b32 v0, v5
+        let mut body = vec![vop1(0x001, 5, vgpr(3))];
+        body.extend(vop3_mod(0x12B, 5, vgpr(1), vgpr(2), 0, abs, neg, 0, false));
+        body.push(vop1(0x001, 0, vgpr(5)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let want = if neg != 0 { ROWS[i].1 } else { ROWS[i].2 };
+            assert!(
+                got == want || nan(got) && nan(want),
+                "{backend}: {label} row {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+/// `v_mad_legacy_f32` and `v_mac_legacy_f32` as RDNA 2 runs them (fork PR #1026): fused,
+/// as `v_fma_legacy_f32` and `v_fmac_legacy_f32`, with subnormal sources flushed and the
+/// legacy rule that a zero factor makes the product +0.
+#[test]
+fn legacy_multiply_adds_fuse_their_product_and_flush_their_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_mac_legacy_f32 v3, v1, v2; v_mov_b32 v0, v3
+    let mac = build_valu_cs(&[vop2(0x06, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))]);
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one rounding,
+        // lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor is a zero factor, even against +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor's product is +0 whatever the other factor's sign: +0 + -0 is +0.
+        [0, 0xbf80_0000, 0x8000_0000, 0],
+    ];
+    let want = [
+        0xa880_0000u32,
+        0x0000_0000,
+        0x3f80_0000,
+        0x3f80_0000,
+        0x0000_0000,
+    ];
+    for (name, shader) in [("v_mad_legacy_f32", &mad), ("v_mac_legacy_f32", &mac)] {
+        run_cases(shader, &cases, |backend, i, _, got| {
+            if backend == "warp" && i == 0 {
+                // WARP rounds the product before the add; the hardware's single
+                // rounding is the reference for the fused form.
+                eprintln!("{backend}: fused rounding differs on WARP; skipped");
+                return;
+            }
+            assert_eq!(got, want[i], "{backend}: {name} case {i}");
+        });
+    }
+}
+
+/// `v_cmp_f_{f32,f16}` and `v_cmp_tru_{f32,f16}` are constant false/true
+/// regardless of operands (even NaNs). Lowering them as `fcmp false`/`fcmp true`
+/// causes WARP to remove the D3D12 device at dispatch; lowering them as constant
+/// lane booleans matches the integer `v_cmp_{f,t}_*` path and runs on both
+/// hardware and WARP.
+#[test]
+fn v_cmp_f_and_tru_lower_as_constant_booleans() {
+    let f = f32::to_bits;
+    let f32_inputs = [
+        [f(1.0), f(2.0), 0, 0],
+        [f(1.0), f(1.0), 0, 0],
+        [f(f32::INFINITY), f(f32::NEG_INFINITY), 0, 0],
+        [0x7FC0_0000, f(0.0), 0, 0],      // qNaN
+        [0x7F80_0001, 0x7FC0_0000, 0, 0], // sNaN, qNaN
+    ];
+    let f16_inputs = [
+        [0x3C00, 0x4000, 0, 0],
+        [0x3C00, 0x3C00, 0, 0],
+        [0x7C00, 0xFC00, 0, 0],
+        [0x7E00, 0x0000, 0, 0], // qNaN
+        [0x7C01, 0x7E00, 0, 0], // sNaN, qNaN
+    ];
+    for (op, name, want, inputs) in [
+        (0x000u16, "v_cmp_f_f32", 0u32, &f32_inputs[..]),
+        (0x00f, "v_cmp_tru_f32", 1, &f32_inputs[..]),
+        (0x0c8, "v_cmp_f_f16", 0, &f16_inputs[..]),
+        (0x0ef, "v_cmp_tru_f16", 1, &f16_inputs[..]),
+    ] {
+        // v_cmp_{f,tru}_{f32,f16}_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, inputs, |backend, i, inp, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) case {i} = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
     }
 }

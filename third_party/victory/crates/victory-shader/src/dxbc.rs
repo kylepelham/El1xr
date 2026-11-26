@@ -17,6 +17,9 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL` (read only with
+    /// `VICTORY_WAVE32_NVIDIA=1`, ported from codec-d/cool_fox 8cc31ab3).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");

@@ -147,9 +147,10 @@ if (-not $NoTunedSettings) {
     # of this tree reads it (Neptune's shader translator, from soldsawn/victory-nvidia-8gb, dropped that wave rule).
     $tuned = [ordered]@{
         VICTORY_CARD_WINDOWS_MB          = '1536'      # draw data on the card; 4096 spilled VRAM on a 12 GB card
-        VICTORY_BAKE_TEXTURES_MS         = '10000'     # textures uploaded before the character bake
-        VICTORY_EARLY_TEXTURES_MS        = '40'
+        VICTORY_BAKE_TEXTURES_MS         = '500'       # cap decoration/character bake upload to avoid 2s+ mid-gameplay freezes
+        VICTORY_EARLY_TEXTURES_MS        = '16'        # tight frame-pacing budget for early placed textures (background prepare handles detile)
         VICTORY_WIDE_MERGE               = '1'         # shader results merged back on several threads
+        VICTORY_RELAY_WIDE_MERGE         = '1'         # relay landings merged back on several threads
         VICTORY_RELAY_OWN_QUEUE          = '1'         # copy-back fetches on a GPU queue of their own
         VICTORY_UNDER_WRITES_WORDS       = '1'         # small changes under shader writes do not force a wait
         VICTORY_UNDER_WRITES_RUNS        = '100000'
@@ -157,7 +158,7 @@ if (-not $NoTunedSettings) {
         VICTORY_RELAY                    = '2'
         VICTORY_WIDE_REFRESH             = '1'
         VICTORY_ASK_ONCE                 = '1'
-        VICTORY_TEXTURE_NO_WAIT          = '1'
+        VICTORY_TEXTURE_NO_WAIT          = '1'         # do not stall xmem streaming threads waiting on texture remaps
         VICTORY_CARD_REHASH_RUNS         = '1'
         VICTORY_JOIN_COPIES              = '1'
         VICTORY_D3D12_BACKGROUND         = '0'
@@ -165,26 +166,48 @@ if (-not $NoTunedSettings) {
         VICTORY_WINDOW_TAILS             = '1'
         VICTORY_TEXTURE_STAGE_MB         = '512'
         VICTORY_CARD_BUFFERS_MIN_KB      = '64'
-        VICTORY_ASK_QUIET                = '8'         # quiet memory asked about once a frame
+        VICTORY_ASK_QUIET                = '8'         # quiet blocks checked once a frame; recently written blocks every submission
+        VICTORY_WATCH_4K                 = '1'         # refresh only written 4 KiB sub-pages instead of whole 64 KiB pages
         VICTORY_COPY_CHANGED             = '1'         # only bytes that differ go up to the card
         VICTORY_QUIET_BACK               = '1'         # copied-back shader results are not read again
         VICTORY_LIST_POOL_MOST           = '2048'      # command lists kept, not made anew each frame
         VICTORY_LIST_POOL_MB             = '512'
-        VICTORY_WIDE_THREADS             = '12'
+        VICTORY_WIDE_THREADS             = '16'
         VICTORY_UNDER_WRITES_MASKS_LEAST = '1'         # small changes go up in one pass per buffer
         VICTORY_INDIRECT_RAW             = '2'         # indirect draws use the game's own arguments
-        VICTORY_TEXTURE_HASH_EVERY       = '32'
+        VICTORY_TEXTURE_HASH_EVERY       = '8'         # re-hash unguarded textures at default cadence instead of every 32 frames
         VICTORY_LEVELS_ON_DEMAND         = '1'         # card memory only for the mip levels the game holds
+        VICTORY_VIEWS_REMADE_QUIET       = '0'         # apply mip/LOD view promotions immediately instead of deferring while submissions are in flight
+        VICTORY_BVH_NO_HIT               = '1'         # ray tests return clean miss when BVH builder is off: fixes oily skin, lit corners, and GPU cost
+        VICTORY_HDR_STANDIN              = '10'        # R16G16B16A16_FLOAT stand-in for R9G9B9E5 (matches victory-fork)
+        VICTORY_WAVE_PAIRS               = '0'         # avoid 16x16 blocky tile artifacts from unsynced paired-lane LDS on Volta+
+        VICTORY_WAVE_LDS_LOOSE           = '0'         # avoid loose intra-region LDS ordering in wave64 compute shaders
         VICTORY_WINDOW_KB                = '1024'
         VICTORY_CARD_BUFFERS_MB          = '1536'
         VICTORY_CARD_WINDOW_UPLOAD       = '1'
         VICTORY_DROP_DXIL                = '1'
         VICTORY_DESC_DATA                = '1'         # shaders that read a descriptor as data translate
         VICTORY_VRAM_IDLE_MS             = '8000,2000,1000'    # an unused texture is kept 8 s while the card has room
-        VICTORY_PIPELINE_WAIT_MS         = '2500'      # a frame waits at most 2.5 s for a shader being compiled
         VICTORY_TEXTURE_ROOM_PERCENT     = '93'        # textures use up to 93 % of the card's room
         VICTORY_HEAP_PASS_DIRTY          = '1'         # the heap pass looks only at slots marked since its last pass
-        VICTORY_COPY_COALESCE            = '256'       # changed runs up to 256 bytes apart go up as one range
+        VICTORY_COPY_COALESCE            = '1024'      # changed runs up to 1024 bytes apart go up as one range
+        VICTORY_REAPER                   = '1'         # drop released host D3D12 objects on a background reaper thread
+        VICTORY_GUARD_HOT                = '0'         # keep page guards active on hot view memory blocks
+        VICTORY_AMBIENT                  = '0.8'       # ambient diffuse light level (RTX visual fix)
+        VICTORY_AMBIENT_AIR              = '1.5'       # ambient air/sky multiplier (RTX visual fix)
+        VICTORY_AMBIENT_MOST             = '1.2'       # ambient lighting cap (RTX visual fix)
+        VICTORY_NAN_SCRUB                = '1'         # scrub NaN shader outputs (RTX visual fix)
+        VICTORY_SHOW_AFTER               = '1'         # present after pending work (RTX visual fix)
+        VICTORY_THREAD_TICKET            = '0'         # avoid WAVE_PAIRS=0 + ticket GPU hang on tiled lighting
+        VICTORY_HEAP_SCAN_EVERY          = '16'        # scan kept heap slots every 16 passes (+7% FPS, 4x fewer stutters)
+        VICTORY_CLAMP_AFTER_WRITER       = '1'         # sanitize indirect args once after writer instead of per-draw barriers
+        VICTORY_WAVE32_NVIDIA            = '1'         # NVIDIA native Wave32 lowering (ACCC, active loop, restored lanes)
+        VICTORY_REUSE_ROOT_CBV           = '1'         # deduplicate repeated unaligned root CBV staging per list
+        VICTORY_TEXTURE_PREPARE_THREADS  = '4'         # prepare & detile streamed textures off the recording thread
+        VICTORY_WATCH_RESERVATION        = '1'         # batch GetWriteWatch queries by memory reservation
+        VICTORY_PORT_CBV                 = '1'         # bind 16-byte-aligned table CBVs in-place as raw SRVs (skips ~22k scratch copies/frame)
+        VICTORY_DIRTY_4K                 = '1'         # narrow write-watched copy spans to dirty 4 KiB subpages (-45% copy bytes)
+        VICTORY_PORT_GUARD               = '1'         # concurrent guard lock (GUARDS.read + per-block claims)
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]

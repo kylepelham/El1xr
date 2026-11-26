@@ -168,6 +168,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again.
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -182,6 +190,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Renderer port 1's regions there: no longer what the title shows.
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -354,13 +364,111 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     let v = views();
     let mut out = Vec::new();
     if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
+        && base.saturating_add(bytes) > start
     {
         out.push((base, bytes));
     }
     for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
         out.push((base, bytes));
     }
+    out
+}
+
+/// For all title views overlapping `[start, end)` (64 KiB block-aligned),
+/// finds pages shown in `2..=MANY_VIEWS` views under a single lock hold.
+/// Returns `(aliased_source_blocks, all_aliased_blocks, peer_blocks_to_protect)`,
+/// with the block lists sorted and deduplicated.
+pub(crate) fn aliases_in_range(start: usize, end: usize) -> (u64, Vec<usize>, Vec<usize>) {
+    if start >= end {
+        return (0, Vec::new(), Vec::new());
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return (0, Vec::new(), Vec::new());
+    }
+    let mut sources = 0u64;
+    let mut all_aliased = Vec::new();
+    let mut peers = Vec::new();
+    let mut visit_view = |base: usize, bytes: usize, section: usize, offset: u64| {
+        let first_block = (base / K64).max(start / K64);
+        let last_block = base.saturating_add(bytes).div_ceil(K64).min(end.div_ceil(K64));
+        for block in first_block..last_block {
+            let page_addr = block * K64;
+            let within = page_addr.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 || shown.len() > crate::watch::MANY_VIEWS {
+                continue;
+            }
+            sources += 1;
+            for &alias_addr in shown {
+                let alias_block = alias_addr / K64;
+                all_aliased.push(alias_block);
+                if alias_block != block {
+                    peers.push(alias_block);
+                }
+            }
+        }
+    };
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        visit_view(base, bytes, section, offset);
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        visit_view(base, bytes, section, offset);
+    }
+    all_aliased.sort_unstable();
+    all_aliased.dedup();
+    peers.sort_unstable();
+    peers.dedup();
+    (sources, all_aliased, peers)
+}
+
+/// All 64 KiB block indices showing the same physical pages as any block in
+/// `runs` (`(from_block, to_block)`), collected under a single lock hold,
+/// sorted and deduplicated.
+pub(crate) fn aliases_for_blocks(runs: &[(usize, usize)]) -> Vec<usize> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(from, to) in runs {
+        let mut b = from;
+        let end_addr = to.saturating_mul(K64);
+        while b < to {
+            let addr = b.saturating_mul(K64);
+            if let Some((&base, &(bytes, section, offset))) = v.views.range(..=addr).next_back()
+                && addr < base.saturating_add(bytes)
+            {
+                let view_end = base.saturating_add(bytes).div_ceil(K64).min(to);
+                for blk in b..view_end {
+                    let within = blk.saturating_mul(K64).wrapping_sub(base);
+                    if within < bytes
+                        && within.is_multiple_of(K64)
+                        && let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                    {
+                        out.extend(shown.iter().map(|&a| a / K64));
+                    }
+                }
+                b = view_end;
+            } else if let Some((&next_base, _)) = v.views.range(addr.saturating_add(1)..end_addr).next() {
+                b = (next_base / K64).max(b + 1);
+            } else {
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -400,6 +508,112 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
         }
     };
     (host != 0).then(|| (host + offset as usize + within) as *mut u8)
+}
+
+/// Classification of a 64 KiB title page under `VIEWS` for lazy copy-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageViewInfo {
+    /// Page is not inside any registered `title_memory_view`.
+    Unknown,
+    /// Page is mapped into multiple title views (aliased physical frame).
+    Aliased,
+    /// Page is backed by a single registered title view: `(section, offset, section_bytes)`.
+    Single(usize, u64, u64),
+}
+
+/// Batch-classifies 64 KiB title addresses under ONE `VIEWS` lock.
+pub(crate) fn single_view_pages_batch(addrs: &[usize]) -> Vec<PageViewInfo> {
+    let v = views();
+    let mut out = Vec::with_capacity(addrs.len());
+    for &page_addr in addrs {
+        if !page_addr.is_multiple_of(K64) {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        let Some((&base, &(bytes, section, offset))) = v.views.range(..=page_addr).next_back() else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        let within = page_addr.wrapping_sub(base);
+        if within >= bytes || within.saturating_add(K64) > bytes {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        let sec_off = offset + within as u64;
+        let Some(shown) = v.pages.get(&(section, sec_off)) else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        if shown.len() != 1 {
+            out.push(PageViewInfo::Aliased);
+            continue;
+        }
+        let Some(sec_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        };
+        if sec_off.checked_add(K64 as u64).is_none_or(|e| e > sec_bytes) {
+            out.push(PageViewInfo::Unknown);
+            continue;
+        }
+        out.push(PageViewInfo::Single(section, sec_off, sec_bytes));
+    }
+    out
+}
+
+/// Writes `bytes` into `section` at `offset` through our persistent writable
+/// whole-section mapping in [`ALIASES`], avoiding per-page `MapViewOfFile` /
+/// `UnmapViewOfFile` kernel transitions during lazy copy-back materialization.
+/// Leaf lock (`ALIASES` only; never acquires `VIEWS` or `LAZY_TABLE`).
+pub(crate) fn write_section_own(
+    section: usize,
+    section_bytes: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let Some(end) = offset.checked_add(bytes.len() as u64) else {
+        return false;
+    };
+    if end > section_bytes {
+        return false;
+    }
+    let host = {
+        let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        match aliases.iter().find(|a| a.0 == section) {
+            Some(&(_, base, size)) => (base != 0 && end <= size).then_some(base),
+            None => {
+                // SAFETY: live section handle passed by runtime (remapping flushes
+                // deferred pages before closing). Mapped whole for read/write.
+                let base = unsafe {
+                    mem::MapViewOfFile(
+                        section as _,
+                        mem::FILE_MAP_READ | mem::FILE_MAP_WRITE,
+                        0,
+                        0,
+                        0,
+                    )
+                }
+                .Value as usize;
+                aliases.push((section, base, section_bytes));
+                (base != 0).then_some(base)
+            }
+        }
+    };
+    let Some(base) = host else {
+        return false;
+    };
+    let Some(dst) = base.checked_add(offset as usize) else {
+        return false;
+    };
+    // SAFETY: `dst..dst+bytes.len()` lies within our persistent writable section
+    // view (`end <= section_bytes`) and does not overlap `bytes`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+    }
+    true
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -486,6 +700,40 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike, if the range is one run of a
+/// section ([`Cover::Run`]): its first address, its bytes, the section and
+/// the offset of its first byte in it.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    // Every view of the stretch has the same address less section offset.
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first
@@ -512,7 +760,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -532,7 +780,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -577,7 +825,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -592,7 +840,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1159,7 +1407,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1182,6 +1430,28 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// The stretch around a run: views on both sides that follow in memory
+    /// and in the section, up to a view from elsewhere or a gap.
+    #[test]
+    fn a_stretch_is_the_views_around_a_run_that_follow_in_the_section() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_2000_0000usize;
+        // From elsewhere in the section, just below.
+        views.insert(at - K64, (K64, 9, 40 * K64 as u64));
+        for (k, n) in [(0usize, 2usize), (2, 3), (5, 1)] {
+            views.insert(at + k * K64, (n * K64, 9, ((10 + k) * K64) as u64));
+        }
+        // Next in memory, of another section; then a gap.
+        views.insert(at + 6 * K64, (K64, 8, 16 * K64 as u64));
+        views.insert(at + 8 * K64, (K64, 9, 18 * K64 as u64));
+        let whole = Some((at, 6 * K64, 9, 10 * K64 as u64));
+        assert_eq!(stretch_in(&views, at + 3 * K64 + 5, 10), whole);
+        assert_eq!(stretch_in(&views, at, 6 * K64), whole);
+        assert_eq!(stretch_in(&views, at + 5 * K64, 2 * K64), None, "into the other section");
+        assert_eq!(stretch_in(&views, at + 6 * K64, K64), Some((at + 6 * K64, K64, 8, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at + 7 * K64, K64), None, "the gap");
     }
 
     /// What the runtime forgets when memory is mapped anew.

@@ -47,11 +47,16 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build() -> [u8; 32] {
+fn build(wave_wide: bool, wave_pairs: bool) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+        WARNED.call_once(|| {
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            )
+        });
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -70,14 +75,167 @@ fn build() -> [u8; 32] {
     // (Neptune) The view heap's null slot is part of the translation (it differs by host
     // GPU): found before it goes into the key, so that no translation is made without it.
     crate::descriptor::host::probe_view_limit();
+    let _env_read = WAVE_WIDE_ENV.read().unwrap_or_else(|e| e.into_inner());
     let mut h = blake3::Hasher::new();
     h.update(b"victory shader cache key 2\0");
     if let Some(exe) = exe {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    if victory_shader::emit::constants_raw() {
+        h.update(b"VICTORY_PORT_CBV=1");
+    }
+    if victory_shader::emit::nvidia::enabled() {
+        h.update(b"VICTORY_WAVE32_NVIDIA=1");
+    }
+    if wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none() {
+        h.update(b"VICTORY_WAVE_WIDE_ONLY=last");
+    }
+    if wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0") {
+        h.update(b"VICTORY_WAVE_PAIRS_ONLY=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// The containers (by the 16-digit hash the log names shaders with) whose
+/// wave64 compute program may take the wave-wide form on a host of 32-lane
+/// waves (`VICTORY_WAVE_WIDE=last`): `VICTORY_WAVE_WIDE_ONLY`, a list of
+/// hashes, or by default the programs of this title that come out of it with
+/// 32-lane waves and otherwise do not run at all on such a host (the driver
+/// refuses their 64-lane form: water transmission volumetrics, both kinds;
+/// particle visibility; the tiling of the screen-space reflection pass; the
+/// effects heap's relocations, `CS_DefragHeap_ComputeRelocations`; the
+/// meshlets' triangle collection, `CS_CollectTriangles_Meshlets`; and
+/// `CS_AlphTransmissionPrefilterMip` as fallback). `VICTORY_WAVE_WIDE_ONLY=none`
+/// or `0` allows none.
+static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
+const WAVE_WIDE_DEFAULT: [&str; 7] = [
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+    "02384a60fda6f2d0",
+    "6b82bc7d22016cb5",
+    "2da4beb386509b77",
+];
+
+/// The containers (by the 16-digit hash the log names shaders with) whose
+/// wave64 compute program may take the paired-lanes form (`VICTORY_WAVE_PAIRS=1`)
+/// even when `VICTORY_WAVE_PAIRS=0` disables it globally: `VICTORY_WAVE_PAIRS_ONLY`,
+/// a list of hashes, or by default the two compute shaders of this title that
+/// still require paired lanes on a 32-lane host (`CS_DefragHeap_ComputeRelocations`
+/// and `CS_CollectTriangles_Meshlets`). `VICTORY_WAVE_PAIRS_ONLY=none` or `0`
+/// allows none.
+static WAVE_PAIRS: OnceLock<Vec<String>> = OnceLock::new();
+const WAVE_PAIRS_DEFAULT: [&str; 2] = ["02384a60fda6f2d0", "6b82bc7d22016cb5"];
+
+/// Serializes temporary `VICTORY_WAVE_WIDE=last` and `VICTORY_WAVE_PAIRS=1`
+/// overrides for allowlisted containers so concurrent translations and
+/// `translation_fingerprint()` never observe the overrides on non-allowlisted
+/// shaders.
+static WAVE_WIDE_ENV: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn parse_hash_list(value: Option<&str>, default: &[&str]) -> Vec<String> {
+    match value {
+        None => default.iter().map(|&s| s.to_owned()).collect(),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+                Vec::new()
+            } else {
+                trimmed
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        }
+    }
+}
+
+fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
+    parse_hash_list(value, &WAVE_WIDE_DEFAULT)
+}
+
+fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
+    parse_hash_list(value, &WAVE_PAIRS_DEFAULT)
+}
+
+fn wave_wide_list() -> &'static [String] {
+    WAVE_WIDE.get_or_init(|| {
+        parse_wave_wide_only(std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref())
+    })
+}
+
+fn wave_pairs_list() -> &'static [String] {
+    WAVE_PAIRS.get_or_init(|| {
+        parse_wave_pairs_only(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref())
+    })
+}
+
+fn hash_in_list(container: &[u8], list: &[String]) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    let hex = blake3::hash(container).to_hex();
+    let short = &hex[..16];
+    list.iter().any(|h| h == short)
+}
+
+fn allow_wave_wide(container: &[u8]) -> bool {
+    hash_in_list(container, wave_wide_list())
+}
+
+fn allow_wave_pairs(container: &[u8]) -> bool {
+    hash_in_list(container, wave_pairs_list())
+}
+
+fn translate_container(
+    container: &[u8],
+    wave_wide: bool,
+    wave_pairs: bool,
+) -> Result<HostShader, String> {
+    let need_wide = wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none();
+    let need_pairs = wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0");
+    if need_wide || need_pairs {
+        let _guard = WAVE_WIDE_ENV.write().unwrap_or_else(|e| e.into_inner());
+        let set_wide = wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none();
+        let set_pairs =
+            wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0");
+        if set_wide || set_pairs {
+            struct ResetEnv {
+                restore_wide: bool,
+                restore_pairs: bool,
+            }
+            impl Drop for ResetEnv {
+                fn drop(&mut self) {
+                    // SAFETY: serialized by `WAVE_WIDE_ENV`; restored before unlocking.
+                    if self.restore_wide {
+                        unsafe { std::env::remove_var("VICTORY_WAVE_WIDE") };
+                    }
+                    if self.restore_pairs {
+                        unsafe { std::env::set_var("VICTORY_WAVE_PAIRS", "0") };
+                    }
+                }
+            }
+            if set_wide {
+                // SAFETY: serialized by `WAVE_WIDE_ENV`; restored by `ResetEnv`.
+                unsafe { std::env::set_var("VICTORY_WAVE_WIDE", "last") };
+            }
+            if set_pairs {
+                // SAFETY: serialized by `WAVE_WIDE_ENV`; restored by `ResetEnv`.
+                unsafe { std::env::set_var("VICTORY_WAVE_PAIRS", "1") };
+            }
+            let _reset = ResetEnv {
+                restore_wide: set_wide,
+                restore_pairs: set_pairs,
+            };
+            return victory_shader::emit::translate(container).map_err(|e| e.to_string());
+        }
+    }
+    let _guard = WAVE_WIDE_ENV.read().unwrap_or_else(|e| e.into_inner());
+    victory_shader::emit::translate(container).map_err(|e| e.to_string())
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
@@ -86,20 +244,24 @@ fn build() -> [u8; 32] {
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
+    let wide = allow_wave_wide(container);
+    let pairs = allow_wave_pairs(container);
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_container(c, wide, pairs)
     };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(wide, pairs), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wide = allow_wave_wide(container);
+    let pairs = allow_wave_pairs(container);
+    let translate = |c: &[u8]| translate_container(c, wide, pairs);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &build(wide, pairs), container, translate),
         None => translate(container),
     }
 }
@@ -249,6 +411,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -317,6 +484,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -327,6 +499,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -361,6 +534,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
@@ -416,5 +590,38 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn wave_wide_only_parses_defaults_disable_and_lists() {
+        let default = parse_wave_wide_only(None);
+        assert!(default.contains(&"02384a60fda6f2d0".to_owned()));
+        assert!(default.contains(&"6b82bc7d22016cb5".to_owned()));
+        assert!(default.contains(&"2da4beb386509b77".to_owned()));
+        assert_eq!(default.len(), WAVE_WIDE_DEFAULT.len());
+
+        for off in ["0", "none", "NONE", "", "   "] {
+            assert!(parse_wave_wide_only(Some(off)).is_empty(), "{off:?}");
+        }
+        assert_eq!(
+            parse_wave_wide_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
+            vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
+        );
+    }
+
+    #[test]
+    fn wave_pairs_only_parses_defaults_disable_and_lists() {
+        let default = parse_wave_pairs_only(None);
+        assert!(default.contains(&"02384a60fda6f2d0".to_owned()));
+        assert!(default.contains(&"6b82bc7d22016cb5".to_owned()));
+        assert_eq!(default.len(), WAVE_PAIRS_DEFAULT.len());
+
+        for off in ["0", "none", "NONE", "", "   "] {
+            assert!(parse_wave_pairs_only(Some(off)).is_empty(), "{off:?}");
+        }
+        assert_eq!(
+            parse_wave_pairs_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
+            vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
+        );
     }
 }

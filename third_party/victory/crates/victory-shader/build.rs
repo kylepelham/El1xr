@@ -4,18 +4,22 @@
 //! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 
+use std::env;
 use std::path::{Path, PathBuf};
 
-fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
+fn walk(dir: &Path, dirs: &mut Vec<PathBuf>, files: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("victory-shader build.rs: failed to read {}: {e}", dir.display()));
+    for e in entries {
+        let e = e.unwrap_or_else(|e| {
+            panic!("victory-shader build.rs: failed to read entry in {}: {e}", dir.display())
+        });
         let p = e.path();
         if p.is_dir() {
-            files(&p, out);
+            dirs.push(p.clone());
+            walk(&p, dirs, files);
         } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
+            files.push(p);
         }
     }
 }
@@ -32,17 +36,35 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    println!("cargo:rerun-if-changed=src");
+    // Read CARGO_MANIFEST_DIR at run time (not compile time via env!) so moving
+    // the repository between drives or directories never hashes a stale path.
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
+        .expect("victory-shader build.rs: CARGO_MANIFEST_DIR is not set");
+    let src = Path::new(&manifest_dir).join("src");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
+    let mut dirs = Vec::new();
     let mut list = Vec::new();
-    files(&src, &mut list);
+    walk(&src, &mut dirs, &mut list);
+    dirs.sort();
     list.sort();
+    assert!(
+        !list.is_empty(),
+        "victory-shader build.rs: no .rs files found under {}",
+        src.display()
+    );
+    for d in &dirs {
+        let rel = d.strip_prefix(&src).unwrap_or(d).to_string_lossy().replace('\\', "/");
+        println!("cargo:rerun-if-changed=src/{rel}");
+    }
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
         let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
-        let text = std::fs::read(p).unwrap_or_default();
+        println!("cargo:rerun-if-changed=src/{rel}");
+        let text = std::fs::read(p)
+            .unwrap_or_else(|e| panic!("victory-shader build.rs: failed to read {}: {e}", p.display()));
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
         fnv(&mut state, &text);
