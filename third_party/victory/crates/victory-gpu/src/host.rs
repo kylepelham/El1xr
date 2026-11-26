@@ -2791,6 +2791,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Host pipelines already kept and named by [`HostList::bind_pipeline`].
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -8891,11 +8893,46 @@ impl HostList {
         }
     }
 
-    /// Whether the list already holds host pipeline `pipeline`: the one it
-    /// was last asked about since its reset. A pipeline bound again after
-    /// the indirect clamp's own is kept once.
+    /// Keeps `pso` and `root` alive on this list and records `name` once per
+    /// list, avoiding repeat COM casts, locks and name lookups when a pipeline
+    /// is bound again after another pipeline or an internal pass.
+    pub(crate) fn bind_pipeline(
+        &self,
+        pso: &ID3D12PipelineState,
+        root: &ID3D12RootSignature,
+        name: &str,
+    ) {
+        let id = pso.as_raw() as usize;
+        if self.kept_pipeline.load(Ordering::Relaxed) == id {
+            return;
+        }
+        self.kept_pipeline.store(id, Ordering::Relaxed);
+        let first = {
+            let mut deferred = self.deferred();
+            if deferred.bound.insert(id) {
+                if let Ok(object) = pso.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(object);
+                }
+                if let Ok(object) = root.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(object);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if first {
+            self.used_pipeline(name);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn holds_pipeline(&self, pipeline: usize) -> bool {
-        self.kept_pipeline.swap(pipeline, Ordering::Relaxed) == pipeline
+        if self.kept_pipeline.load(Ordering::Relaxed) == pipeline {
+            return true;
+        }
+        self.kept_pipeline.store(pipeline, Ordering::Relaxed);
+        !self.deferred().bound.insert(pipeline)
     }
 
     /// The shader-visible descriptor heaps the list keeps (tests).

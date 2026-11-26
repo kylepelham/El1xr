@@ -33,7 +33,8 @@ fn a_list_holds_the_pipeline_it_last_kept_until_its_reset() {
     assert!(!list.holds_pipeline(1));
     assert!(list.holds_pipeline(1));
     assert!(!list.holds_pipeline(2));
-    assert!(!list.holds_pipeline(1));
+    assert!(list.holds_pipeline(1));
+    assert!(list.holds_pipeline(2));
     list.close();
     list.reset();
     assert!(!list.holds_pipeline(1));
