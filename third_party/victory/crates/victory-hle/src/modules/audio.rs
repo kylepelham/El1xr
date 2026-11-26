@@ -28,6 +28,7 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+pub mod mute;
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;

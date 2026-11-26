@@ -1,9 +1,12 @@
 """tools/dev.py reads the `frame pacing:` line that victory-gpu's pacing.rs logs every 5 s."""
 
 import importlib.util
+import sys
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
 
 # The exact line `pacing::tests::line_has_the_shape_dev_py_reads` checks on the Rust side.
 LINE = (
@@ -76,3 +79,31 @@ def test_bench_summary_skips_world_loading():
 def test_no_pacing_lines_give_zeros():
     stats = load_dev().parse_victory_log("nothing here\n")
     assert (stats["p99_ms"], stats["max_ms"], stats["hitches"]) == (0.0, 0.0, 0)
+
+
+def test_dev_bench_and_capture_mute_by_default_with_unmute_opt_out():
+    dev = load_dev()
+    parser = dev.build_parser()
+
+    for sub in ("bench", "capture"):
+        args_default = parser.parse_args([sub])
+        assert not args_default.unmute
+        overrides, mute = dev.apply_mute_default({}, args_default.unmute)
+        assert mute is True and overrides == {"VICTORY_MUTE": "1"}
+        cmd = dev.build_launcher_command(
+            Path("E:/Gta6/Game"), diag=(sub == "capture"), overrides=overrides, mute=mute
+        )
+        ps_cmd = cmd[-1]
+        assert "-Mute" in ps_cmd and "'VICTORY_MUTE' = '1'" in ps_cmd
+
+        overrides_explicit, mute_explicit = dev.apply_mute_default({"VICTORY_MUTE": "0"}, args_default.unmute)
+        assert mute_explicit is True and overrides_explicit == {"VICTORY_MUTE": "0"}
+
+        args_unmute = parser.parse_args([sub, "--unmute"])
+        assert args_unmute.unmute
+        overrides_unmute, mute_unmute = dev.apply_mute_default({}, args_unmute.unmute)
+        assert mute_unmute is False and "VICTORY_MUTE" not in overrides_unmute
+        cmd_unmute = dev.build_launcher_command(
+            Path("E:/Gta6/Game"), diag=(sub == "capture"), overrides=overrides_unmute, mute=mute_unmute
+        )
+        assert "-Mute" not in cmd_unmute[-1] and "VICTORY_MUTE" not in cmd_unmute[-1]
