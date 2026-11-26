@@ -7248,16 +7248,34 @@ impl Host {
         }
         let t_def = std::time::Instant::now();
         let flush_one_before = PREP_PARTS[4].load(Ordering::Relaxed);
+        let mut pending_preludes: Vec<(&HostList, Vec<crate::texture::PreludeUpload>)> =
+            Vec::with_capacity(runs.len());
+        let mut finalize_preludes =
+            |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
+                for (list, textures) in pending.drain(..) {
+                    let mut uploads = Vec::new();
+                    for upload in textures {
+                        if let Some(first_upload) = upload.finish_refresh() {
+                            uploads.push((upload, first_upload));
+                        }
+                    }
+                    firsts.push(lists.len());
+                    if let Some(prelude) = list.prelude(&uploads) {
+                        lists.push(Some(prelude));
+                    }
+                    lists.push(list.list.cast().ok());
+                }
+            };
         for list in runs {
-            let (list_wrote_heap, uploads) = list.run_deferred(&mut batch, heap_rounds.asked());
+            if list.deferred().cbv_epoch > 0 && !pending_preludes.is_empty() {
+                batch.flush_textures();
+                finalize_preludes(&mut pending_preludes);
+            }
+            let (list_wrote_heap, textures) = list.run_deferred(&mut batch, heap_rounds.asked());
             if list_wrote_heap {
                 heap_rounds.wrote();
             }
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
+            pending_preludes.push((list, textures));
         }
         let def_us = t_def.elapsed().as_micros() as u64;
         let flush_one_delta = PREP_PARTS[4]
@@ -7268,6 +7286,9 @@ impl Host {
         batch.flush();
         crate::watch::ask_once_end();
         PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let t_pre = std::time::Instant::now();
+        finalize_preludes(&mut pending_preludes);
+        PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -8956,7 +8977,7 @@ impl HostList {
         &self,
         batch: &mut Batch,
         check_heap_writes: bool,
-    ) -> (bool, Vec<(crate::texture::PreludeUpload, bool)>) {
+    ) -> (bool, Vec<crate::texture::PreludeUpload>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut wrote_heap = false;
@@ -8970,7 +8991,6 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.flush_textures();
                     batch.title_written();
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -9007,8 +9027,11 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
-                        batch.flush_textures();
                         batch.title_written();
+                    } else if !batch.pending_textures.is_empty() {
+                        // Host callbacks can use a refresh result, including the
+                        // mip mask that maps a reserved texture for this upload.
+                        batch.flush_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -9037,7 +9060,11 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        batch.pending_textures.push(upload.staging.clone());
+                        if crate::tex_check::parallel_refresh() {
+                            batch.pending_textures.push(upload.staging.clone());
+                        } else {
+                            upload.staging.refresh();
+                        }
                     }
                     textures.push(upload.clone());
                     continue;
@@ -9046,14 +9073,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
-        batch.flush_textures();
-        let mut uploads = Vec::new();
-        for upload in textures {
-            if let Some(first_upload) = upload.finish_refresh() {
-                uploads.push((upload, first_upload));
-            }
-        }
-        (wrote_heap, uploads)
+        (wrote_heap, textures)
     }
 }
 
@@ -9370,22 +9390,10 @@ impl Batch {
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
     }
 
-    /// Refreshes any queued due textures, in parallel when `VICTORY_WIDE_REFRESH=1`.
+    /// Refreshes any queued due textures side by side (`crate::tex_check`).
     fn flush_textures(&mut self) {
         if !self.pending_textures.is_empty() {
-            if wide_refresh() && self.pending_textures.len() >= 2 {
-                let textures = std::sync::Arc::new(std::mem::take(&mut self.pending_textures));
-                let total = textures.len();
-                crate::shadow::wide_chunks(total, 1, move |start, end| {
-                    for staging in &textures[start..end] {
-                        staging.refresh();
-                    }
-                });
-            } else {
-                for staging in self.pending_textures.drain(..) {
-                    staging.refresh();
-                }
-            }
+            crate::tex_check::check_textures(std::mem::take(&mut self.pending_textures));
         }
     }
 
@@ -10555,6 +10563,7 @@ impl Meter {
         }
         crate::port::log(frames);
         crate::port_cbv::log(frames);
+        crate::tex_check::log(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         crate::resource::room_line();

@@ -86,6 +86,8 @@ mod windowup;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod tex_check;
+#[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texstore;
