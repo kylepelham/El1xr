@@ -1155,7 +1155,9 @@ unsafe impl Sync for PlanePass {}
 fn plane_pass() -> Option<&'static PlanePass> {
     static PASS: OnceLock<PlanePass> = OnceLock::new();
     host()?;
-    Some(PASS.get_or_init(|| PlanePass { made: Mutex::default() }))
+    Some(PASS.get_or_init(|| PlanePass {
+        made: Mutex::default(),
+    }))
 }
 
 /// Views of present planes drawn over the first one ([`Host::present`]): a
@@ -1436,11 +1438,7 @@ impl PlanePass {
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
-fn record_plane_pass(
-    owner: &HostList,
-    depth: &ID3D12Resource,
-    plane: &ID3D12Resource,
-) {
+fn record_plane_pass(owner: &HostList, depth: &ID3D12Resource, plane: &ID3D12Resource) {
     let list = &owner.list;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
@@ -1467,12 +1465,13 @@ fn record_plane_pass(
     // SAFETY: plain heap creation. One view per subresource, and the list
     // keeps the heap until its reset, through every submission of it.
     let views: ID3D12DescriptorHeap = match unsafe {
-        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: kind,
-            NumDescriptors: count,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        })
+        host.device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
     } {
         Ok(heap) => heap,
         Err(e) => {
@@ -1818,7 +1817,8 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     if scratch_pool() {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let kept = crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
+        let kept =
+            crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
         if let Some((chunk, size)) = kept {
             ALIVE[3].fetch_sub(1, Ordering::Relaxed);
             ALIVE[4].fetch_sub(size, Ordering::Relaxed);
@@ -1832,7 +1832,14 @@ fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some((Chunk { buffer, data: data as usize, gpu }, size))
+    Some((
+        Chunk {
+            buffer,
+            data: data as usize,
+            gpu,
+        },
+        size,
+    ))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -3280,8 +3287,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it.
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -3591,7 +3598,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -3606,7 +3613,8 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    line.line
+        .push(Late::Signal(crate::fence::FenceRef::retain(fence), value));
     line.pushed += 1;
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
@@ -6538,9 +6546,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value)
-                }
+                Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
         if last > 0 {
@@ -7048,9 +7054,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => {
-                        crate::fence::set(fence as crate::object::This, value)
-                    }
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
@@ -7347,7 +7351,13 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let tex_back = runs
                 .iter()
-                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .flat_map(|l| {
+                    l.deferred()
+                        .texture_backs
+                        .iter()
+                        .map(crate::texback::Back::range)
+                        .collect::<Vec<_>>()
+                })
                 .collect();
             let sent = Sent {
                 number: this_submission,
@@ -8136,7 +8146,9 @@ impl HostList {
             return;
         }
         let wanted = &mut self.deferred().back_wanted;
-        crate::texback::want(wanted, resource as usize, || crate::texback::Target::new(resource));
+        crate::texback::want(wanted, resource as usize, || {
+            crate::texback::Target::new(resource)
+        });
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
@@ -8898,7 +8910,9 @@ impl HostList {
     /// The shader-visible descriptor heaps the list keeps (tests).
     #[cfg(test)]
     pub(crate) fn kept_shader_heaps(&self) -> Vec<ID3D12DescriptorHeap> {
-        self.deferred().kept.iter()
+        self.deferred()
+            .kept
+            .iter()
             .filter_map(|object| object.cast::<ID3D12DescriptorHeap>().ok())
             .filter(|heap| {
                 // SAFETY: a live descriptor heap.
@@ -10987,8 +11001,13 @@ impl Host {
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, crate::pacing::chain_flags())
+                p.swap_chain.ResizeBuffers(
+                    BUFFERS,
+                    width,
+                    height,
+                    format,
+                    crate::pacing::chain_flags(),
+                )
             };
             match resized {
                 Ok(()) => {

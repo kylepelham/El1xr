@@ -46,6 +46,30 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// A queued wait or signal can outlive the title's last fence reference.
+/// Keep the fence alive until the command runs or its queue discards it.
+#[cfg(windows)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn retain(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
@@ -201,5 +225,18 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fence_ref_keeps_fence_alive_after_title_release() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 2, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let retained = FenceRef::retain(f);
+        // Title releases its only reference; retained ref keeps it alive.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 1);
+        set(retained.as_this(), 9);
+        assert_eq!(completed(retained.as_this()), 9);
+        drop(retained);
     }
 }
