@@ -585,6 +585,17 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// An identically empty mask has zero in both halves even inside a lane
+/// branch. Set `VICTORY_WAVE_ZERO_MASK=0` to exercise the ballot path.
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -622,6 +633,8 @@ pub(super) fn host_max_wave() -> u32 {
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
@@ -3093,14 +3106,55 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar copy preserves both dwords even when some lanes skip the
+    /// copy. If its source was written in the entry block, both host waves
+    /// can ballot it there before the branch.
+    fn entry_mask_copied_by(&self, block: usize, lo: Value) -> Option<Value> {
+        let inst = self.x.p.blocks[block]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let operand = match (inst.name(), src.as_slice()) {
+            ("s_mov_b64", [a]) => a,
+            ("s_and_b64" | "s_or_b64", [a, b]) if a == b => a,
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *operand else {
+            return None;
+        };
+        let source = inst.read(Reg::S(code))?;
+        let high = inst.read(Reg::S(code.checked_add(1)?))?;
+        (self.x.p.blocks[0].preds.is_empty()
+            && self.def_block.get(&source) == Some(&0)
+            && self.x.st.highs.get(&high) == Some(&source)
+            && self.x.st.active.contains(&source))
+        .then_some(source)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
-        let (lo, high) = match self.x.st.highs.get(&v) {
+        let (mut lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        if !self.local
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && let Some(&block) = self.def_block.get(&lo)
+            && !self.all_lanes(block)
+            && let Some(source) = self.entry_mask_copied_by(block, lo)
+        {
+            lo = source;
+        }
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask. Either dword
+        // is zero even when the other half of a console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block, and in the paired form, whose host wave
@@ -9169,7 +9223,10 @@ impl<'a> Lower<'a> {
                 return self.image_with_sampler(inst, b, i, Some(first));
             }
             let edge = |pred: usize| {
-                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                self.edges
+                    .get(&(pred, *block))
+                    .copied()
+                    .or(self.tail[pred])
                     .ok_or("a sampler choice with an unfinished predecessor")
             };
             let (left, right) = (edge(*left)?, edge(*right)?);
@@ -9178,7 +9235,9 @@ impl<'a> Lower<'a> {
             let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
             self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
             self.image_with_sampler(inst, b, i, Some(first))?;
-            let left = inst.writes.iter()
+            let left = inst
+                .writes
+                .iter()
                 .map(|&(_, v)| self.i32_of(v))
                 .collect::<Result<Vec<_>, _>>()?;
             self.image_with_sampler(inst, b, i, Some(second))?;
@@ -11643,15 +11702,23 @@ mod tests {
     fn a_uniform_branch_can_choose_between_immediate_samplers() {
         // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
         let words = [
-            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
-            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
-            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
-            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
-            0xBF85_0002,                    // branch to clamp
-            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
-            0xBE88_03FF, 0x0000_0092,       // clamp all axes
-            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
-            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            0xBE84_0300,
+            0xBE85_0380, // s[4:5] = texture table
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380,
+            0xBE8A_0380,
+            0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // branch to clamp
+            0xBE88_0380,
+            0xBF82_0002, // wrap, skip clamp
+            0xBE88_03FF,
+            0x0000_0092, // clamp all axes
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
             S_ENDPGM,
         ];
         let (mut layout, mut used) = texture_tables();
