@@ -177,7 +177,10 @@ pub fn warm_translations(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) 
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = worker_threads(
+        jobs,
+        std::thread::available_parallelism().map(std::num::NonZeroUsize::get).ok(),
+    );
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -941,6 +944,24 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
 }
 
+fn worker_threads(jobs: Option<usize>, available: Option<usize>) -> usize {
+    jobs.or(available).unwrap_or(4).max(1)
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_threads;
+
+    #[test]
+    fn worker_threads_defaults_to_available_parallelism_and_honors_explicit_jobs() {
+        assert_eq!(worker_threads(None, Some(32)), 32);
+        assert_eq!(worker_threads(None, None), 4);
+        assert_eq!(worker_threads(None, Some(0)), 1);
+        assert_eq!(worker_threads(Some(8), Some(32)), 8);
+        assert_eq!(worker_threads(Some(0), Some(32)), 1);
+    }
 }
