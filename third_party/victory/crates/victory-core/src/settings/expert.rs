@@ -26,6 +26,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_BIND_CACHE", Apply::Restart),
     ("VICTORY_BIND_SPLIT", Apply::Restart),
     ("VICTORY_BOOT_PROF", Apply::Restart),
+    ("VICTORY_BUFFER_FORMAT_CHECK", Apply::Live),
     ("VICTORY_BVH_BUILDER", Apply::Retranslate),
     ("VICTORY_BVH_BUILDER_EARLY", Apply::Restart),
     ("VICTORY_BVH_PREMAP", Apply::Restart),
