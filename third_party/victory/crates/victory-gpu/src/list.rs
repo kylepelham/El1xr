@@ -1058,6 +1058,7 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         ];
         list.list.ResourceBarrier(&back);
     }
+    list.card_constants.wrote(to as usize, len as usize, &target);
     crate::host::CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }

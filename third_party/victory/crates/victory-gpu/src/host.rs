@@ -977,6 +977,7 @@ pub(crate) struct HostList {
     /// draw's table that was made ready when the count stood where it stands now needs
     /// nothing again (`crate::draw`, the tables made afresh).
     pub(crate) changes: std::sync::atomic::AtomicU64,
+    pub(crate) card_constants: crate::card_constants::PerList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -4880,6 +4881,7 @@ impl Host {
                 kept_pipeline: std::sync::atomic::AtomicUsize::new(0),
                 cbv_epoch: std::sync::atomic::AtomicU64::new(0),
                 twins_writing: std::sync::atomic::AtomicBool::new(false),
+                card_constants: Default::default(),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -7864,6 +7866,7 @@ impl HostList {
         self.cbv_epoch.store(0, Ordering::Relaxed);
         self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
+        self.card_constants.clear();
         *self.deferred() = Deferred::default();
         self.states
             .lock()
@@ -8501,6 +8504,7 @@ impl HostList {
         // (Neptune) Title memory or a buffer changes at this place in the list: a table made
         // ready before it is made ready again after it (`crate::draw`).
         self.changes.fetch_add(1, Ordering::Relaxed);
+        self.card_constants.overwritten(dst as usize, len);
         let mut deferred = self.deferred();
         deferred.title_write();
         self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
@@ -10643,6 +10647,7 @@ impl Meter {
             );
         }
         {
+            crate::card_constants::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
