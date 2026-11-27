@@ -881,11 +881,18 @@ fn publish(epochs: &[(usize, usize, u64)]) {
     }
 }
 
-/// Lock-free fast path for [`Shadow::update_free`]: returns `true` when every
-/// page in `[start, end)` has already been copied (`copied[i] != 0`), every
-/// covering block is either already asked ahead or published clean in
-/// [`PUBLISHED`], and no page's journal stamp in [`PARTS`] exceeds `copied[i]`.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+/// Lock-free atomic version of [`nothing_new`] for [`crate::copied_pages::CopiedPages`].
+/// Checks `published_all` first; skips `JOURNAL.read()` on known view memory (`VIEWS.all`);
+/// and when `all_copied` is true skips scanning `copied` for zeros and only loads
+/// `copied[i]` for pages with a nonzero write stamp in `PARTS`.
+pub(crate) fn nothing_new_atomic(
+    start: usize,
+    end: usize,
+    base: usize,
+    copied: &[std::sync::atomic::AtomicU64],
+    all_copied: bool,
+) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
     if !light() || start >= end {
         return false;
     }
@@ -897,11 +904,14 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64])
     let Some(taken) = copied.get(off..off + len) else {
         return false;
     };
-    if taken.contains(&0) {
+    if !all_copied && taken.iter().any(|a| a.load(Acquire) == 0) {
         return false;
     }
     let (fb, lb) = (start / BLOCK, end.div_ceil(BLOCK));
     if !published_all(fb, lb) {
+        if skip_views() && VIEWS.all(fb, lb) {
+            return false;
+        }
         let ahead = {
             let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
             reservation::covered(&j, first, last)
@@ -915,8 +925,8 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64])
         let end_p = last.min((page / PART + 1) * PART);
         if let Some(part) = part_of(&PARTS, page, false) {
             for p in page..end_p {
-                let stamp = part.0[p % PART].load(std::sync::atomic::Ordering::Acquire);
-                if stamp > taken[p - first] {
+                let stamp = part.0[p % PART].load(Acquire);
+                if stamp != 0 && stamp > taken[p - first].load(Acquire) {
                     return false;
                 }
             }
@@ -1277,7 +1287,7 @@ fn dirty4k_mode() -> u8 {
 /// switch on, and in both phases of `alt` (the phase without counts what it
 /// would have saved).
 pub(crate) fn dirty4k_kept() -> bool {
-    dirty4k_mode() != 0
+    !watch_4k() && dirty4k_mode() != 0
 }
 
 /// With [`dirty4k_kept`]: the entries of [`SUB_PAGES`] for the pages of
@@ -1482,14 +1492,18 @@ fn mask_of(stamps: &[u64; PAGE / KERNEL_PAGE], at: u64) -> Option<u16> {
 static COPY_4K: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Notes one stale page refreshed: `mask` (`None`: whole) -> its 4 KiB pages.
-pub(crate) fn note_4k(mask: Option<u16>) {
-    let (i, n) = match mask {
-        Some(m) => (0, u64::from(m.count_ones())),
-        None => (2, 16),
-    };
-    COPY_4K[i].fetch_add(n * KERNEL_PAGE as u64, std::sync::atomic::Ordering::Relaxed);
-    COPY_4K[i + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// Notes stale pages refreshed, batched per `copy_stale` call to avoid per-page
+/// atomic contention across worker threads.
+pub(crate) fn note_4k_batch(sub_4k_count: u64, sub_64k_pages: u64, whole_64k_pages: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if sub_64k_pages > 0 {
+        COPY_4K[0].fetch_add(sub_4k_count * KERNEL_PAGE as u64, Relaxed);
+        COPY_4K[1].fetch_add(sub_64k_pages, Relaxed);
+    }
+    if whole_64k_pages > 0 {
+        COPY_4K[2].fetch_add(whole_64k_pages * PAGE as u64, Relaxed);
+        COPY_4K[3].fetch_add(whole_64k_pages, Relaxed);
+    }
 }
 
 /// [`COPY_4K`], taken.
@@ -1557,6 +1571,98 @@ pub(crate) fn ask_once_active() -> bool {
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
+fn prepare_flush_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_PREPARE_FLUSH").is_some_and(|v| v == "0"))
+}
+
+/// Coalesces view-memory re-guarding (`VirtualProtect`) and any uncovered
+/// private `GetWriteWatch` ranges across all copies in a `Batch::flush` ONCE
+/// on the submitting thread before `wide_chunks` runs.
+///
+/// This prevents 16 worker threads from issuing hundreds of overlapping 1 MiB
+/// `VirtualProtect` / `GetWriteWatch` calls concurrently (which contend on the
+/// Windows kernel VAD lock and fire TLB shootdown IPIs into parallel
+/// `diff_copy_direct` workers).
+pub(crate) fn prepare_flush(ranges: &[(usize, usize)]) {
+    if !prepare_flush_enabled() || !light() || ranges.is_empty() {
+        return;
+    }
+    let mut pages: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(a, b)| a < b)
+        .map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE)))
+        .collect();
+    if pages.is_empty() {
+        return;
+    }
+    pages.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for (a, b) in pages {
+        match merged.last_mut() {
+            Some((_, last)) if a <= *last => *last = (*last).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    const { assert!(BLOCK == PAGE) };
+    let mut views: Vec<(usize, usize)> = Vec::new();
+    let mut priv_cand: Vec<(usize, usize)> = Vec::new();
+    let skip_v = skip_views();
+    for (first, last) in merged {
+        if published_all(first, last) {
+            continue;
+        }
+        let is_v = (skip_v && (PROTECTED.any(first, last) || VIEWS.any(first, last)))
+            || known_view(first * PAGE);
+        if is_v {
+            views.push((first, last));
+        } else {
+            priv_cand.push((first, last));
+        }
+    }
+    if !views.is_empty() {
+        let t = crate::refresh_prof::start();
+        let mut called = 0u64;
+        for (first, last) in views {
+            if published_all(first, last) {
+                continue;
+            }
+            if let Some((guarded_pages, epochs)) = guard_with_epochs(first * PAGE, last * PAGE) {
+                called += 1;
+                if !guarded_pages.is_empty() || !epochs.is_empty() {
+                    let now = next_asking();
+                    for &page in &guarded_pages {
+                        written_set(page, now);
+                    }
+                    publish(&epochs);
+                }
+            }
+        }
+        crate::refresh_prof::add(crate::refresh_prof::P::PrepareViewsCalls, called);
+        crate::refresh_prof::finish(crate::refresh_prof::P::PrepareViewsUs, t);
+    }
+    if !priv_cand.is_empty() && reservation::enabled() && ask_once_active() {
+        let uncovered: Vec<(usize, usize)> = {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            if !j.kept {
+                Vec::new()
+            } else {
+                priv_cand
+                    .into_iter()
+                    .filter(|&(a, b)| !reservation::covered(&j, a, b))
+                    .collect()
+            }
+        };
+        if !uncovered.is_empty() {
+            let t = crate::refresh_prof::start();
+            let n = uncovered.len() as u64;
+            reservation::ask_more(&uncovered);
+            crate::refresh_prof::add(crate::refresh_prof::P::PreparePrivCalls, n);
+            crate::refresh_prof::finish(crate::refresh_prof::P::PreparePrivUs, t);
+        }
+    }
+}
+
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`. Check before allocating/scanning/sorting.
@@ -2531,19 +2637,30 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let (first_b, last_b) = (start / BLOCK, end.div_ceil(BLOCK));
+    let t_path = crate::refresh_prof::start();
+    if guarded && light() && start < end && published_all(first_b, last_b) {
+        let out = Some((next_asking(), written_in(first, last)));
+        crate::refresh_prof::add(crate::refresh_prof::P::PublishedCalls, 1);
+        crate::refresh_prof::finish(crate::refresh_prof::P::PublishedUs, t_path);
+        return out;
+    }
     // Asked ahead with the submission's other ranges: the journal has it. (Neptune) The lock
     // is held for the look alone, and the kernel is asked without it: the pages are
-    // noted in a table of their own (`written_set`).
-    let standing = {
+    // noted in a table of their own (`written_set`). Known view memory is never covered by
+    // GetWriteWatch reservations, so skip the shared RwLock on `VIEWS.all`.
+    let skip_journal = guarded && light() && skip_views() && start < end && VIEWS.all(first_b, last_b);
+    let standing = if skip_journal {
+        None
+    } else {
         let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         reservation::covered(&j, first, last).then_some(j.ahead_asked)
     };
     if let Some(asked) = standing {
-        return Some((asked, written_in(first, last)));
-    }
-    let (first_b, last_b) = (start / BLOCK, end.div_ceil(BLOCK));
-    if guarded && light() && start < end && published_all(first_b, last_b) {
-        return Some((next_asking(), written_in(first, last)));
+        let out = Some((asked, written_in(first, last)));
+        crate::refresh_prof::add(crate::refresh_prof::P::StandingCalls, 1);
+        crate::refresh_prof::finish(crate::refresh_prof::P::StandingUs, t_path);
+        return out;
     }
     // View memory the kernel would refuse, and the caller does not ask the
     // guards (textures, which then fall back to guarded/hash tracking): no
@@ -2643,6 +2760,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         if failed {
             publish(&epochs);
+            crate::refresh_prof::add(crate::refresh_prof::P::GuardCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::GuardUs, t_path);
+        } else {
+            crate::refresh_prof::add(crate::refresh_prof::P::KernelCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::KernelUs, t_path);
         }
         Some((now, written_in(first, last)))
     })

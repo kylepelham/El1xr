@@ -10,7 +10,7 @@ fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
     let end = (base + PAGES) * PAGE - 77;
 
     let mut oracle_at = vec![0u64; PAGES];
-    let mut fast = CopiedPages::new(PAGES);
+    let fast = CopiedPages::new(PAGES);
     assert!(!fast.all_copied());
 
     // Initialize scattered pages including across 64-page word boundaries.
@@ -79,7 +79,8 @@ fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
             .iter()
             .collect();
         assert_eq!(got, expected, "step {step} [{from:#x}..{to:#x})");
-        assert_eq!(fast.at, oracle_at, "copied timestamps diverged at step {step}");
+        let fast_at: Vec<u64> = fast.at.iter().map(|a| a.load(Ordering::Acquire)).collect();
+        assert_eq!(fast_at, oracle_at, "copied timestamps diverged at step {step}");
     }
 }
 
@@ -2226,7 +2227,7 @@ fn bench_shadow_and_rebar() {
     {
         const PAGES: usize = 2560;
         let base = 0x1000usize;
-        let mut cp = CopiedPages::new(PAGES);
+        let cp = CopiedPages::new(PAGES);
         for i in 0..PAGES {
             cp.set(i, 1);
         }

@@ -49,292 +49,7 @@ fn note_carded(shadow: &Arc<Shadow>) {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
 }
 
-/// Inline-first buffer for coalesced dirty page runs produced by
-/// [`CopiedPages::plan_stale`]: avoids heap allocation for up to 8 runs per
-/// refresh (the overwhelming majority of refreshes).
-struct SmallRuns {
-    inline: [(usize, usize); 8],
-    inline_len: usize,
-    spill: Vec<(usize, usize)>,
-}
-
-impl SmallRuns {
-    fn new() -> Self {
-        Self {
-            inline: [(0, 0); 8],
-            inline_len: 0,
-            spill: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, from: usize, to: usize) {
-        if self.inline_len < self.inline.len() {
-            self.inline[self.inline_len] = (from, to);
-            self.inline_len += 1;
-        } else {
-            self.spill.push((from, to));
-        }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.inline[..self.inline_len]
-            .iter()
-            .copied()
-            .chain(self.spill.iter().copied())
-    }
-}
-
-/// Per-page last copied write-watch sequence, paired with a 64-page-per-word
-/// bitmask of uncopied pages so partially-initialized buffers and windows
-/// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
-/// initialized regions 64 pages at a time when uncopied pages exist.
-struct CopiedPages {
-    at: Vec<u64>,
-    /// Bit `i` (word `i / 64`, bit `i % 64`) is 1 iff `at[i] == 0`.
-    /// Unused high bits in the final word are always 0.
-    uncopied_bits: Vec<u64>,
-    uncopied: usize,
-}
-
-impl CopiedPages {
-    fn new(pages: usize) -> Self {
-        let words = pages.div_ceil(64);
-        let mut uncopied_bits = vec![u64::MAX; words];
-        let rem = pages % 64;
-        if rem != 0 {
-            uncopied_bits[words - 1] = (1u64 << rem) - 1;
-        }
-        Self {
-            at: vec![0; pages],
-            uncopied_bits,
-            uncopied: pages,
-        }
-    }
-
-    fn get(&self, index: usize) -> Option<u64> {
-        self.at.get(index).copied()
-    }
-
-    fn set(&mut self, index: usize, now: u64) {
-        if let Some(slot) = self.at.get_mut(index) {
-            if *slot == 0 && now != 0 {
-                self.uncopied -= 1;
-                self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
-            } else if *slot != 0 && now == 0 {
-                self.uncopied += 1;
-                self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
-            }
-            *slot = now;
-        }
-    }
-
-    fn all_uncopied(&self) -> bool {
-        self.uncopied == self.at.len()
-    }
-
-    #[cfg(test)]
-    fn all_copied(&self) -> bool {
-        self.uncopied == 0
-    }
-
-    #[cfg(feature = "diagnostics")]
-    fn copied_count(&self) -> usize {
-        self.at.len() - self.uncopied
-    }
-
-    /// Whether every page index in `lo..=hi` has been copied whole at least once.
-    fn range_all_copied(&self, lo: usize, hi: usize) -> bool {
-        if self.uncopied == 0 {
-            return true;
-        }
-        let first_w = lo / 64;
-        let last_w = hi / 64;
-        let lo_mask = u64::MAX << (lo % 64);
-        let hi_mask = u64::MAX >> (63 - (hi % 64));
-        if first_w == last_w {
-            return (self.uncopied_bits[first_w] & lo_mask & hi_mask) == 0;
-        }
-        if (self.uncopied_bits[first_w] & lo_mask) != 0 {
-            return false;
-        }
-        for &word in &self.uncopied_bits[first_w + 1..last_w] {
-            if word != 0 {
-                return false;
-            }
-        }
-        (self.uncopied_bits[last_w] & hi_mask) == 0
-    }
-
-    /// Lowest page index `>= from_idx` and `<= hi` that has never been copied whole.
-    fn next_uncopied(&self, from_idx: usize, hi: usize) -> Option<usize> {
-        if from_idx > hi || self.uncopied == 0 {
-            return None;
-        }
-        let mut w = from_idx / 64;
-        let last_w = hi / 64;
-        let mut word = self.uncopied_bits[w] & (u64::MAX << (from_idx % 64));
-        loop {
-            if w == last_w {
-                word &= u64::MAX >> (63 - (hi % 64));
-            }
-            if word != 0 {
-                return Some(w * 64 + word.trailing_zeros() as usize);
-            }
-            if w == last_w {
-                return None;
-            }
-            w += 1;
-            word = self.uncopied_bits[w];
-        }
-    }
-
-    /// Plans the coalesced byte ranges `[run_from, run_to)` inside `[from, to)`
-    /// that must be copied from title memory, updating whole-page copied
-    /// timestamps to `now`. Runs purely on metadata so callers can release the
-    /// `copied` mutex before invoking memory copies.
-    #[allow(clippy::too_many_arguments)]
-    fn plan_stale(
-        &mut self,
-        base: usize,
-        start: usize,
-        end: usize,
-        from: usize,
-        to: usize,
-        now: u64,
-        written: &[(usize, u64)],
-    ) -> SmallRuns {
-        self.plan_stale_filtered(base, start, end, from, to, now, written, |_| false)
-    }
-
-    /// Like [`Self::plan_stale`], skipping page indices for which `skip_idx`
-    /// returns `true` (used by lazy GPU-resident write-back so `DEFERRED`
-    /// pages are neither copied from title memory nor coalesced across).
-    #[allow(clippy::too_many_arguments)]
-    fn plan_stale_filtered(
-        &mut self,
-        base: usize,
-        start: usize,
-        end: usize,
-        from: usize,
-        to: usize,
-        now: u64,
-        written: &[(usize, u64)],
-        skip_idx: impl Fn(usize) -> bool,
-    ) -> SmallRuns {
-        let mut runs = SmallRuns::new();
-        if from >= to {
-            return runs;
-        }
-        let first_page = from / PAGE;
-        let last = (to - 1) / PAGE;
-        let lo = first_page - base;
-        let hi = last - base;
-
-        let push_page =
-            |runs: &mut SmallRuns, run: &mut Option<(usize, usize)>, page: usize| match *run {
-                Some((_, run_end)) if page < run_end => {}
-                Some((run_start, run_end)) if page == run_end => {
-                    *run = Some((run_start, page + 1));
-                }
-                Some((run_start, run_end)) => {
-                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-                    *run = Some((page, page + 1));
-                }
-                None => *run = Some((page, page + 1)),
-            };
-
-        let mut run: Option<(usize, usize)> = None;
-        let w_start = if written.len() > 8 {
-            written.partition_point(|&(p, _)| p < first_page)
-        } else {
-            0
-        };
-
-        // Fast path: every page in `[from, to)` has been initialized at least
-        // once (even if other pages of the same buffer/window have not).
-        if self.range_all_copied(lo, hi) {
-            if written.is_empty() {
-                return runs;
-            }
-            for &(page, write) in &written[w_start..] {
-                if page < first_page {
-                    continue;
-                }
-                if page > last {
-                    break;
-                }
-                let idx = page - base;
-                if skip_idx(idx) || write <= self.at[idx] {
-                    continue;
-                }
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    self.set(idx, now);
-                }
-                push_page(&mut runs, &mut run, page);
-            }
-            if let Some((run_start, run_end)) = run {
-                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-            }
-            return runs;
-        }
-
-        // Sparse merge of uncopied pages (via 64-page bitmask) and dirty
-        // `written` entries in `[first_page, last]`.
-        let mut wi = w_start;
-        while wi < written.len() && written[wi].0 < first_page {
-            wi += 1;
-        }
-        let mut next_u = self.next_uncopied(lo, hi);
-        loop {
-            while wi < written.len() && written[wi].0 <= last {
-                let (wp, write) = written[wi];
-                let idx = wp - base;
-                if self.at[idx] == 0 || write > self.at[idx] {
-                    break;
-                }
-                wi += 1;
-            }
-            let next_w =
-                (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
-            let idx = match (next_u, next_w) {
-                (Some(u), Some(w)) if u < w => {
-                    next_u = self.next_uncopied(u + 1, hi);
-                    u
-                }
-                (Some(u), Some(w)) if w < u => {
-                    wi += 1;
-                    w
-                }
-                (Some(u), Some(_)) => {
-                    next_u = self.next_uncopied(u + 1, hi);
-                    wi += 1;
-                    u
-                }
-                (Some(u), None) => {
-                    next_u = self.next_uncopied(u + 1, hi);
-                    u
-                }
-                (None, Some(w)) => {
-                    wi += 1;
-                    w
-                }
-                (None, None) => break,
-            };
-            if skip_idx(idx) {
-                continue;
-            }
-            let page = base + idx;
-            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                self.set(idx, now);
-            }
-            push_page(&mut runs, &mut run, page);
-        }
-        if let Some((run_start, run_end)) = run {
-            runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-        }
-        runs
-    }
-}
+use crate::copied_pages::CopiedPages;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -346,7 +61,7 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never), paired with an uncopied bitmask.
-    copied: Mutex<CopiedPages>,
+    copied: CopiedPages,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -4020,6 +3735,7 @@ mod piece_tests {
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
+#[cfg(test)]
 fn stale_pages_in(
     base: usize,
     copied: &[u64],
@@ -4033,6 +3749,25 @@ fn stale_pages_in(
             None => false,
             Some(0) => true,
             Some(&at) => written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .is_ok_and(|i| written[i].1 > at),
+        })
+        .collect()
+}
+
+fn stale_pages_in_atomic(
+    base: usize,
+    copied: &[AtomicU64],
+    a: usize,
+    e: usize,
+    written: &[(usize, u64)],
+) -> Vec<usize> {
+    (a / PAGE..e.div_ceil(PAGE))
+        .filter(|&page| page >= base)
+        .filter(|&page| match copied.get(page - base).map(|a| a.load(Ordering::Acquire)) {
+            None => false,
+            Some(0) => true,
+            Some(at) => written
                 .binary_search_by_key(&page, |&(p, _)| p)
                 .is_ok_and(|i| written[i].1 > at),
         })
@@ -4136,8 +3871,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = loose_write();
     for s in loose.values() {
-        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.copied_count() as u64;
+        let pages = s.copied.copied_count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -4351,7 +4085,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(CopiedPages::new(pages)),
+            copied: CopiedPages::new(pages),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
@@ -4432,8 +4166,7 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         let base = start / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        if from >= to || copied.all_uncopied() {
+        if from >= to || self.copied.all_uncopied() {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
@@ -4442,7 +4175,7 @@ impl Shadow {
         match crate::watch::asked(from, to) {
             Some((_, written)) => written.into_iter().any(|(page, write)| {
                 page >= base
-                    && copied
+                    && self.copied
                         .get(page - base)
                         .is_none_or(|at| at == 0 || write > at)
             }),
@@ -5061,10 +4794,9 @@ impl Shadow {
                 }
             }
         }
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter()
             .any(|(a, e)| match crate::watch::asked(a, e) {
-                Some((_, written)) => stale_pages_in(base, &copied.at, a, e, &written)
+                Some((_, written)) => stale_pages_in_atomic(base, &self.copied.at, a, e, &written)
                     .into_iter()
                     .any(|p| {
                         !has_deferred
@@ -5177,10 +4909,10 @@ impl Shadow {
         let mut title = Vec::new();
         for (a, e) in busy {
             if watched == 1 {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let clean = crate::watch::nothing_new(a, e, base, &copied.at);
-                drop(copied);
-                if clean {
+                let lo = (a / PAGE).saturating_sub(base);
+                let hi = (e.saturating_sub(1) / PAGE).saturating_sub(base);
+                let all_copied = a < e && hi < self.copied.at.len() && self.copied.range_all_copied(lo, hi);
+                if crate::watch::nothing_new_atomic(a, e, base, &self.copied.at, all_copied) {
                     continue;
                 }
             }
@@ -5195,14 +4927,13 @@ impl Shadow {
                 return true;
             };
             let stale: Vec<(usize, u64)> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied.at, a, e, &written)
+                stale_pages_in_atomic(base, &self.copied.at, a, e, &written)
                     .into_iter()
                     .filter(|&p| {
                         !has_deferred
                             || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire))
                     })
-                    .map(|page| (page, copied.get(page - base).unwrap_or(0)))
+                    .map(|page| (page, self.copied.get(page - base).unwrap_or(0)))
                     .collect()
             };
             if stale.is_empty() {
@@ -5320,8 +5051,7 @@ impl Shadow {
                 // refresh's, which notes only whole pages, and the page is
                 // looked at again.
                 if all_read && (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    copied.set(page - base, now);
+                    self.copied.set(page - base, now);
                 }
             }
         }
@@ -5382,10 +5112,10 @@ impl Shadow {
         to: usize,
         skip_busy: &[(usize, usize)],
     ) -> usize {
-        use crate::refresh_prof::{P, add, time};
+        use crate::refresh_prof::{P, add, finish, start};
         add(P::Calls, 1);
         add(P::Span, (to - from) as u64);
-        let lazy = std::time::Instant::now();
+        let lazy = start();
         // Detect any overlapping OTHER shadow's deferred pages WITHOUT flushing
         // or unprotecting them: marking those pages stale (`copied = 0`) makes
         // `copy_stale` -> `copy` -> `host::copy_mapped` read their fresh GPU
@@ -5399,10 +5129,9 @@ impl Shadow {
         };
         if !other_deferred.is_empty() {
             let base = self.start as usize / PAGE;
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             for &page in &other_deferred {
                 if page >= base {
-                    copied.set(page - base, 0);
+                    self.copied.set(page - base, 0);
                 }
             }
         }
@@ -5411,18 +5140,19 @@ impl Shadow {
         {
             self.lazy_prepare_update(from, to, skip_busy);
         }
-        time(P::LazyUs, lazy);
+        finish(P::LazyUs, lazy);
         let w = self.watched.load(Ordering::Relaxed);
         if w != NOT_WATCHED {
-            let asking = std::time::Instant::now();
+            let asking = start();
             if w == 1 {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let clean =
-                    crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at);
-                drop(copied);
+                let base = self.start as usize / PAGE;
+                let lo = (from / PAGE).saturating_sub(base);
+                let hi = (to.saturating_sub(1) / PAGE).saturating_sub(base);
+                let all_copied = from < to && hi < self.copied.at.len() && self.copied.range_all_copied(lo, hi);
+                let clean = crate::watch::nothing_new_atomic(from, to, base, &self.copied.at, all_copied);
                 if clean {
                     add(P::CleanCalls, 1);
-                    time(P::CleanUs, asking);
+                    finish(P::CleanUs, asking);
                     self.refresh_check(from, to);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -5435,24 +5165,21 @@ impl Shadow {
             }
             let asked = crate::watch::writes(from, to, true);
             add(P::AskCalls, 1);
-            time(P::AskUs, asking);
+            finish(P::AskUs, asking);
             if let Some((now, written)) = asked {
                 self.watched.store(1, Ordering::Relaxed);
-                let stale = std::time::Instant::now();
-                // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
+                // With `VICTORY_DIRTY_4K` (when `VICTORY_WATCH_4K` is off): the 4 KiB pages the kernel found.
                 let subs = crate::watch::subpages(from, to);
                 let copied = self.copy_stale(from, to, now, &written, &subs);
-                time(P::StaleUs, stale);
                 add(P::StaleBytes, copied as u64);
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
                 if !other_deferred.is_empty() {
                     let base = self.start as usize / PAGE;
-                    let mut c = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     for &page in &other_deferred {
                         if page >= base {
-                            c.set(page - base, 0);
+                            self.copied.set(page - base, 0);
                         }
                     }
                 }
@@ -5469,7 +5196,7 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let whole = std::time::Instant::now();
+        let whole = start();
         let bytes = if self.deferred_count.load(Ordering::Acquire) > 0 {
             self.copy_unwatched_skipping_deferred(from, to)
         } else if !in_wide() && to - from >= 1 << 20 && wide_threads() > 1 {
@@ -5489,7 +5216,7 @@ impl Shadow {
         };
         add(P::WholeCalls, 1);
         add(P::WholeBytes, bytes as u64);
-        time(P::WholeUs, whole);
+        finish(P::WholeUs, whole);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);
@@ -5631,37 +5358,76 @@ impl Shadow {
         let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
         let four_k = crate::watch::watch_4k();
         let dirty_4k_kept = crate::watch::dirty4k_kept();
+        let t_plan = crate::refresh_prof::start();
         if !four_k && !dirty_4k_kept {
-            let runs = {
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                if has_deferred {
-                    copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
-                        is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
-                    })
-                } else {
-                    copied.plan_stale(base, start, end, from, to, now, written)
-                }
+            let runs = if has_deferred {
+                self.copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
+                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+                })
+            } else {
+                self.copied.plan_stale(base, start, end, from, to, now, written)
             };
+            crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, t_plan);
+            let t_copy = crate::refresh_prof::start();
             let total: usize = runs.iter().map(|(a, b)| b - a).sum();
-            if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
-                return self.copy_runs_wide(runs.iter());
-            }
-            let mut bytes = 0;
-            for (run_from, run_to) in runs.iter() {
-                bytes += self.copy(run_from, run_to);
-            }
+            let bytes = if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
+                self.copy_runs_wide(runs.iter())
+            } else {
+                let mut bytes = 0;
+                for (run_from, run_to) in runs.iter() {
+                    bytes += self.copy(run_from, run_to);
+                }
+                bytes
+            };
+            crate::refresh_prof::finish(crate::refresh_prof::P::StaleCopyUs, t_copy);
             return bytes;
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
-        // with CopiedPages bitset consistency and lazy-deferred page skipping.
-        let bytes_runs = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // lock-free with CopiedPages bitset consistency and lazy-deferred page skipping.
+        let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let lo = first_page - base;
+        let hi = last - base;
+        let (mut sub_4k, mut sub_64k, mut whole_64k) = (0u64, 0u64, 0u64);
+        if four_k && self.copied.range_all_copied(lo, hi) {
+            let w_start = if written.len() > 8 {
+                written.partition_point(|&(p, _)| p < first_page)
+            } else {
+                0
+            };
+            for &(page, write) in &written[w_start..] {
+                if page < first_page {
+                    continue;
+                }
+                if page > last {
+                    break;
+                }
+                let idx = page - base;
+                if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
+                    continue;
+                }
+                let prev = self.copied.get(idx).unwrap_or(0);
+                if prev == 0 || write > prev {
+                    let m = crate::watch::stale_mask(page, prev);
+                    match m {
+                        Some(bits) => {
+                            sub_4k += u64::from(bits.count_ones());
+                            sub_64k += 1;
+                        }
+                        None => whole_64k += 1,
+                    }
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        self.copied.set(idx, now);
+                    }
+                    extend_runs(&mut run, &mut bytes_runs, page, m.unwrap_or(u16::MAX));
+                }
+            }
+        } else {
             let mut writes = written.iter().peekable();
             let mut subs = subs.iter().peekable();
-            let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
-            let last = (to - 1) / PAGE;
-            for page in from / PAGE..=last {
+            for page in first_page..=last {
                 let write = match writes.peek() {
                     Some(&&(p, w)) if p == page => {
                         writes.next();
@@ -5680,11 +5446,17 @@ impl Shadow {
                 if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
                     continue;
                 }
-                let prev = copied.get(idx).unwrap_or(0);
+                let prev = self.copied.get(idx).unwrap_or(0);
                 if prev == 0 || write > prev {
                     let mask = if four_k {
                         let m = crate::watch::stale_mask(page, prev);
-                        crate::watch::note_4k(m);
+                        match m {
+                            Some(bits) => {
+                                sub_4k += u64::from(bits.count_ones());
+                                sub_64k += 1;
+                            }
+                            None => whole_64k += 1,
+                        }
                         m
                     } else {
                         let found = sub
@@ -5694,14 +5466,16 @@ impl Shadow {
                         if narrow { found } else { None }
                     };
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        copied.set(idx, now);
+                        self.copied.set(idx, now);
                     }
                     extend_runs(&mut run, &mut bytes_runs, page, mask.unwrap_or(u16::MAX));
                 }
             }
-            bytes_runs.extend(run);
-            bytes_runs
-        };
+        }
+        if four_k && (sub_64k > 0 || whole_64k > 0) {
+            crate::watch::note_4k_batch(sub_4k, sub_64k, whole_64k);
+        }
+        bytes_runs.extend(run);
         let bytes_runs: Vec<(usize, usize)> = bytes_runs
             .into_iter()
             .filter_map(|(a, b)| {
@@ -5709,14 +5483,19 @@ impl Shadow {
                 (a < b).then_some((a, b))
             })
             .collect();
+        crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, t_plan);
+        let t_copy = crate::refresh_prof::start();
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
-        if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
-            return self.copy_runs_wide(bytes_runs.into_iter());
-        }
-        let mut bytes = 0;
-        for (a, b) in bytes_runs {
-            bytes += self.copy(a, b);
-        }
+        let bytes = if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
+            self.copy_runs_wide(bytes_runs.into_iter())
+        } else {
+            let mut bytes = 0;
+            for (a, b) in bytes_runs {
+                bytes += self.copy(a, b);
+            }
+            bytes
+        };
+        crate::refresh_prof::finish(crate::refresh_prof::P::StaleCopyUs, t_copy);
         bytes
     }
 
@@ -5727,11 +5506,16 @@ impl Shadow {
         // (Neptune) A transient window has no CPU side: the whole pages go into a chunk of
         // pooled upload memory, to be sent as they are (no byte compare, no snapshot).
         if self.transient() {
-            return self.copy_to_chunk(from, to);
+            let t = crate::refresh_prof::start();
+            let n = self.copy_to_chunk(from, to);
+            crate::refresh_prof::add(crate::refresh_prof::P::CopyTransientBytes, n as u64);
+            crate::refresh_prof::finish(crate::refresh_prof::P::CopyTransientUs, t);
+            return n;
         }
         // (Neptune) A rebar window: the whole pages go straight into the card's memory. No byte
         // compare (it would read write-combined memory), no dirty ranges, no send.
         if self.rebar {
+            let t = crate::refresh_prof::start();
             if to > from {
                 // SAFETY: inside the mapping (`from` and `to` are within the buffer).
                 let at = unsafe { self.data.add(from - start) };
@@ -5739,12 +5523,16 @@ impl Shadow {
                 wc_sfence();
                 REBAR[2].fetch_add((to - from) as u64, Ordering::Relaxed);
             }
-            return to.saturating_sub(from);
+            let n = to.saturating_sub(from);
+            crate::refresh_prof::add(crate::refresh_prof::P::CopyRebarBytes, n as u64);
+            crate::refresh_prof::finish(crate::refresh_prof::P::CopyRebarUs, t);
+            return n;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         // (Neptune) A copy in the card's memory takes only what differs (`copy_changed`).
         if self.card.is_some() && to > from && to - from <= 16 << 20 && copy_changed() {
+            let t_diff = crate::refresh_prof::start();
             const CHUNK: usize = 64 * 1024;
             let n = to - from;
             // SAFETY: `n` bytes of the mapping, which this refresh alone writes (the ranges
@@ -5771,7 +5559,10 @@ impl Shadow {
                             off += len;
                             continue;
                         }
-                        Err(done) => done,
+                        Err(done) => {
+                            crate::refresh_prof::add(crate::refresh_prof::P::CopyDiffFaults, 1);
+                            done
+                        }
                     };
                     let rem = len - skip;
                     let mut tail = [0u8; 32];
@@ -5803,16 +5594,24 @@ impl Shadow {
                     let copied: usize = runs.iter().map(|&(_, m)| m).sum();
                     COPY_CHANGED[1].fetch_add(copied as u64, Ordering::Relaxed);
                     self.changed(from - start + first.0, from - start + last.0 + last.1);
+                    let t_dl = crate::refresh_prof::start();
                     self.card_changed_runs(from - start, &runs, true);
+                    crate::refresh_prof::finish(crate::refresh_prof::P::CopyDirtyLockUs, t_dl);
                 }
             });
+            crate::refresh_prof::add(crate::refresh_prof::P::CopyDiffBytes, n as u64);
+            crate::refresh_prof::finish(crate::refresh_prof::P::CopyDiffUs, t_diff);
             return n;
         }
+        let t_plain = crate::refresh_prof::start();
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        to - from
+        let n = to - from;
+        crate::refresh_prof::add(crate::refresh_prof::P::CopyPlainBytes, n as u64);
+        crate::refresh_prof::finish(crate::refresh_prof::P::CopyPlainUs, t_plain);
+        n
     }
 
     /// [`Shadow::copy`] of a transient window: title memory `[from, to)` into a chunk, noted
@@ -6231,17 +6030,13 @@ impl Shadow {
     /// title wrote too, nor one this copy had not taken the last write of.
     fn holds(&self, marks: &[(usize, u64, u64)], theirs: &[usize]) {
         let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         for &(page, before, now) in marks {
             if theirs.contains(&page) {
                 continue;
             }
             if let Some(i) = page.checked_sub(base)
-                && let Some(held) = copied.get(i)
-                && held != 0
-                && before <= held
+                && self.copied.advance_if_at_least(i, before, now)
             {
-                copied.set(i, now);
                 QUIET_BACK.fetch_add(1, Ordering::Relaxed);
             }
         }

@@ -77,6 +77,8 @@ mod memory;
 #[cfg(windows)]
 mod ramline;
 #[cfg(windows)]
+mod copied_pages;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod refresh_prof;

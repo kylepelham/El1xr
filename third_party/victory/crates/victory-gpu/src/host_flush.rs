@@ -87,11 +87,36 @@ pub(super) fn pieces(from: usize, to: usize, page: usize) -> Vec<(usize, usize)>
     out
 }
 
+/// Whether `pending` contains only cheap carded `Write`/`Barrier` steps (no
+/// `Refresh` steps left), which run faster serially on the submitting thread
+/// than waking up the worker pool for another pass.
+fn only_carded_writes(pending: &[HostCopy]) -> bool {
+    pending.iter().all(|copy| {
+        copy.shadow.carded()
+            && !copy
+                .steps
+                .iter()
+                .any(|s| matches!(s, ShadowStep::Refresh(..)))
+    })
+}
+
 /// The refreshes of a flush: on several threads with `wide`, else one copy
 /// after the other on this thread.
 pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
     let started = Instant::now();
     if wide && copies.len() >= 2 {
+        let prep = Instant::now();
+        let ranges: Vec<(usize, usize)> = copies
+            .iter()
+            .filter(|c| !c.shadow.unwatched())
+            .filter_map(|c| c.refresh_span)
+            .collect();
+        if !ranges.is_empty() {
+            crate::watch::prepare_flush(&ranges);
+        }
+        let prep_us = prep.elapsed().as_micros() as u64;
+        PREPARING[0].fetch_add(prep_us, Ordering::Relaxed);
+        add(F::AskAheadUs, prep_us);
         refresh_wide(copies);
     } else {
         for copy in copies {
@@ -102,11 +127,14 @@ pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
 }
 
 fn refresh_wide(copies: Vec<HostCopy>) {
+    let prof = crate::refresh_prof::on();
     let mut pending = copies;
     while !pending.is_empty() {
-        if pending.len() == 1 {
+        if pending.len() == 1 || only_carded_writes(&pending) {
             let alone = Instant::now();
-            pending.pop().expect("one").run();
+            for copy in pending {
+                copy.run();
+            }
             add(F::AloneUs, alone.elapsed().as_micros() as u64);
             break;
         }
@@ -125,37 +153,57 @@ fn refresh_wide(copies: Vec<HostCopy>) {
         let total = tasks.len();
         crate::shadow::wide_chunks(total, 1, move |start, end| {
             let mut copied = 0usize;
+            let mut busy_us = 0u64;
+            let mut max_us = 0u64;
+            let mut max_span = 0usize;
             for task in &tasks[start..end] {
-                let each = Instant::now();
+                let each = prof.then(Instant::now);
                 let (bytes, span) = match task {
-                    Task::Copy(copy) => (
-                        copy.run_wide(),
-                        copy.steps
-                            .iter()
-                            .map(|s| match *s {
-                                ShadowStep::Refresh(f, t) => t - f,
-                                _ => 0,
-                            })
-                            .sum(),
-                    ),
+                    Task::Copy(copy) => {
+                        let b = copy.run_wide();
+                        let s = if prof {
+                            copy.steps
+                                .iter()
+                                .map(|s| match *s {
+                                    ShadowStep::Refresh(f, t) => t - f,
+                                    _ => 0,
+                                })
+                                .sum()
+                        } else {
+                            0
+                        };
+                        (b, s)
+                    }
                     Task::Chunk(shadow, from, to) => {
+                        #[cfg(feature = "diagnostics")]
+                        let diag_t = Instant::now();
                         let bytes = shadow.update(*from, to - from);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::range(
                             *from,
                             to - from,
-                            each.elapsed().as_micros() as u64,
+                            diag_t.elapsed().as_micros() as u64,
                             0,
                         );
                         (bytes, to - from)
                     }
                 };
                 copied += bytes;
-                task_done(each.elapsed().as_micros() as u64, span);
+                if let Some(t) = each {
+                    let us = t.elapsed().as_micros() as u64;
+                    busy_us += us;
+                    if us > max_us {
+                        max_us = us;
+                        max_span = span;
+                    }
+                }
             }
             if copied > 0 {
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 add(F::Bytes, copied as u64);
+            }
+            if busy_us > 0 {
+                task_done(busy_us, max_us, max_span);
             }
         });
         let us = pass.elapsed().as_micros() as u64;
@@ -205,10 +253,10 @@ pub(super) fn add(what: F, n: u64) {
     stats()[what as usize].fetch_add(n, Ordering::Relaxed);
 }
 
-fn task_done(us: u64, span: usize) {
-    add(F::BusyUs, us);
-    if stats()[F::TaskMaxUs as usize].fetch_max(us, Ordering::Relaxed) < us {
-        stats()[F::TaskMaxSpan as usize].store(span as u64, Ordering::Relaxed);
+fn task_done(busy_us: u64, max_us: u64, max_span: usize) {
+    add(F::BusyUs, busy_us);
+    if stats()[F::TaskMaxUs as usize].fetch_max(max_us, Ordering::Relaxed) < max_us {
+        stats()[F::TaskMaxSpan as usize].store(max_span as u64, Ordering::Relaxed);
     }
 }
 
@@ -236,6 +284,14 @@ pub(super) fn last<R>(flush: impl FnOnce() -> R) -> R {
 /// The account's line, per frame, for both kinds of flush.
 pub(super) fn log(frames: f64) {
     crate::refresh_prof::log(frames);
+    if !crate::refresh_prof::on() {
+        for arr in &STATS_BY {
+            for a in arr {
+                a.store(0, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
     for (which, name) in [(1, "the last flush"), (0, "the rest of the submission")] {
         let s: Vec<u64> = STATS_BY[which]
             .iter()
