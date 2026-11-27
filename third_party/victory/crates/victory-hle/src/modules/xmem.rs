@@ -1385,7 +1385,7 @@ fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool
 /// (`VICTORY_SCATTER_RUNS=0`: page by page, as before).
 fn scatter_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_some_and(|v| v != "0"))
 }
 
 /// Since the last line ([`work_line`]): pages of scatters handled as runs,
