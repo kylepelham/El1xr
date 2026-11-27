@@ -5187,7 +5187,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        crate::gpucost::begin(&self.list, crate::gpucost::TITLE);
+        crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
