@@ -283,6 +283,26 @@ if ($Quality) {
     $env:VICTORY_LIST_POOL_MB = '256'
     $env:VICTORY_TEXTURE_STAGE_MB = '192'
 }
+# The user's settings file (the in-game menu writes it, %LOCALAPPDATA%\victory\settings.toml; VICTORY_SETTINGS_FILE names
+# another, 'none' for no file as dev.py's runs use): its values win over the tuned set and -Quality; the switches below
+# and -Override win over it. VIctory reads the same file for what the environment leaves unset.
+$settingsFile = if ($env:VICTORY_SETTINGS_FILE) { $env:VICTORY_SETTINGS_FILE } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'victory\settings.toml' } else { '' }
+if ($settingsFile -and $settingsFile -ne 'none' -and (Test-Path -LiteralPath $settingsFile -PathType Leaf)) {
+    foreach ($line in Get-Content -LiteralPath $settingsFile -Encoding UTF8) {
+        if ($line -notmatch '^\s*(VICTORY_[A-Z0-9_]+)\s*=\s*(.*?)\s*$') { continue }
+        $name = $Matches[1]
+        $value = $Matches[2]
+        if ($value -match '^"((?:[^"\\]|\\.)*)"') {
+            $value = $Matches[1] -replace '\\(.)', '$1'
+        } elseif ($value -match "^'([^']*)'") {
+            $value = $Matches[1]
+        } else {
+            $value = $value -replace '\s*#.*$', ''
+            if ($value -eq 'true') { $value = '1' } elseif ($value -eq 'false') { $value = '0' }
+        }
+        Set-Item -Path "Env:$name" -Value $value
+    }
+}
 if ($Mute) {
     $env:VICTORY_MUTE = '1'
 }

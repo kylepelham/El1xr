@@ -217,7 +217,8 @@ def faux_outil(tmp_path_factory):
     return exe
 
 
-def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SORTIE_VICTORY, echo=(), commande=None):
+def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SORTIE_VICTORY, echo=(), commande=None,
+            reglages=None):
     """Lance une copie du vrai lanceur : faux dépôt, faux jeu, faux cargo sur le PATH, victory.exe déjà compilé.
 
     echo : noms de variables que victory.exe affiche (valeur ou « unset »). commande : suite PowerShell passée
@@ -246,6 +247,8 @@ def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SO
            "FAKE_TOOL_EXIT_VICTORY": str(code_victory)}
     for nom in ("VICTORY_CARD_REHASH_RUNS", "VICTORY_DISCORD", *echo):
         env.pop(nom, None)
+    # Jamais le fichier de réglages de l'utilisateur : un fichier absent, ou celui du test.
+    env["VICTORY_SETTINGS_FILE"] = str(reglages if reglages is not None else tmp_path / "aucun-reglage.toml")
     if echo:
         env["FAKE_TOOL_ECHO"] = ",".join(echo)
     if commande is None:
@@ -499,3 +502,45 @@ def test_skip_intro_data_dir_and_title_args(tmp_path, faux_outil):
     vals_ov = _valeurs(fini_ov.stdout)
     assert vals_ov["VICTORY_SKIP_INTRO"] == "0"
     assert vals_ov["VICTORY_DATA_DIR"] == "custom"
+
+
+def test_the_users_settings_file_wins_over_the_tuned_set_and_override_wins_over_it(tmp_path, faux_outil):
+    reglages = tmp_path / "settings.toml"
+    reglages.write_text(
+        "# El1xr settings\n"
+        'VICTORY_COPY_COALESCE = "4096"\n'
+        "VICTORY_PRESENT_CAP = 60   # un nombre nu\n"
+        "VICTORY_OVERLAY = false\n"
+        "VICTORY_POP_FOLDER = 'C:\\pop'\n"
+        'VICTORY_DATA_DIR = "C:\\\\saves \\"x\\""\n'
+        'VICTORY_RELAY = "1"\n'
+        "PATH = 'jamais'\n",
+        encoding="utf-8",
+    )
+    noms = ("VICTORY_COPY_COALESCE", "VICTORY_PRESENT_CAP", "VICTORY_OVERLAY", "VICTORY_POP_FOLDER", "VICTORY_DATA_DIR",
+            "VICTORY_RELAY", "VICTORY_CARD_WINDOWS_MB", "VICTORY_SETTINGS_FILE")
+    fini, _, _, _ = _lancer(tmp_path, faux_outil, echo=noms, reglages=reglages,
+                            commande="-Override @{ VICTORY_RELAY = '0' }")
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    valeurs = _valeurs(fini.stdout)
+    assert valeurs["VICTORY_COPY_COALESCE"] == "4096"            # le fichier gagne sur la table (1024)
+    assert valeurs["VICTORY_PRESENT_CAP"] == "60" and valeurs["VICTORY_OVERLAY"] == "0"
+    assert valeurs["VICTORY_POP_FOLDER"] == "C:\\pop" and valeurs["VICTORY_DATA_DIR"] == 'C:\\saves "x"'
+    assert valeurs["VICTORY_RELAY"] == "0"                         # -Override gagne sur le fichier
+    assert valeurs["VICTORY_CARD_WINDOWS_MB"] == "1536"            # le reste de la table ne bouge pas
+    assert valeurs["VICTORY_SETTINGS_FILE"] == str(reglages)
+
+
+def test_no_settings_file_or_none_leaves_the_tuned_set_as_it_is(tmp_path, faux_outil):
+    sans, _, _, _ = _lancer(tmp_path / "sans", faux_outil, echo=ECHO_DEFAUT)
+    aucun, _, _, _ = _lancer(tmp_path / "none", faux_outil, echo=ECHO_DEFAUT, reglages="none")
+    assert sans.returncode == aucun.returncode == CODE_SORTIE_VICTORY, (sans.stderr, aucun.stderr)
+    assert _valeurs(sans.stdout) == _valeurs(aucun.stdout)
+    assert _valeurs(sans.stdout)["VICTORY_COPY_COALESCE"] == "1024"
+
+
+def test_dev_runs_ignore_the_users_settings_file():
+    sys.path.insert(0, str(RACINE / "tools"))
+    import dev
+    cmd = dev.build_launcher_command(game_dir=Path("G:/jeu"), diag=False, overrides={})
+    assert cmd[-1].startswith("$env:VICTORY_SETTINGS_FILE = 'none'; & ")

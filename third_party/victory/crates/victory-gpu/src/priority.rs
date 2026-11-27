@@ -23,6 +23,11 @@
 //! touched: `VICTORY_VCACHE_PIN` still sends the workers to the other cache
 //! and the hot threads to the large one.
 //!
+//! All three are live (`victory_core::settings`): the threads they apply to
+//! are kept (a duplicated handle each, also with the switch off), and a
+//! change sets every kept thread again (0: back to normal, or for the
+//! title's mapping threads to their own priority).
+//!
 //! Source: readmet3xt-lab/foxhound (`dstorage.rs`, `cores.rs`:
 //! `VICTORY_DSTORAGE_PRIORITY`, `VICTORY_DSTORAGE_WORKERS`,
 //! `VICTORY_HELPER_PRIORITY=<n>`) and TaynanGT/Vice-Tay PR #213 (`5c803d236b`,
@@ -32,7 +37,80 @@
 //! second 74.8 → 63.8 ms. Vice-Tay (i5-12400F, RTX 3060): the waits for
 //! helpers shrank (refreshes 19.1 → 16.9 ms a frame), fps did not move.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, Once, OnceLock};
+
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::{GetThreadPriority, SetThreadPriority};
+
+/// Threads a live change applies to: a duplicated handle each (as `usize`,
+/// for `Send`) and, for the title's mapping threads, the priority they had.
+static HELPERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static WORKERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static STREAMERS: Mutex<Vec<(usize, i32)>> = Mutex::new(Vec::new());
+
+/// A handle to the calling thread that other threads can use (0 if refused).
+fn keep_current() -> usize {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates this thread's pseudo handle into a real one in this process.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok != 0 { out as usize } else { 0 }
+}
+
+fn keep(list: &Mutex<Vec<usize>>) {
+    let handle = keep_current();
+    if handle != 0 {
+        list.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+    }
+}
+
+/// Sets every thread in `list` to `priority`; how many took it (a thread
+/// that ended refuses).
+fn set_all(list: &Mutex<Vec<usize>>, priority: i32) -> usize {
+    let list = list.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: handles duplicated by `keep_current`, never closed.
+    list.iter()
+        .filter(|&&h| unsafe { SetThreadPriority(h as HANDLE, priority) } != 0)
+        .count()
+}
+
+/// Registers the live hooks once (from the first thread that asks).
+fn hook() {
+    static HOOKED: Once = Once::new();
+    HOOKED.call_once(|| {
+        victory_core::settings::on_change("VICTORY_HELPER_PRIORITY", |v| {
+            let priority = parse_priority(Some(v)).unwrap_or(0);
+            let threads = set_all(&HELPERS, priority);
+            tracing::info!(priority, threads, "helper threads' priority changed (VICTORY_HELPER_PRIORITY)");
+        });
+        victory_core::settings::on_change("VICTORY_DSTORAGE_PRIORITY", |v| {
+            let priority = parse_priority(Some(v)).unwrap_or(0);
+            let threads = set_all(&WORKERS, priority);
+            tracing::info!(priority, threads, "dstorage workers' priority changed (VICTORY_DSTORAGE_PRIORITY)");
+        });
+        victory_core::settings::on_change("VICTORY_STREAM_PRIORITY", |v| {
+            let on = v == "1";
+            let list = STREAMERS.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: handles duplicated by `keep_current`, never closed.
+            let threads = list
+                .iter()
+                .filter(|&&(h, was)| unsafe { SetThreadPriority(h as HANDLE, if on { 1 } else { was }) } != 0)
+                .count();
+            tracing::info!(on, threads, "title mapping threads' priority changed (VICTORY_STREAM_PRIORITY)");
+        });
+    });
+}
 
 /// A thread priority from `-2` to `2` in `value`; `None` (leave the thread
 /// alone) for 0, nothing, or anything else.
@@ -55,7 +133,7 @@ fn ours(name: Option<&str>) -> bool {
 
 /// Sets the calling thread's priority; false if the system refused.
 fn set(priority: i32) -> bool {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
     // SAFETY: the calling thread's pseudo handle.
     unsafe { SetThreadPriority(GetCurrentThread(), priority) != 0 }
 }
@@ -71,13 +149,18 @@ fn helper_with(priority: Option<i32>) {
     thread_local! {
         static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
+    if DONE.with(|done| done.replace(true)) {
+        return;
+    }
+    let current = std::thread::current();
+    if !ours(current.name()) {
+        return;
+    }
+    hook();
+    keep(&HELPERS);
     let Some(priority) = priority else {
         return;
     };
-    let current = std::thread::current();
-    if !ours(current.name()) || DONE.with(|done| done.replace(true)) {
-        return;
-    }
     let ok = set(priority);
     tracing::info!(
         what = current.name().unwrap_or("thread"),
@@ -111,6 +194,8 @@ pub fn dstorage_priority() -> Option<i32> {
 
 /// Called by each DirectStorage unpack worker as it starts.
 pub fn dstorage_worker() {
+    hook();
+    keep(&WORKERS);
     if let Some(priority) = dstorage_priority()
         && !set(priority)
     {
@@ -118,10 +203,48 @@ pub fn dstorage_worker() {
     }
 }
 
+/// Lifts the calling title thread above normal priority if it runs below
+/// normal (`VICTORY_STREAM_PRIORITY=1`, after cool_fox 49d71266b2), once per
+/// thread. Called where the title's streaming thread scatters pages and
+/// copies page mappings (`victory_hle`'s `xmem`): that thread runs below
+/// normal, and every mapping call it makes waits for the process's
+/// address-space lock behind our guards' and the driver's protection
+/// changes, so loading waits on it. Below-normal threads are kept with the
+/// switch off too, for a live change.
+pub fn stream_thread() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, THREAD_PRIORITY_ABOVE_NORMAL};
+    thread_local!(static LOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if LOOKED.with(|l| l.replace(true)) {
+        return;
+    }
+    // SAFETY: plain call on this thread's pseudo handle.
+    let was = unsafe { GetThreadPriority(GetCurrentThread()) };
+    if !matches!(was, -2..0) {
+        return;
+    }
+    hook();
+    let handle = keep_current();
+    if handle != 0 {
+        STREAMERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((handle, was));
+    }
+    if std::env::var_os("VICTORY_STREAM_PRIORITY").is_some_and(|v| v == "1")
+        // SAFETY: this thread's pseudo handle.
+        && unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } != 0
+    {
+        tracing::info!(
+            was,
+            "a title thread that maps pages lifted above normal priority (VICTORY_STREAM_PRIORITY=1)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
 
     fn priority_now() -> i32 {
         // SAFETY: the calling thread's pseudo handle.
@@ -186,5 +309,24 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(off, 0, "switch off: as made");
+    }
+
+    #[test]
+    fn a_live_change_sets_the_kept_threads_again() {
+        // A list of its own: other tests' threads are in `HELPERS`.
+        static KEPT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (back, seen) = std::sync::mpsc::channel::<i32>();
+        let thread = std::thread::spawn(move || {
+            keep(&KEPT);
+            back.send(priority_now()).unwrap();
+            wait.recv().unwrap();
+            back.send(priority_now()).unwrap();
+        });
+        assert_eq!(seen.recv().unwrap(), 0, "kept, as made");
+        assert_eq!(set_all(&KEPT, 1), 1);
+        go.send(()).unwrap();
+        assert_eq!(seen.recv().unwrap(), 1);
+        thread.join().unwrap();
     }
 }

@@ -3790,14 +3790,14 @@ pub(crate) fn copy_changed() -> bool {
 /// between them are the same on the CPU side and the card (nothing of the stretch is being written
 /// by shaders: `update` cut those ranges out), so sending them again changes nothing; what it saves
 /// is ranges (27,661 a frame for 51 MB in run main-neptune-2258).
+/// Live: the in-game menu may change it between refreshes (each refresh's runs are joined with
+/// one value; any value sends the same bytes).
 fn copy_coalesce_gap() -> usize {
-    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *GAP.get_or_init(|| {
-        std::env::var("VICTORY_COPY_COALESCE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
+    static GAP: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_COPY_COALESCE", |v| {
+            v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0) as u64
+        });
+    GAP.get() as usize
 }
 
 /// `runs` (offset, bytes; in order) with those at most `gap` bytes apart joined.
