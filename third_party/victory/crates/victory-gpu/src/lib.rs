@@ -115,6 +115,10 @@ mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
+mod merge_runs;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;

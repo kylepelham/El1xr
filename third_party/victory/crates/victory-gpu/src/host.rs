@@ -688,6 +688,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
+    crate::timeline::line(frames);
+    crate::merge_runs::line(frames);
+    readcopy::frame_line(frames);
     let [idle, behind, stood] =
         [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -2793,6 +2796,9 @@ enum Step {
     /// list's prelude when changed: once per submission, whichever lists
     /// sample it, until a `Copy` or `Run` intervenes.
     Texture(crate::texture::PreludeUpload),
+    /// (feedcard) A title buffer copy done on the card (`crate::list` `card_copy`): also by the
+    /// CPU at submission as a `Copy` while the flag is set ([`readcopy`]).
+    CardCopy(usize, usize, usize, std::sync::atomic::AtomicBool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3373,6 +3379,27 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// (feedcard) Whether `after` may go to the card in the same host submission as `before`,
+/// behind it (`crate::merge_runs`): nothing `after` does on the CPU at submission meets what
+/// `before`'s shaders and texture copy-backs write ([`late_blocked`]'s test, with `before` in
+/// the air), and it holds no work of ours that may go anywhere.
+pub(crate) fn joinable(before: &[&HostList], after: &[&HostList]) -> bool {
+    if after.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Run(_)))) {
+        return false;
+    }
+    let mut written = Vec::new();
+    join_ranges(
+        &mut written,
+        declared_writes(before)
+            .into_iter()
+            .flat_map(|(_, ranges)| ranges)
+            .chain(before.iter().flat_map(|l| {
+                l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>()
+            })),
+    );
+    blocked_by(&written, after, false).is_none()
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -3383,7 +3410,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
+                Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => {}
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
@@ -4860,6 +4889,7 @@ impl Host {
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
+            crate::timeline::card_idle(since.elapsed());
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
         }
@@ -6495,6 +6525,7 @@ impl Host {
             }
         }
         // In the order given: what tells the title the card is done.
+        let told = items.iter().filter(|i| !matches!(i, Late::Run(_))).count();
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -6517,6 +6548,7 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
+        crate::timeline::landed(now_us().saturating_sub(landing.elapsed().as_micros() as u64), told);
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
@@ -7064,6 +7096,7 @@ impl Host {
         if !PINNED.with(|pinned| pinned.replace(true)) {
             crate::cores::keep_on_fast_cores();
         }
+        crate::timeline::prep_begins(runs.len());
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -7079,11 +7112,15 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::timeline::mark(0);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        if late {
+            readcopy::decide(runs);
+        }
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
@@ -7096,6 +7133,7 @@ impl Host {
             }
             heap_rounds.wrote();
         }
+        crate::timeline::mark(1);
         let needs_heap_sync = runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed));
         let async_heap_sync = needs_heap_sync && crate::descriptor::async_sync_on();
         if needs_heap_sync && !async_heap_sync {
@@ -7121,6 +7159,7 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {
             // Overlap `sync_heaps()` on `victory-heap-sync` with submission
@@ -8995,7 +9034,9 @@ impl HostList {
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
         for step in &self.deferred().copies {
             let (started, copied) = match step {
-                &Step::Copy(dst, src, len) => {
+                Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => continue,
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -11783,6 +11824,9 @@ fn pump() {
         }
     }
 }
+
+#[path = "host_readcopy.rs"]
+mod readcopy;
 
 #[path = "host_flush.rs"]
 mod flush;

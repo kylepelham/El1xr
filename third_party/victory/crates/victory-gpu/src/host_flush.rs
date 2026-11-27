@@ -251,6 +251,12 @@ fn stats() -> &'static [AtomicU64; COUNT] {
 
 pub(super) fn add(what: F, n: u64) {
     stats()[what as usize].fetch_add(n, Ordering::Relaxed);
+    match what {
+        F::Copies => crate::timeline::flushed(0, n),
+        F::Bytes | F::FillBytes => crate::timeline::flushed(1, n),
+        F::Textures => crate::timeline::flushed(2, n),
+        _ => {}
+    }
 }
 
 fn task_done(busy_us: u64, max_us: u64, max_span: usize) {
