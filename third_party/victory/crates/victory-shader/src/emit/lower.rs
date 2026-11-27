@@ -463,6 +463,7 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+pub(super) const CONSTANT_MASK: Why = "a constant lane mask";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
@@ -890,6 +891,9 @@ impl<'a> Lower<'a> {
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps { db_shader_control, .. } = x.native.io {
+            s.set_early_depth(db_shader_control);
+        }
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
@@ -3746,7 +3750,7 @@ impl<'a> Lower<'a> {
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Constant(_) => Err(CONSTANT_MASK),
         }
     }
 
@@ -10691,7 +10695,13 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            let same_as_done = self.s.pixel
+                && !e.done
+                && (i + 1..self.x.p.blocks[b].insts.len()).any(|k| {
+                    self.exports.get(&(b, k)).is_some_and(|d| d.done)
+                        && self.x.st.guards[b][k] == self.x.st.guards[b][i]
+                });
+            if !(e.done && self.s.pixel || same_as_done) {
                 return Err("a conditional export");
             }
             let t = self.s.m.bool(true);
