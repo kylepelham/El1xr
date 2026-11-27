@@ -91,6 +91,16 @@ def build_slot(locks_dir: Path, tag: str, timeout_s: float = 4 * 3600.0):
     return hold_first_free(paths, tag, timeout_s)
 
 
+@contextlib.contextmanager
+def all_build_slots(locks_dir: Path, tag: str, timeout_s: float = 4 * 3600.0) -> Iterator[None]:
+    """Holds every build slot: running builds finish first and no new one starts until release.
+    For quiet benches, whose numbers swing several-fold when the machine is busy building."""
+    with contextlib.ExitStack() as stack:
+        for i in range(build_slots()):
+            stack.enter_context(hold_first_free([locks_dir / f"build{i}.lock"], tag, timeout_s))
+        yield
+
+
 def below_normal_priority() -> None:
     if os.name == "nt":
         import ctypes
