@@ -101,6 +101,7 @@ mod loops_wave;
 mod lower;
 pub mod meet;
 mod mesh_launch;
+mod miss_sky;
 pub mod nvidia;
 mod own_bits;
 mod ray_query;
@@ -134,6 +135,7 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, native_glass};
+pub use miss_sky::miss_sky_key;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
@@ -359,12 +361,12 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_retried(container) {
+    miss_sky::with_container(container, || match translate_retried(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
             structure::without_live_quads(|| translate_retried(container))
         }
         other => other,
-    }
+    })
 }
 
 fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
