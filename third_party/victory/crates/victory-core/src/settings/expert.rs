@@ -265,6 +265,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_SHADER_LOOP_LIMIT", Apply::Retranslate),
     ("VICTORY_SHADER_OPT", Apply::Retranslate),
     ("VICTORY_SHADER_SAVE", Apply::Restart),
+    ("VICTORY_SHORT_REMAP_LOCK", Apply::Restart),
     ("VICTORY_SIGNAL_NOW", Apply::Restart),
     ("VICTORY_SKIP_RT_SKIN", Apply::Restart),
     ("VICTORY_SKIP_RT_VBUFFER", Apply::Restart),
