@@ -1,11 +1,15 @@
 """Tests for fastboot helpers in tools/dev.py (`--save`, `--title-args`, `--skip-intro`, `boot_s`)."""
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 
-DEV_PATH = Path(__file__).resolve().parents[1] / "tools" / "dev.py"
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+DEV_PATH = TOOLS / "dev.py"
 
 
 def load_dev():
@@ -84,7 +88,7 @@ def test_parse_victory_log_reports_boot_seconds_to_first_world_frame():
     assert stats["boot_s"] == pytest.approx(51.25)
 
 
-def test_fast_boot_is_opt_in_and_sets_skip_intro_save_and_menu_cadence():
+def test_fast_boot_is_opt_in_and_sets_skip_intro_and_save():
     dev = load_dev()
     parser = dev.build_parser()
     for sub in ("bench", "capture"):
@@ -95,7 +99,7 @@ def test_fast_boot_is_opt_in_and_sets_skip_intro_save_and_menu_cadence():
         fast = parser.parse_args([sub, "--fast-boot"])
         overrides = dev.apply_fast_boot(fast, {})
         assert fast.skip_intro is True and fast.save == "default_checkpoint"
-        assert overrides == {"VICTORY_AUTO_A_PERIOD_MS": "500"}
+        assert overrides == {}
 
         mine = parser.parse_args([sub, "--fast-boot", "--save", "other"])
         kept = dev.apply_fast_boot(mine, {"VICTORY_AUTO_A_PERIOD_MS": "1000"})

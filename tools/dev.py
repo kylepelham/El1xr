@@ -228,21 +228,18 @@ def normalize_argv(argv: list[str]) -> list[str]:
 
 
 FAST_BOOT_SAVE = "default_checkpoint"
-FAST_BOOT_AUTO_A_PERIOD_MS = "500"
 
 
 def apply_fast_boot(args: argparse.Namespace, overrides: dict[str, str]) -> dict[str, str]:
-    """`--fast-boot`: skip the startup intro (-skipToIIS), press Enter every 0.5 s instead of 4 s
-    through the menus, and load the frozen `default_checkpoint` save unless `--save` names
-    another. Explicit `--override` values win."""
+    """`--fast-boot`: skip the startup intro (-skipToIIS) and load the frozen `default_checkpoint`
+    save unless `--save` names another. The Enter cadence stays at 4 s: 0.5 s taps
+    (VICTORY_AUTO_A_PERIOD_MS=500) dropped a run from the world back to a 2-draw screen for 20 s."""
     if not getattr(args, "fast_boot", False):
         return overrides
     args.skip_intro = True
     if not args.save:
         args.save = FAST_BOOT_SAVE
-    merged = dict(overrides)
-    merged.setdefault("VICTORY_AUTO_A_PERIOD_MS", FAST_BOOT_AUTO_A_PERIOD_MS)
-    return merged
+    return overrides
 
 
 def apply_mute_default(overrides: dict[str, str], unmute: bool) -> tuple[dict[str, str], bool]:
@@ -691,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument(
         "--fast-boot",
         action="store_true",
-        help="Opt-in fast boot: --skip-intro, Enter every 0.5 s, and --save default_checkpoint unless --save is given.",
+        help="Opt-in fast boot: --skip-intro and --save default_checkpoint unless --save is given.",
     )
     p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_bench.set_defaults(func=cmd_bench)
@@ -713,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument(
         "--fast-boot",
         action="store_true",
-        help="Opt-in fast boot: --skip-intro, Enter every 0.5 s, and --save default_checkpoint unless --save is given.",
+        help="Opt-in fast boot: --skip-intro and --save default_checkpoint unless --save is given.",
     )
     p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
