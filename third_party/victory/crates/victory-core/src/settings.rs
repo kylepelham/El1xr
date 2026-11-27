@@ -16,12 +16,14 @@
 //! read through a [`Live`] cell, which re-reads its value after [`set`].
 
 mod expert;
+pub mod schedule;
 mod table;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// When a change takes effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,10 +87,21 @@ pub const NOT_SETTINGS: &[&str] = &[
     "VICTORY_AUDIO_CAPTURE_OF",
     "VICTORY_TEST_EXIT_PROCESS_CHILD",
     "VICTORY_PREPARE_DEDUP_CHILD",
+    "VICTORY_SETTINGS_SCHEDULE",
 ];
 
 /// The variable naming the settings file (`none`: no file).
 pub const FILE_VARIABLE: &str = "VICTORY_SETTINGS_FILE";
+
+/// The variable naming a timeline of live changes ([`schedule`]).
+pub const SCHEDULE_VARIABLE: &str = "VICTORY_SETTINGS_SCHEDULE";
+
+/// When the process started: the first call, which [`init`] makes first
+/// thing in `main`.
+pub fn started() -> Instant {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
+}
 
 /// Every setting: the described ones first, then the rest as expert
 /// entries named after their variable.
@@ -217,6 +230,7 @@ impl Loaded {
 /// the settings the environment leaves unset. Call it first in `main`,
 /// before any thread starts. Without a file nothing changes.
 pub fn init() -> Loaded {
+    started();
     let Some(path) = file_path() else {
         return Loaded::default();
     };

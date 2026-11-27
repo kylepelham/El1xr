@@ -240,6 +240,10 @@ fn main() -> Result<()> {
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
+    // `VICTORY_SETTINGS_SCHEDULE`: live settings changed on a timeline (`dev.py train` live arms).
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        victory_core::settings::schedule::start();
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {

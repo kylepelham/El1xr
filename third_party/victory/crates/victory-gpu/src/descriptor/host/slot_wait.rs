@@ -35,18 +35,23 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// `VICTORY_SLOT_WAIT_ALL=1`.
+/// `VICTORY_SLOT_WAIT_ALL=1`. Live: turned off, the changes still held
+/// are done as their submissions finish ([`drain`] runs while any was ever
+/// held).
+static ON: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_SLOT_WAIT_ALL", |v| u64::from(parse(v)));
+/// A change was held once: [`drain`] runs whatever the switch says now.
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(super) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = parse(std::env::var("VICTORY_SLOT_WAIT_ALL").ok().as_deref());
-        if on {
-            tracing::info!(
-                "slots the layer rewrites wait for every submission begun when the change was queued (VICTORY_SLOT_WAIT_ALL=1; Belobug #636)"
-            );
-        }
-        on
-    })
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on = ON.get_bool();
+    if on && !LOGGED.load(Relaxed) && !LOGGED.swap(true, Relaxed) {
+        tracing::info!(
+            "slots the layer rewrites wait for every submission begun when the change was queued (VICTORY_SLOT_WAIT_ALL=1; Belobug #636)"
+        );
+    }
+    on
 }
 
 fn parse(value: Option<&str>) -> bool {
@@ -127,6 +132,7 @@ pub(super) fn hold(change: Change) -> bool {
     if after <= crate::host::submissions_finished() {
         return false;
     }
+    HELD.store(true, Relaxed);
     let mut line = LINE.lock().unwrap_or_else(|e| e.into_inner());
     if line.push(after, std::time::Instant::now(), change) {
         STATS[0].fetch_add(1, Relaxed);
@@ -139,7 +145,7 @@ pub(super) fn hold(change: Change) -> bool {
 /// Does the changes whose submissions have all finished. Called at every
 /// texture pass and when a show is committed.
 pub(super) fn drain() {
-    if !on() {
+    if !on() && !HELD.load(Relaxed) {
         return;
     }
     let due = {
@@ -226,6 +232,20 @@ fn line_now() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        // Unchanged, the switch reads what the environment said, as before.
+        assert_eq!(on(), parse(std::env::var("VICTORY_SLOT_WAIT_ALL").ok().as_deref()));
+        if std::env::var_os("VICTORY_SLOT_WAIT_ALL").is_some() {
+            return;
+        }
+        victory_core::settings::set("VICTORY_SLOT_WAIT_ALL", "1").unwrap();
+        let now = on();
+        victory_core::settings::set("VICTORY_SLOT_WAIT_ALL", "").unwrap();
+        assert!(now, "a change takes effect while running");
+        assert!(!on(), "and clears back to the launch value");
+    }
 
     fn show(index: u32, key: u64) -> Change {
         Change::Show {
