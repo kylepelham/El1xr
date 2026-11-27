@@ -81,7 +81,7 @@ def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
     dev = load_dev()
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "2")
-    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda: contextlib.nullcontext(0))
+    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda **_: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["bench", "--quiet"])
     with dev._quiet(args, "bench"):
         with pytest.raises(TimeoutError):
@@ -143,6 +143,7 @@ def test_loud_capture_holds_free_slots(tmp_path, monkeypatch):
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
     monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
+    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda **_: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["capture"])
     with dev._quiet(args, "capture"):
         with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3):
@@ -294,3 +295,14 @@ def test_quiet_suspends_tests_started_during_the_run_but_spares_the_game():
         assert late.state == "suspended"
         assert game.state == "running"
     assert late.state == "running"
+
+
+def test_loud_runs_suspend_worktree_tools_but_not_builds():
+    rustc = _SuspendProc(401, "rustc.exe")
+    test_exe = _SuspendProc(402, "victory_gpu-2.exe", r"E:\Gta6\AnyXboxX-wt\feedcard\third_party\victory\target\debug\deps\victory_gpu-2.exe")
+    ps = _SuspendPsutil([rustc, test_exe])
+    with dev_throttle.builds_suspended(ps, rescan_s=0, builds=False) as paused:
+        assert paused == 1
+        assert rustc.state == "running"
+        assert test_exe.state == "suspended"
+    assert test_exe.state == "running"
