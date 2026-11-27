@@ -145,6 +145,10 @@ mod dlss;
 #[cfg(windows)]
 pub mod framegen;
 #[cfg(windows)]
+mod dlssg;
+#[cfg(windows)]
+mod streamline;
+#[cfg(windows)]
 mod ngx;
 pub mod upscale;
 pub mod upscale_live;

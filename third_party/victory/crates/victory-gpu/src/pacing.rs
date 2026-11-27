@@ -213,8 +213,15 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
     } else {
         DXGI_PRESENT(0)
     };
+    let dlssg = crate::dlssg::active();
+    if dlssg {
+        crate::dlssg::before_present();
+    }
     // SAFETY: our swap chain; its buffer was written and moved to the present state.
     let _ = unsafe { swap_chain.Present(sync, flags) };
+    if dlssg {
+        crate::dlssg::after_present();
+    }
     let now = Instant::now();
     if let Some(last) = w.last {
         let us = now
