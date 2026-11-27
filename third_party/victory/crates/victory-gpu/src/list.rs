@@ -2078,6 +2078,7 @@ extern "system" fn execute_indirect(
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    crate::drop_why::signature(args, stride, max, !count.is_null());
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -2103,6 +2104,7 @@ extern "system" fn execute_indirect(
         ));
     }
     if ran {
+        crate::drop_why::ran();
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

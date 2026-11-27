@@ -78,6 +78,8 @@ mod indirect;
 #[cfg(windows)]
 mod launch;
 #[cfg(windows)]
+mod indirect_fit;
+#[cfg(windows)]
 mod cores;
 #[cfg(windows)]
 mod inplace;
