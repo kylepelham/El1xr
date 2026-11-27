@@ -6882,11 +6882,25 @@ mod dynamic_bits_tests {
             );
         }
         crate::list::ensure_state(&list, uav_obj as crate::object::This, 0x8); // UNORDERED_ACCESS
+        // With `VICTORY_ALIAS_PINS` the list holds both host textures until
+        // it is reset (Belobug PR #559).
+        let refs = |r: &ID3D12Resource| -> u32 {
+            let raw = windows::core::Interface::as_raw(r) as crate::object::This;
+            let add = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(raw, 0x08);
+            let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(raw, 0x10);
+            add(raw);
+            release(raw)
+        };
+        let (uav_refs, srv_refs) = (refs(uav_tex), refs(srv_tex));
+        let pins = crate::texture::TEST_ALIAS_PINS.replace(Some(true));
         assert!(crate::texture::alias(
             &list,
             srv_obj as crate::object::This,
             uav_obj as crate::object::This
         ));
+        crate::texture::TEST_ALIAS_PINS.set(pins);
+        assert!(refs(uav_tex) > uav_refs, "the alias copy's source is kept by the list");
+        assert!(refs(srv_tex) > srv_refs, "the alias copy's placed texture is kept by the list");
         crate::list::ensure_state(&list, srv_obj as crate::object::This, 0x800); // COPY_SOURCE
         // SAFETY: open list and `srv_tex` transitioned to `COPY_SOURCE`.
         unsafe {
@@ -6911,6 +6925,9 @@ mod dynamic_bits_tests {
             word
         };
         assert_eq!(got, pattern);
+        list.reset();
+        assert_eq!(refs(uav_tex), uav_refs, "a reset lets the source go");
+        assert_eq!(refs(srv_tex), srv_refs, "a reset lets the placed texture go");
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
