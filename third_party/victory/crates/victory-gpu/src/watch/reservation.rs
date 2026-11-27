@@ -105,6 +105,100 @@ fn keep(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
     }
 }
 
+/// Queries additional uncovered private page spans `(first_page, last_page)`
+/// while an `ask_once` pass is already active, merging any successful atomic
+/// `GetWriteWatch` resets into `j.ahead` so parallel workers do not issue
+/// individual `GetWriteWatch` syscalls during `Batch::flush`.
+pub(super) fn ask_more(extra: &[(usize, usize)]) {
+    if extra.is_empty() {
+        return;
+    }
+    let Some(_mapping) = title_memory_reading_now(0, 0) else {
+        return;
+    };
+    let mut pieces: Vec<(usize, usize)> = extra
+        .iter()
+        .copied()
+        .filter(|&(a, b)| {
+            a < b
+                && a.checked_mul(PAGE).is_some_and(|start| {
+                    b.checked_mul(PAGE)
+                        .is_some_and(|end| start < end && !known_view(start))
+                })
+        })
+        .collect();
+    if pieces.is_empty() {
+        return;
+    }
+    pieces.sort_unstable();
+    pieces.dedup();
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        return;
+    }
+    pieces.retain(|&(a, b)| !covered(&j, a, b));
+    if pieces.is_empty() {
+        return;
+    }
+    j.ahead_asked = next_asking();
+    let mut added: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    let mut slice: &[(usize, usize)] = &pieces;
+    let mut allocation = None;
+    while let Some(&(first, end)) = slice.first() {
+        if allocation.is_none_or(|(a, b, _)| first < a || first >= b) {
+            allocation = if slice.get(1).is_some_and(|&n| can_join(first, end, n))
+                || known_view(first * PAGE)
+            {
+                region(first)
+            } else {
+                None
+            };
+        }
+        let (_, limit, private) = allocation.unwrap_or((first, end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = slice.get(n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        if private
+            && last <= limit
+            && last - first <= AHEAD_MAX
+            && !known_view(first * PAGE)
+            && ask_kernel(&mut j, first, last)
+        {
+            keep(&mut added, &slice[..n]);
+        } else if private && n > 1 {
+            for &piece in &slice[..n] {
+                if piece.1 - piece.0 <= AHEAD_MAX
+                    && !covered(&j, piece.0, piece.1)
+                    && !known_view(piece.0 * PAGE)
+                    && ask_kernel(&mut j, piece.0, piece.1)
+                {
+                    keep(&mut added, &[piece]);
+                }
+            }
+        }
+        slice = &slice[n..];
+    }
+    if !added.is_empty() {
+        j.ahead.extend(added);
+        j.ahead.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(j.ahead.len());
+        for &(a, b) in &j.ahead {
+            match merged.last_mut() {
+                Some((_, last)) if a <= *last => *last = (*last).max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        j.ahead = merged;
+        j.ordered = true;
+    }
+}
+
 pub(super) fn ask(ranges: &[(usize, usize)]) {
     // Sort and remove duplicates before taking the global mapping permit.
     let mut pieces: Vec<_> = ranges

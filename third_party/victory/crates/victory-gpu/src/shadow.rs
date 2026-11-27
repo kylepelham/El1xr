@@ -6058,8 +6058,11 @@ impl Shadow {
             self.lazy_prepare_update(from, to, skip_busy);
         }
         let w = self.watched.load(Ordering::Relaxed);
+        crate::refresh_prof::add(crate::refresh_prof::P::Calls, 1);
+        crate::refresh_prof::add(crate::refresh_prof::P::Span, (to - from) as u64);
         if w != NOT_WATCHED {
             let skip = crate::cold_skip::on();
+            let asking = crate::refresh_prof::start();
             if w == 1 {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 let clean = if skip {
@@ -6075,6 +6078,8 @@ impl Shadow {
                 };
                 drop(copied);
                 if clean {
+                    crate::refresh_prof::add(crate::refresh_prof::P::CleanCalls, 1);
+                    crate::refresh_prof::finish(crate::refresh_prof::P::CleanUs, asking);
                     self.refresh_check(from, to);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -6091,8 +6096,11 @@ impl Shadow {
             } else {
                 crate::watch::writes(from, to, true)
             };
+            crate::refresh_prof::add(crate::refresh_prof::P::AskCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::AskUs, asking);
             if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
+                let stale = crate::refresh_prof::start();
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
                 let copied = if skip {
@@ -6100,6 +6108,8 @@ impl Shadow {
                 } else {
                     self.copy_stale(from, to, now, &written, &subs)
                 };
+                crate::refresh_prof::finish(crate::refresh_prof::P::StaleCopyUs, stale);
+                crate::refresh_prof::add(crate::refresh_prof::P::StaleBytes, copied as u64);
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
