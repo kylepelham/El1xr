@@ -447,6 +447,56 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether redundant host binds (render targets, topology, viewports, scissors,
+/// blend factor, stencil reference, depth bounds) are skipped when the host
+/// list already holds the same state. On by default; `VICTORY_BIND_CACHE=0`
+/// records every bind onto the host list.
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Resolved render-target and depth-stencil views currently bound on the host
+/// list. Comparing both the descriptor values (`RtvSnapshot`) and the resolved
+/// host texture pointer catches descriptors rewritten behind the same handle
+/// as well as textures whose host copy appeared or changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundTargets {
+    rtv_count: u8,
+    rtvs: [Option<(crate::descriptor::RtvSnapshot, usize)>; 8],
+    depth: Option<(crate::descriptor::RtvSnapshot, usize)>,
+}
+
+fn viewports_eq(a: &[D3D12_VIEWPORT], b: &[D3D12_VIEWPORT]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.TopLeftX.to_bits() == y.TopLeftX.to_bits()
+                && x.TopLeftY.to_bits() == y.TopLeftY.to_bits()
+                && x.Width.to_bits() == y.Width.to_bits()
+                && x.Height.to_bits() == y.Height.to_bits()
+                && x.MinDepth.to_bits() == y.MinDepth.to_bits()
+                && x.MaxDepth.to_bits() == y.MaxDepth.to_bits()
+        })
+}
+
+fn rects_eq(a: &[RECT], b: &[RECT]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.left == y.left && x.top == y.top && x.right == y.right && x.bottom == y.bottom
+        })
+}
+
+fn opt_f32_array_eq<const N: usize>(a: Option<[f32; N]>, b: Option<[f32; N]>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x
+            .iter()
+            .zip(y.iter())
+            .all(|(u, v)| u.to_bits() == v.to_bits()),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -482,11 +532,23 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
-    /// What the host list has: pipeline, root signature, heaps.
+    /// What the host list has: pipeline, root signature, heaps, targets and
+    /// fixed-function state (skipped when unchanged under `VICTORY_BIND_CACHE`).
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    bound_targets: Option<BoundTargets>,
+    /// Cached `(host_list_ptr, list_changes, depth_state)` for which all bound
+    /// render targets and depth have already been ensured into their required
+    /// host states, skipping per-draw resource locks and state-map lookups.
+    targets_ready: Option<(usize, u64, u32)>,
+    host_topology: Option<u32>,
+    host_viewports_set: bool,
+    host_scissors_set: bool,
+    host_blend_set: bool,
+    host_stencil_set: bool,
+    host_depth_bounds_set: bool,
     /// Cached host vertex buffer views and binding state for the current host list.
     host_vertex: [D3D12_VERTEX_BUFFER_VIEW; 32],
     host_vertex_bound: u32,
@@ -989,12 +1051,128 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
-    pub(crate) fn reset(&mut self, pipeline: This) {
+    pub(crate) fn reset(&mut self, new_pipeline: This) {
         for (heap, index, _, _) in self.pending_shows.drain(..) {
             crate::descriptor::host::requeue_show(heap, index);
         }
-        *self = State::default();
-        self.pipeline = pipeline as usize;
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        // Exhaustive destructuring ensures every field is reset while reusing
+        // heap capacities of per-list containers across frames.
+        let Self {
+            pipeline,
+            heaps,
+            graphics,
+            compute,
+            vertex,
+            index,
+            targets,
+            depth,
+            depth_state,
+            topology,
+            topology_set,
+            target_views,
+            depth_view,
+            targets_set,
+            viewports,
+            scissors,
+            blend,
+            stencil,
+            depth_bounds,
+            window,
+            host_pipeline,
+            host_roots,
+            host_heaps,
+            bound_targets,
+            targets_ready,
+            host_topology,
+            host_viewports_set,
+            host_scissors_set,
+            host_blend_set,
+            host_stencil_set,
+            host_depth_bounds_set,
+            host_vertex,
+            host_vertex_bound,
+            host_vertex_dirty,
+            host_vb_list,
+            host_vb_list_changes,
+            host_index,
+            host_index_dirty,
+            host_ib_list,
+            host_ib_list_changes,
+            scratch_made,
+            scratch_selected,
+            scratch_textures,
+            fresh_tables,
+            ready_tables,
+            seen_tables,
+            dynamic,
+            root_srv_slots,
+            root_uav_slots,
+            ambient_tables,
+            pending_shows,
+            tables_gone,
+        } = self;
+        *pipeline = new_pipeline as usize;
+        *heaps = [0; 2];
+        graphics.clear();
+        compute.clear();
+        *vertex = [VertexView::default(); 32];
+        *index = IndexView::default();
+        targets.clear();
+        *depth = 0;
+        *depth_state = 0;
+        *topology = 0;
+        *topology_set = false;
+        target_views.clear();
+        *depth_view = None;
+        *targets_set = false;
+        viewports.clear();
+        scissors.clear();
+        *blend = None;
+        *stencil = None;
+        *depth_bounds = None;
+        *window = None;
+        *host_pipeline = 0;
+        *host_roots = [0; 2];
+        *host_heaps = [0; 2];
+        *bound_targets = None;
+        *targets_ready = None;
+        *host_topology = None;
+        *host_viewports_set = false;
+        *host_scissors_set = false;
+        *host_blend_set = false;
+        *host_stencil_set = false;
+        *host_depth_bounds_set = false;
+        *host_vertex = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+        *host_vertex_bound = 0;
+        *host_vertex_dirty = false;
+        *host_vb_list = 0;
+        *host_vb_list_changes = 0;
+        *host_index = None;
+        *host_index_dirty = false;
+        *host_ib_list = 0;
+        *host_ib_list_changes = 0;
+        scratch_made.clear();
+        scratch_selected.clear();
+        scratch_textures.clear();
+        fresh_tables.clear();
+        if fresh_tables.capacity() > 4096 {
+            fresh_tables.shrink_to(1024);
+        }
+        ready_tables.clear();
+        if ready_tables.capacity() > 4096 {
+            ready_tables.shrink_to(1024);
+        }
+        seen_tables.clear();
+        if seen_tables.capacity() > 4096 {
+            seen_tables.shrink_to(1024);
+        }
+        dynamic.clear();
+        root_srv_slots.clear();
+        root_uav_slots.clear();
+        ambient_tables.clear();
+        pending_shows.clear();
+        *tables_gone = false;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1010,6 +1188,10 @@ impl State {
             }
             t => t,
         };
+        if bind_cache() && self.host_topology == Some(host) {
+            return;
+        }
+        self.host_topology = Some(host);
         // SAFETY: an open list.
         unsafe {
             list.list
@@ -1120,19 +1302,45 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        let cache_on = bind_cache();
+        let count = self
+            .target_views
+            .len()
+            .min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize);
+        let mut key = BoundTargets {
+            rtv_count: count as u8,
+            rtvs: [None; 8],
+            depth: None,
+        };
+        let mut resolved_rtvs: [Option<(crate::descriptor::RtvRecord, Option<&ID3D12Resource>)>;
+            8] = [None; 8];
+        for (i, slot) in self.target_views[..count].iter().enumerate() {
+            if let Some(snapshot) = *slot {
+                let record = snapshot.restore();
+                let texture = crate::resource::host_resource(record.resource);
+                key.rtvs[i] = Some((snapshot, texture.map_or(0, |t| t.as_raw() as usize)));
+                resolved_rtvs[i] = Some((record, texture));
+            }
+        }
+        let resolved_depth = self.depth_view.and_then(|snapshot| {
+            let record = snapshot.restore();
+            let texture = crate::resource::host_resource(record.resource)?;
+            key.depth = Some((snapshot, texture.as_raw() as usize));
+            Some((record, texture))
+        });
+        if cache_on && self.bound_targets == Some(key) {
+            return;
+        }
+        self.targets_ready = None;
         self.targets.clear();
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         host.output_views(|output| {
-            let mut rtvs = Vec::new();
-            for snapshot in self
-                .target_views
-                .iter()
-                .flatten()
-                .take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize)
-            {
-                let record = snapshot.restore();
-                let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+            let mut rtv_len = 0usize;
+            for entry in resolved_rtvs[..count].iter().flatten() {
+                let (record, texture) = *entry;
+                let Some(texture) = texture else {
                     // A typed null view (or a target without a host copy) still
                     // takes its slot: left out, the next live target would move
                     // into it and the pixel shader's outputs reach the wrong
@@ -1143,50 +1351,64 @@ impl State {
                         .desc()
                         .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                     if let Some(desc) = null {
-                        rtvs.push(output.rtv(None, Some(&desc)));
+                        rtvs[rtv_len] = output.rtv(None, Some(&desc));
+                        rtv_len += 1;
                     }
                     continue;
                 };
                 self.targets.push(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
-                rtvs.push(output.rtv(Some(texture), record.desc().as_ref()));
+                rtvs[rtv_len] = output.rtv(Some(texture), record.desc().as_ref());
+                rtv_len += 1;
             }
-            let dsv = self.depth_view.and_then(|snapshot| {
-                let record = snapshot.restore();
-                let texture = crate::resource::host_resource(record.resource)?;
+            let dsv = resolved_depth.map(|(record, texture)| {
+                let desc = record.depth_desc();
                 self.depth = record.resource as usize;
-                self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+                self.depth_state = depth_state(texture, desc.as_ref());
                 if crate::resource::depth_and_unordered(record.resource) {
                     crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
-                Some(output.dsv(texture, record.depth_desc().as_ref()))
+                output.dsv(texture, desc.as_ref())
             });
             // SAFETY: an open list; the views live through the call.
             unsafe {
                 list.list.OMSetRenderTargets(
-                    rtvs.len() as u32,
-                    (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                    rtv_len as u32,
+                    (rtv_len > 0).then_some(rtvs.as_ptr()),
                     false,
                     dsv.as_ref().map(std::ptr::from_ref),
                 )
             };
         });
+        self.bound_targets = cache_on.then_some(key);
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if bind_cache() && self.host_viewports_set && viewports_eq(&self.viewports, viewports) {
+            return;
+        }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
+        self.host_viewports_set = true;
         crate::draw::viewports(list, viewports);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if bind_cache()
+            && self.host_scissors_set
+            && !scissor_test()
+            && rects_eq(&self.scissors, rects)
+        {
+            return;
+        }
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
+        self.host_scissors_set = true;
         if scissor_test() {
             // The experiment: every rectangle the title sets is widened to
             // the largest target there is, so nothing is cut by one. What
@@ -1204,17 +1426,31 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
-        self.blend = factor.copied();
+        let next = factor.copied();
+        if bind_cache() && self.host_blend_set && opt_f32_array_eq(self.blend, next) {
+            return;
+        }
+        self.blend = next;
+        self.host_blend_set = true;
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if bind_cache() && self.host_stencil_set && self.stencil == Some(reference) {
+            return;
+        }
         self.stencil = Some(reference);
+        self.host_stencil_set = true;
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
-        self.depth_bounds = Some([min, max]);
+        let next = Some([min, max]);
+        if bind_cache() && self.host_depth_bounds_set && opt_f32_array_eq(self.depth_bounds, next) {
+            return;
+        }
+        self.depth_bounds = next;
+        self.host_depth_bounds_set = true;
         crate::draw::depth_bounds(list, min, max);
     }
 
@@ -1237,6 +1473,11 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
+        self.bound_targets = None;
+        self.targets_ready = None;
+        self.host_topology = None;
+        self.host_viewports_set = false;
+        self.host_scissors_set = false;
         self.host_vertex = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         self.host_vertex_bound = 0;
         self.host_vertex_dirty = true;
@@ -1252,6 +1493,7 @@ impl State {
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
+            self.host_viewports_set = true;
         }
         if !self.scissors.is_empty() {
             let rects = std::mem::take(&mut self.scissors);
@@ -1275,6 +1517,14 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
+        self.bound_targets = None;
+        self.targets_ready = None;
+        self.host_topology = None;
+        self.host_viewports_set = false;
+        self.host_scissors_set = false;
+        self.host_blend_set = false;
+        self.host_stencil_set = false;
+        self.host_depth_bounds_set = false;
         self.host_vertex = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         self.host_vertex_bound = 0;
         self.host_vertex_dirty = true;
@@ -1295,6 +1545,7 @@ impl State {
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
+            self.host_viewports_set = true;
         }
         if !self.scissors.is_empty() {
             let rects = std::mem::take(&mut self.scissors);
@@ -1302,12 +1553,15 @@ impl State {
         }
         if let Some(factor) = self.blend {
             crate::draw::blend_factor(list, Some(&factor));
+            self.host_blend_set = true;
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+            self.host_stencil_set = true;
         }
         if let Some([min, max]) = self.depth_bounds {
             crate::draw::depth_bounds(list, min, max);
+            self.host_depth_bounds_set = true;
         }
     }
 
@@ -1541,17 +1795,13 @@ impl State {
                 self.host_ib_list_changes = list_changes;
             }
         }
-        const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
-            let state = if self.depth_state == DEPTH_READ {
+        // A view that writes neither plane keeps the texture readable:
+        // the depth read state, together with the shader read states
+        // if this draw's shaders read the same texture (the write state
+        // put it out of the state those views need, and a move to it
+        // and back for every such draw).
+        let depth_state = if self.depth != 0 {
+            if self.depth_state == DEPTH_READ {
                 let (tested, read) = TESTED_DEPTH.get();
                 if read && tested == self.depth {
                     DEPTH_READ | SHADER_RESOURCE
@@ -1560,8 +1810,20 @@ impl State {
                 }
             } else {
                 DEPTH_WRITE
-            };
-            crate::list::ensure_state(list, self.depth as This, state);
+            }
+        } else {
+            0
+        };
+        let now_changes = list.changes.load(Ordering::Relaxed);
+        if self.targets_ready != Some((list_ptr, now_changes, depth_state)) {
+            const RENDER_TARGET: u32 = 0x4;
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if self.depth != 0 {
+                crate::list::ensure_state(list, self.depth as This, depth_state);
+            }
+            self.targets_ready = Some((list_ptr, list.changes.load(Ordering::Relaxed), depth_state));
         }
         true
     }
@@ -1633,12 +1895,8 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
-            // Bound again after an indirect clamp, the list holds it already.
-            if !list.holds_pipeline(self.host_pipeline) {
-                list.used_pipeline(&p.name);
-                list.keep(&p.pso);
-                list.keep(&p.root);
-            }
+            // Kept and named once per list even when alternating pipelines.
+            list.bind_pipeline(&p.pso, &p.root, &p.name);
         }
         let mut made = std::mem::take(&mut self.scratch_made);
         for stage in &p.stages {
@@ -1688,7 +1946,9 @@ impl State {
             } else {
                 None
             };
-            if let Some((param, dwords)) = stage.user_data {
+            if let Some((param, dwords)) = stage.user_data
+                && dwords > 0
+            {
                 let mut stack = [0u32; 64];
                 let mut heap_buf = Vec::new();
                 let values: &mut [u32] = if (dwords as usize) <= stack.len() {
@@ -5594,5 +5854,136 @@ mod loading_drain_tests {
             super::compute_ready_drain_budget(Duration::from_millis(4), false),
             Duration::from_millis(4)
         );
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_function_state_comparators_are_bit_exact() {
+        let vp = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: 1920.0,
+            Height: 1080.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let mut vp_neg_zero = vp;
+        vp_neg_zero.TopLeftX = -0.0;
+        assert!(viewports_eq(&[vp], &[vp]));
+        assert!(!viewports_eq(&[vp], &[vp_neg_zero]));
+        assert!(!viewports_eq(&[vp], &[]));
+
+        let r1 = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+        let r2 = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        assert!(rects_eq(&[r1], &[r1]));
+        assert!(!rects_eq(&[r1], &[r2]));
+
+        assert!(opt_f32_array_eq(Some([0.0f32, 1.0, 2.0, 3.0]), Some([0.0, 1.0, 2.0, 3.0])));
+        assert!(!opt_f32_array_eq(Some([0.0f32, 1.0, 2.0, 3.0]), Some([-0.0, 1.0, 2.0, 3.0])));
+        assert!(opt_f32_array_eq::<4>(None, None));
+        assert!(!opt_f32_array_eq(Some([0.0f32; 2]), None));
+    }
+
+    #[test]
+    fn bound_targets_detects_descriptor_or_texture_changes() {
+        let mut slot_a = [0u8; 112];
+        let mut slot_b = [0u8; 112];
+        let res_a = 0x1000usize as This;
+        let desc1 = [28u32, 4, 0, 0, 0, 0];
+        let desc2 = [28u32, 4, 1, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), res_a, &desc1, slot_a.as_mut_ptr() as u64);
+        crate::descriptor::create_rtv(std::ptr::null(), res_a, &desc2, slot_b.as_mut_ptr() as u64);
+        let snap1 = crate::descriptor::rtv_record(slot_a.as_ptr() as u64)
+            .unwrap()
+            .snapshot();
+        let snap2 = crate::descriptor::rtv_record(slot_b.as_ptr() as u64)
+            .unwrap()
+            .snapshot();
+
+        let mut a = BoundTargets {
+            rtv_count: 1,
+            rtvs: [None; 8],
+            depth: None,
+        };
+        a.rtvs[0] = Some((snap1, 0xaaaa));
+        let mut same = a;
+        assert_eq!(a, same);
+
+        // Changing view description behind the same resource misses.
+        same.rtvs[0] = Some((snap2, 0xaaaa));
+        assert_ne!(a, same);
+
+        // Changing resolved host texture pointer misses.
+        same.rtvs[0] = Some((snap1, 0xbbbb));
+        assert_ne!(a, same);
+
+        // Changing rtv_count misses.
+        same.rtvs[0] = Some((snap1, 0xaaaa));
+        same.rtv_count = 2;
+        assert_ne!(a, same);
+    }
+
+    #[test]
+    fn state_reset_clears_state_while_reusing_container_capacity() {
+        let mut s = State::default();
+        s.graphics.reserve(16);
+        s.graphics.push(Root::Table(0x1234));
+        s.fresh_tables.reserve(64);
+        s.fresh_tables.insert((1, 2, 3), (4, None));
+        s.targets.push(0x9999);
+        s.depth = 0x8888;
+        s.host_pipeline = 0x7777;
+        s.host_topology = Some(4);
+        s.host_viewports_set = true;
+        s.targets_ready = Some((0x5555, 12, DEPTH_WRITE));
+        s.tables_gone = true;
+
+        let fresh_cap_before = s.fresh_tables.capacity();
+        let gfx_cap_before = s.graphics.capacity();
+        let pipe = 0x4321usize as This;
+        s.reset(pipe);
+
+        assert_eq!(s.pipeline, 0x4321);
+        assert!(s.graphics.is_empty());
+        assert!(s.fresh_tables.is_empty());
+        assert!(s.targets.is_empty());
+        assert_eq!(s.depth, 0);
+        assert_eq!(s.host_pipeline, 0);
+        assert_eq!(s.host_topology, None);
+        assert!(!s.host_viewports_set);
+        assert_eq!(s.targets_ready, None);
+        assert!(!s.tables_gone);
+        // Capacities are retained across resets to avoid per-frame reallocations.
+        assert!(s.fresh_tables.capacity() >= fresh_cap_before);
+        assert!(s.graphics.capacity() >= gfx_cap_before);
+    }
+
+    #[test]
+    fn host_list_atomic_cbv_epoch_and_twin_fast_paths() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        assert_eq!(list.cbv_epoch(), 0);
+        list.defer(|| {});
+        assert_eq!(list.cbv_epoch(), 1);
+        let mut dst = [0u8; 4];
+        let src = [1u8; 4];
+        list.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 4);
+        assert_eq!(list.cbv_epoch(), 2);
+        // Null resource takes the lock-free early return.
+        assert!(!list.twin_use(std::ptr::null(), false, true));
+        // No twin writing: twins_written takes the lock-free fast path without bumping changes.
+        let before = list.changes.load(Ordering::Relaxed);
+        list.twins_written();
+        assert_eq!(list.changes.load(Ordering::Relaxed), before);
+        list.close();
+        list.reset();
+        assert_eq!(list.cbv_epoch(), 0);
     }
 }
