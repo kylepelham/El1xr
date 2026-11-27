@@ -15,10 +15,6 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod alloc_backoff;
-#[cfg(windows)]
-mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -26,15 +22,16 @@ mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-#[cfg(windows)]
-mod cores;
-#[cfg(windows)]
-#[cfg(windows)]
-mod defrag;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpucost;
+#[cfg(feature = "mimalloc")]
+pub mod heap;
 pub mod descriptor;
 pub mod device;
-#[cfg(all(windows, feature = "dlss"))]
-mod dlss;
+#[cfg(windows)]
+mod alloc_backoff;
+#[cfg(windows)]
+mod ambient;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -43,41 +40,22 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod frametime;
-<<<<<<< HEAD
-#[cfg(all(windows, feature = "diagnostics"))]
-mod gpucost;
-#[cfg(feature = "mimalloc")]
-pub mod heap;
-mod heap_pass;
-=======
 pub mod hitch;
->>>>>>> exp/next
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
-mod indirect;
-#[cfg(windows)]
-mod inplace;
-#[cfg(windows)]
 mod land_aside;
-pub mod list;
-#[cfg(windows)]
-mod memory;
-pub mod object;
 #[cfg(windows)]
 mod output_views;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod pacing;
-pub mod pipeline;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
-<<<<<<< HEAD
-=======
 mod relay_runs;
 #[cfg(windows)]
 mod screenshot;
@@ -90,31 +68,34 @@ mod cores;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
->>>>>>> exp/next
 mod port;
 #[cfg(windows)]
 mod port_cbv;
+pub mod list;
+pub mod object;
+pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+mod heap_pass;
 pub mod query;
 pub mod queue;
-#[cfg(windows)]
-mod ramline;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod stretch;
+#[cfg(all(windows, feature = "dlss"))]
+mod dlss;
+pub mod upscale;
+#[cfg(windows)]
 mod sampler;
-#[cfg(windows)]
-mod scratch_spare;
-#[cfg(windows)]
-mod screenshot;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod shadow;
-pub mod signature;
+mod memory;
 #[cfg(windows)]
-mod stretch;
+mod ramline;
+#[cfg(windows)]
+mod shadow;
 #[cfg(windows)]
 mod copy_profile;
 #[cfg(windows)]
@@ -122,21 +103,24 @@ mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
+mod windowup;
+#[cfg(windows)]
+mod tiles;
+pub mod signature;
+#[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texstore;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
-mod tiles;
-#[cfg(windows)]
 pub mod titlemem;
-pub mod upscale;
+#[cfg(windows)]
+#[cfg(windows)]
+mod defrag;
 mod watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wc_skip;
-#[cfg(windows)]
-mod windowup;
 
 #[cfg(windows)]
 pub use defrag::log_defrag_counters;
@@ -145,13 +129,12 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
+pub use wc_skip::title_memory_reserved;
+#[cfg(windows)]
 pub use shadow::LazyAccessHold;
 #[cfg(windows)]
 pub use watch::{
-    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range,
-    title_memory_remapped, title_memory_remapping, title_memory_remapping_range,
-    title_memory_written, writing as kernel_will_write, writing_hold as kernel_will_write_hold,
-    written_through_view,
+    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
+    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
+    writing_hold as kernel_will_write_hold, written_through_view,
 };
-#[cfg(windows)]
-pub use wc_skip::title_memory_reserved;
