@@ -34,6 +34,9 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
+mod buffers;
+pub(crate) use buffers::{card_buffer, shared_buffer, upload_buffer};
+
 /// Bytes of a block. Pieces of more than half of one are not cut (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
@@ -131,10 +134,15 @@ impl Ripe {
     };
 
     fn now() -> Ripe {
+        Ripe::ahead(SPARES.load(Ordering::Relaxed))
+    }
+
+    /// Now, with at most `most` blocks made ahead.
+    fn ahead(most: usize) -> Ripe {
         Ripe {
             started: crate::host::submissions_started(),
             finished: crate::host::submissions_finished(),
-            ahead: ahead().min(SPARES.load(Ordering::Relaxed)),
+            ahead: ahead().min(most),
         }
     }
 
@@ -172,10 +180,11 @@ impl Ranges {
         Ranges(BTreeMap::from([(0, size)]))
     }
 
-    /// The lowest place for `len` bytes at a multiple of `align`.
-    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
+    /// The lowest place for `len` bytes at a multiple of `align`, from
+    /// `least` on.
+    fn take(&mut self, len: u64, align: u64, least: u64) -> Option<u64> {
         let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
-            let at = start.next_multiple_of(align);
+            let at = start.max(least).next_multiple_of(align);
             (at + len <= start + size).then_some((start, size, at))
         })?;
         self.0.remove(&start);
@@ -234,6 +243,10 @@ struct Pool<B> {
     retry_at: u64,
     /// Blocks alive, for [`free_texture_bytes`].
     alive: &'static AtomicU64,
+    /// Pieces are cut only from memory never used before, as it was made
+    /// (zeros); a block every piece of which has come back is let go
+    /// (`buffers`: memory the card writes that we cannot clear here).
+    fresh: bool,
 }
 
 impl<B: Clone> Pool<B> {
@@ -244,7 +257,31 @@ impl<B: Clone> Pool<B> {
             most,
             retry_at: 0,
             alive,
+            fresh: false,
         }
+    }
+
+    /// A pool that cuts only fresh memory ([`Pool::fresh`]).
+    const fn fresh(most: usize, alive: &'static AtomicU64) -> Pool<B> {
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            most,
+            retry_at: 0,
+            alive,
+            fresh: true,
+        }
+    }
+
+    /// Where a piece of `block` may start: past what was ever used in a
+    /// fresh pool.
+    fn least(&self, block: &Block<B>) -> u64 {
+        if self.fresh { block.used_to } else { 0 }
+    }
+
+    /// A block with no piece that can be cut whole again.
+    fn empty(&self, block: &Block<B>) -> bool {
+        block.free.whole(BLOCK) && (!self.fresh || block.used_to == 0)
     }
 
     /// A piece of `len` bytes, the memory it lies in, and whether that part
@@ -278,10 +315,11 @@ impl<B: Clone> Pool<B> {
             SPARES.load(Ordering::Relaxed),
         );
         let mut found = None;
+        let fresh = self.fresh;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+                && let Some(start) = block.free.take(len, align, if fresh { block.used_to } else { 0 })
             {
                 found = Some((i, start));
                 break;
@@ -295,16 +333,17 @@ impl<B: Clone> Pool<B> {
                 .filter_map(|(i, b)| Some((b.as_ref()?.made, i)))
                 .collect();
             unripe.sort_unstable();
-            found = unripe
-                .into_iter()
-                .find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let least = self.least(self.blocks[i].as_ref()?);
+                Some((i, self.blocks[i].as_mut()?.free.take(len, align, least)?))
+            });
         }
         let (i, start) = match found {
             Some(found) => found,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                (i, self.blocks[i].as_mut()?.free.take(len, align, 0)?)
             }
         };
         if ripe.ahead > 0 {
@@ -312,7 +351,7 @@ impl<B: Clone> Pool<B> {
                 let n = STATS[3].fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::info!(
-                        "textures cut from blocks made while lists ran that still run: {n}"
+                        "pieces cut from blocks made while lists ran that still run: {n}"
                     );
                 }
             }
@@ -320,7 +359,7 @@ impl<B: Clone> Pool<B> {
                 .blocks
                 .iter()
                 .flatten()
-                .filter(|b| b.free.whole(BLOCK))
+                .filter(|b| self.empty(b))
                 .count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
@@ -393,11 +432,14 @@ impl<B: Clone> Pool<B> {
             return;
         }
         let most = spares.min(self.most);
+        let fresh = self.fresh;
         let mut spare = 0;
         for block in &mut self.blocks {
-            if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+            if let Some(b) = block.as_ref()
+                && b.free.whole(BLOCK)
+            {
                 spare += 1;
-                if spare > most {
+                if spare > most || (fresh && b.used_to > 0) {
                     *block = None;
                     self.alive.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -520,6 +562,7 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    give: fn(Piece),
 }
 
 struct Methods([*const (); 3]);
@@ -573,20 +616,27 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            (gone.give)(gone.piece);
         }
         left
     }
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// A texture's piece back in its pool.
+fn give_texture(piece: Piece) {
+    HELD.fetch_sub(piece.len, Ordering::Relaxed);
+    lock(&TEXTURES).give(piece, now());
+}
+
+/// Makes `texture` give `piece` back with `give` when the last reference
+/// to it goes.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, give: fn(Piece)) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim {
         methods: &RECLAIM.0,
         references: AtomicU32::new(1),
         piece,
+        give,
     }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
@@ -797,7 +847,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, give_texture);
             let us = started.elapsed().as_micros() as u64;
             let n = STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
             STATS[1].fetch_add(us, Ordering::Relaxed);
@@ -843,10 +893,10 @@ mod tests {
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {
         let mut r = Ranges::new(1024);
-        assert_eq!(r.take(100, 64), Some(0));
-        assert_eq!(r.take(100, 64), Some(128));
-        assert_eq!(r.take(28, 4), Some(100));
-        assert_eq!(r.take(2000, 4), None);
+        assert_eq!(r.take(100, 64, 0), Some(0));
+        assert_eq!(r.take(100, 64, 0), Some(128));
+        assert_eq!(r.take(28, 4, 0), Some(100));
+        assert_eq!(r.take(2000, 4, 0), None);
         r.give(128, 100);
         r.give(0, 100);
         assert!(!r.whole(1024));
@@ -1214,6 +1264,125 @@ mod allocation_costs {
                     8,
                     &pooled,
                 );
+            }
+        }
+    }
+
+    /// The buffers the host makes on hot paths (`Host::uav_buffer`,
+    /// `shared_buffer`, `upload_buffer`, `read_back_buffer`): committed, and
+    /// placed in 64 MiB heaps (mapped where the CPU maps them).
+    /// `cargo test -p victory-gpu buffer_allocation_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn buffer_allocation_costs() {
+        let Some(host) = crate::host::host() else { return };
+        let device = &host.device;
+        let kinds: [(&str, D3D12_HEAP_PROPERTIES, D3D12_RESOURCE_FLAGS, D3D12_RESOURCE_STATES, bool); 4] = [
+            (
+                "card (uav_buffer)",
+                D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+                false,
+            ),
+            (
+                "shared (shared_buffer)",
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+                true,
+            ),
+            (
+                "upload (upload_buffer)",
+                D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                true,
+            ),
+            (
+                "readback (read_back_buffer)",
+                D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                false,
+            ),
+        ];
+        let touch = |r: &ID3D12Resource, map: bool| {
+            if map {
+                let mut data = std::ptr::null_mut();
+                // SAFETY: a live CPU-visible buffer; its first byte.
+                unsafe {
+                    r.Map(0, None, Some(&mut data)).unwrap();
+                    data.cast::<u8>().write_volatile(1);
+                }
+            }
+        };
+        const N: usize = 1000;
+        const K64: u64 = 64 << 10;
+        for size in [4u64 << 10, 64 << 10, 1 << 20] {
+            println!("-- buffers of {} KiB", size >> 10);
+            for &(what, props, flags, state, map) in &kinds {
+                let mut desc = buffer(size);
+                desc.Flags = flags;
+                let make = |_| {
+                    let mut out: Option<ID3D12Resource> = None;
+                    // SAFETY: plain creation.
+                    unsafe { device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out) }
+                        .expect("committed");
+                    let r = out.unwrap();
+                    touch(&r, map);
+                    r
+                };
+                for threads in [1, 8] {
+                    timed(&format!("{what} committed"), N, threads, &make);
+                }
+                let len = size.next_multiple_of(K64);
+                let per_heap = ((64u64 << 20) / len) as usize;
+                let heaps: Vec<ID3D12Heap> = (0..N.div_ceil(per_heap))
+                    .map(|_| {
+                        let mut heap = None;
+                        let desc = D3D12_HEAP_DESC {
+                            SizeInBytes: 64 << 20,
+                            Properties: props,
+                            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                            ..Default::default()
+                        };
+                        // SAFETY: plain creation.
+                        unsafe { device.CreateHeap(&desc, &mut heap) }.expect("heap");
+                        heap.unwrap()
+                    })
+                    .collect();
+                let place = |i: usize| {
+                    let mut out: Option<ID3D12Resource> = None;
+                    let at = (i % per_heap) as u64 * len;
+                    // SAFETY: a part of a live heap no other buffer has.
+                    unsafe { device.CreatePlacedResource(&heaps[i / per_heap], at, &desc, state, None, &mut out) }
+                        .expect("placed");
+                    let r = out.unwrap();
+                    touch(&r, map);
+                    r
+                };
+                for threads in [1, 8] {
+                    timed(&format!("{what} placed in 64 MB heaps"), N, threads, &place);
+                }
+            }
+            let pools: [(&str, &(dyn Fn(usize) -> ID3D12Resource + Sync)); 3] = [
+                ("card from the pool (VICTORY_CARD_BUFFER_BLOCKS=1)", &|_| super::card_buffer(device, size).expect("pooled")),
+                ("shared from the pool (VICTORY_SHARED_BUFFER_BLOCKS=1)", &|_| super::shared_buffer(device, size).expect("pooled").0),
+                ("upload from the pool (VICTORY_UPLOAD_BLOCKS=1)", &|_| super::upload_buffer(device, size).expect("pooled").0),
+            ];
+            for (i, (what, make)) in pools.into_iter().enumerate() {
+                let on = ["VICTORY_CARD_BUFFER_BLOCKS", "VICTORY_SHARED_BUFFER_BLOCKS", "VICTORY_UPLOAD_BLOCKS"][i];
+                if super::switch(on) {
+                    for threads in [1, 8] {
+                        timed(what, N, threads, make);
+                    }
+                }
             }
         }
     }
