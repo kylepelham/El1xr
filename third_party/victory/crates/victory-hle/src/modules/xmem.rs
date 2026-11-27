@@ -600,6 +600,9 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     })
 });
 
+/// (bootfast) `VICTORY_DSTORAGE_ONE_LOOK=1`: a DirectStorage window's look-ups in one lock each side.
+pub(crate) mod one_look;
+
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -845,14 +848,21 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// where the title sees those pages, the GPU side has to copy them again (it
 /// does not see such writes).
 fn written(slice: &Slice, n: usize) {
-    let mut shown: Vec<usize> = {
-        let physical = physical();
-        (0..n)
-            .filter_map(|k| physical.shown.get(&slice.key(k)))
-            .flatten()
-            .copied()
-            .collect()
-    };
+    let shown = shown_pages(&physical(), slice, n);
+    notify_shown(shown);
+}
+
+/// The title addresses of the pages `n` pages from `slice` on (each a page).
+fn shown_pages(physical: &Physical, slice: &Slice, n: usize) -> Vec<usize> {
+    (0..n)
+        .filter_map(|k| physical.shown.get(&slice.key(k)))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// [`written`]'s calls for the title addresses `shown`.
+fn notify_shown(mut shown: Vec<usize>) {
     shown.sort_unstable();
     for run in shown.chunk_by(|a, b| a + PAGE == *b) {
         victory_gpu::kernel_will_write(run[0], run.len() * PAGE);
@@ -871,11 +881,15 @@ pub(crate) struct PageWindow {
     len: usize,
     slice: Slice,
     _holds: Vec<victory_gpu::LazyAccessHold>,
+    /// (bootfast) The GPU side was told already ([`one_look::done`]).
+    told: bool,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        written(&self.slice, self.view.len / PAGE);
+        if !self.told {
+            written(&self.slice, self.view.len / PAGE);
+        }
     }
 }
 
@@ -902,6 +916,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         len,
         slice: slice.clone(),
         _holds: holds,
+        told: false,
     })
 }
 
@@ -921,23 +936,32 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
         return Vec::new();
     };
+    let pieces = shown_pieces(&physical(), touched, first, offset, end);
+    merge_pieces(pieces)
+}
+
+/// [`shown_at`]'s pieces (address, bytes) of `touched`, the pages from
+/// `first` on, for the bytes `[offset, end)`, unsorted.
+fn shown_pieces(physical: &Physical, touched: &[usize], first: usize, offset: usize, end: usize) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = Vec::new();
-    {
-        let physical = physical();
-        for (i, page) in touched.iter().enumerate() {
-            let Some(addresses) = physical
-                .pages
-                .get(page)
-                .and_then(|slice| physical.shown.get(&slice.key(0)))
-            else {
-                continue;
-            };
-            // The bytes of this page that the write covers.
-            let lo = if i == 0 { offset % PAGE } else { 0 };
-            let hi = (end - (first + i) * PAGE).min(PAGE);
-            pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
-        }
+    for (i, page) in touched.iter().enumerate() {
+        let Some(addresses) = physical
+            .pages
+            .get(page)
+            .and_then(|slice| physical.shown.get(&slice.key(0)))
+        else {
+            continue;
+        };
+        // The bytes of this page that the write covers.
+        let lo = if i == 0 { offset % PAGE } else { 0 };
+        let hi = (end - (first + i) * PAGE).min(PAGE);
+        pieces.extend(addresses.iter().map(|&at| (at + lo, hi - lo)));
     }
+    pieces
+}
+
+/// [`shown_at`]'s runs from its pieces: sorted, adjoining ones joined.
+fn merge_pieces(mut pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     pieces.sort_unstable();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     for (at, bytes) in pieces {
@@ -3109,6 +3133,38 @@ mod tests {
         assert!(page_window(&[0x10], 0, 1).is_none());
         // One page of several is still one run.
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
+        assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// (bootfast) The one-look window finds what `page_window` finds and
+    /// writes the same bytes; `done` stands for its drop and `pages_written`.
+    #[test]
+    fn one_look_windows_match_page_windows() {
+        let (a, b) = (allocate(3), allocate(1));
+        let mut window = one_look::page_window(&a, PAGE + 3, PAGE).expect("one run");
+        assert_eq!(window.bytes().len(), PAGE);
+        window.bytes().fill(0x6b);
+        one_look::done(window, &a, PAGE + 3, PAGE);
+        let (second, third) = (page_bytes(a[1]), page_bytes(a[2]));
+        assert!(second[..3].iter().all(|&b| b == 0));
+        assert!(second[3..].iter().all(|&b| b == 0x6b));
+        assert!(third[..3].iter().all(|&b| b == 0x6b));
+        assert!(third[3..].iter().all(|&b| b == 0));
+        for (pages, offset, len) in [
+            (vec![a[0], b[0]], 0, PAGE + 1),
+            (vec![a[1], a[0]], 0, PAGE + 1),
+            (vec![0x10], 0, 1),
+            (vec![a[0], b[0]], 0, PAGE),
+            (a.clone(), 0, 3 * PAGE),
+            (a.clone(), 2 * PAGE, 1),
+        ] {
+            assert_eq!(
+                one_look::page_window(&pages, offset, len).is_some(),
+                page_window(&pages, offset, len).is_some(),
+                "{pages:x?} {offset} {len}"
+            );
+        }
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
