@@ -265,6 +265,24 @@ fn compute_early_pass_budget(
     Some((kind, (ms, bytes, false)))
 }
 
+/// Wall-clock budget (ms) for draining already-prepared `Slot::Ready` textures
+/// under the default smooth gameplay cap (`VICTORY_TEXTURE_PREPARE_THREADS > 0`).
+/// Each ready texture already has its host copy and detiled staging buffer in
+/// memory and only records `CopyTextureRegion` (< 0.05 ms), so draining bursts
+/// promptly frees prepare-queue headroom before `prune()` discards them.
+const READY_DRAIN_MS: u64 = 12;
+
+fn compute_ready_drain_budget(
+    budget: std::time::Duration,
+    default_smooth_pass: bool,
+) -> std::time::Duration {
+    if default_smooth_pass && !budget.is_zero() {
+        budget.max(std::time::Duration::from_millis(READY_DRAIN_MS))
+    } else {
+        budget
+    }
+}
+
 /// Tracks previous-frame and current-frame host draw counts for `frame`.
 fn note_frame_draws(frame: u64) -> (u64, u64) {
     static TRACKED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -2570,7 +2588,7 @@ impl State {
             Some((_, bytes, _)) if bytes >= (1 << 30) => usize::MAX,
             _ => 4096,
         };
-        let (due, census) = host.texture_slots_due(frame, slot_limit);
+        let (mut due, census) = host.texture_slots_due(frame, slot_limit);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2696,12 +2714,22 @@ impl State {
         let mut recorded = std::collections::HashSet::new();
         // With `prepare`: nothing more may be handed out in this pass.
         let mut full = false;
-        if prepare {
+        let [mut looked, mut handed, mut waited, mut uploads] = [0u64; 4];
+        let ready_count = if prepare {
             crate::texture::prepare::prune();
-        }
+            let (ready_count, skipped_waiting) = crate::texture::prepare::prioritize_due(&mut due);
+            waited += skipped_waiting;
+            looked += skipped_waiting;
+            ready_count
+        } else {
+            0
+        };
+        let ready_budget = compute_ready_drain_budget(
+            budget,
+            PASS_BUDGET.get().is_none() && heap_textures_ms.is_none(),
+        );
         let ([made_before, made_us_before], staged_before) =
             (crate::resource::made_here(), crate::texture::staged_here());
-        let [mut looked, mut handed, mut waited, mut uploads] = [0u64; 4];
         HEAP_TEXTURE_PARTS[14].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
         let mut laps = Laps::new();
         let began = std::time::Instant::now();
@@ -2714,34 +2742,24 @@ impl State {
             (usize, u32),
             Option<((u64, u64), u64, bool)>,
         > = std::collections::HashMap::new();
-        for (index, write) in due {
+        for (i, (index, write)) in due.into_iter().enumerate() {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
+            let is_ready = prepare && i < ready_count;
+            // All ready-prepared textures sit at `0..ready_count`; once the
+            // prepare budget is full there is nothing more to hand out.
+            if !is_ready && full {
+                break;
+            }
+            let slot_budget = if is_ready { ready_budget } else { budget };
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most
                 || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
-                    && began.elapsed() >= budget)
+                    && began.elapsed() >= slot_budget)
             {
                 break;
             }
             checked += 1;
             looked += 1;
-            // (Neptune) With prepare threads: a slot whose texture is handed
-            // out and not ready yet is passed over at once (it stays due);
-            // once nothing more may be handed out, so is every slot but the
-            // ones whose texture was made ready.
-            let hint = if prepare {
-                crate::texture::prepare::slot(index)
-            } else {
-                crate::texture::prepare::Slot::Other
-            };
-            match hint {
-                crate::texture::prepare::Slot::Waiting => {
-                    waited += 1;
-                    continue;
-                }
-                crate::texture::prepare::Slot::Other if full => continue,
-                _ => {}
-            }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2817,7 +2835,7 @@ impl State {
                         .is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 // (Neptune) Nor a slot whose texture a prepare thread made
                 // ready (its host copy made while the card had room).
-                let prepared = hint == crate::texture::prepare::Slot::Ready;
+                let prepared = is_ready;
                 if !has_its_texture && !prepared {
                     refused += 1;
                     if full_card_pass() {
@@ -5552,5 +5570,29 @@ mod loading_drain_tests {
         assert_eq!(parse_mb_bytes(" 256 "), Some(256 << 20));
         assert_eq!(parse_mb_bytes("0"), Some(0));
         assert_eq!(parse_mb_bytes("not-a-num"), None);
+    }
+
+    #[test]
+    fn ready_drain_budget_expands_only_default_smooth_gameplay_cap() {
+        use std::time::Duration;
+        // Default 4 ms gameplay cap gets READY_DRAIN_MS (12 ms) for already-prepared textures.
+        assert_eq!(
+            super::compute_ready_drain_budget(Duration::from_millis(4), true),
+            Duration::from_millis(super::READY_DRAIN_MS)
+        );
+        // Larger default budgets (e.g. 200 ms initial loading) are never reduced.
+        assert_eq!(
+            super::compute_ready_drain_budget(Duration::from_millis(200), true),
+            Duration::from_millis(200)
+        );
+        // Zero budget or explicit override (`VICTORY_HEAP_TEXTURES_MS` / `PASS_BUDGET`) stays exact.
+        assert_eq!(
+            super::compute_ready_drain_budget(Duration::ZERO, true),
+            Duration::ZERO
+        );
+        assert_eq!(
+            super::compute_ready_drain_budget(Duration::from_millis(4), false),
+            Duration::from_millis(4)
+        );
     }
 }

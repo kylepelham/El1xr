@@ -902,8 +902,10 @@ impl PreludeUpload {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some((levels, bytes)) = prefill {
-            prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes);
+        if let Some((levels, bytes)) = prefill
+            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
+        {
+            crate::descriptor::host::levels_changed(self.staging.memory as u64);
         }
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the list's
