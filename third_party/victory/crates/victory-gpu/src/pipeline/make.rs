@@ -56,6 +56,9 @@ pub(crate) struct Pending {
     /// Whether a draw has waited for it past the frame budget already: it
     /// is waited for so once ([`wait_scene_input`]).
     scene_waited: AtomicBool,
+    /// (bootfast) Queued at creation by `VICTORY_PIPELINE_EAGER`
+    /// ([`super::eager`]); set under [`QUEUE`]'s lock.
+    eager: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -222,6 +225,7 @@ impl Pending {
             completion: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            eager: AtomicBool::new(false),
         }
     }
 
@@ -408,6 +412,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        super::eager::first_use(origin(p), p.made.get().is_some());
     }
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
@@ -416,8 +421,22 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         } else {
             wait(p, crate::frame::current());
         }
+        super::eager::waited(p.made.get().is_some());
     }
     p.made.get()?.as_ref()
+}
+
+/// How `p` came to be queued, at its first draw or dispatch
+/// ([`super::eager`]'s counters).
+fn origin(p: &Pending) -> super::eager::Origin {
+    use super::eager::Origin;
+    if p.eager.load(Ordering::Relaxed) {
+        Origin::Eager
+    } else if p.made.get().is_some() || p.queue_state.load(Ordering::Relaxed) != NOT_QUEUED {
+        Origin::Early
+    } else {
+        Origin::AtDraw
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -471,8 +490,27 @@ pub(crate) fn early(p: &Arc<Pending>) {
     if let Some(rank) = super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY, rank);
+        return;
+    }
+    // (bootfast, Belobug #622) `VICTORY_PIPELINE_EAGER=N`: one no earlier
+    // run drew with is queued now too, behind the early list.
+    let limit = super::eager::limit();
+    if limit > 0 && workers() {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.push_eager(p, limit) {
+            super::eager::queued();
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+            AVAILABLE.notify_one();
+        }
     }
 }
+
+/// The rank of a pipeline queued at creation by `VICTORY_PIPELINE_EAGER`:
+/// after every pipeline of the early list, in the order of creation.
+const EAGER_RANK: u32 = u32::MAX;
 
 /// How the threads that wait in one frame share its budget
 /// (`VICTORY_PIPELINE_WAIT_SHARED`): by default a window of waiting time
@@ -752,6 +790,8 @@ struct Queue {
     early: BinaryHeap<Early>,
     created: u64,
     requested: VecDeque<Arc<Pending>>,
+    /// Pipelines queued by [`Queue::push_eager`] not taken by a worker yet.
+    eager: u64,
 }
 
 impl Queue {
@@ -760,7 +800,21 @@ impl Queue {
             early: BinaryHeap::new(),
             created: 0,
             requested: VecDeque::new(),
+            eager: 0,
         }
+    }
+
+    /// Queues a pipeline nobody asked for yet at [`EAGER_RANK`] while fewer
+    /// than `limit` such wait (read and raised under [`QUEUE`]'s lock, so
+    /// however many threads create pipelines at once the limit holds);
+    /// whether it was queued.
+    fn push_eager(&mut self, p: &Arc<Pending>, limit: u64) -> bool {
+        if self.eager >= limit || self.push(p, EARLY, EAGER_RANK) != Some(true) {
+            return false;
+        }
+        p.eager.store(true, Ordering::Relaxed);
+        self.eager += 1;
+        true
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation
@@ -791,6 +845,10 @@ impl Queue {
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
+        // Taken once: a promoted one is skipped in the heap after.
+        if p.eager.load(Ordering::Relaxed) {
+            self.eager -= 1;
+        }
         Some(p)
     }
 }
@@ -912,6 +970,7 @@ fn drained() {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
+        super::eager::log();
     }
     save_library_async();
 }
@@ -1263,6 +1322,58 @@ mod tests {
             assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
         }
         assert!(queue.pop().is_none());
+    }
+
+    /// (bootfast, Belobug #622) Pipelines queued at creation go after the
+    /// early list and every requested one, at most `limit` waiting at once;
+    /// a draw promotes one ahead of the rest, and it is taken once.
+    #[test]
+    fn eager_pipelines_wait_behind_the_early_list_and_are_bounded() {
+        let [a, b, c, listed, asked] =
+            std::array::from_fn(|_| Arc::new(Pending::new(Vec::new(), None)));
+        let mut queue = Queue::new();
+        assert!(queue.push_eager(&a, 2));
+        assert!(!queue.push_eager(&a, 2));
+        assert!(queue.push_eager(&b, 2));
+        assert!(!queue.push_eager(&c, 2));
+        assert_eq!(c.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(!c.eager.load(Ordering::Relaxed));
+        assert_eq!(queue.push(&listed, EARLY, 5), Some(true));
+        assert_eq!(queue.push(&asked, REQUESTED, 0), Some(true));
+        assert_eq!(queue.push(&b, REQUESTED, 0), Some(false));
+        for expected in [&asked, &b, &listed] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+        }
+        assert_eq!(queue.eager, 1);
+        assert!(queue.push_eager(&c, 2));
+        for expected in [&a, &c] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+        }
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.eager, 0);
+    }
+
+    /// Many threads creating pipelines at once never queue more than the
+    /// limit (Belobug #622's review test).
+    #[test]
+    fn concurrent_eager_pushes_hold_the_limit() {
+        const LIMIT: u64 = 64;
+        let queue = Mutex::new(Queue::new());
+        let queued = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        let p = Arc::new(Pending::new(Vec::new(), None));
+                        if queue.lock().unwrap().push_eager(&p, LIMIT) {
+                            queued.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(queued.load(Ordering::Relaxed), LIMIT);
+        assert_eq!(queue.lock().unwrap().eager, LIMIT);
     }
 
     #[test]

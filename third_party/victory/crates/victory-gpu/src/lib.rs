@@ -38,12 +38,18 @@ mod alloc_backoff;
 mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod ambient_miss;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod dred;
+#[cfg(windows)]
+mod hang_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
 pub mod dxgi;
@@ -56,6 +62,8 @@ pub mod frame;
 pub mod frametime;
 pub mod hitch;
 pub mod host_facts;
+#[cfg(windows)]
+pub mod card_awake;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]

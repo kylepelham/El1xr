@@ -24,12 +24,14 @@ use crate::host::{HostList, host};
 use crate::object::This;
 
 pub(crate) mod alias_skip;
+pub(crate) mod blind_hash;
 mod gpu_detile;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
 mod stage_unlocked;
+mod stale_audit;
 pub(crate) mod take_by_table;
 
 macro_rules! once {
@@ -685,6 +687,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    stale_audit::tick();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -1575,15 +1578,19 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(
-            whole.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let mut blind = false;
+        let read = self.refresh_timed(&mut blind);
+        let us = whole.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        if blind {
+            blind_hash::note_read(read, us);
+        }
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    /// `blind` is set when the texture is read although no write to it was
+    /// seen ([`blind_hash`]).
+    fn refresh_timed(&self, blind: &mut bool) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1628,14 +1635,7 @@ impl Staging {
             // hashed all the same. The hash is for a write the guards did not see; they see
             // writes through every view of a page now, and the hashing was 5 ms of every
             // frame of the first room.
-            static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let hash_every = *HASH_EVERY.get_or_init(|| {
-                std::env::var("VICTORY_TEXTURE_HASH_EVERY")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8)
-                    .max(1)
-            });
+            let hash_every = blind_hash::hash_every();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
@@ -1650,6 +1650,7 @@ impl Staging {
                 return 0;
             }
             unseen = unwritten;
+            *blind = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1751,6 +1752,7 @@ impl Staging {
     /// often this happens (a texture streamed in once is soon guarded
     /// again, a movie's is not).
     fn unseen_write(&self, last: &mut Last) {
+        blind_hash::note_changed();
         let frame = crate::frame::current();
         let more = if frame < last.unguarded { 120 } else { 16 };
         #[cfg(feature = "diagnostics")]

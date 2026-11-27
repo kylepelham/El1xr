@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="250" viewBox="0 0 900 250" role="img" aria-labelledby="title desc">
+  <title id="title">El1xr performance at a glance, RTX 5090, 4K, 27 November 2026</title>
+  <desc id="desc">Four tiles. Settled frame rate 24 to 25 fps (three quiet runs: 24.9, 25.2 and 24.2 fps). 0 refused GPU pipelines, no device loss in benchmark runs. 31 to 33 seconds from launch to the first world frame, was 41 to 54 seconds. Worst freeze when entering the world 1.5 to 1.9 seconds, was 7.6 to 8.1 seconds.</desc>
+  <style>
+    .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
+    .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+    .up{text-transform:uppercase;letter-spacing:.08em}
+    .fade{animation:fade .7s ease-out both}
+    .grow{transform-box:fill-box;transform-origin:left center;animation:grow 1.1s cubic-bezier(.2,.7,.2,1) both}
+    .rise{transform-box:fill-box;transform-origin:center bottom;animation:rise 1.6s cubic-bezier(.2,.7,.2,1) both}
+    .t1{animation-delay:.15s}.t2{animation-delay:.3s}.t3{animation-delay:.45s}.t4{animation-delay:.6s}
+    .t5{animation-delay:.75s}.t6{animation-delay:.9s}.t7{animation-delay:1.1s}.t8{animation-delay:1.4s}
+    @keyframes fade{from{opacity:0}to{opacity:1}}
+    @keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+    @keyframes rise{from{transform:translateY(24px);opacity:.4}to{transform:none;opacity:1}}
+    @media (prefers-reduced-motion:reduce){.fade,.grow,.rise{animation:none}}
+  </style>
+  <defs>
+    <linearGradient id="cardbg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#120a24"/><stop offset="1" stop-color="#1b0f33"/></linearGradient>
+    <radialGradient id="glow" cx=".85" cy="1.05" r=".75"><stop offset="0" stop-color="#ff3d8b" stop-opacity=".22"/><stop offset=".5" stop-color="#9b5cff" stop-opacity=".08"/><stop offset="1" stop-color="#9b5cff" stop-opacity="0"/></radialGradient>
+    <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
+    <linearGradient id="sunsetv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
+    <clipPath id="cardclip"><rect width="900" height="250" rx="18"/></clipPath>
+  </defs>
+  <g clip-path="url(#cardclip)">
+    <rect width="900" height="250" fill="url(#cardbg)"/>
+    <rect width="900" height="250" fill="url(#glow)"/>
+    <path d="M0 250L0 233L29 233L29 231L66 231L66 236L80 236L80 225L94 225L94 215L96 215L96 225L110 225L110 240L135 240L135 245L163 245L163 221L184 221L184 223L191 223L191 213L193 213L193 223L201 223L201 241L215 241L215 231L217 231L217 241L230 241L230 239L265 239L265 218L303 218L303 227L340 227L340 213L359 213L359 214L396 214L396 238L406 238L406 228L408 228L408 238L419 238L419 234L434 234L434 221L448 221L448 216L470 216L470 228L491 228L491 211L498 211L498 201L500 201L500 211L507 211L507 216L522 216L522 206L524 206L524 216L539 216L539 232L572 232L572 243L586 243L586 238L623 238L623 215L659 215L659 229L681 229L681 223L698 223L698 244L733 244L733 236L749 236L749 236L785 236L785 238L812 238L812 244L820 244L820 234L822 234L822 244L830 244L830 224L845 224L845 214L847 214L847 224L861 224L861 226L876 226L876 242L900 242L900 238L900 238L900 250Z" fill="#9b5cff" fill-opacity=".07"/>
+    <rect width="900" height="4" fill="url(#sunset)"/>
+  </g>
+  <rect x=".5" y=".5" width="899" height="249" rx="18" fill="none" stroke="#2c2048"/>
+  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Performance, 27 Nov 2026</text>
+  <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">At a glance</text>
+  <g class="fade t1">
+    <polygon points="36,104 218,104 234,120 234,222 36,222" fill="#170f2b" stroke="#2c2048"/>
+    <text class="d" x="56" y="154" font-size="40" font-style="italic" fill="#ffd36e">24-25<tspan font-size="20" fill="#a99bc6" dx="4">FPS</tspan></text>
+    <text class="s up" x="56" y="180" font-size="12" font-weight="700" fill="#f6eefe">settled frame rate</text>
+    <text class="s" x="56" y="203" font-size="13" fill="#a99bc6">quiet runs: 24.9, 25.2, 24.2</text>
+  </g>
+  <g class="fade t2">
+    <polygon points="246,104 428,104 444,120 444,222 246,222" fill="#170f2b" stroke="#2c2048"/>
+    <text class="d" x="266" y="154" font-size="40" font-style="italic" fill="#2de2e6">0</text>
+    <text class="s up" x="266" y="180" font-size="12" font-weight="700" fill="#f6eefe">refused GPU pipelines</text>
+    <text class="s" x="266" y="203" font-size="13" fill="#a99bc6">no device loss in bench runs</text>
+  </g>
+  <g class="fade t3">
+    <polygon points="456,104 638,104 654,120 654,222 456,222" fill="#170f2b" stroke="#2c2048"/>
+    <text class="d" x="476" y="154" font-size="40" font-style="italic" fill="#ff8a3d">31-33<tspan font-size="20" fill="#a99bc6" dx="4">S</tspan></text>
+    <text class="s up" x="476" y="180" font-size="12" font-weight="700" fill="#f6eefe">launch to world</text>
+    <text class="s" x="476" y="203" font-size="13" fill="#a99bc6">was 41-54 s</text>
+  </g>
+  <g class="fade t4">
+    <polygon points="666,104 848,104 864,120 864,222 666,222" fill="#170f2b" stroke="#2c2048"/>
+    <text class="d" x="686" y="154" font-size="40" font-style="italic" fill="#ff3d8b">1.5-1.9<tspan font-size="20" fill="#a99bc6" dx="4">S</tspan></text>
+    <text class="s up" x="686" y="180" font-size="12" font-weight="700" fill="#f6eefe">worst entry freeze</text>
+    <text class="s" x="686" y="203" font-size="13" fill="#a99bc6">was 7.6-8.1 s</text>
+  </g>
+  <text class="s" x="864" y="78" font-size="13" text-anchor="end" fill="#a99bc6">RTX 5090, 4K, 200 s runs</text>
+</svg>
