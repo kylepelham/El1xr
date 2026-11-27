@@ -359,6 +359,11 @@ def report(
     if any(run_flags.values()):
         lines += ["", "## Flags", ""]
         lines += [f"- **{ids[s]}**: " + " / ".join(run_flags[s]) for s in ids if run_flags[s]]
+    hung = [s for s in ids if scans[s].hang]
+    if hung:
+        lines += ["", "## Hang lines (`dred:`, `hang watch:`)"]
+        for s in hung:
+            lines += ["", f"**{ids[s]}**", "", "```", *scans[s].hang, "```"]
     if plan.greps and ids:
         lines += ["", "## Greps (lines matched / median / last captured number)", ""]
         lines.append("| grep | regex | " + " | ".join(ids.values()) + " |")

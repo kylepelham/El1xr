@@ -10,7 +10,9 @@ The report gives, per grep and run, the count of matching lines and, for a regex
 the median and last number it captured. Every run is also checked for lines naming `device
 removed`, `DEVICE_HUNG` or `panicked`, and for a sharp rise in WARN lines against the baseline
 arm (more than WARN_RISE_FACTOR times its median plus WARN_RISE_MIN), with the WARN messages
-that rose most.
+that rose most. The lines of the device-removed report (`dred:`, `VICTORY_DRED=1`) and of the
+hang watch (`hang watch:`, `VICTORY_HANG_WATCH`) are kept per run (`hang_lines`): bench,
+capture and train print them under the run's summary line, and the train report lists them.
 
 `--greps-from <ready.md ...>` reads the `## Batch items` tables of writers' ready.md files and
 adds every backticked log-line phrase it finds there (best effort: placeholders such as `N` or
@@ -47,6 +49,9 @@ SKIP_PHRASE_RE = re.compile(
     r"^(?:VICTORY_|bench\b|train\b|capture\b)|--|\s=\s|->|[/\\]|\bdev\.py\b|\bcargo\b|\.(?:rs|png|md|toml|py|log)\b"
 )
 TABLE_HEADER_RE = re.compile(r"^\s*\[greps\]\s*(?:#.*)?$")
+HANG_RE = re.compile(r"\b(?:dred|hang watch): ")
+HANG_SKIP_RE = re.compile(r"device-removed data on\b|hang watch: on\b")
+HANG_LINES_MOST = 80
 
 
 class GrepError(ValueError):
@@ -93,6 +98,27 @@ class LogScan:
     fatal: dict[str, int] = field(default_factory=dict)
     warns: int = 0
     warn_kinds: Counter[str] = field(default_factory=Counter)
+    hang: list[str] = field(default_factory=list)
+
+
+def hang_lines(text: str, most: int = HANG_LINES_MOST) -> list[str]:
+    """The `dred:` and `hang watch:` lines of a run's log, from those words on, each once (the
+    crash report repeats the failure's text), at most `most`; not the lines saying they are on."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = ANSI_RE.sub("", raw).rstrip()
+        m = HANG_RE.search(line)
+        if not m or HANG_SKIP_RE.search(line):
+            continue
+        line = line[m.start():]
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+        if len(out) >= most:
+            break
+    return out
 
 
 def scan_log(text: str, greps: dict[str, re.Pattern[str]]) -> LogScan:
@@ -116,6 +142,7 @@ def scan_log(text: str, greps: dict[str, re.Pattern[str]]) -> LogScan:
             scan.warns += 1
             scan.warn_kinds[warn_kind(level.group(2), level.group(3))] += 1
     scan.greps = {name: (counts[name], values[name]) for name in greps}
+    scan.hang = hang_lines(text)
     return scan
 
 
