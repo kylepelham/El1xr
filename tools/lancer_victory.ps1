@@ -282,6 +282,10 @@ if (-not $NoTunedSettings) {
         VICTORY_UPLOAD_BLOCKS            = '1'         # batch 3: uploads from pooled blocks
         VICTORY_GUARD_4K                 = '1'         # batch 3: 4 KiB guards, no crash, neutral
         VICTORY_BAKE_INPUTS              = '1'         # batch 4: face/skin bakes get their own textures first (0 black faces in 24 diner snaps vs 0-3 per run)
+        VICTORY_BAKE_ONE_BUDGET          = '1'         # batch 4: a bake pass takes its budget once (boot -5 s)
+        VICTORY_LOAD_FPS                 = '60'        # batch 4: loading screen up to 60 fps until the world (boot -5 s)
+        VICTORY_LOAD_END                 = 'world'     # batch 4: loading rate ends at the first world frame
+        VICTORY_LOAD_UNPACED             = '1'         # batch 4: loading screen not paced by our clock
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]

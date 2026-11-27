@@ -61,6 +61,10 @@ REGLAGES = {
     "VICTORY_UPLOAD_BLOCKS": "1",
     "VICTORY_GUARD_4K": "1",
     "VICTORY_BAKE_INPUTS": "1",
+    "VICTORY_BAKE_ONE_BUDGET": "1",
+    "VICTORY_LOAD_FPS": "60",
+    "VICTORY_LOAD_END": "world",
+    "VICTORY_LOAD_UNPACED": "1",
     "VICTORY_ASYNC_SUBMIT": "1",
 }
 # -Quality, par-dessus la table (lu dans le bloc `if ($Quality)` du lanceur).
