@@ -30,6 +30,7 @@ pub(crate) mod prepare;
 mod read_marks_tests;
 mod reinterpret;
 mod stage_unlocked;
+mod stale_audit;
 pub(crate) mod take_by_table;
 
 macro_rules! once {
@@ -685,6 +686,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    stale_audit::tick();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
