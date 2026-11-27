@@ -1,12 +1,12 @@
 <div align="center">
 
-![El1xr: Grand Theft Auto VI para Xbox Series, funcionando en un PC con Windows. 24-25 fps en 4K en una RTX 5090, 0 pipelines rechazados, 31-33 s desde el arranque hasta el mundo, jugable desde el 27 de noviembre de 2026](../images/hero.svg)
+![El1xr: Grand Theft Auto VI para Xbox Series, funcionando en un PC con Windows. 23,5 fps en el mundo en 4K en una RTX 5090, 0 pipelines rechazados, 32 s desde el arranque hasta el mundo, jugable desde el 27 de noviembre de 2026](../images/hero.svg)
 
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-9b5cff?style=flat-square&labelColor=170f2b)
 ![Platform: Windows 10 and 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2de2e6?style=flat-square&labelColor=170f2b)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-ff8a3d?style=flat-square&labelColor=170f2b&logo=rust&logoColor=white)
 ![Status: playable](https://img.shields.io/badge/status-playable-ff3d8b?style=flat-square&labelColor=170f2b)
-![24-25 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-24--25%20fps-ffd36e?style=flat-square&labelColor=170f2b)
+![23.5 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.5%20fps-ffd36e?style=flat-square&labelColor=170f2b)
 ![Discord: bonemeld](https://img.shields.io/badge/Discord-bonemeld-5865F2?style=flat-square&labelColor=170f2b&logo=discord&logoColor=white)
 
 [English](../../README.md) · [Français](README.fr.md) · **Español** · [Deutsch](README.de.md) · [Italiano](README.it.md) · [Português](README.pt-BR.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Русский](README.ru.md)
@@ -18,9 +18,9 @@ El1xr ejecuta la versión de Xbox Series de Grand Theft Auto VI (build 1.0.2.1) 
 ## Estado
 
 > [!NOTE]
-> **A 27 de noviembre de 2026, GTA VI (Xbox Series, build 1.0.2.1) arranca, llega a los menús y es jugable en el mundo abierto en Windows.** Funciona a 24-25 fps una vez estabilizado, en 4K en una RTX 5090, con 0 pipelines de GPU rechazados. El siguiente objetivo son 30 fps estables. Después vendrá eliminar los tirones y los fallos visuales.
+> **A 27 de noviembre de 2026, GTA VI (Xbox Series, build 1.0.2.1) arranca, llega a los menús y es jugable en el mundo abierto en Windows.** En las últimas pruebas con el equipo en reposo (lote 3, 4K, RTX 5090), el mundo funciona a una mediana de 23,5 fps, con 0 pipelines de GPU rechazados. Aún queda por debajo del siguiente objetivo, 30 fps estables. Después vendrá eliminar los tirones y los fallos visuales.
 
-![Hitos: arranque, menú principal y partida a más tardar el 24 de noviembre de 2026; jugable a 24-25 fps el 27 de noviembre de 2026; 30 fps a continuación; estabilidad en curso](../images/milestones.svg)
+![Hitos: arranque, menú principal y partida a más tardar el 24 de noviembre de 2026; jugable a 23,5 fps el 27 de noviembre de 2026; 30 fps a continuación; estabilidad en curso](../images/milestones.svg)
 
 | Hito | Estado | Pruebas | Fecha |
 |---|---|---|---|
@@ -28,35 +28,38 @@ El1xr ejecuta la versión de Xbox Series de Grand Theft Auto VI (build 1.0.2.1) 
 | Primer fotograma | Hecho | La animación de inicio y las pantallas legales se muestran sin parpadeos. | a más tardar el 24 nov. 2026 |
 | Menú principal | Hecho | La pantalla de perfil, los ajustes del primer arranque, las pantallas legales, la pantalla de carga y el menú de pausa funcionan. Los menús van a 30 fps (RTX 4070 SUPER). | a más tardar el 24 nov. 2026 |
 | En partida | Hecho | El juego llega al mundo abierto y el personaje se mueve bajo el control del jugador. Una sesión de 13 minutos en la prisión funcionó a unos 4 fps (RTX 4070 SUPER). | a más tardar el 24 nov. 2026 |
-| Jugable | Hecho, por debajo de la velocidad objetivo | El mundo se juega a 24-25 fps una vez estabilizado en 4K (RTX 5090; tres pruebas de rendimiento con el equipo en reposo: 24,9; 25,2 y 24,2 fps). | 27 nov. 2026 |
+| Jugable | Hecho, por debajo de la velocidad objetivo | El mundo se juega a 23,5 fps en 4K (RTX 5090; mediana de la parte en el mundo de una prueba de 200 segundos del lote 3 con el equipo en reposo). | 27 nov. 2026 |
 | Avance en la historia | Dos primeras misiones completadas | Un colaborador completó las dos primeras misiones en una sesión de 45 minutos a unos 2 fps (RTX 4070 SUPER; según su informe, no medido a partir de los registros). Todas las cinemáticas se reproducen completas. En Linux (Proton, RX 9070 XT), una prueba de 23 minutos superó el prólogo y llegó al capítulo 1. | 25 nov. 2026 |
-| 30 fps | Todavía no | 24-25 fps una vez estabilizado, con un tiempo de fotograma mediano de unos 40 ms frente al objetivo de 33,3 ms (RTX 5090, 4K). | 27 nov. 2026 |
-| Estable | En curso | Con los ajustes por defecto, las pruebas de rendimiento de 200 segundos terminan sin cierres, sin reinicios del controlador de la GPU y sin pérdida del dispositivo. Los fallos visuales todavía varían de una prueba a otra (ver Problemas conocidos). | 27 nov. 2026 |
+| 30 fps | Todavía no | 23,5 fps en el mundo, con un tiempo de fotograma mediano de 42 ms frente al objetivo de 33,3 ms (RTX 5090, 4K). | 27 nov. 2026 |
+| Estable | En curso | Con los ajustes por defecto, las pruebas de 200 segundos terminan sin cierres, sin reinicios del controlador de la GPU y sin pérdida del dispositivo. Al entrar en el mundo todavía hay un parón de 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)), y los fallos visuales todavía varían de una prueba a otra (ver Problemas conocidos). | 27 nov. 2026 |
 
 ## Rendimiento
 
-![De un vistazo: 24-25 fps una vez estabilizado, 0 pipelines de GPU rechazados, 31-33 s desde el arranque hasta el mundo, peor congelamiento al entrar de 1,5-1,9 s](../images/stats.svg)
+![De un vistazo: 23,5 fps en el mundo, 0 pipelines de GPU rechazados, 32 s desde el arranque hasta el mundo, 7 tirones de más de 1 s por prueba](../images/stats.svg)
 
 | Medida (RTX 5090, 4K) | Ahora | Objetivo |
 |---|---|---|
-| Tasa de fotogramas estabilizada | **24-25 fps** | 30+ fps |
-| Tiempo de fotograma mediano | ~40 ms | 33,3 ms o menos |
-| Fotograma del percentil 99 | 68-73 ms | sin tirones |
-| Tiempo de CPU para preparar un fotograma | 25-26 ms | por debajo del tiempo de la GPU |
+| Tasa de fotogramas en el mundo (mediana) | **23,5 fps** | 30+ fps |
+| Tiempo de fotograma mediano | 42 ms | 33,3 ms o menos |
+| Fotograma del percentil 99 en juego estabilizado | ~70 ms | sin tirones |
+| Tiempo de CPU para preparar un fotograma | 28 ms | por debajo del tiempo de la GPU |
 | Pipelines de GPU rechazados | **0** | 0 |
-| Del arranque al primer fotograma del mundo | ~31-33 s | |
-| Peor congelamiento al entrar en el mundo | 1,5-1,9 s | ninguno |
-| Streaming tras entrar en el mundo | 52-63 s | unos pocos segundos |
+| Del arranque al primer fotograma del mundo | 32 s | |
+| Del arranque al juego estabilizado | 49 s | |
+| Parón al entrar en el mundo | 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)) | ninguno |
+| Fotogramas de más de 250 ms en el mundo | 20 por prueba | ninguno |
+| Tirones de más de 1 s | 7 por prueba | ninguno |
+| Streaming tras entrar en el mundo | 74 s | unos pocos segundos |
 
-La tasa de fotogramas y los tiempos de fotograma proceden de `python tools/dev.py bench --quiet --seconds 200`. Cada prueba hace un arranque rápido desde un punto de control fijo, sin nada más ejecutándose en la máquina, y las cifras se leen del propio registro de fotogramas del emulador. El tiempo de arranque y el congelamiento al entrar proceden de pruebas hechas mientras la máquina estaba compilando, así que una máquina en reposo debería lograr algo mejor.
+Estas cifras proceden de las pruebas del lote 3 con el equipo en reposo (`python tools/dev.py bench --quiet --seconds 200`, 27 de noviembre de 2026). Cada prueba hace un arranque rápido desde un punto de control fijo mientras el resto del trabajo de la máquina queda en pausa, y las cifras se leen del propio registro de fotogramas del emulador. En todas las pruebas había parte del registro de diagnóstico activado. El parón al entrar en el mundo es el rango observado en las pruebas del lote 3.
 
 ![En qué se va un fotograma: pasadas del juego 22,8 ms, trabajo de GPU de El1xr 7,0 ms, sin medir 3,8 ms, GPU inactiva 6,2 ms, frente a la línea de 33,3 ms de los 30 fps](../images/frame-budget.svg)
 
-Un fotograma estabilizado tarda unos 40 ms. Las pasadas de renderizado del propio juego necesitan 22,8 ms de tiempo de GPU, lo que deja margen para los 30 fps. El resto se reparte entre el trabajo de GPU propio de El1xr (7 ms: comprobaciones de límites en los draws indirectos, copias de texturas entre formatos, subidas de datos) y el tiempo que la GPU pasa inactiva (6-10 ms) mientras un solo hilo de CPU prepara el siguiente lote de trabajo. Esas dos partidas son el objetivo de las próximas actualizaciones.
+El último perfil de tiempos de GPU, tomado antes del lote 3, situaba un fotograma estabilizado en unos 40 ms. Las pasadas de renderizado del propio juego necesitan 22,8 ms de tiempo de GPU, lo que deja margen para los 30 fps. El resto se reparte entre el trabajo de GPU propio de El1xr (7 ms: comprobaciones de límites en los draws indirectos, copias de texturas entre formatos, subidas de datos) y el tiempo que la GPU pasa inactiva (6-10 ms) mientras un solo hilo de CPU prepara el siguiente lote de trabajo. Esas dos partidas son el objetivo de las próximas actualizaciones.
 
-![Tiempos de carga: del arranque al primer fotograma del mundo, de 41-54 s a 31-33 s; peor congelamiento al entrar en el mundo, de 7,6-8,1 s a 1,5-1,9 s](../images/load-times.svg)
+![Lote 3: con bloques agrupados, del arranque al primer fotograma del mundo pasó de 58-67 s a 32 s, del arranque al juego estabilizado de 117-120 s a 49 s, y los fotogramas de más de 250 ms en el mundo de 51-74 a 20](../images/load-times.svg)
 
-La actualización del 27 de noviembre de 2026 prepara las texturas sin bloqueos, precalcula los personajes en paralelo durante la carga y traduce cada shader en cuanto el juego lo crea. El tiempo desde el arranque hasta el primer fotograma del mundo bajó de 41-54 s a 31-33 s, y el peor congelamiento al entrar en el mundo, de 7,6-8,1 s a 1,5-1,9 s.
+El lote 3 (27 de noviembre de 2026) conservó dos grupos de switches, ahora activados por defecto en el lanzador: memoria en secciones de 2 MiB, búferes del juego mantenidos en la memoria de la GPU y mayor prioridad para los hilos de fotograma (el grupo fg_rt de siete switches), y búferes de staging, de GPU, compartidos y de subida tomados de bloques agrupados (cuatro switches). Las guardas de escritura de 4 KiB también están activadas; resultaron neutras. Frente a la misma build sin bloques agrupados, en pruebas consecutivas, el tiempo desde el arranque hasta el primer fotograma del mundo bajó de 58-67 s a 32 s, el juego estabilizado de 117-120 s a 49 s, los fotogramas de más de 250 ms en el mundo de 51-74 a 20, los tirones de más de 1 s de 26-35 a 7, y el streaming de 80-87 s a 74 s. Se descartó un grupo de siete switches que rompía las paredes de la celda de la prisión. La prueba del lote sin ninguno de estos switches dio 14 fps y un arranque de 100 s, pero la máquina estaba más cargada durante esa prueba, así que no es una comparación limpia de antes y después.
 
 ### Equipo de prueba
 
@@ -108,8 +111,9 @@ python tools/dev.py gate       # todos los tests, falla ante cualquier aviso
 
 ## Problemas conocidos
 
-- **Fallos visuales que varían de una prueba a otra.** En aproximadamente la mitad de las pruebas, las caras salen negras o con manchas, Lucia lleva la ropa equivocada en el diner o su pelo se vuelve naranja en la ventana de la prisión.
-- **Streaming lento.** Tras entrar en el mundo, todos los recursos tardan aproximadamente un minuto en llegar, con elementos que aparecen de golpe mientras tanto.
+- **Fallos visuales que varían de una prueba a otra.** En aproximadamente la mitad de las pruebas, las caras salen negras o con manchas (se está trabajando en ello en [#35](https://github.com/kylepelham/El1xr/issues/35)), Lucia lleva la ropa equivocada en el diner o su pelo se vuelve naranja en la ventana de la prisión.
+- **Un parón al entrar en el mundo.** Justo después de que aparezca el mundo, el juego se congela 3-9 s mientras la GPU procesa un lote de comandos. La causa se está investigando en [#78](https://github.com/kylepelham/El1xr/issues/78).
+- **Streaming lento.** Tras entrar en el mundo, todos los recursos tardan unos 74 s en llegar, con elementos que aparecen de golpe mientras tanto.
 - **La GPU espera a la CPU** 6-10 ms por fotograma (ver el reparto del fotograma más arriba).
 - **La iluminación con ray tracing está casi toda desactivada.** El juego construye sus estructuras de ray tracing por software, y ese constructor está desactivado por ahora.
 - **Un único equipo de referencia.** Las cifras actuales proceden de la RTX 5090 indicada arriba. Las demás GPU no se han medido con la build actual.
@@ -118,11 +122,11 @@ python tools/dev.py gate       # todos los tests, falla ante cualquier aviso
 
 El objetivo son 30 fps estables en 4K en la RTX 5090, y después eliminar los tirones y los fallos visuales. Hay unas 60 aceleraciones más escritas y pendientes de medir. Cada una permanece desactivada por defecto hasta que demuestre su eficacia.
 
-- **Memoria en secciones de 2 MiB, búferes del juego mantenidos en la memoria de la GPU y mayor prioridad para los hilos de fotograma.** *En pruebas, una sola ejecución (27 nov. 2026, RTX 5090):* 26,5 fps frente a 23,8 fps, estabilización en 92 s frente a 115 s, y una liberación de los mapeos de memoria entre 8 y 12 veces más barata. Dos ejecuciones que lo combinaban con tres correcciones de shaders bloquearon la GPU al entrar en el mundo, así que seguirá desactivado hasta que se resuelva.
+- **El parón al entrar en el mundo** ([#78](https://github.com/kylepelham/El1xr/issues/78)): averiguar qué pasada de ese lote de comandos de GPU tarda segundos.
 - **Menos esperas y menos sobrecarga**: recortar los 6-10 ms que la GPU espera a la CPU en cada fotograma y los 7 ms de trabajo de GPU propio de El1xr.
 - **Escalado DLSS** y **ray tracing por hardware en los núcleos RT**, que permitiría recuperar la iluminación con ray tracing.
 - **Precalentamiento sin conexión de shaders y pipelines**, para que no se compile ningún shader durante la partida.
-- **Correcciones para las caras y la ropa que varían de una prueba a otra**.
+- **Correcciones para las caras negras ([#35](https://github.com/kylepelham/El1xr/issues/35)) y la ropa que varía de una prueba a otra**.
 
 ## El proyecto en cifras
 
