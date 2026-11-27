@@ -96,6 +96,7 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+pub mod meet;
 mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
