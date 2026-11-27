@@ -157,7 +157,7 @@ pub(crate) fn to_rgb(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8])
     Some(out)
 }
 
-fn f32_from_half(h: u16) -> f32 {
+pub(crate) fn f32_from_half(h: u16) -> f32 {
     let (sign, exp, man) = (u32::from(h >> 15), u32::from(h >> 10 & 0x1f), u32::from(h & 0x3ff));
     let magnitude = match exp {
         0 => man as f32 * 2f32.powi(-24),

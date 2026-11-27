@@ -36,6 +36,8 @@ mod ambient;
 mod bake_ahead;
 #[cfg(windows)]
 mod draw;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod drop_why;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -75,6 +77,8 @@ mod indirect;
 mod cores;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod popwatch;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
