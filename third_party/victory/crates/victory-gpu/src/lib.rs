@@ -136,6 +136,7 @@ mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
+pub mod upscale_live;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
