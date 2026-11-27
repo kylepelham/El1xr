@@ -163,6 +163,8 @@ pub mod titlemem;
 #[cfg(windows)]
 pub mod topology;
 #[cfg(windows)]
+pub mod priority;
+#[cfg(windows)]
 #[cfg(windows)]
 mod defrag;
 mod watch;

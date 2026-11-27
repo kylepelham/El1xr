@@ -308,6 +308,7 @@ fn stage() -> u32 {
 /// different sizes, [`cache_cores`]). (A selection of processors is a
 /// preference the scheduler keeps unless nothing of it is free.)
 pub(crate) fn keep_on_fast_cores() {
+    crate::priority::helper();
     if crate::topology::vcache_pin_enabled() {
         let current = std::thread::current();
         crate::topology::pin_hot(current.name().unwrap_or("thread"));
@@ -319,6 +320,7 @@ pub(crate) fn keep_on_fast_cores() {
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
 /// a landing shares its work with.
 pub(crate) fn keep_helper_on_fast_cores() {
+    crate::priority::helper();
     // With V-Cache placement on (`crate::topology`), wide copy/merge worker pools stay unpinned
     // so 24+ bulk workers never oversubscribe CCD0's 8 cores or evict the
     // 96 MiB 3D V-Cache.
