@@ -92,6 +92,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
+mod texstore;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 pub mod titlemem;
