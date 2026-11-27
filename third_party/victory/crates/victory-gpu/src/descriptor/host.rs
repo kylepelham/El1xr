@@ -1126,6 +1126,15 @@ impl TextureQueue {
         order
     }
 
+    /// Of `indices`, the slots in the queue whatever frame they are due from, each with its
+    /// write number, in the order given (`crate::bake_inputs`).
+    fn pick(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        indices
+            .iter()
+            .filter_map(|&index| self.slots.get(&index).map(|w| (index, w.write)))
+            .collect()
+    }
+
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
@@ -1825,6 +1834,15 @@ impl HostHeap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .has_due(frame)
+    }
+
+    /// Of `indices`, the title slots in the queue of textures picked by index (due now or
+    /// later), each with its write number ([`TextureQueue::pick`]).
+    pub(crate) fn texture_slots_pick(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pick(indices)
     }
 
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
@@ -5809,6 +5827,21 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(q.due(2, 9).iter().any(|d| d.0 == 8));
         q.rechecked(8, &seen[0].1, false, 5, false, None);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
+    }
+
+    /// A bake draw's slots (`crate::bake_inputs`) are found in the queue whether due now or
+    /// later, in the order asked, and leave it once uploaded.
+    #[test]
+    fn picked_slots_are_found_due_or_not() {
+        let mut q = TextureQueue::default();
+        q.written(3, 1, 1, false);
+        q.written(5, 1, 50, false);
+        q.written(9, 1, 1, false);
+        let picked = q.pick(&[5, 4, 3]);
+        assert_eq!(picked.iter().map(|p| p.0).collect::<Vec<_>>(), vec![5, 3]);
+        assert!(q.due(1, 9).iter().all(|d| d.0 != 5), "5 is not due yet");
+        q.done(5, picked[0].1);
+        assert_eq!(q.pick(&[5, 3]), vec![picked[1]]);
     }
 
     /// A slot found changed after its upload becomes live: served ahead of
