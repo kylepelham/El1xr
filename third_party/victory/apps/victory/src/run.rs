@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    title_args: &[String],
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -45,6 +46,10 @@ pub fn run(
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     victory_hle::runtime::set_image_size(image.base(), image.info().size_of_image as usize);
+    let effective_args = victory_hle::modules::cmdline::set_title_command_line(exe, title_args);
+    if !effective_args.is_empty() {
+        println!("title args     {}", effective_args.join(" "));
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -360,6 +365,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: &[String]) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

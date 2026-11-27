@@ -269,9 +269,9 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
-            title_args: _,
+            title_args,
         } => {
-            let result = run::run(&exe, unimplemented, strict, execute, console);
+            let result = run::run(&exe, unimplemented, strict, execute, console, &title_args);
             // The process's own end, as `main`'s Result maps it: Ok is 0,
             // Err is 1. A title that ends the process itself logs its own
             // line and never returns here.
