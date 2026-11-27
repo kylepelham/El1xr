@@ -5323,7 +5323,11 @@ impl State {
                 );
             }
         }
-        if after_writer || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
+        // (El1xr) `VICTORY_SPLIT_RAW=1`: and a dispatch split into parts, in one piece.
+        let split_raw = split && crate::indirect::split_raw();
+        if after_writer
+            || split_raw
+            || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
         {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5375,6 +5379,9 @@ impl State {
                 self.mesh_scissor(list, false);
             }
             CLAMPS[2].fetch_add(1, Ordering::Relaxed);
+            if split_raw {
+                crate::indirect::SPLIT_RAW.fetch_add(1, Ordering::Relaxed);
+            }
             if kind == DISPATCH {
                 DISPATCHED.fetch_add(1, Ordering::Relaxed);
             } else {
