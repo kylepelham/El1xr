@@ -1008,6 +1008,9 @@ pub(crate) struct HostList {
     /// a draw/dispatch) since its last reset, so submitting it needs
     /// `descriptor::sync_heaps` and `make_waiting`.
     uses_heaps: std::sync::atomic::AtomicBool,
+    /// `VICTORY_HEAP_ROUND_SHARE`: the heap-sync ticket it needs a round
+    /// from, stamped when the title gave it to a queue (0: none).
+    pub(crate) heap_stamp: std::sync::atomic::AtomicU64,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -3483,8 +3486,8 @@ pub(crate) use late::{
     walls_landed, walls_trace,
 };
 use late::{
-    COPIES_JOINED, continues, declared_writes, hand_back, join_copies, late_line, late_threads,
-    read_backs, relay_hand_back, relay_wait, settle_now, stale_under_flights, wait_unlocked,
+    COPIES_JOINED, continues, declared_writes, hand_back, heap_landed, join_copies, late_line,
+    late_threads, read_backs, relay_hand_back, relay_wait, settle_now, stale_under_flights, wait_unlocked,
 };
 #[cfg(test)]
 pub(crate) use late::{HOST_COPY, READ_BACK, relay_hand_back_for_test};
@@ -3720,6 +3723,7 @@ impl Host {
                 twins: Mutex::default(),
                 plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 uses_heaps: std::sync::atomic::AtomicBool::new(false),
+                heap_stamp: std::sync::atomic::AtomicU64::new(0),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -3820,6 +3824,7 @@ impl Host {
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         let landed_count = items.len() as u64;
+        let mut _landing = None;
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -3845,6 +3850,7 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> =
                     flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                _landing = Some(crate::round_share::Landing::begin());
                 if !no_copy_back() {
                     self.relay_card_back(&plans, fetch);
                     // (Neptune) The kernel forgets the writes of these merges together.
@@ -3883,6 +3889,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        heap_landed(&items);
         // In the order given: what tells the title the card is done.
         let told = items.iter().filter(|i| !matches!(i, Late::Run(_))).count();
         let mut last = 0;
@@ -4317,6 +4324,8 @@ impl Host {
             };
             let item_count = items.len() as u64;
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
+            // From the copy-backs until the read-backs below are done.
+            let mut _landing = None;
             if !counted {
                 counted = true;
                 LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -4369,6 +4378,7 @@ impl Host {
                     ));
                 }
                 submitting(3, flights);
+                _landing = Some(crate::round_share::Landing::begin());
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
@@ -4396,6 +4406,7 @@ impl Host {
                     }
                 }
                 hand_back(&back);
+                heap_landed(&items);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -4466,7 +4477,7 @@ impl Host {
             && crate::descriptor::async_sync_on()
             && runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed))
         {
-            heap_rounds = crate::heap_rounds::Rounds::start();
+            heap_rounds = crate::heap_rounds::Rounds::start_for(runs);
         }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -4650,6 +4661,7 @@ impl Host {
             }
             let (list_wrote_heap, textures) = list.run_deferred(&mut batch, heap_rounds.asked());
             if list_wrote_heap {
+                crate::round_share::list_wrote();
                 heap_rounds.wrote();
             }
             pending_preludes.push((list, textures));
@@ -4899,12 +4911,14 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let _landing = crate::round_share::Landing::begin();
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         hand_back(&back);
+        crate::round_share::touched(back.iter().flat_map(|(_, r)| r.iter().copied()));
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5147,6 +5161,7 @@ impl HostList {
         crate::texture::alias_skip::reset(&self.alias_log);
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
+        self.heap_stamp.store(0, Ordering::Relaxed);
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
