@@ -608,6 +608,9 @@ pub(crate) struct State {
     pending_shows: Vec<(usize, u32, u64, u64)>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The last `CS_RayPrePass*` this list dispatched was the alpha one: its
+    /// `CS_RaytraceVBuffer*` serves the glass (`crate::pipeline::skips_rt_skin`).
+    alpha_rays: bool,
 }
 
 impl Drop for State {
@@ -1214,6 +1217,7 @@ impl State {
             ambient_tables,
             pending_shows,
             tables_gone,
+            alpha_rays,
             root_bindings,
         } = self;
         *pipeline = new_pipeline as usize;
@@ -1283,6 +1287,7 @@ impl State {
         ambient_tables.clear();
         pending_shows.clear();
         *tables_gone = false;
+        *alpha_rays = false;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -3676,9 +3681,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
-        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+        if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
+            self.alpha_rays = alpha;
+        }
+        if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
-                "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS, VICTORY_RT_TRACE =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning)"
+                "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS, VICTORY_RT_TRACE =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
             );
             RT_SKIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -4974,9 +4982,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+        if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
+            self.alpha_rays = alpha;
+        }
+        if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
-                "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning)"
+                "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
             );
             RT_SKIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return false;
