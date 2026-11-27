@@ -127,6 +127,8 @@ pub mod list;
 pub mod native_rt;
 #[cfg(windows)]
 mod rt_bind;
+#[cfg(windows)]
+mod rt_diag;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
