@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3), with PS5 HID input when XInput reports no pads or both
+//! sources are explicitly requested. With no pad the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +21,9 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+#[cfg(any(windows, test))]
+mod dualsense;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1203,7 +1207,8 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, then PS5 pads, the keyboard while our process
+/// has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1266,10 +1271,13 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The input snapshot for this poll and the HID connection owning each slot.
+        pads: [Option<PadState>; PADS],
+        hid_slots: [Option<u64>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1280,8 +1288,23 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if slot == 0 {
+                let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                self.pads = super::dualsense::slots(
+                    super::dualsense::mode(),
+                    xinput,
+                    &mut self.hid_slots,
+                    super::dualsense::pads,
+                );
+            }
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1753,6 +1776,47 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    /// Hardware probe, not a check: prints what each host slot holds
+    /// whenever that changes, for `VICTORY_PROBE_SECS` (default 60), so a
+    /// pad can be unplugged, switched to Bluetooth or put behind a remapper
+    /// while it runs. `cargo test -p victory-hle probe_host_pads -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs real pads and someone to plug them"]
+    fn probe_host_pads() {
+        let secs = std::env::var("VICTORY_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let end = Instant::now() + Duration::from_secs(secs);
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("victory_hle::modules::gameinput=debug")
+            .with_test_writer()
+            .try_init();
+        let mut host = Host::default();
+        let mut last = String::new();
+        let start = Instant::now();
+        while Instant::now() < end {
+            let mut line = String::new();
+            for slot in 0..PADS {
+                let xinput = host.xinput(slot).is_some();
+                let pad = host.pad(slot);
+                let from = match (pad, xinput) {
+                    (None, _) => "-",
+                    (Some(_), true) => "xinput",
+                    (Some(_), false) => "hid",
+                };
+                let pressed = pad.map(|p| p.buttons).unwrap_or(0);
+                line += &format!("[{slot}: {from} {pressed:#06x}] ");
+            }
+            line += &format!("hid pads: {}", super::dualsense::pads().len());
+            if line != last {
+                println!("{:6.1}s {line}", start.elapsed().as_secs_f32());
+                last = line;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
