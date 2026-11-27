@@ -14,6 +14,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod list_views;
+pub(crate) use list_views::on as list_views;
+
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
 /// textures picked by index ([`TextureQueue::slots`] or [`TextureQueue::rechecks`]).
 const SLOT_IN_TEXTURES: u8 = 1 << 0;
@@ -232,6 +235,10 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// With `VICTORY_TABLED_ALL` (`super::tabled_all`), by title slot: the
+    /// stamp of the frame in which a draw last bound a table the slot is
+    /// one of, whatever it held (0: never). Empty without the switch.
+    table_any: Vec<std::sync::atomic::AtomicU32>,
     /// (Neptune) Per block of [`TABLED_BLOCK`] title slots, the frame (plus one; 0: never) in
     /// which a draw last made a table with a slot in it ([`HostHeap::left_to_draws`]).
     tabled_blocks: Vec<std::sync::atomic::AtomicU32>,
@@ -1556,6 +1563,9 @@ impl HostHeap {
             tabled_blocks: (0..if sampler { 0 } else { count / TABLED_BLOCK + 1 })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            table_any: (0..if sampler || !super::tabled_all::on() { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             slot_flags: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
@@ -2462,6 +2472,20 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// Title slot `index` is one of a table a draw binds, whatever it
+    /// holds (`VICTORY_TABLED_ALL`, `super::tabled_all`; nothing without):
+    /// the pass over records copied in as bytes leaves it to its draws for
+    /// a while.
+    pub(crate) fn table_slot(&self, index: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(stamp) = self.table_any.get(index as usize) {
+            let now = super::tabled_all::stamp(crate::frame::current());
+            if stamp.load(Relaxed) != now {
+                stamp.store(now, Relaxed);
+            }
+        }
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2544,39 +2568,75 @@ impl HostHeap {
     /// slot, with the frame and the switches looked up for each, the question alone was
     /// most of the 12 to 16 ms a frame the pass took over 310,000 to 365,000 slots (run
     /// ve138, where it then mirrored 450 of them).
-    pub(crate) fn not_left_to_draws(&self, slots: std::ops::Range<u64>, out: &mut Vec<u32>) {
+    ///
+    /// With `VICTORY_TABLED_ALL` (`super::tabled_all`) a slot of a table a
+    /// draw bound lately is left too, and `retry_at` is made the first
+    /// frame in which one so left is left no longer, if that is before the
+    /// frame it holds: the caller reads the page again then.
+    pub(crate) fn not_left_to_draws(
+        &self,
+        slots: std::ops::Range<u64>,
+        out: &mut Vec<u32>,
+        retry_at: Option<&mut u64>,
+    ) {
+        self.not_left_to_draws_in(slots, out, crate::frame::current(), retry_at);
+    }
+
+    /// [`HostHeap::not_left_to_draws`] in frame `frame`.
+    fn not_left_to_draws_in(
+        &self,
+        slots: std::ops::Range<u64>,
+        out: &mut Vec<u32>,
+        frame: u64,
+        mut retry_at: Option<&mut u64>,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         out.clear();
         let slots = slots.start.min(u64::from(self.count)) as usize
             ..slots.end.min(u64::from(self.count)) as usize;
-        if sync_tables() || !tabled_out() || self.tabled.len() < slots.end {
+        let textures = tabled_out() && self.tabled.len() >= slots.end;
+        let any = self.table_any.len() >= slots.end && !self.table_any.is_empty();
+        if sync_tables() || !(textures || any) {
             out.extend(slots.map(|i| i as u32));
             return;
         }
+        let any_frames = super::tabled_all::frames();
         static BLOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let blocks = *BLOCKS
             .get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BLOCKS").is_none_or(|v| v != "0"));
-        let now = (crate::frame::current() as u32).wrapping_add(1) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         let lately = |stamp: u32| stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES;
         let n = slots.len();
         let (mut block_of, mut block_lately) = (usize::MAX, false);
         for i in slots {
-            let stamp = self.tabled[i].load(Relaxed) & !TABLED_READ;
-            if lately(stamp) {
-                continue;
-            }
-            if stamp != 0 && blocks {
-                let block = i / TABLED_BLOCK as usize;
-                if block != block_of {
-                    block_of = block;
-                    block_lately = self
-                        .tabled_blocks
-                        .get(block)
-                        .is_some_and(|b| lately(b.load(Relaxed)));
-                }
-                if block_lately {
+            if textures {
+                let stamp = self.tabled[i].load(Relaxed) & !TABLED_READ;
+                if lately(stamp) {
                     continue;
                 }
+                if stamp != 0 && blocks {
+                    let block = i / TABLED_BLOCK as usize;
+                    if block != block_of {
+                        block_of = block;
+                        block_lately = self
+                            .tabled_blocks
+                            .get(block)
+                            .is_some_and(|b| lately(b.load(Relaxed)));
+                    }
+                    if block_lately {
+                        continue;
+                    }
+                }
+            }
+            // Left by the switch's own stamp: and read again when it runs out.
+            if any
+                && let Some(until) =
+                    super::tabled_all::until(self.table_any[i].load(Relaxed), frame, any_frames)
+            {
+                if let Some(at) = retry_at.as_deref_mut() {
+                    *at = (*at).min(until);
+                }
+                continue;
             }
             out.push(i as u32);
         }
@@ -5169,6 +5229,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (`VICTORY_TABLED_ALL`) A slot of a table a draw bound is left to its
+    /// draws for the switch's frames and asked for in the frame after, with
+    /// the page's read asked for then; a slot no draw bound is asked for at
+    /// once, and without the stamps (the switch off) nothing changes.
+    #[test]
+    fn a_tables_slot_is_left_for_its_frames_and_its_page_read_again_after() {
+        let Some(mut heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let no_any = |heap: &HostHeap, frame: u64| {
+            let mut out = Vec::new();
+            let mut at = u64::MAX;
+            heap.not_left_to_draws_in(0..8, &mut out, frame, Some(&mut at));
+            (out, at)
+        };
+        let frame = 1_000;
+        // The switch off: no stamps, every slot asked, nothing to retry.
+        assert!(heap.table_any.is_empty());
+        heap.table_slot(5);
+        assert_eq!(no_any(&heap, frame), ((0..8).collect(), u64::MAX));
+        // (The stamps are there only with the switch: here whatever it says.)
+        heap.table_any = (0..8).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let frames = super::super::tabled_all::frames();
+        heap.table_any[5].store(super::super::tabled_all::stamp(frame), std::sync::atomic::Ordering::Relaxed);
+        let others: Vec<u32> = (0..8).filter(|&i| i != 5).collect();
+        assert_eq!(no_any(&heap, frame), (others.clone(), frame + frames + 1));
+        assert_eq!(no_any(&heap, frame + frames), (others, frame + frames + 1));
+        assert_eq!(no_any(&heap, frame + frames + 1), ((0..8).collect(), u64::MAX));
+        // A texture slot of a table lately (the texture queue's own rule)
+        // is left as before, and its page not asked for again on its account.
+        if tabled_out() {
+            heap.tabled_in(2, false, frame);
+            let (out, at) = no_any(&heap, frame);
+            assert!(!out.contains(&2));
+            assert_eq!(at, frame + frames + 1);
+        }
+    }
 
     /// The set of changed buffer slots is emptied, not replaced: it keeps
     /// its allocation from one heap pass to the next.

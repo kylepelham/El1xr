@@ -581,6 +581,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → (first
     /// dynamic slot, scratch CBV epoch if backed by scratch constants).
     fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Option<u64>)>,
+    /// This recording of the list, for the views its fresh tables hold
+    /// (`VICTORY_LIST_VIEWS`, `HostHeap::make_listed`; 0: none yet).
+    recording: u64,
     /// (Neptune) Of those, the ones whose views were made ready for a draw
     /// (`readable`) with nothing to do again while the host list's count of state
     /// changes stands: the host list, that count, and the textures the table shows.
@@ -729,6 +732,7 @@ impl State {
         crate::descriptor::release_dynamic_many(&self.dynamic);
         self.dynamic.clear();
         self.fresh_tables.clear();
+        self.recording = 0;
         self.ready_tables.clear();
         self.seen_tables.clear();
         self.root_srv_slots.clear();
@@ -1217,6 +1221,7 @@ impl State {
             scratch_selected,
             scratch_textures,
             fresh_tables,
+            recording,
             ready_tables,
             seen_tables,
             dynamic,
@@ -1281,6 +1286,7 @@ impl State {
         if fresh_tables.capacity() > 4096 {
             fresh_tables.shrink_to(1024);
         }
+        *recording = 0;
         ready_tables.clear();
         if ready_tables.capacity() > 4096 {
             ready_tables.shrink_to(1024);
@@ -4253,12 +4259,17 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+        match host.mirror(index, handle, true) {
+            Some(view) => {
+                readable(list, u.kind, &view);
+                // Up to date by this draw: not the texture pass's to make.
+                if crate::descriptor::host::is_texture_view(&view) {
+                    host.texture_slot_tabled(index, true);
+                } else {
+                    host.table_slot(index);
+                }
             }
+            None => host.table_slot(index),
         }
     }
 
@@ -4548,6 +4559,10 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if self.recording == 0 && crate::descriptor::host::list_views() {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
             let mut plain = ready_tables_on() && !group.has_uav;
             let mut deferred = false;
             textures.clear();
@@ -4556,6 +4571,11 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let entry = group.entry(k);
+                // The title's own slot is a table's, whatever it holds
+                // (`VICTORY_TABLED_ALL`).
+                if let Some(title) = title_first {
+                    host.table_slot(title + k);
+                }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let in_place = crate::port_cbv::in_place_on();
@@ -4646,7 +4666,18 @@ impl State {
                             .flatten()
                         {
                             Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                            // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
+                            None => {
+                                let listed = crate::descriptor::host::list_views()
+                                    && host.make_listed(
+                                        self.recording,
+                                        crate::descriptor::record_at(table + u64::from(k) * 32),
+                                        index,
+                                    );
+                                if !listed {
+                                    host.make_at(index, &view);
+                                }
+                            }
                         }
                         let kind = entry.map(|u| u.kind).or_else(|| {
                             selected

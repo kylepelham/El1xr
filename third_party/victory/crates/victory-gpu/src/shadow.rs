@@ -7619,6 +7619,53 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    if build::loose_on() {
+        // Made outside the windows' table's lock (`VICTORY_LOOSE_ALLOC_OUTSIDE`).
+        drop(map);
+        return build::loose_outside(
+            (start, len),
+            |map| loose_key(map, address, end, unsized_ask, any),
+            || loose_copy(start, len),
+            note,
+        )
+        .unwrap_or_else(|| loose(address, end, unsized_ask, any));
+    }
+    let shadow = loose_copy(start, len)?;
+    note(&shadow);
+    map.insert((start, len), shadow.clone());
+    Some(shadow)
+}
+
+/// The window of title memory `[address, end)` an ask selects in `map`, as
+/// [`loose`] selects it.
+fn loose_key(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+) -> (u64, u64) {
+    let (cell, _) = window_of(address, end, WINDOW);
+    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    if unsized_ask && tails() {
+        let there = map
+            .range((cell, 0)..=(address, u64::MAX))
+            .map(|(key, _)| *key);
+        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+    } else if any && fine() && !unsized_ask {
+        let there = map
+            .range((cell, 0)..=(address, u64::MAX))
+            .map(|(key, _)| *key);
+        holder(there, address, end).unwrap_or(named)
+    } else {
+        named
+    }
+}
+
+/// The copy of window `[start, start + len)` of title memory outside
+/// buffers: in a GPU upload heap, on the card alone (transient), or in the
+/// PC's memory with or without a card side.
+fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // (Neptune) With `window_upload`, a window that gets a card side has no CPU side
     // (a transient window); one that gets none is made as before.
     // (Neptune) With `window_rebar`: one copy in a GPU upload heap, before either.
@@ -7712,8 +7759,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let _ = card.me.set(weak.clone());
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
     Some(shadow)
 }
 
