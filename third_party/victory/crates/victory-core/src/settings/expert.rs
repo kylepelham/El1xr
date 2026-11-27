@@ -206,6 +206,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_PATCH_CLZERO", Apply::Restart),
     ("VICTORY_PATCH_WAITS", Apply::Restart),
     ("VICTORY_PC_DXC", Apply::Retranslate),
+    ("VICTORY_PIPELINE_COMPUTE_WAIT", Apply::Restart),
     ("VICTORY_PIPELINE_EAGER", Apply::Restart),
     ("VICTORY_PIPELINE_GATE_S", Apply::Restart),
     ("VICTORY_PIPELINE_RECIPES", Apply::Restart),
