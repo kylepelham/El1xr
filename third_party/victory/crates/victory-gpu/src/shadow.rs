@@ -26,6 +26,8 @@ use crate::watch::PAGE;
 
 #[path = "lazy.rs"]
 pub(crate) mod lazy;
+#[path = "shadow_build.rs"]
+mod build;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -6934,6 +6936,8 @@ impl Shadow {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// While its copy is made outside the table's lock ([`build`]).
+    building: Option<build::Ticket>,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -7013,6 +7017,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         Entry {
             end: start + len,
             shadow: None,
+            building: None,
         },
     );
 }
@@ -7119,6 +7124,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let ask_len = len;
     let end = address.checked_add(len.max(1))?;
     {
         // (Neptune) The buffer's copy is there already, the usual case: found beside the
@@ -7214,63 +7220,78 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || {
-                    format!("title buffer {:#x}+{len:#x} on the card", key.0)
-                });
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: Some(buffer),
-                    chunks: Mutex::default(),
-                    flagged: std::sync::atomic::AtomicBool::new(false),
-                    me: std::sync::OnceLock::new(),
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    has_dirty: AtomicBool::new(false),
-                    sent: Mutex::default(),
-                    has_sent: AtomicBool::new(false),
-                    side: [const { Mutex::new(()) }; 64],
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+        if build::on() {
+            // Another thread makes it already: wait for its ticket, not the table.
+            let ticket = entry.building.get_or_insert_with(Default::default).clone();
+            drop(map);
+            return build::made_outside(address, ask_len, any, end, key, ticket, || {
+                copied_buffer(key, len, size)
+            });
+        }
+        entry.shadow = Some(copied_buffer(key, len, size)?);
+    }
+    entry.shadow.clone()
+}
+
+/// The host copy of title buffer `key` (`len` bytes, `size` rounded up):
+/// a buffer of the PC's memory, and for a big one with `cards` one in the
+/// card's memory that shaders use.
+fn copied_buffer(key: (u64, usize), len: u64, size: u64) -> Option<Arc<Shadow>> {
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || {
+                format!("title buffer {:#x}+{len:#x} on the card", key.0)
+            });
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
-                "large buffer copied to the host"
+                "a buffer's host copy is in the card's memory"
             );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+            let card = Card {
+                staging: Some(buffer),
+                chunks: Mutex::default(),
+                flagged: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                has_dirty: AtomicBool::new(false),
+                sent: Mutex::default(),
+                has_sent: AtomicBool::new(false),
+                side: [const { Mutex::new(()) }; 64],
+                size,
+            };
+            (on_card, Some(card))
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if let Some(card) = &shadow.card {
-            let weak = Arc::downgrade(&shadow);
-            let _ = card.me.set(weak.clone());
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
-        }
-        entry.shadow = Some(shadow);
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
     }
-    entry.shadow.clone()
+    let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if let Some(card) = &shadow.card {
+        let weak = Arc::downgrade(&shadow);
+        let _ = card.me.set(weak.clone());
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+    Some(shadow)
 }
 
 /// Whether small title buffers inside one window cell share the cell's
