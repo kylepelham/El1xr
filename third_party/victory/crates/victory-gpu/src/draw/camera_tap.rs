@@ -7,13 +7,23 @@
 //! before the UI blit, [`crate::camera_copy`]) and `VICTORY_CAMERA_MV_CHECK=1`
 //! (64 pixels of depth and motion after the velocity pass,
 //! [`crate::camera_mv`]) record.
+//!
+//! Programs are named by their `_Wrapped` identifier or known hash
+//! ([`crate::camera_diag::program_name`]). On Series X 1.0.2.1 no
+//! `PS_BlitUISDRToBackbuffer` runs: the scene reaches output size in
+//! `PS_TAA2_SpatialUpscaleWithDithering` and the Scaleform UI draws onto it,
+//! so the HUD-less picture is also taken at the frame's first Scaleform draw
+//! onto that target (or one of its size). `VICTORY_CAMERA_DIAG=1` logs a
+//! frame's candidate passes now and then ([`crate::camera_diag`]).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use super::{HostList, Root, State};
+use crate::camera_diag::{Entry, Shape};
 use crate::descriptor::View;
 use crate::pipeline::host::{HostPipeline, Stage};
 
@@ -29,6 +39,10 @@ pub(super) enum Role {
     /// The other velocity shaders (the record only).
     Velocity,
     Ui,
+    /// `PS_TAA2_SpatialUpscale*`: writes the scene at output size.
+    SceneOut,
+    /// A Scaleform UI draw (HUD, menus).
+    UiDraw,
 }
 
 /// What a shader of this program name is to the camera.
@@ -41,21 +55,42 @@ pub(super) fn role_of(name: &str) -> Role {
         Role::Velocity
     } else if name.starts_with("PS_BlitUISDRToBackbuffer") {
         Role::Ui
+    } else if name.starts_with("PS_TAA2_SpatialUpscale") {
+        Role::SceneOut
+    } else if crate::camera_diag::is_scaleform(name) {
+        Role::UiDraw
     } else {
         Role::None
     }
 }
 
+/// What the camera knows of a shader.
+struct Info {
+    role: Role,
+    name: String,
+    tag: Option<&'static str>,
+}
+
 /// By shader object (the shader table keeps every one for the run).
-fn role(stage: &Stage) -> Role {
-    static ROLES: Mutex<Option<HashMap<usize, Role>>> = Mutex::new(None);
-    let key = std::sync::Arc::as_ptr(&stage.shader) as usize;
-    let mut roles = ROLES.lock().unwrap_or_else(|e| e.into_inner());
-    *roles
+fn info(stage: &Stage) -> Arc<Info> {
+    static INFOS: Mutex<Option<HashMap<usize, Arc<Info>>>> = Mutex::new(None);
+    let key = Arc::as_ptr(&stage.shader) as usize;
+    let mut infos = INFOS.lock().unwrap_or_else(|e| e.into_inner());
+    infos
         .get_or_insert_with(HashMap::new)
         .entry(key)
-        .or_insert_with(|| role_of(stage.shader.program().unwrap_or("")))
+        .or_insert_with(|| {
+            let name = stage.shader.camera_name();
+            Arc::new(Info { role: role_of(&name), tag: crate::camera_diag::tag(&name), name })
+        })
+        .clone()
 }
+
+/// The frame (`camera::frame`) and title render target the scene reached
+/// output size in.
+static SCENE_OUT: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
+/// The last frame the UI was found drawing over the scene.
+static UI_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// The table SRV the velocity shaders read the per-view record from.
 fn is_view_record(u: &UsedResource) -> bool {
@@ -88,10 +123,18 @@ fn is_ui_texture(u: &UsedResource) -> bool {
 impl State {
     pub(super) fn camera_tap(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         crate::camera_mv::at_bind(me_of(self), list);
+        let diag = crate::camera_diag::recording();
+        let bind = if diag { crate::camera_diag::next_bind() } else { 0 };
         for stage in &p.stages {
-            match role(stage) {
+            let info = info(stage);
+            if diag {
+                self.camera_diag(list, stage, compute, &info, bind);
+            }
+            match info.role {
                 Role::None => {}
                 Role::Ui => self.camera_ui(list, stage, compute),
+                Role::SceneOut => self.camera_scene_out(compute),
+                Role::UiDraw => self.camera_ui_draw(list, compute),
                 r => {
                     self.camera_velocity(stage, compute);
                     self.camera_targets(list, stage, compute, r);
@@ -192,6 +235,91 @@ impl State {
     }
 }
 
+impl State {
+    fn camera_scene_out(&self, compute: bool) {
+        if let (false, Some(&t)) = (compute, self.targets.first()) {
+            *SCENE_OUT.lock().unwrap_or_else(|e| e.into_inner()) = (crate::camera::frame(), t as u64);
+        }
+    }
+
+    /// The frame's first Scaleform draw onto the scene at output size (the
+    /// same target, or one of its size): the HUD-less picture is the target
+    /// as it is now.
+    fn camera_ui_draw(&self, list: &HostList, compute: bool) {
+        let frame = crate::camera::frame();
+        if compute || UI_FRAME.load(Ordering::Relaxed) == frame {
+            return;
+        }
+        let Some(current) = self.targets.first().map(|&t| t as u64) else {
+            return;
+        };
+        let (scene_frame, scene) = *SCENE_OUT.lock().unwrap_or_else(|e| e.into_inner());
+        if scene_frame != frame || scene == 0 {
+            return;
+        }
+        if current != scene {
+            let size = |t| crate::camera_copy::surface_of(t).map(|s| s.0.size);
+            if size(current).is_none() || size(current) != size(scene) {
+                return;
+            }
+        }
+        UI_FRAME.store(frame, Ordering::Relaxed);
+        crate::camera::note_ui(crate::camera::Ui { texture: 0, target: current });
+        crate::dlssg::tag_from_camera(list);
+        if crate::camera_copy::hudless_on() {
+            crate::camera_copy::copy_hudless(list, current);
+        }
+    }
+
+    /// `VICTORY_CAMERA_DIAG=1`: the bind's targets and views, kept for the
+    /// frame's dump if it is a candidate.
+    fn camera_diag(&self, list: &HostList, stage: &Stage, compute: bool, info: &Info, bind: u32) {
+        if stage.shader.stage == "vertex" {
+            return;
+        }
+        let shape = |slot: String, title: u64| {
+            if title == 0 || !crate::resource::host_copy_made(title as crate::object::This) {
+                return None;
+            }
+            crate::camera_copy::surface_of(title)
+                .map(|(s, _)| Shape { slot, title, format: s.format, size: s.size })
+        };
+        let mut shapes = Vec::new();
+        if !compute {
+            shapes.extend(self.targets.iter().enumerate().filter_map(|(i, &t)| shape(format!("rt{i}"), t as u64)));
+            shapes.extend(shape("dsv".into(), self.depth as u64));
+        }
+        let views = |kind: ResourceType, prefix: char| {
+            stage
+                .translated()
+                .used
+                .iter()
+                .filter(move |u| u.kind == kind && u.root == RootType::Table)
+                .filter_map(move |u| match self.camera_view(compute, u) {
+                    Some(View::Shader(r, _) | View::Unordered(r, _, _)) => {
+                        shape(format!("{prefix}{}", u.lower_bound), r as u64)
+                    }
+                    _ => None,
+                })
+        };
+        shapes.extend(views(ResourceType::Uav, 'u').take(8));
+        let written = shapes.iter().any(|s| s.format == crate::camera_diag::R16G16_FLOAT);
+        if info.tag.is_none() && !written {
+            return;
+        }
+        shapes.extend(views(ResourceType::Srv, 't').take(8));
+        crate::camera_diag::note(Entry {
+            bind,
+            list: std::ptr::from_ref(list) as usize,
+            stage: stage.shader.stage,
+            hash: stage.shader.hash.clone(),
+            name: info.name.clone(),
+            tag: info.tag,
+            shapes,
+        });
+    }
+}
+
 fn me_of(s: &State) -> usize {
     std::ptr::from_ref(s) as usize
 }
@@ -217,6 +345,15 @@ mod tests {
         );
         assert_eq!(role_of("VS_VelocityFill_4f86a26b_Wrapped"), Role::None);
         assert_eq!(role_of("PS_LateComposite_f0b98a13_Wrapped"), Role::None);
+        assert_eq!(
+            role_of("PS_TAA2_SpatialUpscaleWithDithering_08f754c8_Wrapped"),
+            Role::SceneOut
+        );
+        assert_eq!(role_of("VS_TAA2_SpatialUpscale_08f754c8_Wrapped"), Role::None);
+        assert_eq!(role_of("FVertexCxformEAlpha_bc8bd7de_Wrapped"), Role::UiDraw);
+        assert_eq!(role_of("FTexTGCxformEAlpha_dbb12f08_Wrapped"), Role::UiDraw);
+        // What the old name lookup gave a graphics container: no role.
+        assert_eq!(role_of("SV_Position"), Role::None);
         assert_eq!(role_of(""), Role::None);
     }
 

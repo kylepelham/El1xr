@@ -72,9 +72,12 @@ pub(crate) struct Shader {
 }
 
 impl Shader {
-    /// The program name in its container (`PS_VelocityFill_...`), if any.
-    pub(crate) fn program(&self) -> Option<&str> {
-        program_name(&self.container)
+    /// The program as the camera tap names it: the container's `_Wrapped`
+    /// identifier (a graphics container names `SV_Position` first), else
+    /// known by hash (`crate::camera_diag`).
+    #[cfg(windows)]
+    pub(crate) fn camera_name(&self) -> String {
+        crate::camera_diag::program_name(&self.container, &self.hash)
     }
 
     /// Whether it is a skin lighting pixel stage (`crate::skin_fill`).

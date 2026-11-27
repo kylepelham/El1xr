@@ -163,6 +163,7 @@ mod ngx;
 pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
+pub mod camera_diag;
 #[cfg(windows)]
 pub mod camera_copy;
 #[cfg(windows)]
