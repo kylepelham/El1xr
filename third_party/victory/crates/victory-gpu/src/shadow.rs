@@ -5344,21 +5344,31 @@ impl Shadow {
         if !self.has_pending.load(Ordering::Acquire) {
             return self.update_free(from, to, &[]);
         }
+        let page_from = (from & !(PAGE - 1)).max(start);
+        let page_to = to.next_multiple_of(PAGE).min(end);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .copied()
-            .filter(|&(a, e)| a < to && e > from)
+            .filter(|&(a, e)| a < page_to && e > page_from)
             .collect();
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). `busy` also includes pending
+            // ranges in the same 64 KiB edge pages so `copy_stale` never
+            // expands a partial page over shader-written bytes.
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for &(a, e) in &busy {
+                if e <= from {
+                    continue;
+                }
+                if a >= to {
+                    break;
+                }
                 if a > at {
                     bytes += self.update_free(at, a, &busy);
                 }
@@ -5372,6 +5382,25 @@ impl Shadow {
         self.update_free(from, to, &[])
     }
 
+    fn profile_kind(&self) -> crate::copy_profile::ShadowKind {
+        use crate::copy_profile::ShadowKind;
+        if self.window {
+            if self.rebar {
+                ShadowKind::WinRebar
+            } else if self.transient() {
+                ShadowKind::WinTransient
+            } else if self.card.is_some() {
+                ShadowKind::WinCard
+            } else {
+                ShadowKind::WinHost
+            }
+        } else if self.card.is_some() {
+            ShadowKind::BufCard
+        } else {
+            ShadowKind::BufHost
+        }
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(
@@ -5380,6 +5409,11 @@ impl Shadow {
         to: usize,
         skip_busy: &[(usize, usize)],
     ) -> usize {
+        let prof = crate::copy_profile::enabled();
+        let prof_start = prof.then(std::time::Instant::now);
+        if prof {
+            crate::copy_profile::begin_diff();
+        }
         // Detect any overlapping OTHER shadow's deferred pages WITHOUT flushing
         // or unprotecting them: marking those pages stale (`copied = 0`) makes
         // `copy_stale` -> `copy` -> `host::copy_mapped` read their fresh GPU
@@ -5427,7 +5461,19 @@ impl Shadow {
                 self.watched.store(1, Ordering::Relaxed);
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, &subs);
+                let is_view = prof && crate::watch::is_known_view(from);
+                let mut prof_counts = crate::copy_profile::UpdateCounts::default();
+                let copied = self.copy_stale(
+                    from,
+                    to,
+                    skip_busy,
+                    other_deferred.is_empty(),
+                    now,
+                    &written,
+                    &subs,
+                    is_view,
+                    prof.then_some(&mut prof_counts),
+                );
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
@@ -5441,6 +5487,21 @@ impl Shadow {
                     }
                 }
                 self.refresh_check(from, to);
+                if let Some(t0) = prof_start
+                    && copied > 0
+                {
+                    crate::copy_profile::note_shadow_update(
+                        self.id,
+                        self.start,
+                        self.len,
+                        self.profile_kind(),
+                        is_view,
+                        to - from,
+                        copied,
+                        t0.elapsed().as_micros() as u64,
+                        prof_counts,
+                    );
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -5470,6 +5531,23 @@ impl Shadow {
         } else {
             self.copy(from, to)
         };
+        if let Some(t0) = prof_start
+            && bytes > 0
+        {
+            let mut counts = crate::copy_profile::UpdateCounts::default();
+            counts.unwatched_bytes = bytes as u64;
+            crate::copy_profile::note_shadow_update(
+                self.id,
+                self.start,
+                self.len,
+                self.profile_kind(),
+                crate::watch::is_known_view(from),
+                to - from,
+                bytes,
+                t0.elapsed().as_micros() as u64,
+                counts,
+            );
+        }
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);
@@ -5598,16 +5676,25 @@ impl Shadow {
     /// found and the asking before that which found the page written. A copy
     /// that took the page at or after that earlier asking copies only those
     /// 4 KiB pages (`crate::watch::dirty4k`).
+    #[allow(clippy::too_many_arguments)]
     fn copy_stale(
         self: &Arc<Self>,
         from: usize,
         to: usize,
+        skip_busy: &[(usize, usize)],
+        allow_expand: bool,
         now: u64,
         written: &[(usize, u64)],
         subs: &[(usize, u64, u64, u16)],
+        is_view: bool,
+        mut prof_counts: Option<&mut crate::copy_profile::UpdateCounts>,
     ) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let (eff_from, eff_to) =
+            crate::copy_profile::expand_bounds(from, to, start, end, skip_busy, allow_expand);
         let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
         let four_k = crate::watch::watch_4k();
         let dirty_4k_kept = crate::watch::dirty4k_kept();
@@ -5615,11 +5702,18 @@ impl Shadow {
             let runs = {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 if has_deferred {
-                    copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
-                        is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
-                    })
+                    copied.plan_stale_filtered(
+                        base,
+                        start,
+                        end,
+                        eff_from,
+                        eff_to,
+                        now,
+                        written,
+                        |idx| is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
+                    )
                 } else {
-                    copied.plan_stale(base, start, end, from, to, now, written)
+                    copied.plan_stale(base, start, end, eff_from, eff_to, now, written)
                 }
             };
             let total: usize = runs.iter().map(|(a, b)| b - a).sum();
@@ -5637,18 +5731,12 @@ impl Shadow {
         // with CopiedPages bitset consistency and lazy-deferred page skipping.
         let bytes_runs = {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let mut writes = written.iter().peekable();
-            let mut subs = subs.iter().peekable();
             let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
-            let last = (to - 1) / PAGE;
-            for page in from / PAGE..=last {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
+            let lo = first_page - base;
+            let hi = last - base;
+            let all_copied = copied.range_all_copied(lo, hi);
+            let mut subs = subs.iter().peekable();
+            let mut handle_page = |copied: &mut CopiedPages, page: usize, write: u64| {
                 while subs.peek().is_some_and(|s| s.0 < page) {
                     subs.next();
                 }
@@ -5658,7 +5746,7 @@ impl Shadow {
                     .map(|s| (s.2, s.3));
                 let idx = page - base;
                 if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
-                    continue;
+                    return;
                 }
                 let prev = copied.get(idx).unwrap_or(0);
                 if prev == 0 || write > prev {
@@ -5673,10 +5761,79 @@ impl Shadow {
                         crate::watch::dirty4k_count(found, narrow && found.is_some());
                         if narrow { found } else { None }
                     };
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    let marked = (page * PAGE).max(start) >= eff_from
+                        && ((page + 1) * PAGE).min(end) <= eff_to;
+                    if marked {
                         copied.set(idx, now);
                     }
+                    if let Some(pc) = prof_counts.as_deref_mut() {
+                        let lo_b = (page * PAGE).max(eff_from);
+                        let hi_b = ((page + 1) * PAGE).min(eff_to);
+                        let span_b = hi_b.saturating_sub(lo_b) as u64;
+                        let pg_b = match mask {
+                            Some(m) => {
+                                let mut b = 0u64;
+                                for k in 0..16usize {
+                                    if m & (1u16 << k) != 0 {
+                                        let a = (page * PAGE + k * 4096).max(eff_from);
+                                        let e = (page * PAGE + (k + 1) * 4096).min(eff_to);
+                                        b += e.saturating_sub(a) as u64;
+                                    }
+                                }
+                                b
+                            }
+                            None => span_b,
+                        };
+                        if !marked {
+                            pc.partial_unmarked_bytes += pg_b;
+                            pc.partial_unmarked_pages += 1;
+                        }
+                        if prev == 0 {
+                            pc.first_bytes += pg_b;
+                            pc.first_pages += 1;
+                        } else if mask.is_some() {
+                            pc.mask4k_bytes += pg_b;
+                            pc.mask4k_pages += 1;
+                        } else if is_view {
+                            pc.whole_view_bytes += pg_b;
+                            pc.whole_view_pages += 1;
+                        } else {
+                            pc.whole_other_bytes += pg_b;
+                            pc.whole_other_pages += 1;
+                        }
+                    }
                     extend_runs(&mut run, &mut bytes_runs, page, mask.unwrap_or(u16::MAX));
+                }
+            };
+            if all_copied {
+                let w_start = if written.len() > 8 {
+                    written.partition_point(|&(p, _)| p < first_page)
+                } else {
+                    0
+                };
+                for &(page, write) in &written[w_start..] {
+                    if page < first_page {
+                        continue;
+                    }
+                    if page > last {
+                        break;
+                    }
+                    handle_page(&mut copied, page, write);
+                }
+            } else {
+                let mut writes = written.iter().peekable();
+                for page in first_page..=last {
+                    while writes.peek().is_some_and(|&&(p, _)| p < page) {
+                        writes.next();
+                    }
+                    let write = match writes.peek() {
+                        Some(&&(p, w)) if p == page => {
+                            writes.next();
+                            w
+                        }
+                        _ => 0,
+                    };
+                    handle_page(&mut copied, page, write);
                 }
             }
             bytes_runs.extend(run);
@@ -5685,7 +5842,7 @@ impl Shadow {
         let bytes_runs: Vec<(usize, usize)> = bytes_runs
             .into_iter()
             .filter_map(|(a, b)| {
-                let (a, b) = (a.max(from), b.min(to));
+                let (a, b) = (a.max(eff_from), b.min(eff_to));
                 (a < b).then_some((a, b))
             })
             .collect();
@@ -5779,12 +5936,16 @@ impl Shadow {
                     off += len;
                 }
                 COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
-                if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
+                let copied_diff = if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
                     let copied: usize = runs.iter().map(|&(_, m)| m).sum();
                     COPY_CHANGED[1].fetch_add(copied as u64, Ordering::Relaxed);
                     self.changed(from - start + first.0, from - start + last.0 + last.1);
                     self.card_changed_runs(from - start, &runs, true);
-                }
+                    copied
+                } else {
+                    0
+                };
+                crate::copy_profile::note_diff(n, copied_diff);
             });
             return n;
         }

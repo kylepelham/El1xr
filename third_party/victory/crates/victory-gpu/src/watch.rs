@@ -1274,10 +1274,11 @@ fn dirty4k_mode() -> u8 {
 }
 
 /// Whether the journal keeps the 4 KiB pages found ([`SUB_PAGES`]): with the
-/// switch on, and in both phases of `alt` (the phase without counts what it
+/// switch on (unless [`watch_4k`] already handles 4 KiB sub-pages lock-free via
+/// [`SUBS`]), and in both phases of `alt` (the phase without counts what it
 /// would have saved).
 pub(crate) fn dirty4k_kept() -> bool {
-    dirty4k_mode() != 0
+    !watch_4k() && dirty4k_mode() != 0
 }
 
 /// With [`dirty4k_kept`]: the entries of [`SUB_PAGES`] for the pages of
@@ -1454,17 +1455,31 @@ fn found_set(address: usize, now: u64) {
 /// copied (`at == 0`), written without a 4 KiB answer, or nothing found.
 pub(crate) fn stale_mask(page: usize, at: u64) -> Option<u16> {
     use std::sync::atomic::Ordering::Acquire;
-    if !watch_4k() || at == 0 {
+    if !watch_4k() {
+        if at != 0 {
+            crate::copy_profile::note_whole_why(crate::copy_profile::WholeWhy::NoWatch4k);
+        }
+        return None;
+    }
+    if at == 0 {
         return None;
     }
     if part_of(&WHOLE, page, false).is_some_and(|p| p.0[page % PART].load(Acquire) > at) {
+        crate::copy_profile::note_whole_why(crate::copy_profile::WholeWhy::WholeStamp);
         return None;
     }
     let sub = page * (PAGE / KERNEL_PAGE);
-    let part = part_of(&SUBS, sub, false)?;
+    let Some(part) = part_of(&SUBS, sub, false) else {
+        crate::copy_profile::note_whole_why(crate::copy_profile::WholeWhy::NoSubsPart);
+        return None;
+    };
     let stamps: [u64; PAGE / KERNEL_PAGE] =
         std::array::from_fn(|k| part.0[(sub + k) % PART].load(Acquire));
-    mask_of(&stamps, at)
+    let m = mask_of(&stamps, at);
+    if m.is_none() {
+        crate::copy_profile::note_whole_why(crate::copy_profile::WholeWhy::ZeroMask);
+    }
+    m
 }
 
 /// The sub-pages stamped after `at`; `None` if there are none (the page's stamp then rests on
@@ -2688,6 +2703,10 @@ const BLOCK: usize = PAGE;
 /// Whether the block holding `start` is view memory the guards already hold (read-only by our
 /// hand, or noted absent): asking the kernel's write watch about it can only fail.
 /// `VICTORY_VIEW_ASK=1` (or `VICTORY_GUARD_ASK=1`) asks anyway, as before.
+pub(crate) fn is_known_view(start: usize) -> bool {
+    known_view(start)
+}
+
 fn known_view(start: usize) -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| {
