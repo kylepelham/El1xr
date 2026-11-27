@@ -157,6 +157,13 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     victory_hle::modules::audio::mute::start();
+    struct MuteStop;
+    impl Drop for MuteStop {
+        fn drop(&mut self) {
+            victory_hle::modules::audio::mute::stop();
+        }
+    }
+    let _mute_stop = MuteStop;
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {

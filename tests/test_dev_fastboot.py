@@ -82,3 +82,48 @@ def test_parse_victory_log_reports_boot_seconds_to_first_world_frame():
     stats = dev.parse_victory_log(log)
     assert stats["world_samples"] == 1
     assert stats["boot_s"] == pytest.approx(51.25)
+
+
+def test_fast_boot_is_opt_in_and_sets_skip_intro_save_and_menu_cadence():
+    dev = load_dev()
+    parser = dev.build_parser()
+    for sub in ("bench", "capture"):
+        plain = parser.parse_args([sub])
+        assert dev.apply_fast_boot(plain, {}) == {}
+        assert plain.skip_intro is False and plain.save is None
+
+        fast = parser.parse_args([sub, "--fast-boot"])
+        overrides = dev.apply_fast_boot(fast, {})
+        assert fast.skip_intro is True and fast.save == "default_checkpoint"
+        assert overrides == {"VICTORY_AUTO_A_PERIOD_MS": "500"}
+
+        mine = parser.parse_args([sub, "--fast-boot", "--save", "other"])
+        kept = dev.apply_fast_boot(mine, {"VICTORY_AUTO_A_PERIOD_MS": "1000"})
+        assert mine.save == "other" and kept == {"VICTORY_AUTO_A_PERIOD_MS": "1000"}
+
+
+def pacing(ts: str, p50: float, draws: int) -> str:
+    return (
+        f"{ts}  INFO victory_gpu::pacing: frame pacing: 100 frames in 5.0 s (20.0 fps), frame time p50 {p50} ms "
+        f"p95 60.0 ms p99 70.0 ms max 80.0 ms, 0 over 50 ms, 0 over 100 ms, "
+        f"present interval sd 1.0 ms jitter 1.0 ms; {draws} draws/frame"
+    )
+
+
+def test_settled_s_is_the_first_world_window_after_the_last_loading_one():
+    dev = load_dev()
+    log = "\n".join(
+        [
+            "2026-11-26T23:00:00.000000Z  INFO victory_loader::windows: image mapped",
+            pacing("2026-11-26T23:00:10.000000Z", 40.0, 12),
+            pacing("2026-11-26T23:00:40.000000Z", 300.0, 1500),
+            pacing("2026-11-26T23:00:45.000000Z", 40.0, 1500),
+            pacing("2026-11-26T23:00:50.000000Z", 250.0, 1500),
+            pacing("2026-11-26T23:00:55.000000Z", 35.0, 1500),
+            pacing("2026-11-26T23:01:00.000000Z", 34.0, 1500),
+        ]
+    )
+    stats = dev.parse_victory_log(log)
+    assert stats["boot_s"] == pytest.approx(40.0)
+    assert stats["settled_s"] == pytest.approx(55.0)
+    assert dev.parse_victory_log(pacing("2026-11-26T23:00:00.000000Z", 300.0, 1500))["settled_s"] == 0.0

@@ -792,6 +792,101 @@ pub(crate) fn note_drop(this: This) {
     note_why(why);
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrepareFailure {
+    #[default]
+    Unclassified,
+    SkippedPipeline,
+    MissingHostPipeline,
+    PipelineKind,
+    IndexBuffer,
+    DynamicDescriptorTable,
+    ShaderMemoryViews,
+    RootUavBuffer,
+    RootUavHeap,
+    RootUavSlot,
+    RootSrvHeap,
+    RootSrvSlot,
+}
+
+/// Keep the first example of each failure per pipeline, with room for every
+/// kind even when one compute pipeline repeatedly fails during world load.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn new_indirect_example(
+    seen: &mut Vec<(u32, String, PrepareFailure)>,
+    kind: u32,
+    key: &str,
+    why: PrepareFailure,
+) -> bool {
+    const PER_KIND: usize = 8;
+    if seen.iter().any(|(k, p, r)| *k == kind && p == key && *r == why)
+        || seen.iter().filter(|(k, _, _)| *k == kind).count() >= PER_KIND
+    {
+        return false;
+    }
+    seen.push((kind, key.to_owned(), why));
+    true
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_indirect_prepare(
+    this: This,
+    why: PrepareFailure,
+    (kind, stride, max): (u32, u32, u32),
+    (args, address): (&crate::shadow::Shadow, u64),
+    counter: Option<&(Arc<crate::shadow::Shadow>, u64)>,
+) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_PREPARE_LOG").is_some_and(|v| v == "1"))
+    {
+        return;
+    }
+    static SEEN: Mutex<Vec<(u32, String, PrepareFailure)>> = Mutex::new(Vec::new());
+    let key = shaders_of(this);
+    if !new_indirect_example(
+        &mut SEEN.lock().unwrap_or_else(|e| e.into_inner()),
+        kind,
+        &key,
+        why,
+    ) {
+        return;
+    }
+    let shaders: Vec<_> = if this.is_null() {
+        Vec::new()
+    } else {
+        pipeline(this)
+            .shaders
+            .iter()
+            .map(|s| (s.stage, s.hash.as_str()))
+            .collect()
+    };
+    let command = match kind {
+        0 => "draw",
+        1 => "draw indexed",
+        2 => "dispatch",
+        10 => "dispatch mesh",
+        _ => "unknown",
+    };
+    tracing::info!(
+        frame = crate::frame::current(),
+        kind,
+        command,
+        stride,
+        max,
+        reason = ?why,
+        pipeline = ?this,
+        guest_shaders = ?shaders,
+        arguments = format_args!("{address:#x}"),
+        argument_buffer = args.id(),
+        argument_offset = args.offset(address),
+        count_address = counter.map(|(_, at)| *at),
+        count_buffer = counter.map(|(s, _)| s.id()),
+        count_offset = counter.map(|(s, at)| s.offset(*at)),
+        "indirect command preparation failed"
+    );
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(windows)]
 pub(crate) fn note_why(why: String) {
@@ -921,6 +1016,30 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Slot 0x218 tries a precompiled compute pipeline. On a miss the caller
+/// retries at 0x1f0 with its full shader container.
+pub(crate) extern "system" fn cached_compute(
+    _: This,
+    _desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    if !out.is_null() {
+        // SAFETY: the caller supplies the pipeline out pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if misses.is_power_of_two() {
+        tracing::info!(
+            misses,
+            "precompiled compute cache miss at 0x218; the caller can retry with its shader at 0x1f0"
+        );
+    }
+    object::E_NOTIMPL
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -1179,6 +1298,100 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn cached_compute_miss_falls_back_to_the_compute_container() {
+        use crate::object::slot;
+        type Cached = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        type Compute = extern "system" fn(
+            This,
+            *const ComputeHead,
+            u32,
+            *const u8,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        let device = crate::device::device();
+        let pair_data = [0u32; 7];
+        let mut entry = [0usize; 9];
+        for pair in entry[1..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&[pair_data.as_ptr() as usize, size_of_val(&pair_data)]);
+        }
+        let mut p = device;
+        assert!(
+            slot::<Cached>(device, 0x218)(device, entry.as_ptr().cast(), &PIPELINE_IIDS[0], &mut p)
+                < 0
+        );
+        assert!(p.is_null());
+        let code = [1u8, 2, 3, 4];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+        };
+        assert_eq!(
+            slot::<Compute>(device, 0x1f0)(
+                device,
+                &desc,
+                0,
+                std::ptr::null(),
+                &PIPELINE_IIDS[0],
+                &mut p
+            ),
+            S_OK
+        );
+        assert_eq!(shaders(p), [("compute", code.to_vec())]);
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn indirect_prepare_examples_preserve_each_command_kind() {
+        use PrepareFailure::{DynamicDescriptorTable, IndexBuffer};
+
+        let mut seen = Vec::new();
+        assert!(new_indirect_example(
+            &mut seen,
+            2,
+            "first",
+            DynamicDescriptorTable
+        ));
+        assert!(!new_indirect_example(
+            &mut seen,
+            2,
+            "first",
+            DynamicDescriptorTable
+        ));
+        for key in 1..8 {
+            assert!(new_indirect_example(
+                &mut seen,
+                2,
+                &key.to_string(),
+                DynamicDescriptorTable
+            ));
+        }
+        assert!(!new_indirect_example(
+            &mut seen,
+            2,
+            "later",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(
+            &mut seen,
+            10,
+            "first",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(
+            &mut seen,
+            1,
+            "other",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(&mut seen, 1, "other", IndexBuffer));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

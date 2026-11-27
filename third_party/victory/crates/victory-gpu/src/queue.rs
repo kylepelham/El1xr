@@ -44,15 +44,15 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
 /// The queues that hold something (their addresses).
@@ -509,12 +509,29 @@ pub(crate) fn release_held(all: bool) {
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
                         break;
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(&Held::Value(wait)) if !all => {
+                        let met = if async_submit() {
+                            // `late_met` can wait for GPU writes to reach title memory;
+                            // release the queue's line lock while checking so the title
+                            // can keep enqueueing behind this head.
+                            RUNNING.store(q, Ordering::Release);
+                            drop(held);
+                            let met = value_met(&wait);
+                            held = lock(held_of);
+                            RUNNING.store(0, Ordering::Release);
+                            met
+                        } else {
+                            value_met(&wait)
+                        };
+                        if !met {
+                            break;
+                        }
+                    }
                     Some(_) => {}
                 }
                 match held.remove(0) {
@@ -603,8 +620,8 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.as_this(), value) {
+                            crate::fence::set(fence.as_this(), value);
                         }
                     }
                 }
@@ -813,13 +830,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::retain(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -851,7 +868,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         let aside = async_present() && {
             let mut later = lock(&LATER.0);
             if later.pending && waits() {
-                later.next.push((this as usize, Held::Wait(fence as usize, value)));
+                later.next.push((this as usize, Held::Wait(crate::fence::FenceRef::retain(fence), value)));
             }
             later.pending
         };
@@ -859,7 +876,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value || RUNNING.load(Ordering::Acquire) == this as usize;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::retain(fence), value));
             }
             behind
         };

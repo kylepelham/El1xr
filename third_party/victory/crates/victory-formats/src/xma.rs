@@ -279,23 +279,69 @@ fn log2(v: usize) -> u32 {
 
 // The inverse transform.
 
+/// Precomputed pre- and post-twiddle factors for an `n`-point half-IMDCT.
+struct ImdctTwiddles {
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+}
+
+impl ImdctTwiddles {
+    fn new(n: usize) -> Self {
+        let m = n / 2;
+        let pre = (0..m)
+            .map(|k| (-std::f64::consts::PI * k as f64 / n as f64).sin_cos())
+            .collect();
+        let post = (0..m)
+            .map(|k| (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos())
+            .collect();
+        Self { pre, post }
+    }
+}
+
+/// Precomputed twiddle tables for the three XMA subframe lengths (128, 256, 512)
+/// and radix-2 FFT stage step angles (`len = 2..=256`).
+struct ImdctTables {
+    sizes: [ImdctTwiddles; BLOCK_SIZES],
+    fft_steps: [(f64, f64); 8],
+}
+
+fn imdct_tables() -> &'static ImdctTables {
+    static TABLES: OnceLock<ImdctTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let sizes = [
+            ImdctTwiddles::new(128),
+            ImdctTwiddles::new(256),
+            ImdctTwiddles::new(512),
+        ];
+        let fft_steps = std::array::from_fn(|stage| {
+            let len = 2usize << stage;
+            (-2.0 * std::f64::consts::PI / len as f64).sin_cos()
+        });
+        ImdctTables { sizes, fft_steps }
+    })
+}
+
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
-/// n/2-point complex FFT.
+/// n/2-point complex FFT using precomputed twiddles and stack scratch.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
     let m = n / 2;
-    let mut re = vec![0f64; m];
-    let mut im = vec![0f64; m];
+    debug_assert!(matches!(n, 128 | 256 | 512));
+    let tables = imdct_tables();
+    let tw = &tables.sizes[log2(n) as usize - 7];
+    let mut re_buf = [0f64; FRAME_SAMPLES / 2];
+    let mut im_buf = [0f64; FRAME_SAMPLES / 2];
+    let (re, im) = (&mut re_buf[..m], &mut im_buf[..m]);
     for k in 0..m {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+        let (s, c) = tw.pre[k];
         (re[k], im[k]) = (a * c - b * s, a * s + b * c);
     }
-    fft(&mut re, &mut im);
+    fft(re, im, &tables.fft_steps);
     for k in 0..m {
-        let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+        let (s, c) = tw.post[k];
         let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
         // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
         out[n - 1 - 2 * k] = (wr as f32) * scale;
@@ -304,7 +350,7 @@ fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
 }
 
 /// In-place radix-2 forward DFT (`exp(-2πi nk/N)`).
-fn fft(re: &mut [f64], im: &mut [f64]) {
+fn fft(re: &mut [f64], im: &mut [f64], steps: &[(f64, f64)]) {
     let n = re.len();
     let mut j = 0;
     for i in 1..n {
@@ -320,8 +366,9 @@ fn fft(re: &mut [f64], im: &mut [f64]) {
         }
     }
     let mut len = 2;
+    let mut stage = 0;
     while len <= n {
-        let (ws, wc) = (-2.0 * std::f64::consts::PI / len as f64).sin_cos();
+        let (ws, wc) = steps[stage];
         for start in (0..n).step_by(len) {
             let (mut cr, mut ci) = (1.0, 0.0);
             for k in 0..len / 2 {
@@ -333,6 +380,7 @@ fn fft(re: &mut [f64], im: &mut [f64]) {
             }
         }
         len <<= 1;
+        stage += 1;
     }
 }
 
@@ -1025,6 +1073,15 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_bounds_declared_bits_to_real_payload() {
+        let mut dec = Decoder::new(1, 48000);
+        let mut out = Vec::new();
+        // Declared length far past the 4-byte payload must not loop or panic.
+        let _ = dec.decode(&[0u8; 4], 100_000, &mut out);
+        assert_eq!(out.len(), FRAME_SAMPLES);
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {

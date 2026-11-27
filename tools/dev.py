@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import dev_driver
 import dev_gate
+import dev_throttle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -112,48 +114,31 @@ def parse_overrides(items: list[str]) -> dict[str, str]:
 @contextlib.contextmanager
 def acquire_gpu_lock(tag: str, timeout_s: float = 4 * 3600.0) -> Iterator[None]:
     ensure_coord_dirs()
-    deadline = time.monotonic() + timeout_s
-    fd = os.open(str(GPU_LOCK), os.O_CREAT | os.O_RDWR)
-    locked = False
-    try:
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Timed out waiting for GPU lock {GPU_LOCK}")
-                time.sleep(0.25)
-
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()} tag={tag} started={stamp}\n".encode("utf-8"))
+    with dev_throttle.hold_first_free([GPU_LOCK], tag, timeout_s):
         yield
-    finally:
-        if locked:
-            try:
-                if os.name == "nt":
-                    import msvcrt
 
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
 
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
+def throttled(name: str):
+    """Build/test/gate/policy: refuse on a nearly full drive, run below normal priority, and wait
+    for one of the machine-wide build slots so parallel worktree jobs cannot swamp the CPU."""
+
+    def wrap(func):
+        def run(args: argparse.Namespace) -> int:
+            free_gb = dev_throttle.disk_free_gb(REPO_ROOT)
+            if free_gb < dev_throttle.MIN_FREE_GB:
+                print(
+                    f"DEV {name} FAIL disk_free_gb={free_gb:.0f} "
+                    f"need={dev_throttle.MIN_FREE_GB:.0f} (clear target/ of merged worktrees)"
+                )
+                return 1
+            ensure_coord_dirs()
+            dev_throttle.below_normal_priority()
+            with dev_throttle.build_slot(LOCKS_DIR, f"{JOB or 'main'}:{name}"):
+                return func(args)
+
+        return run
+
+    return wrap
 
 
 def run_logged_steps(
@@ -240,6 +225,24 @@ def normalize_argv(argv: list[str]) -> list[str]:
             out.append(argv[i])
             i += 1
     return out
+
+
+FAST_BOOT_SAVE = "default_checkpoint"
+FAST_BOOT_AUTO_A_PERIOD_MS = "500"
+
+
+def apply_fast_boot(args: argparse.Namespace, overrides: dict[str, str]) -> dict[str, str]:
+    """`--fast-boot`: skip the startup intro (-skipToIIS), press Enter every 0.5 s instead of 4 s
+    through the menus, and load the frozen `default_checkpoint` save unless `--save` names
+    another. Explicit `--override` values win."""
+    if not getattr(args, "fast_boot", False):
+        return overrides
+    args.skip_intro = True
+    if not args.save:
+        args.save = FAST_BOOT_SAVE
+    merged = dict(overrides)
+    merged.setdefault("VICTORY_AUTO_A_PERIOD_MS", FAST_BOOT_AUTO_A_PERIOD_MS)
+    return merged
 
 
 def apply_mute_default(overrides: dict[str, str], unmute: bool) -> tuple[dict[str, str], bool]:
@@ -343,6 +346,14 @@ def parse_pacing_line(line: str) -> dict[str, float] | None:
     return {k: float(v) for k, v in zip(keys, m.groups())}
 
 
+def settled_world_ts(windows: list[tuple[datetime, float]]) -> datetime | None:
+    """End of the first world pacing window after the last one still loading (median frame over
+    LOADING_P50_MS), as `summarize_pacing` counts settled; None while the world never settles."""
+    loading = [i for i, (_, p50) in enumerate(windows) if p50 > LOADING_P50_MS]
+    start = loading[-1] + 1 if loading else 0
+    return windows[start][0] if start < len(windows) else None
+
+
 def summarize_pacing(windows: list[dict[str, float]]) -> dict[str, float]:
     """Settled world windows: median p50/p99/sd/jitter, the worst frame, and the frames over
     50 and 100 ms (hitches) summed. Settled is after the last world window whose median frame
@@ -377,6 +388,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
     device_removed = False
     first_ts: datetime | None = None
     first_world_ts: datetime | None = None
+    world_window_ts: list[tuple[datetime, float]] = []
 
     for raw_line in text.splitlines():
         line = ANSI_RE.sub("", raw_line)
@@ -405,8 +417,10 @@ def parse_victory_log(text: str) -> dict[str, object]:
         pacing = parse_pacing_line(line)
         if pacing:
             pacing_windows.append(pacing)
-            if pacing["draws"] >= WORLD_DRAWS_MIN and first_world_ts is None and line_ts is not None:
-                first_world_ts = line_ts
+            if pacing["draws"] >= WORLD_DRAWS_MIN and line_ts is not None:
+                if first_world_ts is None:
+                    first_world_ts = line_ts
+                world_window_ts.append((line_ts, pacing["p50"]))
         m_ds = DSTORAGE_RE.search(line)
         if m_ds:
             dstorage_rates.append(float(m_ds.group(1)))
@@ -417,9 +431,12 @@ def parse_victory_log(text: str) -> dict[str, object]:
     prep_med = statistics.median(r[2] for r in settled) if settled else 0.0
     ds_med = statistics.median(dstorage_rates) if dstorage_rates else 0.0
     boot_s = (first_world_ts - first_ts).total_seconds() if (first_ts and first_world_ts) else 0.0
+    settled_ts = settled_world_ts(world_window_ts)
+    settled_s = (settled_ts - first_ts).total_seconds() if (first_ts and settled_ts) else 0.0
     return {
         "world_samples": len(world_rows),
         "boot_s": boot_s,
+        "settled_s": settled_s,
         "fps": fps_med,
         "gpu_ms": gpu_med,
         "prep_ms": prep_med,
@@ -430,6 +447,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
     }
 
 
+@throttled("build")
 def cmd_build(args: argparse.Namespace) -> int:
     rel_step = (
         "cargo build release",
@@ -462,6 +480,7 @@ def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
     return f"DEV {cmd} {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={v}" for k, v in fields.items())
 
 
+@throttled("test")
 def cmd_test(args: argparse.Namespace) -> int:
     ensure_coord_dirs()
     ok, _build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate)
@@ -469,6 +488,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@throttled("gate")
 def cmd_gate(args: argparse.Namespace) -> int:
     """The merge gate: every workspace test, policy and pytest, and no compiler warning."""
     ensure_coord_dirs()
@@ -489,6 +509,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@throttled("policy")
 def cmd_policy(_args: argparse.Namespace) -> int:
     ok, outputs = run_logged_steps(
         [("cargo xtask policy", ["cargo", "xtask", "policy"], VICTORY_DIR)],
@@ -504,7 +525,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     log_path = DEV_DIR / "bench.log"
     try:
         game_dir = resolve_game_dir(args.game_dir)
-        overrides = parse_overrides(args.override)
+        overrides = apply_fast_boot(args, parse_overrides(args.override))
         title_args = parse_title_args(args.title_args)
         if args.save:
             resolve_save_dir(args.save)
@@ -512,7 +533,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         ensure_coord_dirs()
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
         print(
-            "DEV bench FAIL boot_s=0.0 fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0 "
+            "DEV bench FAIL boot_s=0.0 settled_s=0.0 fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0 "
             "p50_ms=0.0 p99_ms=0.0 max_ms=0.0 sd_ms=0.0 jitter_ms=0.0 over50=0 hitches=0"
         )
         return 1
@@ -529,7 +550,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
             title_args=title_args,
         )
         with acquire_gpu_lock("bench"):
+            resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
+            resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     ok = int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
@@ -537,6 +560,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print(
         f"DEV bench {status} "
         f"boot_s={float(stats['boot_s']):.1f} "
+        f"settled_s={float(stats['settled_s']):.1f} "
         f"fps={float(stats['fps']):.1f} "
         f"gpu_ms={float(stats['gpu_ms']):.1f} "
         f"prep_ms={float(stats['prep_ms']):.1f} "
@@ -548,9 +572,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"sd_ms={float(stats['sd_ms']):.1f} "
         f"jitter_ms={float(stats['jitter_ms']):.1f} "
         f"over50={int(stats['over50'])} "
-        f"hitches={int(stats['hitches'])}"
+        f"hitches={int(stats['hitches'])} "
+        f"driver_resets={_count(resets_after)}"
     )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
+
+
+def _count(value: int | None) -> str:
+    return "?" if value is None else str(value)
+
+
+def _print_driver_warning(before: int | None, after: int | None) -> None:
+    line = dev_driver.warning(before, after)
+    if line:
+        print(line)
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -561,13 +597,13 @@ def cmd_capture(args: argparse.Namespace) -> int:
     cap_dir.mkdir(parents=True, exist_ok=True)
     try:
         game_dir = resolve_game_dir(args.game_dir)
-        user_overrides = parse_overrides(args.override)
+        user_overrides = apply_fast_boot(args, parse_overrides(args.override))
         title_args = parse_title_args(args.title_args)
         if args.save:
             resolve_save_dir(args.save)
     except (FileNotFoundError, ValueError) as exc:
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
-        print(f"DEV capture FAIL boot_s=0.0 frames=0 refused=0 dir={cap_dir}")
+        print(f"DEV capture FAIL boot_s=0.0 settled_s=0.0 frames=0 refused=0 dir={cap_dir}")
         return 1
 
     overrides = {
@@ -587,7 +623,9 @@ def cmd_capture(args: argparse.Namespace) -> int:
             title_args=title_args,
         )
         with acquire_gpu_lock(f"capture:{safe_tag}"):
+            resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
+            resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     frames = len(list(cap_dir.glob("*.png")))
@@ -595,8 +633,10 @@ def cmd_capture(args: argparse.Namespace) -> int:
     status = "PASS" if ok else "FAIL"
     print(
         f"DEV capture {status} boot_s={float(stats['boot_s']):.1f} "
-        f"frames={frames} refused={int(stats['refused'])} dir={cap_dir}"
+        f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} "
+        f"driver_resets={_count(resets_after)} dir={cap_dir}"
     )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
 
 
@@ -648,6 +688,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Title arguments passed after `--` (repeatable, e.g. --title-args=-skipToIIS).",
     )
     p_bench.add_argument("--skip-intro", action="store_true", help="Skip startup intro movie (VICTORY_SKIP_INTRO=1 / -SkipIntro).")
+    p_bench.add_argument(
+        "--fast-boot",
+        action="store_true",
+        help="Opt-in fast boot: --skip-intro, Enter every 0.5 s, and --save default_checkpoint unless --save is given.",
+    )
     p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_bench.set_defaults(func=cmd_bench)
 
@@ -665,6 +710,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Title arguments passed after `--` (repeatable, e.g. --title-args=-skipToIIS).",
     )
     p_cap.add_argument("--skip-intro", action="store_true", help="Skip startup intro movie (VICTORY_SKIP_INTRO=1 / -SkipIntro).")
+    p_cap.add_argument(
+        "--fast-boot",
+        action="store_true",
+        help="Opt-in fast boot: --skip-intro, Enter every 0.5 s, and --save default_checkpoint unless --save is given.",
+    )
     p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
 
