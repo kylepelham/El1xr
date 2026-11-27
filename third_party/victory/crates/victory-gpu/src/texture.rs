@@ -32,6 +32,7 @@ mod read_marks_tests;
 mod reinterpret;
 mod short_remap;
 mod stage_unlocked;
+pub(crate) mod staged_ask;
 mod stale_audit;
 pub(crate) mod take_by_table;
 
@@ -2077,7 +2078,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         // the slot is due again (`texture_slots_remapped`, `note_buffer`).
         return Some((s.held_bytes() as u64, true));
     }
-    Some((s.size as u64, committed(s.memory, s.size)))
+    Some((s.size as u64, staged_ask::whole(resource, s.memory, s.size, committed)))
 }
 
 /// The first mip a title texture's staging buffer holds; `u32::MAX` without
