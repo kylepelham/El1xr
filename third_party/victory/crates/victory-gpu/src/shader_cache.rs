@@ -264,16 +264,20 @@ fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
 
 fn wave_wide_list() -> &'static [String] {
     WAVE_WIDE.get_or_init(|| {
-        parse_wave_wide_only(
+        let list = parse_wave_wide_only(
             std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref(),
             std::env::var("VICTORY_WATER_WIDE").is_ok_and(|v| v.trim() == "1"),
-        )
+        );
+        let more = crate::wave_more::wide(std::env::var("VICTORY_WAVE_WIDE_MORE").ok().as_deref());
+        crate::wave_more::extend(list, &more)
     })
 }
 
 fn wave_pairs_list() -> &'static [String] {
     WAVE_PAIRS.get_or_init(|| {
-        parse_wave_pairs_only(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref())
+        let list = parse_wave_pairs_only(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref());
+        let more = crate::wave_more::pairs(std::env::var("VICTORY_WAVE_PAIRS_MORE").ok().as_deref());
+        crate::wave_more::extend(list, &more)
     })
 }
 
