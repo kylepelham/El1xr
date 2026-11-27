@@ -23,7 +23,8 @@ El1xr é o projeto de emulação de GTA VI de Bone/Nevaa: um fork do [AnyXboxX](
 >
 > - 🎮 **O mundo é jogável em 4K, a 24-25 fps depois de estabilizado**, em uma RTX 5090 (três execuções de benchmark com a máquina sem outra carga: 24,9; 25,2 e 24,2 fps). A meta é 30 fps estáveis.
 > - ✅ **0 pipelines de GPU recusados** e nenhuma perda do dispositivo de GPU nas execuções de benchmark.
-> - ✅ As cutscenes são reproduzidas por inteiro e as primeiras missões já foram jogadas até o fim; o primeiro quadro do mundo aparece 46-52 s após a inicialização.
+> - ✅ As cutscenes são reproduzidas por inteiro e as primeiras missões já foram jogadas até o fim.
+> - ⚡ **Lote 1 integrado**: da inicialização ao primeiro quadro do mundo agora cerca de 31-33 s (antes 41-54 s), e o pior congelamento ao entrar no mundo 1,5-1,9 s (antes 7,6-8,1 s).
 > - 🚧 Cerca de **60 outras otimizações de desempenho estão escritas e em teste** (veja [Em teste](#em-teste)).
 
 ## Visão geral
@@ -35,10 +36,10 @@ El1xr é o projeto de emulação de GTA VI de Bone/Nevaa: um fork do [AnyXboxX](
 | Quadro no percentil 99 | 68-73 ms | sem engasgos |
 | Tempo de CPU para preparar um quadro | 25-26 ms | abaixo do tempo da GPU |
 | Pipelines de GPU recusados | **0** | 0 |
-| Da inicialização ao primeiro quadro do mundo | 46-52 s | |
+| Da inicialização ao primeiro quadro do mundo | ~31-33 s | |
 | Streaming após entrar no mundo | 52-63 s | poucos segundos |
 
-Medido com `python tools/dev.py bench --quiet --seconds 200`: inicialização rápida a partir de um checkpoint fixo, nada mais rodando na máquina, números lidos do próprio log de quadros do emulador.
+Medido com `python tools/dev.py bench --quiet --seconds 200`: inicialização rápida a partir de um checkpoint fixo, nada mais rodando na máquina, números lidos do próprio log de quadros do emulador. O tempo de inicialização vem das execuções do lote 1, feitas enquanto outros trabalhos compilavam, então uma máquina ociosa deve se sair um pouco melhor.
 
 ## Máquina de teste
 
@@ -92,8 +93,8 @@ Um quadro estabilizado leva cerca de 40 ms. Os passes de renderização do próp
 
 O trabalho é escrito em paralelo e testado em lotes na única GPU: cada mudança fica atrás de sua própria chave `VICTORY_*`, um lote roda todas as chaves novas ligadas contra todas desligadas, e cada chave é mantida ou descartada com base nos números e nas capturas de tela.
 
-- **Lote 1 (em execução)**: pools de memória para texturas e buffers, staging de texturas sem lock, menos reconstruções de descritores, mapeamento de memória em 8 threads, baking de personagens em paralelo no carregamento, shaders traduzidos assim que o jogo os cria, envios à GPU agrupados, cópias de alias mais baratas e as correções de rostos e cabelo.
-- **Lote 2 (próximo)**: memória do título em seções de 2 MiB (tempo de mapeamento 55,5 s → 7,3 s no upstream), buffers do jogo mantidos na memória da GPU (−15 % de tempo de quadro no upstream em uma RTX 5090), upscaling DLSS, prioridade mais alta para as threads de quadro do emulador, pré-aquecimento offline de shaders e pipelines, e ray tracing por hardware nos RT cores.
+- **Lote 1 (concluído, 20 chaves mantidas)**: staging de texturas sem lock, menos reconstruções de descritores e esperas por locks, baking de personagens em paralelo no carregamento, shaders traduzidos assim que o jogo os cria, carregamento mais rápido das bibliotecas de pipelines, mapeamento de memória mais enxuto e as correções de roupas, rostos e cabelo (a blusa da Lucia na lanchonete saiu certa em 4 de 5 execuções, contra 0 de 2 antes). Descartados por enquanto: os pools de memória para texturas e buffers (deixavam mais lento o desmapeamento de memória) e duas chaves que travavam o jogo; seus autores estão corrigindo.
+- **Lote 2 (em execução)**: memória do título em seções de 2 MiB (tempo de mapeamento 55,5 s → 7,3 s no upstream), buffers do jogo mantidos na memória da GPU (−15 % de tempo de quadro no upstream em uma RTX 5090), upscaling DLSS, prioridade mais alta para as threads de quadro do emulador, pré-aquecimento offline de shaders e pipelines, e ray tracing por hardware nos RT cores.
 
 ## Como rodar
 

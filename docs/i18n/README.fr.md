@@ -23,7 +23,8 @@ El1xr est le projet d'émulation de GTA VI de Bone/Nevaa : un fork d'[AnyXboxX](
 >
 > - 🎮 **Le monde est jouable en 4K, à 24-25 fps une fois stabilisé** sur une RTX 5090 (trois essais de benchmark sur une machine au repos : 24,9 ; 25,2 et 24,2 fps). L'objectif est un 30 fps stable.
 > - ✅ **0 pipeline GPU refusé** et aucune perte du périphérique GPU pendant les essais de benchmark.
-> - ✅ Les cinématiques se jouent en entier et les premières missions ont été terminées ; la première image du monde apparaît 46 à 52 s après le lancement.
+> - ✅ Les cinématiques se jouent en entier et les premières missions ont été terminées.
+> - ⚡ **Lot 1 fusionné** : du lancement à la première image du monde, environ 31 à 33 s désormais (contre 41 à 54 s), et le pire gel à l'entrée dans le monde dure 1,5 à 1,9 s (contre 7,6 à 8,1 s).
 > - 🚧 Environ **60 accélérations supplémentaires sont écrites et en cours de test** (voir [En cours de test](#en-cours-de-test)).
 
 ## En bref
@@ -35,10 +36,10 @@ El1xr est le projet d'émulation de GTA VI de Bone/Nevaa : un fork d'[AnyXboxX](
 | Image au 99e centile | 68-73 ms | aucun à-coup |
 | Temps CPU pour préparer une image | 25-26 ms | inférieur au temps GPU |
 | Pipelines GPU refusés | **0** | 0 |
-| Du lancement à la première image du monde | 46-52 s | |
+| Du lancement à la première image du monde | ~31-33 s | |
 | Streaming après l'entrée dans le monde | 52-63 s | quelques secondes |
 
-Mesuré avec `python tools/dev.py bench --quiet --seconds 200` : démarrage rapide depuis un point de sauvegarde fixe, rien d'autre ne tourne sur la machine, chiffres lus dans le journal d'images de l'émulateur lui-même.
+Mesuré avec `python tools/dev.py bench --quiet --seconds 200` : démarrage rapide depuis un point de sauvegarde fixe, rien d'autre ne tourne sur la machine, chiffres lus dans le journal d'images de l'émulateur lui-même. Le temps de lancement provient des essais du lot 1, faits pendant que d'autres travaux compilaient : une machine au repos devrait faire un peu mieux.
 
 ## Machine de test
 
@@ -92,8 +93,8 @@ Ce sont ces deux postes que vise le travail en cours de test.
 
 Le travail est écrit en parallèle et testé par lots sur l'unique GPU : chaque changement se trouve derrière son propre interrupteur `VICTORY_*`, un lot compare tous les nouveaux interrupteurs activés à tous désactivés, et chaque interrupteur est gardé ou abandonné au vu des chiffres et des captures d'écran.
 
-- **Lot 1 (en cours)** : pools de mémoire pour les textures et les buffers, préparation des textures sans verrou, moins de reconstructions de descripteurs, mappage mémoire sur 8 threads, précalcul des personnages en parallèle au chargement, shaders traduits dès que le jeu les crée, soumissions GPU fusionnées, copies d'alias moins coûteuses, et les correctifs des visages et des cheveux.
-- **Lot 2 (le suivant)** : mémoire du titre en sections de 2 Mio (temps de mappage 55,5 s → 7,3 s en amont), buffers du jeu gardés en mémoire GPU (−15 % de temps d'image en amont sur une RTX 5090), upscaling DLSS, priorité plus élevée pour les threads d'image de l'émulateur, préchauffage hors ligne des shaders et des pipelines, et ray tracing matériel sur les cœurs RT.
+- **Lot 1 (terminé, 20 interrupteurs gardés)** : préparation des textures sans verrou, moins de reconstructions de descripteurs et d'attentes de verrou, précalcul des personnages en parallèle au chargement, shaders traduits dès que le jeu les crée, chargement plus rapide des bibliothèques de pipelines, mappage mémoire allégé, et les correctifs des tenues, des visages et des cheveux (le haut que porte Lucia au diner était correct dans 4 essais sur 5, contre 0 sur 2 avant). Abandonnés pour l'instant : les pools de mémoire pour les textures et les buffers (ils ralentissaient le démappage de la mémoire) et deux interrupteurs qui plantaient ; leurs auteurs les corrigent.
+- **Lot 2 (en cours)** : mémoire du titre en sections de 2 Mio (temps de mappage 55,5 s → 7,3 s en amont), buffers du jeu gardés en mémoire GPU (−15 % de temps d'image en amont sur une RTX 5090), upscaling DLSS, priorité plus élevée pour les threads d'image de l'émulateur, préchauffage hors ligne des shaders et des pipelines, et ray tracing matériel sur les cœurs RT.
 
 ## Lancer le jeu
 
