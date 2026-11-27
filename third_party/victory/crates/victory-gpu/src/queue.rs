@@ -830,9 +830,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || {
-        Held::Signal(crate::fence::FenceRef::retain(fence), value)
-    }) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::retain(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
@@ -866,19 +864,11 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || {
-            format!(
-                "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
-                queue(this).kind
-            )
-        });
+        crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
         let aside = async_present() && {
             let mut later = lock(&LATER.0);
             if later.pending && waits() {
-                later.next.push((
-                    this as usize,
-                    Held::Wait(crate::fence::FenceRef::retain(fence), value),
-                ));
+                later.next.push((this as usize, Held::Wait(crate::fence::FenceRef::retain(fence), value)));
             }
             later.pending
         };
@@ -1241,9 +1231,7 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
-        });
+        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
 }

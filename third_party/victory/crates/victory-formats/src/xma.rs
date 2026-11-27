@@ -1117,9 +1117,7 @@ mod tests {
                 -(input
                     .iter()
                     .enumerate()
-                    .map(|(k, &x)| {
-                        x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos()
-                    })
+                    .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
                     .sum::<f64>() as f32)
             })
             .collect()
@@ -1306,6 +1304,7 @@ mod tests {
             assert!(errors == 0 && snr > 40.0);
         }
     }
+
 
     /// Deterministic noise: xorshift64, as in BCPack's noise test.
     struct Noise(u64);
