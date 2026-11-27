@@ -67,14 +67,15 @@ pub(crate) fn scan_every() -> u64 {
 }
 
 /// How many passes a full heap buffer rescan is spread across
-/// (`VICTORY_HEAP_RESCAN_SLICES`, default 16; 1: single-frame full rescan).
+/// (`VICTORY_HEAP_RESCAN_SLICES`, default 1: single-frame full rescan; 16
+/// put Lucia's prison hair and the yard on stale views in a capture).
 pub(crate) fn rescan_slices() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("VICTORY_HEAP_RESCAN_SLICES")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(16)
+            .unwrap_or(1)
             .clamp(1, 1024)
     })
 }

@@ -1,5 +1,7 @@
 //! Soft thread placement across a processor's two last-level caches
-//! (`VICTORY_VCACHE_PIN`: on by default where they differ, `0` off).
+//! (`VICTORY_VCACHE_PIN`, opt-in: with it on by default, a capture showed
+//! black faces, the wrong jacket and orange hair, likely texture races that
+//! the changed thread timing exposes).
 //!
 //! On a dual-CCD 3D V-Cache part such as the Ryzen 9 9950X3D (CCD0: 16 sets
 //! on 96 MiB of L3, CCD1: 16 sets on 32 MiB) every core reports the same
@@ -84,13 +86,13 @@ pub fn classify(sets: &[(u32, u8, u8)], l3: &[(u32, u32)]) -> Placement {
     }
 }
 
-/// `VICTORY_VCACHE_PIN`: `0` off, `1` on wherever the sets split, anything
-/// else (unset) on only where the last-level caches differ (the measured case).
+/// `VICTORY_VCACHE_PIN`: `1` on wherever the sets split, `cache` only where
+/// the last-level caches differ, anything else (unset) off.
 pub fn active(value: Option<&str>, split: Split) -> bool {
     match value.map(str::trim) {
-        Some("0") => false,
         Some("1") => split != Split::Uniform,
-        _ => matches!(split, Split::Cache { .. }),
+        Some("cache") => matches!(split, Split::Cache { .. }),
+        _ => false,
     }
 }
 
@@ -242,13 +244,14 @@ mod tests {
     }
 
     #[test]
-    fn unset_places_only_where_the_caches_differ() {
+    fn placement_is_opt_in() {
         let cache = Split::Cache {
             hot: 96 * MB,
             other: 32 * MB,
         };
-        assert!(active(None, cache));
-        assert!(!active(None, Split::Class));
+        assert!(!active(None, cache));
+        assert!(active(Some("cache"), cache));
+        assert!(!active(Some("cache"), Split::Class));
         assert!(!active(None, Split::Uniform));
         assert!(!active(Some("0"), cache));
         assert!(active(Some(" 1 "), Split::Class));

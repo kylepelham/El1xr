@@ -419,7 +419,9 @@ pub(crate) static LANDED: AtomicU64 = AtomicU64::new(0);
 static REPLACED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether texture read-backs are tiled and written into title memory on a
-/// thread of their own (`VICTORY_TEXBACK_ASYNC`; on unless `0`).
+/// thread of their own (`VICTORY_TEXBACK_ASYNC=1`; off by default: the late
+/// write can overwrite texels the title wrote meanwhile, which dressed Lucia in
+/// the wrong jacket in the diner).
 ///
 /// Copying out of the D3D12 read-back buffer still runs on the landing thread
 /// so the pooled buffer returns promptly; tiling and writing into title memory
@@ -428,7 +430,7 @@ static REPLACED: AtomicU64 = AtomicU64::new(0);
 /// only the newest is written.
 fn asynchronous() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_ASYNC").is_some_and(|v| v == "1"))
 }
 
 /// A read-back's linear texels copied out of its D3D12 buffer, ready to be
@@ -488,7 +490,7 @@ impl Writer {
                 tracing::info!(
                     replaced = n,
                     landed = LANDED.load(Ordering::Relaxed),
-                    "texture read-backs replaced by a newer copy before they were written (VICTORY_TEXBACK_ASYNC=0 writes each)"
+                    "texture read-backs replaced by a newer copy before they were written (unset VICTORY_TEXBACK_ASYNC writes each)"
                 );
             }
         }
@@ -525,7 +527,7 @@ fn writer() -> Option<&'static Writer> {
         match started {
             Ok(_) => {
                 tracing::info!(
-                    "texture read-backs are tiled and written on a thread of their own (VICTORY_TEXBACK_ASYNC=0: inline)"
+                    "texture read-backs are tiled and written on a thread of their own (unset VICTORY_TEXBACK_ASYNC: inline)"
                 );
                 Some(writer)
             }
