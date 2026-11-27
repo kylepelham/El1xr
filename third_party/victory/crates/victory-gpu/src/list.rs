@@ -748,6 +748,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        crate::timeline::closed(std::ptr::from_ref(host) as usize);
         host.close();
     }
     S_OK

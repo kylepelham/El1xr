@@ -691,6 +691,7 @@ fn card_clock_line(frames: f64, ms: f64) {
     crate::timeline::line(frames);
     crate::merge_runs::line(frames);
     readcopy::frame_line(frames);
+    sweep_aside::line(frames);
     let [idle, behind, stood] =
         [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -7099,7 +7100,7 @@ impl Host {
         if !PINNED.with(|pinned| pinned.replace(true)) {
             crate::cores::keep_on_fast_cores();
         }
-        crate::timeline::prep_begins(runs.len());
+        crate::timeline::prep_begins(runs);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -7156,10 +7157,16 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            sweep();
+            if sweep_aside::on() {
+                sweep_aside::ask();
+            } else {
+                // With the present sent ahead nothing else brings a moment
+                // with nothing in the air: one is made for the sweep.
+                let t_settle = std::time::Instant::now();
+                self.settle(&mut submitted, WHY_SYNC);
+                sweep_aside::settled(t_settle.elapsed().as_micros() as u64);
+                sweep_aside::sweep_timed();
+            }
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         crate::timeline::mark(2);
@@ -11838,6 +11845,9 @@ fn pump() {
 
 #[path = "host_readcopy.rs"]
 mod readcopy;
+
+#[path = "host_sweep.rs"]
+mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
