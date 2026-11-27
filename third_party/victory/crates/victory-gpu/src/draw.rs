@@ -714,6 +714,7 @@ impl RootBindings {
 impl State {
     fn commit_pending_shows(&mut self) {
         for (heap, index, handle, key) in self.pending_shows.drain(..) {
+            crate::bake_publish::released(heap, index);
             crate::descriptor::host::commit_show(heap, index, handle, key);
         }
     }
@@ -1191,6 +1192,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 impl State {
     pub(crate) fn reset(&mut self, new_pipeline: This) {
         for (heap, index, _, _) in self.pending_shows.drain(..) {
+            crate::bake_publish::released(heap, index);
             crate::descriptor::host::requeue_show(heap, index);
         }
         crate::descriptor::release_dynamic_many(&self.dynamic);
@@ -2842,9 +2844,17 @@ impl State {
         }
         // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
         if p.is_bake && !compute && crate::bake_inputs::on() {
-            return self.bake_draw_textures(list, p);
+            self.bake_draw_textures(list, p);
+        } else {
+            self.early_textures_plain(list, p, compute);
         }
-        self.early_textures_plain(list, p, compute);
+        // `VICTORY_BAKE_PUBLISH=1|2`: its textures held back by `VICTORY_SHOW_AFTER` shown now.
+        if p.is_bake && !compute {
+            let mode = crate::bake_publish::mode();
+            if mode > 0 {
+                self.bake_publish(p, mode);
+            }
+        }
     }
 
     fn early_textures_plain(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
@@ -3573,8 +3583,7 @@ impl State {
                 return;
             }
             if let Some(key) = deferred_key {
-                self.pending_shows
-                    .push((std::ptr::from_ref(heap) as usize, index, handle, key));
+                self.hold_show(std::ptr::from_ref(heap) as usize, index, handle, key);
             }
             if let Some(recheck) = previous {
                 let live = host.texture_slot_done(index, write, None);
@@ -5853,6 +5862,7 @@ mod miss_views;
 mod reflect_views;
 
 mod bake_pass;
+mod bake_publish;
 mod material_pass;
 mod skin_views;
 
