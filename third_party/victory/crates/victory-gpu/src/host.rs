@@ -1035,6 +1035,8 @@ pub(crate) struct HostList {
     /// records into ([`HostList::clamp_ahead`]), and whether a prelude has
     /// left each in the indirect-argument state. Kept across resets.
     ahead_chunks: Mutex<Vec<(ID3D12Resource, bool)>>,
+    /// Left open for the title's next reset (`crate::fresh_open`).
+    pub(crate) left_open: std::sync::atomic::AtomicU8,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Its title commands, for device-removed data and the hang watch.
@@ -1869,6 +1871,21 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// [`give_chunks`] for a held list whose submission landed, before its reset
+/// (`crate::scratch_landing`): what the pool has no room for comes back, to
+/// stay with the list and be freed at that reset as before.
+fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    crate::scratch_landing::spare_what_fits(chunks, |chunk, size| {
+        let back = spare.give(chunk, size, crate::scratch_spare::spare_most());
+        if back.is_none() {
+            ALIVE[3].fetch_add(1, Ordering::Relaxed);
+            ALIVE[4].fetch_add(size, Ordering::Relaxed);
+        }
+        back
+    })
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3733,6 +3750,7 @@ impl Host {
                 twins_writing: std::sync::atomic::AtomicBool::new(false),
                 card_constants: Default::default(),
                 ahead_chunks: Mutex::default(),
+                left_open: crate::fresh_open::mark(),
                 _alive: Counted::new(),
                 ops,
                 #[cfg(feature = "diagnostics")]
@@ -3901,6 +3919,7 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
+                    flight.lists.iter().for_each(|l| l.host().release_scratch());
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -4419,6 +4438,7 @@ impl Host {
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
+                        flight.lists.iter().for_each(|l| l.host().release_scratch());
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -5120,6 +5140,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.left_open.store(crate::fresh_open::NO, Ordering::Release);
         crate::gpucost::at(&self.list, crate::gpucost::LIST_END);
         self.twins_to_depth();
         self.textures_back();
@@ -5142,6 +5163,18 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+    }
+
+    /// Its held submission landed: the card read its scratch for the last
+    /// time (`crate::scratch_landing`, `VICTORY_SCRATCH_AT_LANDING=1`).
+    pub(crate) fn release_scratch(&self) {
+        if !scratch_pool() || !crate::scratch_landing::on() {
+            return;
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        (scratch.current, scratch.used) = (0, 0);
+        let chunks = std::mem::take(&mut scratch.chunks);
+        scratch.chunks = spare_what_fits(chunks);
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -5185,16 +5218,19 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        // Open and empty since it was made or last reset (`crate::fresh_open`).
+        if !crate::fresh_open::skip_reset(self) {
+            // SAFETY: the list is not executing.
+            let reset = unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
+            crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         }
-        crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,

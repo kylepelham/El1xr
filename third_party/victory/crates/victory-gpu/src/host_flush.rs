@@ -351,6 +351,8 @@ pub(super) fn log(frames: f64) {
     crate::shadow::refresh_stamp::line(frames);
     crate::compare_apart::line(frames);
     crate::shadow::wide_wake::line(frames);
+    crate::scratch_landing::line(frames);
+    crate::fresh_open::line(frames);
     if !crate::refresh_prof::on() {
         for arr in &STATS_BY {
             for a in arr {

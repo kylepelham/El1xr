@@ -199,6 +199,10 @@ mod card_prof;
 #[cfg(windows)]
 mod compare_apart;
 #[cfg(windows)]
+mod fresh_open;
+#[cfg(windows)]
+mod scratch_landing;
+#[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
 mod timeline;
