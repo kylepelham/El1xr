@@ -2803,6 +2803,14 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
+        if p.is_bake && !compute && crate::bake_inputs::on() {
+            return self.bake_draw_textures(list, p);
+        }
+        self.early_textures_plain(list, p, compute);
+    }
+
+    fn early_textures_plain(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
         let cfg = early_pass_config();
         let heap_passes = HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed);
@@ -3095,7 +3103,27 @@ impl State {
             Some((_, bytes, _)) if bytes >= (1 << 30) => usize::MAX,
             _ => 4096,
         };
-        let (mut due, census) = host.texture_slots_due(frame, slot_limit);
+        let only = bake_pass::ONLY.get();
+        let (mut due, census) = host.texture_slots_due(frame, if only { 0 } else { slot_limit });
+        // (`VICTORY_BAKE_INPUTS`) A bake draw's own textures go first, outside the budgets, in a
+        // pass whose uploads must be there now.
+        let pinned = if PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
+            bake_pass::PINNED.with_borrow(|mine| {
+                (!mine.is_empty()).then(|| host.texture_slots_pick(mine))
+            })
+        } else {
+            None
+        };
+        let pinned = match pinned {
+            Some(first) => {
+                bake_pass::SERVED.set(true);
+                due.retain(|d| !first.iter().any(|f| f.0 == d.0));
+                let n = first.len();
+                due.splice(0..0, first);
+                n
+            }
+            None => 0,
+        };
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -3264,9 +3292,10 @@ impl State {
                 break;
             }
             let slot_budget = if is_ready { ready_budget } else { budget };
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
-                    && began.elapsed() >= slot_budget)
+            if i >= pinned
+                && (SPENT.load(Ordering::Relaxed) >= bytes_at_most
+                    || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
+                        && began.elapsed() >= slot_budget))
             {
                 break;
             }
@@ -5729,6 +5758,8 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 mod indirect_signature_tests;
 
 mod miss_views;
+
+mod bake_pass;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
