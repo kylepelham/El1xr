@@ -2040,7 +2040,7 @@ impl State {
             crate::bake_watch::binding(list as *const HostList as usize, stages, p.is_bake);
         }
         if crate::camera::on() {
-            self.camera_tap(p, compute);
+            self.camera_tap(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {

@@ -150,6 +150,10 @@ pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
 #[cfg(windows)]
+pub mod camera_copy;
+#[cfg(windows)]
+pub mod camera_mv;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
