@@ -302,6 +302,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_TRAIL", Apply::Restart),
     ("VICTORY_TRANSLATE_ONLY", Apply::Restart),
     ("VICTORY_TRAP_LOG", Apply::Restart),
+    ("VICTORY_UNIFORM_STRICT_ALL", Apply::Retranslate),
     ("VICTORY_UNWATCHED_FRAMES", Apply::Restart),
     ("VICTORY_UNWIND_CHECKS", Apply::Restart),
     ("VICTORY_UPSCALE_PROBE", Apply::Restart),
