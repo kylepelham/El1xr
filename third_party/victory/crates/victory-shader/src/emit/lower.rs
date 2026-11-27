@@ -104,6 +104,10 @@ mod sop;
 #[path = "lds_loop.rs"]
 mod lds_loop;
 
+/// The group's LDS set-up by its first thread whether its lane runs (`VICTORY_LDS_FIRST_INIT=1`).
+#[path = "lds_first.rs"]
+mod lds_first;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -5090,6 +5094,20 @@ impl<'a> Lower<'a> {
             } else {
                 return Err("an LDS write of bytes or halves");
             };
+            if let Some((first, constants)) =
+                self.first_thread_init(b, i, addr.as_ref(), data, &elements)
+            {
+                // The group's first thread sets shared memory up, whether its lane runs or not.
+                let at = self.begin_guarded(Some(first));
+                for (bytes, x) in constants {
+                    let (index, x) = (self.s.m.i32(bytes / 4), self.s.m.i32(x));
+                    let lds = self.s.lds();
+                    let ptr = self.s.m.element(self.cur, lds, index);
+                    self.s.m.store(self.cur, ptr, x);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut stores = Vec::new();
             for (e, (off, w)) in elements.into_iter().enumerate() {
                 let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
