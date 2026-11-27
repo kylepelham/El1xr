@@ -315,6 +315,9 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    /// Actual library key and declared color formats for opt-in mismatch reports.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) traced_targets: Option<(String, D3D12_RT_FORMAT_ARRAY)>,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -629,6 +632,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                #[cfg(feature = "diagnostics")]
+                traced_targets: None,
                 pso,
                 root,
                 stages: bound,
@@ -696,6 +701,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                #[cfg(feature = "diagnostics")]
+                traced_targets: crate::draw::rtv_trace::enabled().then_some((name, g.targets)),
                 pso,
                 root,
                 stages: bound,
@@ -782,7 +789,8 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let mut library_key = name(rect_gs.as_ref());
+        let mut made = make(&desc, &library_key);
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(
@@ -792,7 +800,8 @@ impl HostPipeline {
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            library_key = name(None);
+            made = make(&desc, &library_key);
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -817,6 +826,8 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            #[cfg(feature = "diagnostics")]
+            traced_targets: crate::draw::rtv_trace::enabled().then_some((library_key, g.targets)),
             pso,
             root,
             stages: bound,
