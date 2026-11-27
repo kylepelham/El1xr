@@ -387,6 +387,7 @@ mod tests {
 
     #[test]
     fn nested_spans_leave_out_their_inner_time() {
+        let started = std::time::Instant::now();
         let outer = span(Phase::Submit);
         std::thread::sleep(std::time::Duration::from_millis(20));
         {
@@ -394,11 +395,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
         drop(outer);
+        let elapsed = started.elapsed().as_micros() as u64;
         let bank = bank();
         let submit = MICROS[bank][Phase::Submit as usize].swap(0, Ordering::Relaxed);
         let heap = MICROS[bank][Phase::HeapBuffers as usize].swap(0, Ordering::Relaxed);
         assert!(heap >= 40_000, "{heap}");
-        assert!((20_000..40_000).contains(&submit), "{submit}");
+        // The outer span leaves out the inner one: what is left is the outer sleep, however long a
+        // loaded machine made either sleep.
+        assert!(submit >= 20_000 && submit + heap <= elapsed + 1_000, "{submit} + {heap} vs {elapsed}");
         assert_eq!(
             CALLS[bank][Phase::Submit as usize].swap(0, Ordering::Relaxed),
             1
