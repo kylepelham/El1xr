@@ -85,6 +85,9 @@ fn build(wave_wide: bool, wave_pairs: bool) -> [u8; 32] {
     if victory_shader::emit::constants_raw() {
         h.update(b"VICTORY_PORT_CBV=1");
     }
+    if victory_shader::emit::wave_collapse() {
+        h.update(b"VICTORY_WAVE_COLLAPSE=1");
+    }
     if victory_shader::emit::nvidia::enabled() {
         h.update(b"VICTORY_WAVE32_NVIDIA=1");
     }

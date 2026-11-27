@@ -863,8 +863,8 @@ impl Lower<'_> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(self.cur, has);
-                        let (lo, hi) = self.exchange_halves(self.cur, mine);
+                        let ((lo_has, hi_has), (lo, hi)) =
+                            self.exchange_halves_two(self.cur, has, mine);
                         let c = self.cur;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);

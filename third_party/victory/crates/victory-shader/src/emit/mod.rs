@@ -518,6 +518,28 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_WAVE_COLLAPSE=1` (off by default): two lane-mask loop phis whose
+/// back edges are the same `s_*_wrexec_*` result are one mask (a waterfall
+/// over a narrowed EXEC then collapses to one access), and a guarded
+/// `v_readfirstlane_b32` of a wave64 program in two host waves exchanges its
+/// two words through one pair of barriers. A test can choose for its own
+/// thread.
+pub fn wave_collapse() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COLLAPSE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAVE_COLLAPSE").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_collapse`], for its thread only.
+    pub(crate) static TEST_COLLAPSE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Meet sites the face-relocation compute emitted, or 0 before it is translated.
 pub fn defrag_meet_sites() -> u32 {
     lower::meet_sites()
