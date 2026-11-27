@@ -79,6 +79,51 @@ struct Long {
     /// In the stretch: waiting for the submission lock, for flights (settle or relay wait),
     /// and the sweep with what follows up to the parts, microseconds ([`mark`]).
     steps: [u64; 3],
+    /// From its first and its last list's `Close` to the start of its preparing, microseconds:
+    /// the room there is for work done at `Close` instead ([`closed`]).
+    closed: (u64, u64),
+}
+
+/// When each host list (by address) was last closed, until a submission takes it.
+static CLOSED: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// The most closed lists kept: a list closed and never submitted is forgotten past it.
+const CLOSED_KEPT: usize = 4096;
+
+/// The title closed the host list at `list`.
+pub(crate) fn closed(list: usize) {
+    if !on() {
+        return;
+    }
+    let t = now();
+    let mut c = CLOSED.lock().unwrap_or_else(|e| e.into_inner());
+    c.retain(|&(l, _)| l != list);
+    if c.len() >= CLOSED_KEPT {
+        c.remove(0);
+    }
+    c.push((list, t));
+}
+
+/// For lists at `lists` taken by a submission whose preparing starts at `t`: microseconds from
+/// the first and from the last one's close; (0, 0) when none was seen closing.
+fn since_closed(closed: &mut Vec<(usize, u64)>, lists: &[usize], t: u64) -> (u64, u64) {
+    let mut at: Vec<u64> = Vec::new();
+    closed.retain(|&(l, c)| {
+        let taken = lists.contains(&l);
+        if taken {
+            at.push(c);
+        }
+        !taken
+    });
+    match (at.iter().min(), at.iter().max()) {
+        (Some(&first), Some(&last)) => (t.saturating_sub(first), t.saturating_sub(last)),
+        _ => (0, 0),
+    }
+}
+
+thread_local! {
+    /// [`since_closed`] for this thread's current preparing.
+    static CLOSED_AT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// Since the last line: microseconds of the stretches' [`Long::steps`], all stretches.
@@ -146,10 +191,15 @@ pub(crate) fn title_submit() {
     }
 }
 
-/// This thread begins preparing a submission of `lists` lists.
-pub(crate) fn prep_begins(lists: usize) {
+/// This thread begins preparing a submission of `runs`.
+pub(crate) fn prep_begins(runs: &[&crate::host::HostList]) {
     if on() {
-        PREP.with(|p| p.set((now(), lists)));
+        let lists: Vec<usize> = runs.iter().map(|&l| std::ptr::from_ref(l) as usize).collect();
+        let lists = &lists[..];
+        let t = now();
+        let gap = since_closed(&mut CLOSED.lock().unwrap_or_else(|e| e.into_inner()), lists, t);
+        CLOSED_AT.with(|c| c.set(gap));
+        PREP.with(|p| p.set((t, lists.len())));
         STEPS.with(|s| s.set([0; 3]));
         PREP_AT.with(|p| p.set((prep_parts(), flushed_now())));
     }
@@ -230,6 +280,7 @@ pub(crate) fn card_idle(idle: std::time::Duration) {
             parts: spent,
             flushed: std::array::from_fn(|i| now[i].saturating_sub(flushed_at[i])),
             steps,
+            closed: CLOSED_AT.with(Cell::get),
         });
     }
 }
@@ -332,7 +383,8 @@ pub(crate) fn line(frames: f64) {
             "card idle long stretch: {:.2} ms idle, {:.2} ms of it preparing, {:.2} ms waiting for the title; the submission \
              {} lists, preparing parts ask_once {:.2} ms, stale_flights {:.2} ms, run_other {:.2} ms, batch_flush {:.2} ms, \
              card_before {:.2} ms, sync_heaps {:.2} ms; its flushes {} copies, {:.2} MB, {} textures; in the stretch the lock \
-             {:.2} ms, flights {:.2} ms, sweep {:.2} ms (VICTORY_FENCE_TIMELINE)",
+             {:.2} ms, flights {:.2} ms, sweep {:.2} ms; its lists closed {:.2} to {:.2} ms before its preparing began \
+             (VICTORY_FENCE_TIMELINE)",
             ms(k.idle_us),
             ms(k.prepare_us),
             ms(k.title_us),
@@ -349,6 +401,8 @@ pub(crate) fn line(frames: f64) {
             ms(k.steps[0]),
             ms(k.steps[1]),
             ms(k.steps[2]),
+            ms(k.closed.0),
+            ms(k.closed.1),
         );
     }
 }
@@ -356,6 +410,14 @@ pub(crate) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_closed_takes_the_lists_it_finds() {
+        let mut c = vec![(1, 100), (2, 300), (3, 50)];
+        assert_eq!(since_closed(&mut c, &[2, 3, 9], 1000), (950, 700));
+        assert_eq!(c, vec![(1, 100)]);
+        assert_eq!(since_closed(&mut c, &[9], 1000), (0, 0));
+    }
 
     #[test]
     fn within_cuts_to_the_stretch() {
