@@ -23,7 +23,8 @@ El1xr è il progetto di emulazione di GTA VI di Bone/Nevaa: un fork di [AnyXboxX
 >
 > - 🎮 **Il mondo è giocabile in 4K, a 24-25 fps una volta stabilizzato** su una RTX 5090 (tre sessioni di benchmark a macchina scarica: 24,9; 25,2 e 24,2 fps). L'obiettivo sono 30 fps stabili.
 > - ✅ **0 pipeline GPU rifiutate** e nessuna perdita del dispositivo GPU nelle sessioni di benchmark.
-> - ✅ Le cutscene vengono riprodotte per intero e le prime missioni sono state giocate fino in fondo; il primo fotogramma del mondo compare 46-52 s dopo l'avvio.
+> - ✅ Le cutscene vengono riprodotte per intero e le prime missioni sono state giocate fino in fondo.
+> - ⚡ **Lotto 1 integrato**: dall'avvio al primo fotogramma del mondo ora circa 31-33 s (prima 41-54 s), e il blocco peggiore all'ingresso nel mondo 1,5-1,9 s (prima 7,6-8,1 s).
 > - 🚧 Circa **60 ulteriori accelerazioni sono scritte e in fase di test** (vedi [In fase di test](#in-fase-di-test)).
 
 ## In breve
@@ -35,10 +36,10 @@ El1xr è il progetto di emulazione di GTA VI di Bone/Nevaa: un fork di [AnyXboxX
 | Fotogramma al 99° percentile | 68-73 ms | nessuno scatto |
 | Tempo CPU per preparare un fotogramma | 25-26 ms | sotto il tempo della GPU |
 | Pipeline GPU rifiutate | **0** | 0 |
-| Dall'avvio al primo fotogramma del mondo | 46-52 s | |
+| Dall'avvio al primo fotogramma del mondo | ~31-33 s | |
 | Streaming dopo l'ingresso nel mondo | 52-63 s | pochi secondi |
 
-Misurato con `python tools/dev.py bench --quiet --seconds 200`: avvio rapido da un checkpoint fisso, nient'altro in esecuzione sulla macchina, valori letti dal registro dei fotogrammi dell'emulatore stesso.
+Misurato con `python tools/dev.py bench --quiet --seconds 200`: avvio rapido da un checkpoint fisso, nient'altro in esecuzione sulla macchina, valori letti dal registro dei fotogrammi dell'emulatore stesso. Il tempo di avvio viene dalle sessioni del lotto 1, eseguite mentre altro lavoro veniva compilato, quindi una macchina a riposo dovrebbe fare un po' meglio.
 
 ## Macchina di prova
 
@@ -92,8 +93,8 @@ Sono entrambi l'obiettivo del lavoro in fase di test.
 
 Il lavoro viene scritto in parallelo e testato a lotti sull'unica GPU: ogni modifica sta dietro un proprio interruttore `VICTORY_*`, un lotto confronta tutti i nuovi interruttori attivi con tutti disattivati, e ogni interruttore viene tenuto o scartato in base ai numeri e agli screenshot.
 
-- **Lotto 1 (in corso)**: pool di memoria per texture e buffer, staging delle texture senza lock, meno ricostruzioni dei descrittori, mappatura della memoria su 8 thread, precalcolo parallelo dei personaggi durante il caricamento, shader tradotti non appena il gioco li crea, invii alla GPU accorpati, copie alias più economiche, e le correzioni di volti e capelli.
-- **Lotto 2 (il prossimo)**: memoria del titolo in sezioni da 2 MiB (tempo di mappatura 55,5 s → 7,3 s nel progetto originale), buffer del gioco mantenuti nella memoria della GPU (−15 % di tempo per fotogramma nel progetto originale su una RTX 5090), upscaling DLSS, priorità più alta per i thread dei fotogrammi dell'emulatore, preriscaldamento offline di shader e pipeline, e ray tracing hardware sui core RT.
+- **Lotto 1 (concluso, 20 interruttori tenuti)**: staging delle texture senza lock, meno ricostruzioni dei descrittori e attese sui lock, precalcolo parallelo dei personaggi durante il caricamento, shader tradotti non appena il gioco li crea, caricamento più rapido delle librerie di pipeline, mappatura della memoria più snella, e le correzioni di abiti, volti e capelli (il top di Lucia nel diner era corretto in 4 sessioni su 5, contro 0 su 2 prima). Scartati per ora: i pool di memoria per texture e buffer (rallentavano l'unmap della memoria) e due interruttori che causavano crash; i loro autori li stanno correggendo.
+- **Lotto 2 (in corso)**: memoria del titolo in sezioni da 2 MiB (tempo di mappatura 55,5 s → 7,3 s nel progetto originale), buffer del gioco mantenuti nella memoria della GPU (−15 % di tempo per fotogramma nel progetto originale su una RTX 5090), upscaling DLSS, priorità più alta per i thread dei fotogrammi dell'emulatore, preriscaldamento offline di shader e pipeline, e ray tracing hardware sui core RT.
 
 ## Avvialo
 

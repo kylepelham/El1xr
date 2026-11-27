@@ -23,7 +23,8 @@ El1xr es el proyecto de emulación de GTA VI de Bone/Nevaa: un fork de [AnyXboxX
 >
 > - 🎮 **El mundo es jugable en 4K, a 24-25 fps una vez estabilizado** en una RTX 5090 (tres pruebas de rendimiento con el equipo en reposo: 24,9; 25,2 y 24,2 fps). El objetivo son 30 fps estables.
 > - ✅ **0 pipelines de GPU rechazados** y ninguna pérdida del dispositivo GPU en las pruebas de rendimiento.
-> - ✅ Las cinemáticas se reproducen completas y las primeras misiones se han jugado hasta el final; el primer fotograma del mundo aparece entre 46 y 52 s después del arranque.
+> - ✅ Las cinemáticas se reproducen completas y las primeras misiones se han jugado hasta el final.
+> - ⚡ **Lote 1 integrado**: del arranque al primer fotograma del mundo ahora unos 31-33 s (antes 41-54 s), y el peor congelamiento al entrar en el mundo, 1,5-1,9 s (antes 7,6-8,1 s).
 > - 🚧 Unas **60 aceleraciones más están escritas y en pruebas** (ver [En pruebas](#en-pruebas)).
 
 ## De un vistazo
@@ -35,10 +36,10 @@ El1xr es el proyecto de emulación de GTA VI de Bone/Nevaa: un fork de [AnyXboxX
 | Fotograma del percentil 99 | 68-73 ms | sin tirones |
 | Tiempo de CPU para preparar un fotograma | 25-26 ms | por debajo del tiempo de la GPU |
 | Pipelines de GPU rechazados | **0** | 0 |
-| Del arranque al primer fotograma del mundo | 46-52 s | |
+| Del arranque al primer fotograma del mundo | ~31-33 s | |
 | Streaming tras entrar en el mundo | 52-63 s | unos pocos segundos |
 
-Medido con `python tools/dev.py bench --quiet --seconds 200`: arranque rápido desde un punto de control fijo, nada más ejecutándose en la máquina, cifras leídas del propio registro de fotogramas del emulador.
+Medido con `python tools/dev.py bench --quiet --seconds 200`: arranque rápido desde un punto de control fijo, nada más ejecutándose en la máquina, cifras leídas del propio registro de fotogramas del emulador. El tiempo de arranque sale de las pruebas del lote 1, hechas mientras se compilaba otro trabajo, así que una máquina en reposo debería lograr algo mejor.
 
 ## Equipo de prueba
 
@@ -92,8 +93,8 @@ Ambos son el objetivo del trabajo en pruebas.
 
 El trabajo se escribe en paralelo y se prueba por lotes en la única GPU: cada cambio va detrás de su propio interruptor `VICTORY_*`, un lote ejecuta todos los interruptores nuevos activados frente a todos desactivados, y cada interruptor se conserva o se descarta según las cifras y las capturas de pantalla.
 
-- **Lote 1 (en marcha)**: pools de memoria para texturas y búferes, preparación de texturas sin bloqueos, menos reconstrucciones de descriptores, mapeo de memoria en 8 hilos, precálculo de personajes en paralelo durante la carga, shaders traducidos en cuanto el juego los crea, envíos a la GPU fusionados, copias de alias más baratas, y las correcciones de caras y pelo.
-- **Lote 2 (el siguiente)**: memoria del título en secciones de 2 MiB (tiempo de mapeo 55,5 s → 7,3 s en el proyecto de origen), búferes del juego mantenidos en la memoria de la GPU (−15 % de tiempo de fotograma en el proyecto de origen en una RTX 5090), escalado DLSS, mayor prioridad para los hilos de fotograma del emulador, precalentamiento sin conexión de shaders y pipelines, y ray tracing por hardware en los núcleos RT.
+- **Lote 1 (terminado, 20 interruptores conservados)**: preparación de texturas sin bloqueos, menos reconstrucciones de descriptores y esperas de bloqueos, precálculo de personajes en paralelo durante la carga, shaders traducidos en cuanto el juego los crea, cargas más rápidas de bibliotecas de pipelines, mapeo de memoria más ligero, y las correcciones de ropa, caras y pelo (la camiseta de Lucia en el diner salió bien en 4 de 5 pruebas, frente a 0 de 2 antes). Descartados por ahora: los pools de memoria para texturas y búferes (ralentizaban la liberación de los mapeos de memoria) y dos interruptores que provocaban cierres; sus autores los están corrigiendo.
+- **Lote 2 (en marcha)**: memoria del título en secciones de 2 MiB (tiempo de mapeo 55,5 s → 7,3 s en el proyecto de origen), búferes del juego mantenidos en la memoria de la GPU (−15 % de tiempo de fotograma en el proyecto de origen en una RTX 5090), escalado DLSS, mayor prioridad para los hilos de fotograma del emulador, precalentamiento sin conexión de shaders y pipelines, y ray tracing por hardware en los núcleos RT.
 
 ## Ejecútalo
 
