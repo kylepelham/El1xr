@@ -258,7 +258,7 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        let done = self.translated
             .get_or_init(|| {
                 let _hitch = crate::hitch::span(crate::hitch::Phase::ShaderTranslate);
                 let done = translate(&self.container);
@@ -299,17 +299,34 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        name = program_name(&self.container).unwrap_or("?"),
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
+                    #[cfg(windows)]
+                    Err(e) if translate_ahead::on_ahead_thread() => translate_ahead::refused_ahead(
+                        self,
+                        program_name(&self.container).unwrap_or("?"),
+                        e,
                     ),
+                    Err(e) => self.log_refused(e),
                 }
                 done.ok()
-            })
-            .as_ref()
+            });
+        let done = done.as_ref();
+        // (bootfast) Refused ahead (`VICTORY_TRANSLATE_AHEAD`) and now
+        // needed: reported as a refusal, as it would have been here.
+        #[cfg(windows)]
+        if done.is_none() && !translate_ahead::on_ahead_thread() && translate_ahead::needed(self) {
+            self.log_refused("does not translate (refused ahead)");
+        }
+        done
+    }
+
+    fn log_refused(&self, error: &str) {
+        tracing::warn!(
+            stage = self.stage,
+            hash = %self.hash,
+            name = program_name(&self.container).unwrap_or("?"),
+            error = %error,
+            "shader does not translate; its pipelines' draws are dropped"
+        );
     }
 }
 

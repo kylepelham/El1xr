@@ -1362,6 +1362,10 @@ fn target_changes(address: u64) -> &'static std::sync::atomic::AtomicU32 {
 /// table near its memory (0 for one it cannot alias, not placed).
 #[cfg(windows)]
 pub(crate) fn alias_stamp(this: This) -> u32 {
+    // A null view's texture (batch 1 crashed here, reading off null).
+    if this.is_null() {
+        return 0;
+    }
     let r = resource(this);
     if r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
         target_changes(r.data() as u64)
@@ -4123,6 +4127,14 @@ mod tests {
     #[test]
     fn a_null_view_has_no_alias_source() {
         assert!(super::alias_of(std::ptr::null()).is_none());
+    }
+
+    /// (`VICTORY_LIST_READABLE_ONCE`) A null view's texture has no alias
+    /// stamp, and is not read for one (batch 1: a read off null at boot).
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_stamp() {
+        assert_eq!(super::alias_stamp(std::ptr::null()), 0);
     }
 
     #[cfg(windows)]

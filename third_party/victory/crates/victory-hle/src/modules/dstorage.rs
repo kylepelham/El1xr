@@ -31,6 +31,10 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+mod scratch;
+mod timing;
+use timing::{Phase, mark};
+
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
@@ -550,9 +554,11 @@ fn work(scheduler: &'static Scheduler) {
             continue;
         };
         drop(lanes);
+        timing::begin(job.seq);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
+        mark(Phase::Other);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -560,6 +566,8 @@ fn work(scheduler: &'static Scheduler) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
+        mark(Phase::Finish);
+        timing::end(job.request.destination_size, job.request.options);
     }
 }
 
@@ -700,7 +708,12 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    if timing::on() {
+                        timing::submitted([seq]);
+                    }
+                    lane.reads.push_back((seq, request))
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -912,8 +925,9 @@ fn queue(this: QueueRef, command: Command) {
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         let capacity = lane.capacity;
+        let before = waiting_reads(&lanes);
         lanes.submit_as(id, false);
-        scheduler.work.notify_all();
+        wake(scheduler, waiting_reads(&lanes).saturating_sub(before));
         let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
         let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() {
@@ -936,8 +950,36 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
+    let before = waiting_reads(&lanes);
     lanes.submit(id);
-    scheduler.work.notify_all();
+    wake(scheduler, waiting_reads(&lanes).saturating_sub(before));
+}
+
+/// Reads submitted and not started, over all queues.
+fn waiting_reads(lanes: &Lanes) -> usize {
+    lanes.lanes.values().map(|l| l.reads.len()).sum()
+}
+
+/// (bootfast) `VICTORY_DSTORAGE_WAKE_FEW=1`: after a Submit that gave the
+/// workers `added` reads, wakes that many of them (one each), not all 32:
+/// every Submit woke every idle worker, which all queued for the scheduler's
+/// one lock and most of which found nothing to start (thousands of Submits
+/// a second while loading). Off: all, as before.
+fn wake(scheduler: &Scheduler, added: usize) {
+    static FEW: OnceLock<bool> = OnceLock::new();
+    if !*FEW.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_WAKE_FEW").is_some_and(|v| v == "1")) {
+        scheduler.work.notify_all();
+        return;
+    }
+    for _ in 0..wakes(added) {
+        scheduler.work.notify_one();
+    }
+}
+
+/// How many workers [`wake`] wakes for `added` reads: one each, at most as
+/// many as there can be workers.
+fn wakes(added: usize) -> usize {
+    added.min(64)
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -991,32 +1033,60 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            let mut data = scratch::take(scratch::Slot::Bounce, size);
+            mark(Phase::Other);
+            let read = read_into(request, &mut data);
+            if read.is_ok() {
+                out.copy_from_slice(&data);
+                mark(Phase::Copy);
+            }
+            scratch::give(scratch::Slot::Bounce, data);
+            read.map(|()| size)
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+    let (source, slot) = if bc != 0 && options & ZLIB != 0 {
+        let mut packed = scratch::take(scratch::Slot::Packed, request.intermediate_size as usize);
+        mark(Phase::Other);
+        let inflated = inflate(&source, &mut packed);
+        mark(Phase::Zlib);
+        if let Cow::Owned(bytes) = source {
+            // The compressed bytes aren't needed past here: not held while BCPack unpacks.
+            scratch::give(scratch::Slot::Source, bytes);
+        }
+        let n = match inflated {
+            Ok(n) => n,
+            Err(hr) => {
+                scratch::give(scratch::Slot::Packed, packed);
+                return Err(fail(hr, "zlib"));
+            }
+        };
         packed.truncate(n);
-        // The compressed bytes aren't needed past here: not held while BCPack unpacks.
-        drop(source);
-        Cow::Owned(packed)
+        (Cow::Owned(packed), scratch::Slot::Packed)
     } else {
-        source
+        (source, scratch::Slot::Source)
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    let done = into_destination(request, size, |out| match tables {
+        Some(tables) => {
+            let decoded = bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()));
+            mark(Phase::Bcpack);
+            decoded
+        }
+        None => {
+            let inflated = inflate(&source, out).map_err(|hr| fail(hr, "zlib"));
+            mark(Phase::Zlib);
+            inflated
+        }
+    });
+    if let Cow::Owned(bytes) = source {
+        scratch::give(slot, bytes);
+    }
+    done?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1129,8 +1199,12 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    let mut bytes = scratch::take(scratch::Slot::Source, size);
+    mark(Phase::Other);
+    if let Err(hr) = read_into(request, &mut bytes) {
+        scratch::give(scratch::Slot::Source, bytes);
+        return Err(hr);
+    }
     Ok(Cow::Owned(bytes))
 }
 
@@ -1146,6 +1220,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        mark(Phase::Read);
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1175,6 +1250,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if let Some(own) = own {
         state.more.lock().unwrap_or_else(|e| e.into_inner()).push(own);
     }
+    mark(Phase::Read);
     result
 }
 
@@ -1188,12 +1264,14 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    mark(Phase::Other);
     if request.options & PAGE_DESTINATION == 0 {
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        mark(Phase::Dest);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1204,13 +1282,25 @@ fn into_destination(
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
+        mark(Phase::Notify);
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    // (bootfast) `VICTORY_DSTORAGE_ONE_LOOK=1`: the page table looked at
+    // once before the write and once after (`xmem::one_look`).
+    if super::xmem::one_look::on() {
+        if let Some(mut window) = super::xmem::one_look::page_window(pages, offset, len) {
+            mark(Phase::Dest);
+            let filled = fill(window.bytes()).map(drop);
+            super::xmem::one_look::done(window, pages, offset, len);
+            mark(Phase::Notify);
+            return filled;
+        }
+    } else if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        // Consecutive pages of one allocation (the usual case): written in
+        // place through one view.
+        mark(Phase::Dest);
         let filled = fill(window.bytes()).map(drop);
         drop(window);
         // The title maps pages where the card reads them and has them
@@ -1219,10 +1309,19 @@ fn into_destination(
         // #571). After a decode that failed part way too: what it wrote
         // is there.
         super::xmem::pages_written(pages, offset, len);
+        mark(Phase::Notify);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    mark(Phase::Dest);
+    let mut data = scratch::take(scratch::Slot::Bounce, len);
+    mark(Phase::Other);
+    let n = match fill(&mut data) {
+        Ok(n) => n,
+        Err(hr) => {
+            scratch::give(scratch::Slot::Bounce, data);
+            return Err(hr);
+        }
+    };
     // A page the title has just made, or a view the host refuses for a
     // moment, comes right a little later: the write is tried again before
     // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
@@ -1243,6 +1342,8 @@ fn into_destination(
         tries += 1;
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
+    mark(Phase::Copy);
+    scratch::give(scratch::Slot::Bounce, data);
     if written {
         if tries > 0 {
             let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
@@ -1257,6 +1358,7 @@ fn into_destination(
         }
         // As above, after the write that succeeded.
         super::xmem::pages_written(pages, offset, n);
+        mark(Phase::Notify);
         Ok(())
     } else {
         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
@@ -1490,6 +1592,14 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// (bootfast) One worker woken per read a Submit added, none for none.
+    #[test]
+    fn a_submit_wakes_a_worker_per_read() {
+        assert_eq!(wakes(0), 0);
+        assert_eq!(wakes(3), 3);
+        assert_eq!(wakes(10_000), 64);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
