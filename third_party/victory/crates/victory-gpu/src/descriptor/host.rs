@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod flicker;
+pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
 mod list_views;
@@ -2872,7 +2873,9 @@ impl HostHeap {
                 if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
             {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                true
+                // One the host writes: nothing for the pass to bring up to
+                // date (`VICTORY_QUEUE_HOST_TEXTURES=0`).
+                host_textures::queues(*r as crate::object::This)
             }
             _ => false,
         };
