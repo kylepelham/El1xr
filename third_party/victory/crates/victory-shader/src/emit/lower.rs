@@ -539,6 +539,11 @@ pub(super) fn take_needs() -> Vec<usize> {
     NEEDS.take()
 }
 
+/// Puts back blocks [`take_needs`] took, for a lowering whose retry was not kept.
+pub(super) fn set_needs(needs: Vec<usize>) {
+    NEEDS.set(needs);
+}
+
 fn need(block: usize) {
     NEEDS.with_borrow_mut(|n| {
         if !n.contains(&block) {
@@ -4327,6 +4332,23 @@ impl<'a> Lower<'a> {
             return Ok(self
                 .s
                 .op(c, name, Attr::NoUnwind, self.s.t.i1, code, &[pair]));
+        }
+        if self.x.st.host_wide.contains(&b) {
+            // A loop's branch each host wave takes for itself (`VICTORY_LOOPS_WAVE=1`): the
+            // host wave's own answer. Its lanes then leave the loop together and are one wave
+            // behind it. A host wave whose lanes are all done goes on while the other half of
+            // its console wave still loops: the console would run the loop's code with those
+            // lanes off, which changes nothing of theirs.
+            let c = self.cur;
+            let mine = self.boolean(when, c)?;
+            let i1t = self.s.t.i1;
+            self.s.flags |= flags::WAVE_OPS;
+            let (name, code) = if any {
+                ("waveAnyTrue", 113)
+            } else {
+                ("waveAllTrue", 114)
+            };
+            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
         }
         if self.exchange.is_none()
             && self.halves.is_none()
@@ -8128,7 +8150,7 @@ impl<'a> Lower<'a> {
                             && self.mask_data == MaskData::Console
                             && st.scc_some.contains_key(&arg) =>
                     {
-                        let per_lane = !st.wide.contains(&q)
+                        let per_lane = (!st.wide.contains(&q) || st.host_wide.contains(&q))
                             && matches!(st.exits[q], LaneExit::Branch { when, .. }
                                 if !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))));
                         if per_lane {
