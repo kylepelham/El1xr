@@ -9075,6 +9075,8 @@ mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_one_pass.rs"]
+mod one_pass;
 #[path = "host_step_reads.rs"]
 mod step_reads;
 #[path = "host_run_split.rs"]
