@@ -34,8 +34,10 @@ PACING_RE = re.compile(
 PREP_RE = re.compile(r"[0-9.]+ fps, [0-9.]+ ms/frame \(([0-9.]+) preparing")
 STALL_RE = re.compile(r"hang watch: the card's fence has stood at \d+ for ([0-9.]+) s|hang watch: the card moved on.*?stood_s=([0-9.]+)")
 LEVEL_RE = re.compile(r"\b(WARN|ERROR)\b")
-FPS_TOL = 0.5
-PREP_TOL = 1.0
+# Batch 3 steady tails varied by 0.6-1.5 fps and up to 3.8 ms prep; the verdict's noise floors are 4 fps
+# and 8 ms, so a band tighter than this only keeps runs going without changing a verdict.
+FPS_TOL = 1.5
+PREP_TOL = 3.0
 STALL_S = 9.0
 FATAL_GRACE_S = 10.0
 Z95 = 1.96
