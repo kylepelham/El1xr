@@ -17,6 +17,8 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+mod state_bytes;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {

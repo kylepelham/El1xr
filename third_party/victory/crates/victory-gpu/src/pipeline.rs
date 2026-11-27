@@ -1245,6 +1245,10 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+mod recipe;
+#[cfg(windows)]
+pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
+#[cfg(windows)]
 mod translate_ahead;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
