@@ -8382,15 +8382,28 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            // (racefix, #57) A black present may show the last good frame
+            // (`VICTORY_HOLD_LAST_FRAME`): the texture is read by its scan too.
+            let hold = over.is_none() && crate::hold_frame::most() > 0;
+            let read = if hold {
+                crate::hold_frame::READ
+            } else {
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            };
             list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(texture, state, read),
                 transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            let held = hold
+                .then(|| crate::hold_frame::record(&self.device, list, texture, &back))
+                .flatten();
+            if held.is_none() {
+                list.CopyResource(&back, texture);
+            }
             let shot = shot_now
                 .then(|| crate::screenshot::read_back(&self.device, list, texture))
                 .flatten();
@@ -8421,7 +8434,7 @@ impl Host {
                 )
             });
             list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                transition(texture, read, state),
                 transition(
                     &back,
                     if composed {
@@ -8449,6 +8462,9 @@ impl Host {
             }
             if let Some(audited) = audited {
                 crate::present_audit::sent(audited, flown);
+            }
+            if let Some(slot) = held {
+                crate::hold_frame::sent(slot, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {

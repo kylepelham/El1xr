@@ -117,6 +117,8 @@ mod popwatch;
 #[cfg(windows)]
 mod present_audit;
 #[cfg(windows)]
+mod hold_frame;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;

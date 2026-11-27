@@ -138,6 +138,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_TEXTURES_MS", Apply::Restart),
     ("VICTORY_HITCH_MS", Apply::Restart),
     ("VICTORY_HITCH_STACKS_TITLE", Apply::Restart),
+    ("VICTORY_HOLD_LAST_FRAME", Apply::Live),
     ("VICTORY_HOLES_ONCE", Apply::Restart),
     ("VICTORY_HOST_MAX_WAVE", Apply::Restart),
     ("VICTORY_HOST_WAVE", Apply::Retranslate),
