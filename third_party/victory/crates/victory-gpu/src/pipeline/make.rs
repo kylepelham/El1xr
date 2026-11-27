@@ -892,6 +892,15 @@ impl Queue {
     }
 }
 
+/// Queues `p` for the workers if it is not made or queued yet: `asked`, as
+/// a draw's is (before the pipelines nothing has asked for), or else among
+/// those made early. Does not wait (`VICTORY_BVH_BUILDER_EARLY`).
+pub(crate) fn soon(p: &Arc<Pending>, asked: bool) {
+    if p.left_out.is_none() && p.made.get().is_none() && !p.shaders.is_empty() {
+        start(p, if asked { REQUESTED } else { EARLY }, 0);
+    }
+}
+
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 

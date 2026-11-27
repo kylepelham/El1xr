@@ -1815,6 +1815,9 @@ impl State {
         if kind == USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return crate::rt_diag::thread_limit();
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -3798,8 +3801,8 @@ impl State {
     /// Runs a dispatch on the host.
     /// `DispatchX`: its dimensions may be thread counts (`crate::rt_diag`).
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
-        let [x, y, z] = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
-        self.dispatch(list, x, y, z);
+        let ([x, y, z], limit) = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
+        crate::rt_diag::with_thread_limit(limit, || self.dispatch(list, x, y, z));
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {

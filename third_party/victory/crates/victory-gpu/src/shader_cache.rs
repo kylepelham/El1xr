@@ -112,6 +112,12 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     if let Some(key) = victory_shader::emit::miss_sky_key() {
         h.update(key.as_bytes());
     }
+    if let Some(key) = crate::rt_hit_only::key() {
+        h.update(key.as_bytes());
+    }
+    if victory_shader::emit::dispatchx_mask() {
+        h.update(b"VICTORY_DISPATCHX_MASK=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -189,6 +195,13 @@ pub fn wave_pairs_vt_listed(container: &[u8]) -> bool {
 /// [`translate_container`], for a container [`allow_wave_pairs_vt`] names inside
 /// `with_wave_pairs_vt`, with one log line saying what the paired form made of it.
 fn translate_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
+    victory_shader::emit::with_rays_missed(crate::rt_hit_only::misses(container), || {
+        translate_paired_vt(container, wide, pairs, vt)
+    })
+}
+
+/// [`translate_vt`] inside `VICTORY_RT_HIT_ONLY`'s choice.
+fn translate_paired_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
     if !vt {
         return translate_container(container, wide, pairs);
     }
