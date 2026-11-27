@@ -77,9 +77,14 @@ fn marks_of(resource: usize, alias: u32) -> Marks {
     }
 }
 
-/// Title texture `resource`'s marks now; `None` with the switch off.
+/// Title texture `resource`'s marks now; `None` with the switch off, and
+/// for a null view's (no texture: nothing to remember, nothing to read).
 pub(crate) fn marks(resource: usize) -> Option<Marks> {
-    on().then(|| {
+    marks_when(on(), resource)
+}
+
+fn marks_when(on: bool, resource: usize) -> Option<Marks> {
+    (on && resource != 0).then(|| {
         marks_of(
             resource,
             crate::resource::alias_stamp(resource as crate::object::This),
@@ -149,7 +154,7 @@ fn at(list: &crate::host::HostList) -> (usize, u64) {
 /// as it was made by this thread (`tested`: the depth target the draw
 /// tests, never skipped).
 pub(crate) fn ready(list: &crate::host::HostList, resource: usize, tested: usize) -> bool {
-    on() && READY.with_borrow_mut(|r| {
+    on() && resource != 0 && READY.with_borrow_mut(|r| {
         r.hit(at(list), resource, tested, || {
             marks(resource).unwrap_or(Marks {
                 generation: u32::MAX,
@@ -201,6 +206,16 @@ mod tests {
         assert!(!switch(None));
         assert!(!switch(Some(std::ffi::OsStr::new("0"))));
         assert!(switch(Some(std::ffi::OsStr::new("1"))));
+    }
+
+    /// A null view (`View::Shader(0, _)`) has no marks and reads nothing
+    /// for them (batch 1 crashed at boot reading an alias stamp off null);
+    /// a live texture has them.
+    #[test]
+    fn a_null_view_has_no_marks() {
+        assert_eq!(marks_when(true, 0), None);
+        assert_eq!(marks_when(false, 0), None);
+        assert_eq!(marks_when(false, TEX), None);
     }
 
     /// Nothing changed: the second read is skipped.

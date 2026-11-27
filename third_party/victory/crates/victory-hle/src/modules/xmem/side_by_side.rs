@@ -18,7 +18,7 @@
 //! after them. Placeholders are split by the caller too, before: a thread
 //! that maps a piece of one while another cuts it can fail.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -30,7 +30,10 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use super::{PAGE, Physical, SCATTER, Slice, WORK, commit, lean, noted, unmap, unshow};
+use super::{
+    PAGE, Physical, SCATTER, Slice, WORK, commit, lean, map, map_pages, noted, remap_same, shows,
+    shows_nothing, touched, unmap, unshow,
+};
 
 /// How many threads make the system calls of one run of a scatter
 /// (`VICTORY_MAP_THREADS`, 1 to 32; unset or 1: the caller alone, a page
@@ -99,7 +102,7 @@ impl Op {
                     )
                 };
                 WORK[0].fetch_add(1, Ordering::Relaxed);
-                WORK[1].fetch_add(taken.elapsed().as_micros() as u64, Ordering::Relaxed);
+                WORK[11].fetch_add(taken.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if gone != 0 { DONE } else { NOT_MAPPED }
             }
             Op::Map(at, len, slice) => {
@@ -124,10 +127,10 @@ impl Op {
                 if view.Value as usize != at {
                     return NOT_MAPPED;
                 }
-                // The calls' time, as `Made` counts it in `map_view` (the
-                // caller counts the view and its notes).
+                // The calls' time, summed over the threads (the caller counts
+                // the view, and the batch's time as the title waits for it).
                 let done = || {
-                    WORK[3].fetch_add(made.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    WORK[11].fetch_add(made.elapsed().as_micros() as u64, Ordering::Relaxed);
                 };
                 if slice.section.all_committed(slice.index, n) {
                     done();
@@ -164,37 +167,53 @@ pub(super) fn change(
     if len == 0 {
         return maps.is_empty();
     }
-    let end = base + len;
-    // The views there: whole ones go side by side, what reaches past the
-    // range is taken away and mapped again in part by `unmap`, as before.
-    let first = physical
-        .views
-        .range(..=base)
-        .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
-        .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
+    change_many(physical, &[(base, len)], maps, again)
+}
+
+/// [`change`] for several ranges apart (`ranges`: address, bytes; none
+/// empty), their calls side by side as one: what is mapped in each is
+/// taken away, then `maps` (each inside one of them) are mapped.
+pub(super) fn change_many(
+    physical: &mut Physical,
+    ranges: &[(usize, usize)],
+    maps: Vec<(usize, usize, Slice)>,
+    again: impl Fn(&mut Physical, usize, usize, Slice) -> bool,
+) -> bool {
     let mut ops = Vec::new();
-    for at in hit {
-        let size = physical.views[&at].0;
-        if at < base || at + size > end {
-            let (lo, hi) = (base.max(at), end.min(at + size));
-            unmap(physical, lo, hi - lo);
-            continue;
+    for &(base, len) in ranges {
+        let end = base + len;
+        // The views there: whole ones go side by side, what reaches past
+        // the range is taken away and mapped again in part by `unmap`, as
+        // before.
+        let first = physical
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map(|(at, _)| *at);
+        let hit: Vec<usize> = first
+            .into_iter()
+            .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
+            .collect();
+        for at in hit {
+            let size = physical.views[&at].0;
+            if at < base || at + size > end {
+                let (lo, hi) = (base.max(at), end.min(at + size));
+                unmap(physical, lo, hi - lo);
+                continue;
+            }
+            let Some((size, slice)) = physical.views.remove(&at) else {
+                continue;
+            };
+            super::probe::gone(at, size);
+            // As `unmap` does before its call.
+            for k in 0..size / PAGE {
+                unshow(physical, &slice, k, at + k * PAGE);
+            }
+            victory_gpu::titlemem::title_range_free(at);
+            victory_gpu::title_memory_remapped(at, size);
+            ops.push(Op::Unmap(at, size));
         }
-        let Some((size, slice)) = physical.views.remove(&at) else {
-            continue;
-        };
-        // As `unmap` does before its call.
-        for k in 0..size / PAGE {
-            unshow(physical, &slice, k, at + k * PAGE);
-        }
-        victory_gpu::titlemem::title_range_free(at);
-        victory_gpu::title_memory_remapped(at, size);
-        ops.push(Op::Unmap(at, size));
     }
     // The placeholders the views taken away left: each exactly its view.
     let mut own = HashMap::new();
@@ -249,6 +268,81 @@ pub(super) fn change(
         }
     }
     ok
+}
+
+/// `XMemMapPhysicalPagesScatter` with `VICTORY_SCATTER_RUNS` off: what
+/// page by page `map_pages` does, a page at each address, with the system
+/// calls of every page up to an address given twice (or a page that is not
+/// the title's) side by side. A page already showing what is asked is left
+/// as `map_pages` leaves it. One remapping lock is held for each such
+/// stretch, over all the addresses it touches (from the lowest to the
+/// highest): reads of title memory in place there wait for the stretch.
+pub(super) fn scatter(
+    physical: &mut Physical,
+    addresses: &[*mut c_void],
+    want: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let n = addresses.len();
+    let mode = remap_same();
+    let mut i = 0;
+    while i < n {
+        let mut seen = HashSet::new();
+        let mut batch: Vec<(usize, Option<Slice>)> = Vec::new();
+        let mut j = i;
+        let mut unknown = false;
+        while j < n {
+            let at = addresses[j] as usize;
+            let page = want(j);
+            let slice = match page {
+                Some(p) => match physical.pages.get(&p) {
+                    Some(s) => Some(s.clone()),
+                    None => {
+                        unknown = true;
+                        break;
+                    }
+                },
+                None => None,
+            };
+            if !seen.insert(at) {
+                break;
+            }
+            j += 1;
+            WORK[7].fetch_add(1, Ordering::Relaxed);
+            if mode != 0 {
+                if page.is_some_and(|p| shows(physical, at, &[p])) {
+                    WORK[8].fetch_add(1, Ordering::Relaxed);
+                    if mode == 1 {
+                        victory_gpu::kernel_will_write(at, PAGE);
+                    }
+                    continue;
+                }
+                if page.is_none() && shows_nothing(physical, at, PAGE) {
+                    WORK[9].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            batch.push((at, slice));
+        }
+        if !batch.is_empty() {
+            let (lo, hi) = batch.iter().fold((usize::MAX, 0), |(lo, hi), &(at, _)| {
+                let (a, b) = touched(physical, at, PAGE);
+                (lo.min(a), hi.max(b))
+            });
+            let _changing = victory_gpu::title_memory_remapping_range(lo, hi - lo);
+            let ranges: Vec<(usize, usize)> = batch.iter().map(|&(at, _)| (at, PAGE)).collect();
+            let maps = batch.into_iter().filter_map(|(at, s)| Some((at, PAGE, s?))).collect();
+            if !change_many(physical, &ranges, maps, map) {
+                return false;
+            }
+        }
+        if unknown {
+            // As one after the other: it fails, after what came before it.
+            let page = want(j);
+            return map_pages(physical, addresses[j] as usize, 1, page.as_ref().map(std::slice::from_ref));
+        }
+        i = j;
+    }
+    true
 }
 
 /// Consecutive slices of one section in `slices` (by page, from `base`),
@@ -355,8 +449,23 @@ fn serve(pool: &Pool) {
     }
 }
 
-/// Runs `ops`, the caller too; each with how it ended.
+/// Runs `ops`, the caller too; each with how it ended. The time the
+/// caller waits for them goes to the work line (`WORK[1]` for views taken
+/// away, `WORK[3]` for views made), as one after the other would count
+/// it; the calls' own time, summed over the threads, to `WORK[11]`. (Each
+/// call's own time counted as the views' time made ops that wait for one
+/// another in the kernel look several times as costly as they are: batch 1,
+/// 0.28 ms an unmap against 0.07 with the threads off, with the title's
+/// time in its calls lower.)
 fn all(ops: Vec<Op>) -> Vec<(Op, u8)> {
+    let unmaps = ops.first().is_some_and(|op| matches!(op, Op::Unmap(..)));
+    let began = Instant::now();
+    let done = all_untimed(ops);
+    WORK[if unmaps { 1 } else { 3 }].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    done
+}
+
+fn all_untimed(ops: Vec<Op>) -> Vec<(Op, u8)> {
     // Waking the others takes longer than a few quick calls.
     if ops.len() < 3 {
         return ops
