@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+mod compute_wait;
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -447,6 +449,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         } else {
             wait(p, crate::frame::current());
         }
+        compute_wait::after(p, crate::frame::current());
         super::eager::waited(p.made.get().is_some());
     }
     p.made.get()?.as_ref()
@@ -862,6 +865,16 @@ impl Queue {
             });
         }
         Some(prev == NOT_QUEUED)
+    }
+
+    /// Moves a requested pipeline not taken yet to the front
+    /// ([`compute_wait`]).
+    fn to_front(&mut self, p: &Arc<Pending>) {
+        if let Some(at) = self.requested.iter().position(|q| Arc::ptr_eq(q, p))
+            && let Some(q) = self.requested.remove(at)
+        {
+            self.requested.push_front(q);
+        }
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
