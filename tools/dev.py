@@ -128,9 +128,11 @@ def acquire_gpu_lock(tag: str, timeout_s: float = 4 * 3600.0) -> Iterator[None]:
         yield
 
 
-def throttled(name: str):
+def throttled(name: str, whole: bool = True):
     """Build/test/gate/policy: refuse on a nearly full drive, run below normal priority, and wait
-    for one of the machine-wide build slots so parallel worktree jobs cannot swamp the CPU."""
+    for one of the machine-wide build slots so parallel worktree jobs cannot swamp the CPU. With
+    `whole=False` the command takes the slot itself (`build_slot`) for its cargo build only: a
+    gate's test run uses 2-4 cores, so holding a slot through it kept other builds waiting."""
 
     def wrap(func):
         def run(args: argparse.Namespace) -> int:
@@ -143,12 +145,19 @@ def throttled(name: str):
                 return 1
             ensure_coord_dirs()
             dev_throttle.below_normal_priority()
-            with dev_throttle.build_slot(LOCKS_DIR, f"{JOB or 'main'}:{name}"):
+            if not whole:
+                return func(args)
+            with build_slot(name)():
                 return func(args)
 
         return run
 
     return wrap
+
+
+def build_slot(name: str):
+    """A factory for this job's hold on one machine-wide build slot."""
+    return lambda: dev_throttle.build_slot(LOCKS_DIR, f"{JOB or 'main'}:{name}")
 
 
 def run_logged_steps(
@@ -540,15 +549,17 @@ def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
     return f"DEV {cmd} {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={v}" for k, v in fields.items())
 
 
-@throttled("test")
+@throttled("test", whole=False)
 def cmd_test(args: argparse.Namespace) -> int:
     ensure_coord_dirs()
-    ok, _build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate)
+    ok, _build, fields = dev_gate.gate(
+        VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate, build_slot("test")
+    )
     print(_dev_line("test", ok, fields))
     return 0 if ok else 1
 
 
-@throttled("gate")
+@throttled("gate", whole=False)
 def cmd_gate(args: argparse.Namespace) -> int:
     """The merge gate: every workspace test, policy and pytest, and no compiler warning."""
     ensure_coord_dirs()
@@ -557,7 +568,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
     fields: dict[str, str] = {}
     ok = True
     for _ in range(runs):
-        ok, build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None)
+        ok, build, fields = dev_gate.gate(
+            VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None, build_slot("gate")
+        )
         ok = ok and not build.warnings
         walls.append(fields["wall_s"])
         if not ok:

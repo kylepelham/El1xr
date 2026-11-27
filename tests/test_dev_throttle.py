@@ -67,6 +67,55 @@ def test_throttled_command_runs_inside_a_slot(tmp_path, monkeypatch):
     assert dev.throttled("gate")(body)(None) == 0
 
 
+def test_a_gate_holds_its_build_slot_for_the_build_only(tmp_path, monkeypatch):
+    import dev_gate
+
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "1")
+    seen = {}
+
+    def slot_is_free():
+        try:
+            with dev_throttle.build_slot(tmp_path, "other", timeout_s=0.3):
+                return True
+        except TimeoutError:
+            return False
+
+    def fake_build(_manifest, _crate):
+        seen["during_build"] = slot_is_free()
+        return dev_gate.Build(True, 0.0, [("victory_formats", "f.exe")])
+
+    def fake_run_all(steps):
+        seen["during_tests"] = slot_is_free()
+        for s in steps:
+            s.ok = True
+        return steps
+
+    monkeypatch.setattr(dev_gate, "build", fake_build)
+    monkeypatch.setattr(dev_gate, "run_all", fake_run_all)
+    ok, _b, _fields = dev_gate.gate(
+        tmp_path, tmp_path, tmp_path, tmp_path / "gate.log", None,
+        lambda: dev_throttle.build_slot(tmp_path, "gate", timeout_s=0.3),
+    )
+    assert ok
+    assert seen == {"during_build": False, "during_tests": True}
+
+
+def test_gate_and_test_commands_wait_for_no_slot_before_their_build(tmp_path, monkeypatch):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
+    monkeypatch.setattr(dev, "ensure_coord_dirs", lambda: None)
+    monkeypatch.setattr(dev.dev_throttle, "disk_free_gb", lambda _path: 500.0)
+    monkeypatch.setattr(dev.dev_throttle, "below_normal_priority", lambda: None)
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "1")
+
+    def body(_args):
+        with dev_throttle.build_slot(tmp_path, "other", timeout_s=0.3):
+            pass
+        return 0
+
+    assert dev.throttled("gate", whole=False)(body)(None) == 0
+
+
 def test_all_build_slots_block_every_build(tmp_path, monkeypatch):
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
     with dev_throttle.all_build_slots(tmp_path, "quiet"):
