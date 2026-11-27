@@ -63,3 +63,28 @@ def test_throttled_command_runs_inside_a_slot(tmp_path, monkeypatch):
         return 0
 
     assert dev.throttled("gate")(body)(None) == 0
+
+
+def test_all_build_slots_block_every_build(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
+    with dev_throttle.all_build_slots(tmp_path, "quiet"):
+        with pytest.raises(TimeoutError):
+            with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
+                pass
+    with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
+        pass
+
+
+def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "2")
+    args = dev.build_parser().parse_args(["bench", "--quiet"])
+    with dev._quiet(args, "bench"):
+        with pytest.raises(TimeoutError):
+            with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
+                pass
+    loud = dev.build_parser().parse_args(["bench"])
+    with dev._quiet(loud, "bench"):
+        with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
+            pass

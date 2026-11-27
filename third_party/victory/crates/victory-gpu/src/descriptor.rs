@@ -358,7 +358,11 @@ fn heap_sync_worker() -> (&'static HeapSyncWorker, bool) {
         std::thread::Builder::new()
             .name("victory-heap-sync".into())
             .spawn(move || {
-                crate::cores::keep_helper_on_fast_cores();
+                if crate::topology::vcache_pin_enabled() {
+                    crate::topology::pin_hot("victory-heap-sync");
+                } else {
+                    crate::cores::keep_helper_on_fast_cores();
+                }
                 heap_sync_loop(worker);
             })
             .is_ok()

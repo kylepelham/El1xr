@@ -44,6 +44,7 @@ impl AsideWorker {
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
+                crate::topology::pin_background("victory-land-aside");
                 while asked.recv().is_ok() {
                     // One landing for all the asks queued so far.
                     while asked.try_recv().is_ok() {}

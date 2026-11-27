@@ -1342,8 +1342,17 @@ mod host {
             static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
                 std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
             });
+            static AUTO_A_PERIOD_MS: LazyLock<u128> = LazyLock::new(|| {
+                std::env::var("VICTORY_AUTO_A_PERIOD_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u128>().ok())
+                    .map(|ms| ms.max(250))
+                    .unwrap_or(4000)
+            });
             let run = super::START.elapsed();
-            if run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250 && !down.contains(&0x0D) {
+            let period = *AUTO_A_PERIOD_MS;
+            let hold = (period / 3).clamp(100, 250);
+            if run.as_secs() < *AUTO_A && run.as_millis() % period < hold && !down.contains(&0x0D) {
                 down.push(0x0D);
             }
             down.into_iter()

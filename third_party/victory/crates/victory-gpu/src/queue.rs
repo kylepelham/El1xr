@@ -172,9 +172,11 @@ fn wake_releaser() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-submit".into()).spawn(|| {
+            crate::topology::pin_hot("victory-submit");
             RELEASER.with(|mine| mine.set(true));
             loop {
                 {
+                    let _idle = crate::hitch::span(crate::hitch::Phase::Idle);
                     let mut wake = lock(&WAKE.0);
                     while !*wake {
                         wake = WAKE.1.wait(wake).unwrap_or_else(|e| e.into_inner());
@@ -987,6 +989,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    crate::hitch::title_presents();
     // (Neptune) What the title names, read now: the first plane's first resource, and a
     // second plane's if it is another one.
     #[cfg(windows)]
@@ -1023,6 +1026,7 @@ extern "system" fn present(
         {
             // One present at a time waits its turn: the title is not let more than a
             // frame ahead of what has been sent.
+            let _turn = crate::hitch::span(crate::hitch::Phase::PresentTurn);
             let mut later = lock(&LATER.0);
             while later.pending {
                 later = LATER.1.wait(later).unwrap_or_else(|e| e.into_inner());
