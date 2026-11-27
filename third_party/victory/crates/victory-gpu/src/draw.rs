@@ -5157,8 +5157,6 @@ impl State {
         let written = shape && list.gpu_written(arguments as usize, len as usize);
         let after_writer = written && {
             args.refresh(list, arguments, len);
-            #[cfg(windows)]
-            crate::gpucost::mark(&list.list, || "ours: indirect sanitize after writer");
             let (safe, ran) = crate::indirect::sanitized(list, &args, arguments, kind);
             if ran {
                 // The pass bound a compute pipeline and root signature of its own.
@@ -5248,9 +5246,17 @@ impl State {
         // (Neptune) A single record without a count buffer, which nothing
         // the list has recorded so far lets its shaders write: clamped in
         // the list's prelude, and drawn from its slot there.
+        // (El1xr) And a dispatch split into parts for its first group's number
+        // (`crate::indirect::split_ahead`).
+        let split_parts = split
+            .then(|| {
+                group_base(p).zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32))
+            })
+            .flatten()
+            .filter(|_| crate::indirect::split_ahead());
         if clamp_ahead()
             && !windows()
-            && kind != DISPATCH
+            && (kind != DISPATCH || split_parts.is_some())
             && max == 1
             && count.is_none()
             && crate::indirect::ahead_layout(kind, stride, args.offset(arguments))
@@ -5264,6 +5270,13 @@ impl State {
                 let ran = match kind {
                     DRAW | INDEXED => self.prepare(list, kind == INDEXED),
                     MESH => self.prepare_for(list, false, true),
+                    DISPATCH => {
+                        let bound = self.bind(list, p, true);
+                        if bound {
+                            note_defrag(p, None);
+                        }
+                        bound
+                    }
                     _ => prepare_failed!(self, PipelineKind),
                 };
                 if !ran {
@@ -5289,6 +5302,12 @@ impl State {
                 });
                 if kind == MESH {
                     self.mesh_scissor(list, true);
+                }
+                if let Some(((param, dword), parts)) = split_parts {
+                    crate::indirect::execute_parts(&list.list, (param, dword), parts, (&slots, at));
+                    CLAMPS[0].fetch_add(1, Ordering::Relaxed);
+                    DISPATCHED.fetch_add(1, Ordering::Relaxed);
+                    return true;
                 }
                 // SAFETY: an open list with everything set; the list keeps its
                 // ahead buffers, and the signature is cached.
@@ -5459,18 +5478,8 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            if let Some(((param, dword), signature)) = &parts {
-                for part in 0..crate::indirect::SPLIT {
-                    list.list.SetComputeRoot32BitConstant(
-                        *param,
-                        part * crate::indirect::PART,
-                        *dword,
-                    );
-                    let at = u64::from(part) * crate::indirect::PART_BYTES;
-                    list.list
-                        .ExecuteIndirect(*signature, 1, &bounded, at, None, 0);
-                }
-                list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
+            if let Some((base, signature)) = parts {
+                crate::indirect::execute_parts(&list.list, base, signature, (&bounded, 0));
             } else {
                 list.list.ExecuteIndirect(
                     signature,
