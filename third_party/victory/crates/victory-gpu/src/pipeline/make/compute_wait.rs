@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{Pending, QUEUE, REQUESTED};
@@ -68,19 +68,30 @@ pub(super) fn parse(value: Option<&str>) -> Option<Limits> {
     })
 }
 
+/// Live: each wait takes the limits as they are when it begins; the line is
+/// logged whenever they change to new ones.
 fn limits() -> Option<Limits> {
-    static ON: OnceLock<Option<Limits>> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let limits = parse(std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT").ok().as_deref());
-        if let Some(l) = limits {
-            tracing::info!(
-                each_ms = l.each.as_millis() as u64,
-                frame_ms = l.frame.as_millis() as u64,
-                "VICTORY_PIPELINE_COMPUTE_WAIT: a dispatch waits longer for its compute pipeline, bounded per dispatch and per frame"
-            );
-        }
-        limits
-    })
+    static ON: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_PIPELINE_COMPUTE_WAIT", |v| {
+        // Both at most 2,000 ms: 32 bits each; 0 off (`each` is never 0).
+        parse(v).map_or(0, |l| (l.each.as_millis() as u64) << 32 | l.frame.as_millis() as u64)
+    });
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let bits = ON.get();
+    if bits == 0 {
+        return None;
+    }
+    let limits = Limits {
+        each: Duration::from_millis(bits >> 32),
+        frame: Duration::from_millis(bits & u64::from(u32::MAX)),
+    };
+    if LOGGED.swap(bits, std::sync::atomic::Ordering::Relaxed) != bits {
+        tracing::info!(
+            each_ms = limits.each.as_millis() as u64,
+            frame_ms = limits.frame.as_millis() as u64,
+            "VICTORY_PIPELINE_COMPUTE_WAIT: a dispatch waits longer for its compute pipeline, bounded per dispatch and per frame"
+        );
+    }
+    Some(limits)
 }
 
 /// One frame's extra waiting: each wait takes its share before it begins
@@ -260,6 +271,12 @@ fn dropped(p: &Pending, frame: u64, why: Dropped, waited: Duration) {
 mod tests {
     use super::super::{MAKING, Queue};
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        let on = Some(Limits { each: ms(EACH_DEFAULT), frame: ms(FRAME_DEFAULT) });
+        victory_core::settings::check_live("VICTORY_PIPELINE_COMPUTE_WAIT", "1", limits, None, on);
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)

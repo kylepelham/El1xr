@@ -115,6 +115,10 @@ pub(crate) fn waits_taken() -> [u64; 9] {
 }
 
 /// Frames begun so far (frame waits that ended).
+/// (Neptune) `VICTORY_PACE=0`: the waits do not sleep.
+static PACED: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PACE", |v| u64::from(v.is_none_or(|v| v != "0")));
+
 pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
@@ -192,9 +196,8 @@ pub(crate) extern "system" fn wait(
     // (Neptune) `VICTORY_PACE=0`: no wait sleeps (a poll whose tick is not due times out at
     // once, a blocking wait ends at once on the next tick): an experiment, to see how much
     // of a slow frame is the title waiting for its own clock.
-    static PACED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let paced = *PACED.get_or_init(|| std::env::var_os("VICTORY_PACE").is_none_or(|v| v != "0"))
-        && crate::load_rate::paced_now();
+    // Live: each wait takes it as it is.
+    let paced = PACED.get_bool() && crate::load_rate::paced_now();
     let started = Instant::now();
     let hr = if wait > limit {
         if paced {
@@ -262,6 +265,11 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pace_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_PACE", "0", || PACED.get_bool(), true, false);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {

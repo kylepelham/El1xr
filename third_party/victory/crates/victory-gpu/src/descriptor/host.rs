@@ -878,8 +878,8 @@ fn tabled_out() -> bool {
 /// ([`SLOT_IN_TEXTURES`]) first, so a read of a slot not queued takes no
 /// lock. A candidate of the flicker at scene loads.
 pub(crate) fn tabled_reread() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_some_and(|v| v == "1"))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_TABLED_REREAD");
+    ON.get_bool()
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -1728,13 +1728,7 @@ impl HostHeap {
         // every pipeline made). The slots come back as the lists in the air land, so the
         // table waits for them, up to `VICTORY_DYNAMIC_WAIT_MS` (30; 0: refused at once, as
         // before), before it is given up.
-        static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let wait = *WAIT.get_or_init(|| {
-            std::env::var("VICTORY_DYNAMIC_WAIT_MS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(30)
-        });
+        let wait = DYNAMIC_WAIT_MS.get();
         let began = std::time::Instant::now();
         let deadline = std::time::Duration::from_millis(wait);
         let mut waited = false;
@@ -1943,15 +1937,7 @@ impl HostHeap {
         /// Looks per pass (each reads 48 KiB, or up to 4 MiB for live slots),
         /// and the time they may take.
         const MOST: usize = 256;
-        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-        let span = *SPAN.get_or_init(|| {
-            let ms = std::env::var("VICTORY_TEXTURE_RECHECK_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|ms| ms.max(1))
-                .unwrap_or(4);
-            std::time::Duration::from_millis(ms)
-        });
+        let span = std::time::Duration::from_millis(TEXTURE_RECHECK_MS.get());
         let (due, waiting) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -5135,10 +5121,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
 /// nothing yet shows magenta: on the screen, a texture that is not there is
 /// told from one whose contents are black. False if it is to be null.
-/// (In every build since #55: the operator runs release builds.)
+/// (In every build since #55: the operator runs release builds.) Live: a
+/// slot made magenta stays so until it is made again.
 fn magenta_for(desc: &[u32], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+    if !NULL_MAGENTA.get_bool() {
         return false;
     }
     // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
@@ -5153,6 +5139,17 @@ fn magenta_for(desc: &[u32], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     unsafe { host.device.CreateShaderResourceView(texture, None, at) };
     true
 }
+
+/// Live, as are the next two: each use takes them as they are.
+static DYNAMIC_WAIT_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_DYNAMIC_WAIT_MS", |v| {
+    v.and_then(|v| v.trim().parse().ok()).unwrap_or(30)
+});
+
+static TEXTURE_RECHECK_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_RECHECK_MS", |v| {
+    v.and_then(|v| v.parse::<u64>().ok()).map(|ms| ms.max(1)).unwrap_or(4)
+});
+
+static NULL_MAGENTA: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_NULL_MAGENTA");
 
 /// One magenta texel, written by the processor.
 fn magenta() -> Option<&'static ID3D12Resource> {
@@ -5388,6 +5385,15 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reread_and_magenta_switches_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_TABLED_REREAD", "1", tabled_reread, false, true);
+        check_live("VICTORY_NULL_MAGENTA", "1", || NULL_MAGENTA.get_bool(), false, true);
+        check_live("VICTORY_DYNAMIC_WAIT_MS", "0", || DYNAMIC_WAIT_MS.get(), 30, 0);
+        check_live("VICTORY_TEXTURE_RECHECK_MS", "0", || TEXTURE_RECHECK_MS.get(), 4, 1);
+    }
 
     /// (`VICTORY_TABLED_ALL`) A slot of a table a draw bound is left to its
     /// draws for the switch's frames and asked for in the frame after, with

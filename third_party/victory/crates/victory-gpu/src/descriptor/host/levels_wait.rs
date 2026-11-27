@@ -22,9 +22,20 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use super::View;
 
 /// Frames a slot may wait (`VICTORY_LEVELS_WAIT_SHOWN`); 0 off.
+/// Live: a slot keeps the last frame it was given; slots held before it is
+/// turned off are still made by draws and passes ([`EVER_HELD`]).
 pub(super) fn frames() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| parse_frames(std::env::var("VICTORY_LEVELS_WAIT_SHOWN").ok().as_deref()))
+    static N: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_LEVELS_WAIT_SHOWN", parse_frames);
+    N.get()
+}
+
+/// Whether a slot was ever held: the reads and passes that make held slots
+/// then run with the switch off too.
+static EVER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether held slots are to be looked at: the switch is on or was.
+fn looking() -> bool {
+    frames() != 0 || EVER_HELD.load(Relaxed)
 }
 
 fn parse_frames(value: Option<&str>) -> u64 {
@@ -142,6 +153,7 @@ impl super::HostHeap {
                 return false;
             }
             pending.insert((self.me(), index), Pending { key, frame });
+            EVER_HELD.store(true, Relaxed);
         }
         made[index as usize] = key;
         // Not shown yet: every look at the slot takes the records' lock and
@@ -157,7 +169,7 @@ impl super::HostHeap {
     /// it waits for its texture's levels, it is made now (the draw uploads
     /// them before it reads them; a show runs after its upload).
     pub(super) fn levels_read(&self, index: u32, key: u64, view: &View) {
-        if frames() == 0 || self.sampler {
+        if !looking() || self.sampler {
             return;
         }
         self.levels_read_now(index, key, view);
@@ -204,7 +216,7 @@ impl super::HostHeap {
     /// their view; those the title wrote again since are let go. How many
     /// were made.
     pub(super) fn levels_due(&self) -> usize {
-        if frames() == 0 || self.sampler {
+        if !looking() || self.sampler {
             return 0;
         }
         self.levels_due_at(crate::frame::current())
@@ -263,6 +275,11 @@ impl super::HostHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_LEVELS_WAIT_SHOWN", "1", frames, 0, 60);
+    }
 
     #[test]
     fn the_wait_is_off_unless_asked_and_bounded() {
