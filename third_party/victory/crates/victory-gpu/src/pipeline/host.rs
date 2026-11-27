@@ -20,6 +20,7 @@ use crate::host::host;
 #[path = "host_launch.rs"]
 mod launch;
 pub(crate) use launch::Launch;
+mod state_bytes;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
