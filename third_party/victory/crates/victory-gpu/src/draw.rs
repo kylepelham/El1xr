@@ -6005,6 +6005,8 @@ mod tests {
         list.close();
         list.reset();
         assert_eq!(list.cbv_epoch(), 0);
+    }
+}
 
 #[cfg(test)]
 mod bake_budget_tests {
@@ -6020,7 +6022,5 @@ mod bake_budget_tests {
         assert_eq!(bake_left(7, 500, 1600), 0);
         // The next frame starts again.
         assert_eq!(bake_left(8, 500, 1700), 500);
-    }
-}
     }
 }
