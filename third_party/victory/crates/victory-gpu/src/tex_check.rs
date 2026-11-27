@@ -167,6 +167,7 @@ pub(crate) fn log(frames: f64) {
     crate::texture::blind_hash::log(frames);
     crate::texture::staged_ask::log(frames);
     crate::descriptor::host::host_textures::log(frames);
+    crate::descriptor::host::queue_marks::log(frames);
     let [batches, textures, sum_us, wall_us] =
         [0, 1, 2, 3].map(|i| WINDOW_STATS[i].swap(0, Relaxed));
     if batches == 0 {
