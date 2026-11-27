@@ -49,6 +49,8 @@ mod bake_inputs;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
+mod bake_why;
+#[cfg(windows)]
 mod draw;
 #[cfg(windows)]
 mod dred;
