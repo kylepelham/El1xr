@@ -23,7 +23,8 @@ El1xr ist das GTA-VI-Emulationsprojekt von Bone/Nevaa: ein Fork von [AnyXboxX](h
 >
 > - 🎮 **Die Spielwelt ist in 4K spielbar, mit 24-25 fps nach dem Einpendeln** auf einer RTX 5090 (drei Benchmark-Läufe auf ruhigem Rechner: 24,9; 25,2 und 24,2 fps). Ziel sind stabile 30 fps.
 > - ✅ **0 abgelehnte GPU-Pipelines** und kein Verlust des GPU-Geräts in den Benchmark-Läufen.
-> - ✅ Zwischensequenzen laufen vollständig, und die ersten Missionen wurden durchgespielt; das erste Bild der Spielwelt erscheint 46-52 s nach dem Start.
+> - ✅ Zwischensequenzen laufen vollständig, und die ersten Missionen wurden durchgespielt.
+> - ⚡ **Stapel 1 übernommen**: Vom Start bis zum ersten Bild der Spielwelt jetzt etwa 31-33 s (vorher 41-54 s), das schlimmste Einfrieren beim Betreten der Spielwelt 1,5-1,9 s (vorher 7,6-8,1 s).
 > - 🚧 Rund **60 weitere Beschleunigungen sind geschrieben und in Erprobung** (siehe [In Erprobung](#in-erprobung)).
 
 ## Auf einen Blick
@@ -35,10 +36,10 @@ El1xr ist das GTA-VI-Emulationsprojekt von Bone/Nevaa: ein Fork von [AnyXboxX](h
 | Frame im 99. Perzentil | 68-73 ms | keine Ruckler |
 | CPU-Zeit zur Vorbereitung eines Frames | 25-26 ms | unter der GPU-Zeit |
 | Abgelehnte GPU-Pipelines | **0** | 0 |
-| Vom Start bis zum ersten Bild der Spielwelt | 46-52 s | |
+| Vom Start bis zum ersten Bild der Spielwelt | ~31-33 s | |
 | Streaming nach dem Betreten der Spielwelt | 52-63 s | wenige Sekunden |
 
-Gemessen mit `python tools/dev.py bench --quiet --seconds 200`: Schnellstart von einem festen Checkpoint, sonst läuft nichts auf dem Rechner, Werte aus dem eigenen Frame-Log des Emulators.
+Gemessen mit `python tools/dev.py bench --quiet --seconds 200`: Schnellstart von einem festen Checkpoint, sonst läuft nichts auf dem Rechner, Werte aus dem eigenen Frame-Log des Emulators. Die Startzeit stammt aus den Läufen von Stapel 1, die liefen, während anderes kompiliert wurde; auf einem ruhigen Rechner sollte sie etwas besser ausfallen.
 
 ## Testrechner
 
@@ -92,8 +93,8 @@ Genau darauf zielt die Arbeit, die gerade erprobt wird.
 
 Die Arbeit wird parallel geschrieben und in Stapeln auf der einen GPU getestet: Jede Änderung steckt hinter ihrem eigenen `VICTORY_*`-Schalter, ein Stapel lässt alle neuen Schalter eingeschaltet gegen alle ausgeschaltet laufen, und jeder Schalter wird anhand der Zahlen und der Screenshots behalten oder verworfen.
 
-- **Stapel 1 (läuft)**: Speicherpools für Texturen und Buffer, Textur-Staging ohne Sperren, weniger Neuaufbauten von Deskriptoren, Speicher-Mapping auf 8 Threads, paralleles Vorberechnen der Figuren beim Laden, Shader-Übersetzung, sobald das Spiel die Shader anlegt, zusammengeführte GPU-Submissions, günstigere Alias-Kopien sowie die Korrekturen für Gesichter und Haare.
-- **Stapel 2 (als Nächstes)**: Titelspeicher in 2-MiB-Abschnitten (Mapping-Zeit upstream 55,5 s → 7,3 s), Spiel-Buffer im GPU-Speicher gehalten (upstream −15 % Frametime auf einer RTX 5090), DLSS-Upscaling, höhere Priorität für die Frame-Threads des Emulators, Offline-Vorwärmen von Shadern und Pipelines sowie Hardware-Raytracing auf den RT-Kernen.
+- **Stapel 1 (fertig, 20 Schalter behalten)**: Textur-Staging ohne Sperren, weniger Neuaufbauten von Deskriptoren und weniger Warten auf Sperren, paralleles Vorberechnen der Figuren beim Laden, Shader-Übersetzung, sobald das Spiel die Shader anlegt, schnelleres Laden der Pipeline-Bibliotheken, schlankeres Speicher-Mapping sowie die Korrekturen für Outfits, Gesichter und Haare (Lucias Oberteil im Diner stimmte in 4 von 5 Läufen, vorher in 0 von 2). Vorerst verworfen: die Speicherpools für Texturen und Buffer (sie verlangsamten das Unmapping von Speicher) und zwei Schalter, die abstürzten; ihre Autoren beheben das.
+- **Stapel 2 (läuft)**: Titelspeicher in 2-MiB-Abschnitten (Mapping-Zeit upstream 55,5 s → 7,3 s), Spiel-Buffer im GPU-Speicher gehalten (upstream −15 % Frametime auf einer RTX 5090), DLSS-Upscaling, höhere Priorität für die Frame-Threads des Emulators, Offline-Vorwärmen von Shadern und Pipelines sowie Hardware-Raytracing auf den RT-Kernen.
 
 ## Ausführen
 
