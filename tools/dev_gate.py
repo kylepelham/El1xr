@@ -15,6 +15,7 @@ one thread (measured 2026-11-27 with other jobs building).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, ContextManager
 
 SERIAL_BINARIES = frozenset({"victory_gpu"})
 SHARDED_BINARIES = {"victory_shader": 6}
@@ -256,11 +258,13 @@ def summary(b: Build, steps: list[Step], wall: float) -> dict[str, str]:
 
 def gate(
     victory_dir: Path, repo_root: Path, coord_dir: Path, log_path: Path, crate: str | None,
+    build_slot: Callable[[], ContextManager[object]] = contextlib.nullcontext,
 ) -> tuple[bool, Build, dict[str, str]]:
-    """Builds, runs every check at once and logs them; whether all passed, the build, and the
-    DEV line's fields."""
+    """Builds inside `build_slot()`, then outside it runs every check at once and logs them;
+    whether all passed, the build, and the DEV line's fields."""
     t0 = time.monotonic()
-    b = build(victory_dir / "Cargo.toml", crate)
+    with build_slot():
+        b = build(victory_dir / "Cargo.toml", crate)
     steps: list[Step] = []
     if b.ok:
         steps = run_all(plan(b, victory_dir, repo_root, python_for_tests(repo_root, coord_dir)))
