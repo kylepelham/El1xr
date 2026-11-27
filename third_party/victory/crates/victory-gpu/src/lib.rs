@@ -138,6 +138,7 @@ mod readable_once;
 mod dlss;
 pub mod upscale;
 pub mod upscale_live;
+pub mod camera;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

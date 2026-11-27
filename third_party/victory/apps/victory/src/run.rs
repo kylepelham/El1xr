@@ -124,18 +124,31 @@ pub fn run(
     // `victory_hle::modules::ffx`; the rest of the DLL stays the title's.
     // Unset (default): untouched, preserving default native 4K Series X.
     let upscale_mode = victory_hle::modules::ffx::asked_mode();
+    let series_s = victory_hle::console::current() == victory_hle::console::Console::SeriesS;
     let take = victory_hle::modules::ffx::should_take_dispatch(
-        victory_hle::console::current() == victory_hle::console::Console::SeriesS,
+        series_s,
         victory_loader::resolution::asked_upscaler(),
         victory_hle::modules::fidelityfx::enabled(),
         upscale_mode,
     );
-    if take {
+    // VICTORY_CAMERA_CAPTURE=1: observe the dispatch for the camera record.
+    let observe = !take
+        && victory_hle::modules::ffx::should_observe_dispatch(
+            series_s,
+            victory_loader::resolution::asked_upscaler(),
+            victory_hle::modules::fidelityfx::enabled(),
+            victory_hle::modules::ffx::camera_capture(),
+        );
+    if observe {
+        println!("upscale        the title's ffxDispatch is observed (VICTORY_CAMERA_CAPTURE=1)");
+    }
+    let take = take || observe;
+    if take && upscale_mode.is_some() {
         println!(
             "upscale        the title's ffxDispatch is ours (VICTORY_UPSCALE={})",
             upscale_mode.unwrap().as_str()
         );
-    } else if upscale_mode.is_some() && !victory_hle::modules::fidelityfx::enabled() {
+    } else if !take && upscale_mode.is_some() && !victory_hle::modules::fidelityfx::enabled() {
         println!(
             "upscale        VICTORY_UPSCALE ignored on Series X without VICTORY_UPSCALER=7 (keeping native upscaler)"
         );
