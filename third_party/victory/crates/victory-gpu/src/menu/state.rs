@@ -165,12 +165,7 @@ impl Menu {
                     }
                 }
                 Some(&Row::Preset(p)) => self.apply_preset(model, p),
-                Some(Row::Save) => {
-                    self.status = Some(match model.save() {
-                        Ok(()) => "Settings saved".into(),
-                        Err(e) => format!("Not saved: {e}"),
-                    })
-                }
+                Some(Row::Save) => self.status = Some(save_status(model.save())),
                 Some(Row::Undo) => self.undo(model),
                 None => return false,
             },
@@ -279,6 +274,17 @@ impl Menu {
             0 => "Nothing to undo".into(),
             n => format!("{n} changes undone"),
         });
+    }
+}
+
+/// What SAVE says: a read-only file or folder in words, other errors as the OS gives them.
+fn save_status(saved: std::io::Result<()>) -> String {
+    match saved {
+        Ok(()) => "Settings saved".into(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            "Not saved: the settings file or its folder is read-only".into()
+        }
+        Err(e) => format!("Not saved: {e}"),
     }
 }
 
@@ -666,6 +672,22 @@ mod tests {
         );
         m.act(&mut model, Action::Activate);
         assert_eq!(m.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn save_says_why_it_failed() {
+        let mut model = Registry::with_save(|| Err(std::io::ErrorKind::PermissionDenied.into()));
+        let mut m = opened(&mut model);
+        m.act(&mut model, Action::SelectTab(Tab::Presets));
+        let save = model.presets().len();
+        m.act(&mut model, Action::SelectRow(save));
+        m.act(&mut model, Action::Activate);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("Not saved: the settings file or its folder is read-only")
+        );
+        let none = std::io::Error::new(std::io::ErrorKind::Unsupported, "no settings file (VICTORY_SETTINGS_FILE=none)");
+        assert_eq!(save_status(Err(none)), "Not saved: no settings file (VICTORY_SETTINGS_FILE=none)");
     }
 
     #[test]
