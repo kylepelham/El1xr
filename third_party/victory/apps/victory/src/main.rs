@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod live_hooks;
 mod run;
 mod shader;
 mod translate;

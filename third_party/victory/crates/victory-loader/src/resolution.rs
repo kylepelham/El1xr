@@ -270,6 +270,12 @@ pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
 static FFX_SLOT: AtomicUsize = AtomicUsize::new(0);
 static FFX_START: AtomicU32 = AtomicU32::new(0);
 
+/// Whether `VICTORY_FFX_SCALE` was patched at startup, so
+/// [`request_ffx_scale`] can change it.
+pub fn ffx_scale_live() -> bool {
+    FFX_SLOT.load(Ordering::Relaxed) != 0
+}
+
 /// A live render scale for FidelityFX (the settings' live hook, or
 /// `VICTORY_UPSCALE_LIVE_TEST`): rewrites the scale `VICTORY_FFX_SCALE`
 /// placed at startup, clamped to 0.5 .. that startup scale (the title's
