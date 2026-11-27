@@ -85,6 +85,9 @@ static TOTALS: Mutex<Option<HashMap<Label, (u64, u64, u64)>>> = Mutex::new(None)
 /// its first label (what kind of list it is).
 static INTERVALS: Mutex<Vec<(u64, u64, Label)>> = Mutex::new(Vec::new());
 
+/// Since the last line: list runs not counted, by why and list kind.
+static SKIPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
 /// Since the last line: runs of lists counted, and runs not counted (not
 /// run, or stamps out of order).
 static RUNS: [std::sync::atomic::AtomicU64; 2] =
@@ -218,8 +221,28 @@ fn collect(s: &mut Stamps) {
     };
     let ordered = stamps.windows(2).all(|w| w[0] <= w[1]);
     let span = stamps[n - 1].wrapping_sub(stamps[0]);
-    if stamps.contains(&UNWRITTEN) || !ordered || span > frequency() {
+    let why = if stamps.contains(&UNWRITTEN) {
+        Some(if stamps.iter().all(|&t| t == UNWRITTEN) {
+            "not run"
+        } else {
+            "partly written"
+        })
+    } else if !ordered {
+        Some("out of order")
+    } else if span > frequency() {
+        Some("over a second")
+    } else {
+        None
+    };
+    if let Some(why) = why {
         RUNS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let kind = labels[0].split(" (").next().unwrap_or(&labels[0]).to_owned();
+        *SKIPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(format!("{why}: {kind}"))
+            .or_insert(0) += 1;
         return;
     }
     RUNS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +336,7 @@ pub(crate) fn title(kind: &str, pipeline: &str) -> Label {
 }
 
 /// Logs the sums per frame since the last line, `frames` frames.
-pub(crate) fn log(frames: f64) {
+pub(crate) fn log(frames: f64, frame_ms: f64) {
     if !on() {
         return;
     }
@@ -327,8 +350,39 @@ pub(crate) fn log(frames: f64) {
     let ms = |ticks: u64| ticks as f64 * 1e3 / frequency() as f64 / frames;
     let mut rows: Vec<(Label, (u64, u64, u64))> = totals.into_iter().collect();
     let all: u64 = rows.iter().map(|r| r.1.1).sum();
-    let (gaps, long) = gaps();
-    let idle: u64 = gaps.values().map(|g| g.1).sum();
+    let (gaps, long, span, busy) = gaps();
+    // The gaps are of the runs up to a second before the last one seen (a
+    // list's stamps are read at its next reset): per frame of that span.
+    let per_span = |ticks: u64| {
+        let f = span as f64 * 1e3 / frequency() as f64 / frame_ms.max(1.0);
+        ticks as f64 * frames / f.max(1.0)
+    };
+    let gaps: Vec<(Label, (u64, u64, u64))> = gaps
+        .into_iter()
+        .map(|(l, (n, t, m))| (l, (n, per_span(t) as u64, m)))
+        .collect();
+    let idle: u64 = gaps.iter().map(|g| g.1.1).sum();
+    let busy = per_span(busy) as u64;
+    let mut skips: Vec<(String, u64)> = SKIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    skips.sort_by_key(|s| std::cmp::Reverse(s.1));
+    tracing::info!(
+        "gpu cost: card busy in timed lists {:.2} ms/frame (their union), idle between them {:.2} ms; \
+         list runs not counted per frame: {}",
+        ms(busy),
+        ms(idle),
+        skips
+            .iter()
+            .take(8)
+            .map(|(k, n)| format!("{k} {:.1}", *n as f64 / frames))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     rows.extend(gaps);
     rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
     let ours: u64 = rows
@@ -385,9 +439,23 @@ pub(crate) fn log(frames: f64) {
 /// kinds of the lists before and after (stretches, ticks, longest), and how
 /// many gaps of over 100 ms were left out (lists counted late, or the title
 /// not submitting).
-fn gaps() -> (HashMap<Label, (u64, u64, u64)>, u64) {
-    let mut runs = std::mem::take(&mut *INTERVALS.lock().unwrap_or_else(|e| e.into_inner()));
+fn gaps() -> (HashMap<Label, (u64, u64, u64)>, u64, u64, u64) {
+    let mut runs = {
+        let mut all = INTERVALS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cut) = all.iter().map(|r| r.1).max().map(|m| m.saturating_sub(frequency()))
+        else {
+            return (HashMap::new(), 0, 0, 0);
+        };
+        let (old, keep): (Vec<_>, Vec<_>) = all.drain(..).partition(|r| r.1 <= cut);
+        *all = keep;
+        old
+    };
     runs.sort_by_key(|r| r.0);
+    let span = match (runs.first(), runs.iter().map(|r| r.1).max()) {
+        (Some(f), Some(l)) => l - f.0,
+        _ => 0,
+    };
+    let mut busy = 0u64;
     let most = frequency() / 10;
     let kind = |l: &Label| l.split(" (").next().unwrap_or(l).to_owned();
     let mut out: HashMap<Label, (u64, u64, u64)> = HashMap::new();
@@ -412,9 +480,11 @@ fn gaps() -> (HashMap<Label, (u64, u64, u64)>, u64) {
                 }
             }
         }
+        let start = end.map_or(*from, |(last, _)| (*from).max(last));
+        busy += to.saturating_sub(start);
         if end.is_none_or(|(last, _)| *to > last) {
             end = Some((*to, label));
         }
     }
-    (out, long)
+    (out, long, span, busy)
 }

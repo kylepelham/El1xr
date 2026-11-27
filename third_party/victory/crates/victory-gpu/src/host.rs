@@ -10717,7 +10717,7 @@ impl Meter {
         }
         late_line(frames);
         card_clock_line(frames, ms);
-        crate::gpucost::log(frames);
+        crate::gpucost::log(frames, ms);
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
