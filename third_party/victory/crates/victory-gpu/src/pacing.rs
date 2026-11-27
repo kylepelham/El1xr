@@ -139,7 +139,9 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         turn: None,
         mean_us: 0.0,
     });
-    if let Some(period) = c.cap {
+    // Frame generation's proxy swap chain paces its own presents.
+    let paced_by_proxy = crate::framegen::active();
+    if let Some(period) = c.cap.filter(|_| !paced_by_proxy) {
         let now = Instant::now();
         let at = match w.turn {
             Some(turn) if turn > now => {
@@ -150,7 +152,7 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         };
         w.turn = Some(at + period);
     }
-    if let (Some(fraction), Some(last)) = (c.smooth, w.last) {
+    if let (Some(fraction), Some(last), false) = (c.smooth, w.last, paced_by_proxy) {
         let hold = last + Duration::from_micros((w.mean_us * fraction) as u64);
         let now = Instant::now();
         if hold > now {

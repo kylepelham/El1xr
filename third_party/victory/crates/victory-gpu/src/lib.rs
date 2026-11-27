@@ -136,8 +136,12 @@ mod stretch;
 mod table_defer;
 #[cfg(windows)]
 mod readable_once;
-#[cfg(all(windows, feature = "dlss"))]
+#[cfg(windows)]
 mod dlss;
+#[cfg(windows)]
+pub mod framegen;
+#[cfg(windows)]
+mod ngx;
 pub mod upscale;
 pub mod upscale_live;
 #[cfg(windows)]
