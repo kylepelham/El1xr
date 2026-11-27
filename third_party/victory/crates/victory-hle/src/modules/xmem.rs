@@ -33,7 +33,6 @@ use windows_sys::core::BOOL;
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
-const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
@@ -1354,7 +1353,7 @@ fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -
 }
 
 /// Maps `n` slices from `first` on at `base`: one view where the run lies
-/// in one placeholder (or adjacent placeholders that coalesce), else one
+/// in one placeholder, else (error 487, nothing changed) one
 /// view per page.
 fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool {
     if n > 1 {
@@ -1788,9 +1787,11 @@ fn map_view(
     let began = std::time::Instant::now();
     // SAFETY: maps the section directly when `[base, base + len)` is already
     // an exact placeholder (recycled slot after `UnmapViewOfFile2`), skipping
-    // the `VirtualFree` split syscall. Otherwise splits an enclosing
-    // placeholder (or, for multi-page views, coalesces adjacent placeholders
-    // inside the same reservation) and retries once.
+    // the `VirtualFree` split syscall. Otherwise splits the placeholder
+    // around it and retries once. Adjacent placeholders are never coalesced:
+    // views that grew across them were split again page by page by the
+    // title's unmaps, the whole view each time (bench w_on1/w_off1: unmaps
+    // of 0.1-0.5 ms each where the baseline's took 8-16 us).
     let map_once = || unsafe {
         MapViewOfFile3(
             slice.section.handle,
@@ -1808,21 +1809,14 @@ fn map_view(
     if view.Value as usize == base {
         SCATTER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
-        // SAFETY: both `VirtualFree` forms act only on placeholders and leave
-        // mapped views and unrelated regions untouched if they fail.
+        // SAFETY: acts only on placeholders; fails harmlessly when the
+        // range is a whole placeholder or spans several.
         unsafe {
-            let split = VirtualFree(
+            VirtualFree(
                 base as *mut c_void,
                 len,
                 MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
             );
-            if split == 0 && len > PAGE {
-                VirtualFree(
-                    base as *mut c_void,
-                    len,
-                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
-                );
-            }
         }
         view = map_once();
     }
@@ -3004,8 +2998,9 @@ mod tests {
 
     /// Unmapping the middle of a multi-page view via scatter tears down the
     /// view once, keeping both ends' bytes and `shown` entries; consecutive
-    /// slices scattered back are one view, across placeholders too (they are
-    /// coalesced); unchanged pages in the middle of a run are untouched.
+    /// slices scattered back into one placeholder are one view (across
+    /// placeholders, a view per page); unchanged pages in the middle of a run
+    /// are untouched.
     #[test]
     fn a_scatter_unmaps_a_run_once_and_keeps_pages_independent() {
         let pages = allocate(8);
@@ -3048,12 +3043,12 @@ mod tests {
         assert_eq!(views_in(a, 8), [(0, 2), (2, 4), (6, 2)]);
         assert_eq!((2..6).map(read).collect::<Vec<_>>(), [12, 13, 14, 15]);
 
-        // Unmapping all 8 pages leaves 3 placeholders; mapping all 8 pages
-        // again coalesces them back into a single 8-page view.
+        // Unmapping all 8 pages leaves 3 placeholders, which are never
+        // coalesced: the run across them is mapped a page at a time.
         assert_eq!(scatter(0, &[0; 8]), 1);
         assert!(views_in(a, 8).is_empty());
         assert_eq!(scatter(0, &pages), 1);
-        assert_eq!(views_in(a, 8), [(0, 8)]);
+        assert_eq!(views_in(a, 8), (0..8).map(|k| (k, 1)).collect::<Vec<_>>());
         assert_eq!(
             (0..8).map(read).collect::<Vec<_>>(),
             (10..18).collect::<Vec<_>>()
@@ -3200,10 +3195,10 @@ mod tests {
     }
 
     /// `map_alias_constant` unmaps a multi-page view once, leaves surviving
-    /// tails and already-matching pages intact, and a subsequent `map_alias`
-    /// coalesces adjacent 1-page placeholders back into one multi-page view.
+    /// tails and already-matching pages intact; a later `map_alias` over the
+    /// 1-page placeholders it left maps a view per page (no coalescing).
     #[test]
-    fn map_alias_constant_unmaps_once_and_coalesces_placeholders() {
+    fn map_alias_constant_unmaps_once_and_never_coalesces_placeholders() {
         let pages = allocate(6);
         let pool = reserve(6);
         let dest = reserve(6);
@@ -3239,10 +3234,13 @@ mod tests {
             (4 * PAGE) as u64
         ));
 
-        // Mapping the 6 consecutive pool pages back over the 6 1-page views
-        // coalesces their placeholders into a single 6-page view.
+        // Mapping the 6 consecutive pool pages back over the 6 1-page
+        // placeholders: never coalesced, so a view per page.
         assert!(map_alias(dest as u64, pool as u64, (6 * PAGE) as u64));
-        assert_eq!(views_in(dest, 6), [(0, 6)]);
+        assert_eq!(
+            views_in(dest, 6),
+            (0..6).map(|k| (k, 1)).collect::<Vec<_>>()
+        );
         let restored: Vec<u8> = (0..6)
             .map(|k| unsafe { at(dest, k).cast::<u8>().read() })
             .collect();

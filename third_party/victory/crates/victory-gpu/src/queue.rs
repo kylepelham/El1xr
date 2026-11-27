@@ -1208,14 +1208,6 @@ extern "system" fn copy_page_mappings(
             let mut next = i + 1;
             match r.kind {
                 0 => {
-                    while next < ranges.len()
-                        && ranges[next].kind == 0
-                        && r.start.checked_add(pages) == Some(ranges[next].start)
-                        && pages.checked_add(ranges[next].count).is_some()
-                    {
-                        pages += ranges[next].count;
-                        next += 1;
-                    }
                     let len = u64::from(pages) * PAGE;
                     let source = pool + u64::from(r.start) * PAGE;
                     ok &= inside(r.start, pages) && map(at, source, len);
