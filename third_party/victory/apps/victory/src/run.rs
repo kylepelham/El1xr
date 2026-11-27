@@ -90,6 +90,11 @@ pub fn run(
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
         }
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxQuery")
+        {
+            victory_hle::modules::ffx::set_real_query(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
         victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
@@ -120,7 +125,7 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     // `VICTORY_UPSCALE=stretch|dlss` (opt-in on Series S, or Series X with
-    // `VICTORY_UPSCALER=7`): `ffxDispatch` alone is intercepted by
+    // `VICTORY_UPSCALER=7`): `ffxDispatch` and `ffxQuery` are intercepted by
     // `victory_hle::modules::ffx`; the rest of the DLL stays the title's.
     // Unset (default): untouched, preserving default native 4K Series X.
     let upscale_mode = victory_hle::modules::ffx::asked_mode();
@@ -295,20 +300,31 @@ fn watch(base: usize, size: usize) {
     });
 }
 
-/// Intercepts only `amd_fidelityfx_loader_xbox.dll!ffxDispatch` when opted in
-/// via `VICTORY_UPSCALE=stretch|dlss`; forwards all other imports unchanged.
+/// Intercepts only `amd_fidelityfx_loader_xbox.dll!ffxDispatch` and
+/// `ffxQuery` (its failed answers, `victory_hle::modules::ffx::query`) when
+/// opted in via `VICTORY_UPSCALE=stretch|dlss`; forwards all other imports
+/// unchanged.
 #[cfg(windows)]
 struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool);
 
 #[cfg(windows)]
 impl victory_loader::ImportResolver for TakeDispatch<'_> {
     fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
-        let ours = self.1
-            && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-            && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
-        if ours {
+        let ours = match symbol {
+            victory_pe::ImportSymbol::Name { name, .. }
+                if self.1 && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER) =>
+            {
+                match name.as_str() {
+                    "ffxDispatch" => Some(victory_hle::modules::ffx::dispatch_address()),
+                    "ffxQuery" => Some(victory_hle::modules::ffx::query_address()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(address) = ours {
             return victory_loader::Resolution::Found {
-                address: victory_hle::modules::ffx::dispatch_address(),
+                address,
                 provenance: victory_loader::Provenance::Hle,
             };
         }
@@ -504,12 +520,26 @@ mod tests {
             Resolution::Found { address: 0x1234, provenance: Provenance::Title }
         ));
 
-        // Enabled: only amd_fidelityfx_loader_xbox.dll!ffxDispatch is taken.
+        // Enabled: only amd_fidelityfx_loader_xbox.dll!ffxDispatch and
+        // ffxQuery are taken.
         let on = super::TakeDispatch(&Inner, true);
         assert!(matches!(
             on.resolve(loader, &dispatch),
             Resolution::Found { address, provenance: Provenance::Hle }
                 if address == victory_hle::modules::ffx::dispatch_address()
+        ));
+        let query = ImportSymbol::Name {
+            hint: 0,
+            name: "ffxQuery".to_owned(),
+        };
+        assert!(matches!(
+            on.resolve(loader, &query),
+            Resolution::Found { address, provenance: Provenance::Hle }
+                if address == victory_hle::modules::ffx::query_address()
+        ));
+        assert!(matches!(
+            off.resolve(loader, &query),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
         ));
         assert!(matches!(
             on.resolve(loader, &other),
