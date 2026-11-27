@@ -107,6 +107,9 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// `(hash, sample)` of the last whole read, with
+    /// `VICTORY_TEXTURE_HASH_SAMPLED` ([`blind_hash::kept_sample`]).
+    sample: Option<(blake3::Hash, blake3::Hash)>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1578,19 +1581,17 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let mut blind = false;
+        let mut blind = blind_hash::Read::Seen;
         let read = self.refresh_timed(&mut blind);
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-        if blind {
-            blind_hash::note_read(read, us);
-        }
+        blind_hash::note_read(blind, read, us);
         read
     }
 
-    /// `blind` is set when the texture is read although no write to it was
-    /// seen ([`blind_hash`]).
-    fn refresh_timed(&self, blind: &mut bool) -> usize {
+    /// `blind` says whether the texture was read although no write to it was
+    /// seen, and how ([`blind_hash`]).
+    fn refresh_timed(&self, blind: &mut blind_hash::Read) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1627,6 +1628,11 @@ impl Staging {
         // that only changed every eighth frame, one old picture after
         // another on the screen).
         let mut unseen = false;
+        // `VICTORY_TEXTURE_HASH_SAMPLED`: a guarded texture's sample is taken with its
+        // whole reads, and a look for an unseen write that is not a whole one reads the
+        // sample alone.
+        let mut sampling = false;
+        let mut sampled_look = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) =
                 waited(1, || crate::watch::writes(start, start + size, true))
@@ -1650,7 +1656,16 @@ impl Staging {
                 return 0;
             }
             unseen = unwritten;
-            *blind = unwritten;
+            if unwritten {
+                *blind = blind_hash::Read::Blind;
+            }
+            if let Some(full) = blind_hash::full_every() {
+                sampling = true;
+                sampled_look = unwritten
+                    && !film
+                    && frame >= last.unguarded
+                    && !blind_hash::full_turn(frame, start, full);
+            }
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1730,13 +1745,25 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let sample = sampling.then(|| blind_hash::sample(tiled));
+        let kept = blind_hash::kept_sample(last.sample, last.hash);
+        if sampled_look && sample.is_some() && sample == kept {
+            *blind = blind_hash::Read::Sampled;
+            return blind_hash::sampled_bytes(size);
+        }
         let hash = blake3::hash(tiled);
+        if let Some(sample) = sample {
+            last.sample = Some((hash, sample));
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
         }
         if unseen && last.hash.is_some() {
+            if sample.is_some() && sample == kept {
+                blind_hash::note_sample_missed();
+            }
             self.unseen_write(last);
         }
         last.hash = Some(hash);
