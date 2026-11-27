@@ -819,6 +819,7 @@ pub(crate) fn take_dropped() -> u64 {
             "ray-only dispatches skipped since the last frame line (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning)"
         );
     }
+    crate::drop_why::line(crate::queue::frame_count());
     DROPPED.swap(0, Ordering::Relaxed)
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
@@ -1140,6 +1141,7 @@ macro_rules! prepare_failed {
         {
             $state.prepare_failure = crate::pipeline::PrepareFailure::$why;
         }
+        crate::drop_why::set(stringify!($why));
         false
     }};
 }
@@ -3678,7 +3680,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::drop_why::set("SkippedPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("dispatch");
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3694,7 +3698,9 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::drop_why::set("ray-tracing structure builder off");
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("dispatch");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why(
@@ -3709,7 +3715,9 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            crate::drop_why::set("MissingHostPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("dispatch");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3723,6 +3731,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("dispatch");
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -4115,6 +4124,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("mesh");
             dropped(self.pipeline);
         }
     }
@@ -4768,6 +4778,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("draw");
             dropped(self.pipeline);
         }
     }
@@ -4804,9 +4815,11 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
+                crate::drop_why::set("rectangle vertices outside their buffer");
                 return false;
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                crate::drop_why::set("no scratch memory for rectangles");
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -4858,6 +4871,7 @@ impl State {
         let lost = self.topology == RECTANGLES && !self.completes_rects();
         if lost {
             once!("indexed rectangles not drawn");
+            crate::drop_why::set("indexed rectangles without their geometry stage");
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
@@ -4879,6 +4893,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count("indexed");
             dropped(self.pipeline);
         }
     }
@@ -4991,9 +5006,11 @@ impl State {
                 "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
             );
             RT_SKIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::set("ray-only pass left out");
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::drop_why::set("ray-tracing structure builder off");
             return false;
         }
         const DRAW: u32 = 0;
@@ -5007,6 +5024,7 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            crate::drop_why::set("MissingHostPipeline");
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
@@ -5033,6 +5051,7 @@ impl State {
             _ => false,
         };
         if !matches_kind {
+            crate::drop_why::set("pipeline of another kind");
             why(&format!(
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
@@ -5041,6 +5060,7 @@ impl State {
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
+            crate::drop_why::set("arguments outside title buffers");
             why("arguments outside title buffers");
             return false;
         };
@@ -5055,6 +5075,7 @@ impl State {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
+                    crate::drop_why::set("count outside title buffers");
                     why("count outside title buffers");
                     return false;
                 }
@@ -5065,10 +5086,12 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
+            crate::drop_why::set("no host signature");
             why("no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            crate::drop_why::set("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
@@ -5369,6 +5392,7 @@ impl State {
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
+                    crate::drop_why::set("not bounded (no clamp, or arguments not 4-byte aligned)");
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };

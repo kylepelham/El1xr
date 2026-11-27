@@ -157,7 +157,7 @@ fn to_rgb(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<
     Some(out)
 }
 
-fn f32_from_half(h: u16) -> f32 {
+pub(crate) fn f32_from_half(h: u16) -> f32 {
     let (sign, exp, man) = (u32::from(h >> 15), u32::from(h >> 10 & 0x1f), u32::from(h & 0x3ff));
     let magnitude = match exp {
         0 => man as f32 * 2f32.powi(-24),
@@ -188,7 +188,7 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 }
 
 /// A PNG of 8-bit RGB `rgb` (`w * h * 3` bytes): per-row filters, deflated by zlib-rs at level 6.
-fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
     let raw = crate::pixels::filter_image(rgb, w as usize * 3, 3);
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
