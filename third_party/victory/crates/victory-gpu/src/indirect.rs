@@ -623,6 +623,22 @@ pub(crate) fn split_ahead() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_AHEAD").is_some_and(|v| v == "1"))
 }
 
+/// (El1xr) `VICTORY_SPLIT_RAW=1` (off by default): a dispatch that would be split into parts
+/// ([`bound_split`]) runs in one piece from the title's own record, as the other indirect
+/// records do with `VICTORY_INDIRECT_RAW=2`: no pass of ours and no waits for every earlier
+/// shader write before and after it (in place, some 260-290 such dispatches a frame were 1.49 ms
+/// of the card in `VICTORY_GPU_COST`, as "ours: indirect clamp in place"). The program's group
+/// base stays 0. Over 65,535 groups in x (about one record a frame, up to 115,200) this counts
+/// on the card running every group of the record, which the RTX 5090 does
+/// (`split_raw_tests`); D3D12 leaves it undefined. No bound on the record's groups either.
+pub(crate) fn split_raw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_RAW").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: dispatches run in one piece by [`split_raw`].
+pub(crate) static SPLIT_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Executes the [`SPLIT`] parts of a dispatch clamped into `records` at the
 /// byte `at`, the program's group base (root parameter `param`, word
 /// `dword`) set to each part's first group, and back to 0 after.
@@ -934,6 +950,9 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(all(test, windows))]
 mod args_state_tests;
+
+#[cfg(all(test, windows))]
+mod split_raw_tests;
 
 #[cfg(test)]
 mod tests {

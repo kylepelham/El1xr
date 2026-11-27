@@ -527,6 +527,11 @@ pub(crate) fn trail(what: impl FnOnce() -> String) {
 static SUBMITTING: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// [`SUBMITTING`] as it stands (for the hang watch).
+pub(crate) fn submitting_state() -> [u64; 3] {
+    SUBMITTING.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
 fn submitting(phase: u64, lists: usize) {
     SUBMITTING[1].store(lists as u64, Ordering::Relaxed);
     SUBMITTING[2].store(now_us(), Ordering::Relaxed);
@@ -781,11 +786,12 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            text.push_str(&crate::dred::report_once(&host.device, &|_| None));
             log_removal_context();
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => {
+            None if host.messages.is_none() && !crate::dred::on() => {
                 text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command")
             }
             None => {}
@@ -845,16 +851,10 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
+        // Device-removed data (the command that faulted, the faulting
+        // address), read when the device is removed (`crate::dred`).
         if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            }
+            crate::dred::enable();
         }
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
@@ -1032,6 +1032,8 @@ pub(crate) struct HostList {
     ahead_chunks: Mutex<Vec<(ID3D12Resource, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Its title commands, for device-removed data and the hang watch.
+    pub(crate) ops: std::sync::Arc<crate::dred::Ops>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1649,12 +1651,13 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (`VICTORY_D3D12_DRED` in diagnostics
+/// builds, `VICTORY_DRED=1` in any: `crate::dred`).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some())
+            || crate::dred::on()
     })
 }
 
@@ -3672,6 +3675,7 @@ impl Host {
                     None,
                 )?;
                 list.Close()?;
+                name(&list, || "victory prelude".into());
                 Ok((allocator, list))
             })()
         };
@@ -3701,6 +3705,8 @@ impl Host {
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
+            let ops = crate::dred::Ops::new();
+            name(&list, || format!("victory list #{}", ops.id()));
             Ok(HostList {
                 allocator,
                 list,
@@ -3722,6 +3728,7 @@ impl Host {
                 card_constants: Default::default(),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
+                ops,
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4714,6 +4721,7 @@ impl Host {
                 self.card_sent();
                 if signalled.is_ok() {
                     self.submitted_fence.store(*submitted, Ordering::Release);
+                    crate::dred::sent(*submitted, this_submission, runs);
                     for (shadow, _) in &back {
                         shadow.note_write_fence(*submitted);
                     }
@@ -4782,6 +4790,7 @@ impl Host {
                     self.card_sent();
                     self.queue.Signal(&self.fence, *submitted).and_then(|()| {
                         self.submitted_fence.store(*submitted, Ordering::Release);
+                        crate::dred::sent(*submitted, this_submission, runs);
                         for (shadow, _) in &back {
                             shadow.note_write_fence(*submitted);
                         }
@@ -4932,112 +4941,25 @@ impl Host {
         None
     }
 
-    /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
-    /// it lies in (by the names we give them) or the title memory copy just
-    /// below it; for each list that did not finish, the command it stopped
-    /// at and what the draws and dispatches in flight there run (or, in
-    /// lists that never started, the pipelines they bind).
+    /// With device-removed data on (`crate::dred`), once: the faulting
+    /// address and the allocations it lies in, and for each list that did
+    /// not finish the command it stopped at and what the draws and
+    /// dispatches around it run. `runs` are the failing submission's lists;
+    /// in diagnostics builds their notes are the markers.
     fn removal_data(&self, runs: &[&HostList]) -> String {
-        let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
-        };
-        let mut text = String::new();
-        let mut fault_va = None;
-        // SAFETY: the outputs are the runtime's, valid while the device
-        // lives; nodes are walked as linked, histories have their counts.
-        unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
-                && fault.PageFaultVA != 0
-            {
-                let va = fault.PageFaultVA;
-                fault_va = Some(va);
-                text.push_str(&format!("; page fault at {va:#x}"));
-                for (what, head) in [
-                    ("inside", fault.pHeadExistingAllocationNode),
-                    ("inside freed", fault.pHeadRecentFreedAllocationNode),
-                ] {
-                    let mut names = Vec::new();
-                    let mut node = head;
-                    while let Some(n) = node.as_ref()
-                        && names.len() < 8
-                    {
-                        let name = if n.ObjectNameW.is_null() {
-                            "unnamed".to_owned()
-                        } else {
-                            n.ObjectNameW.to_string().unwrap_or_default()
-                        };
-                        names.push(format!("{name} (type {})", n.AllocationType.0));
-                        node = n.pNext;
-                    }
-                    if !names.is_empty() {
-                        text.push_str(&format!("; {what} {names:?}"));
-                    }
-                }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
-            }
-            // The plain output: the extended one (with marker texts) came
-            // back without stopped lists on this host.
-            let crumbs = match dred.GetAutoBreadcrumbsOutput() {
-                Ok(crumbs) => crumbs,
-                Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
-                    return text;
-                }
+        crate::dred::report_once(&self.device, &|raw| {
+            let r = runs.iter().find(|r| r.list.as_raw() as usize == raw)?;
+            #[cfg(feature = "diagnostics")]
+            let view = crate::dred::ListView {
+                name: format!("victory list #{}", r.ops.id()),
+                first: 0,
+                ops: r.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                marked: true,
             };
-            // Every list's progress (done/count), in the runtime's order.
-            let mut progress = Vec::new();
-            let mut node = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
-                node = p.pNext;
-            }
-            text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            let mut plain = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = plain.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
-                    let history =
-                        std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
-                    // The k-th marker command is the k-th note.
-                    #[cfg(feature = "diagnostics")]
-                    let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-                        history
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, op)| **op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
-                            .zip(notes.iter())
-                            .map(|((at, _), (note, range))| {
-                                let place = fault_va.zip(*range).map(|(va, r)| fault_in(va, r));
-                                (at as u32, format!("{note}{}", place.unwrap_or_default()))
-                            })
-                            .collect()
-                    });
-                    #[cfg(not(feature = "diagnostics"))]
-                    let markers: Vec<(u32, String)> = Vec::new();
-                    #[cfg(not(feature = "diagnostics"))]
-                    let _ = fault_va;
-                    if done > 0 {
-                        text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
-                        let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                        text.push_str(&format!(", its pipelines {pipelines:?}"));
-                    }
-                }
-                plain = p.pNext;
-            }
-        }
-        text
+            #[cfg(not(feature = "diagnostics"))]
+            let view = r.ops.view();
+            Some(view)
+        })
     }
 
     /// Moves the debug layer's messages into our log; returns the first
@@ -5226,6 +5148,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.ops.reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7955,8 +7878,9 @@ impl Meter {
             );
             let [ahead, in_place, raw] = [0, 1, 2]
                 .map(|i| crate::draw::CLAMPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let split_raw = crate::indirect::SPLIT_RAW.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
-                "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2)"
+                "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2), of which {split_raw:.0} dispatches in one piece (VICTORY_SPLIT_RAW=1)"
             );
             let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4]
                 .map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9038,60 +8962,6 @@ fn last_notes(runs: &[&HostList]) -> String {
     }
 }
 
-/// Where the faulting address `va` lies against a range `(start, bytes)` a
-/// command reads (diagnostics).
-#[cfg(feature = "diagnostics")]
-fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
-    let end = start + bytes;
-    if va < start {
-        format!(" (fault {:#x} below its source)", start - va)
-    } else if va < end {
-        format!(" (fault at source +{:#x})", va - start)
-    } else {
-        format!(" (fault {:#x} past its source's end)", va - end)
-    }
-}
-
-/// The commands that may have been running where a list stopped at
-/// command `done`: those between the barriers around it (work between
-/// barriers overlaps on the GPU), by kind, and what the markers just
-/// before them say (`HostList::note_op`: diagnostics builds with
-/// device-removed data on).
-fn in_flight(
-    history: &[D3D12_AUTO_BREADCRUMB_OP],
-    markers: &[(u32, String)],
-    done: usize,
-) -> String {
-    let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    let from = history[..done]
-        .iter()
-        .rposition(barrier)
-        .map_or(0, |b| b + 1);
-    let to = history[done..]
-        .iter()
-        .position(barrier)
-        .map_or(history.len(), |b| (done + b).max(done + 1));
-    let mut text = format!(", commands {from}..{to} between its barriers:");
-    let mut shown = 0;
-    // From just before the command the GPU had not finished: the first
-    // twelve after the barrier named draws long done when a list of 79
-    // mesh draws stopped at its 45th (run 41).
-    for i in from.max(done.saturating_sub(4))..to {
-        let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
-            continue;
-        }
-        shown += 1;
-        let marker = i
-            .checked_sub(1)
-            .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
-            .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
-            .map_or("no marker", |(_, s)| s.as_str());
-        text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
-    }
-    text
-}
-
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -9205,6 +9075,8 @@ mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_one_pass.rs"]
+mod one_pass;
 #[path = "host_step_reads.rs"]
 mod step_reads;
 #[path = "host_run_split.rs"]
