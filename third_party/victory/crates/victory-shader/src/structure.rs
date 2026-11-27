@@ -467,10 +467,14 @@ thread_local! {
 /// they went on: for a program that goes on to a lane test the lowering cannot make (a
 /// constant lane mask) and translated that way.
 pub fn without_live_quads<T>(f: impl FnOnce() -> T) -> T {
-    let was = LIVE_QUADS.replace(false);
-    let r = f();
-    LIVE_QUADS.set(was);
-    r
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LIVE_QUADS.set(self.0);
+        }
+    }
+    let _restore = Restore(LIVE_QUADS.replace(false));
+    f()
 }
 
 /// Builds the per-lane form of `program`.
@@ -1740,6 +1744,14 @@ mod tests {
             let support = s.bools.support(when);
             assert!(!support.iter().any(|a| matches!(a, Atom::Quad(_))));
         }
+        assert!(LIVE_QUADS.get());
+        let _ = std::panic::catch_unwind(|| {
+            without_live_quads(|| {
+                assert!(!LIVE_QUADS.get());
+                panic!("synthetic structure panic");
+            });
+        });
+        assert!(LIVE_QUADS.get());
     }
 
     #[test]
