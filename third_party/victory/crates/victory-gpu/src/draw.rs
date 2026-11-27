@@ -3682,7 +3682,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::drop_why::set("SkippedPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("dispatch");
+            crate::drop_why::count_of("dispatch", self.pipeline);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -3700,7 +3700,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             crate::drop_why::set("ray-tracing structure builder off");
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("dispatch");
+            crate::drop_why::count_of("dispatch", self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why(
@@ -3717,7 +3717,7 @@ impl State {
             );
             crate::drop_why::set("MissingHostPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("dispatch");
+            crate::drop_why::count_of("dispatch", self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3731,7 +3731,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("dispatch");
+            crate::drop_why::count_of("dispatch", self.pipeline);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -4144,7 +4144,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("mesh");
+            crate::drop_why::count_of("mesh", self.pipeline);
             dropped(self.pipeline);
         }
     }
@@ -4800,7 +4800,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("draw");
+            crate::drop_why::count_of("draw", self.pipeline);
             dropped(self.pipeline);
         }
     }
@@ -4917,7 +4917,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::drop_why::count("indexed");
+            crate::drop_why::count_of("indexed", self.pipeline);
             dropped(self.pipeline);
         }
     }
@@ -4937,7 +4937,11 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if ran {
+            crate::drop_why::pipeline(0);
+        }
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
         // geometry missing; an empty one is no loss).

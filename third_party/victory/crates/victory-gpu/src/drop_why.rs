@@ -6,7 +6,8 @@
 //!
 //! A failure point notes its reason on its thread ([`set`]); the drop site
 //! counts it ([`count`]) and clears it. A drop with no reason noted is
-//! counted as "unclassified".
+//! counted as "unclassified". A second line names the pipelines (their
+//! shaders' hashes) dropped most.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -22,12 +23,27 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_REASONS").is_some_and(|v| v == "1"))
 }
 
+/// Pipelines per frame line named at most.
+const NAMED: usize = 8;
+
 thread_local! {
     static WHY: Cell<&'static str> = const { Cell::new("") };
+    /// The title pipeline of the draw or dispatch being recorded.
+    static PIPELINE: Cell<usize> = const { Cell::new(0) };
 }
 
-/// (site, reason) -> drops since the last line.
-static COUNTS: Mutex<Option<HashMap<(&'static str, &'static str), u64>>> = Mutex::new(None);
+type Key = (&'static str, &'static str);
+
+/// Since the last line: (site, reason) -> drops; (site, reason, shaders)
+/// -> drops; and the shaders of each pipeline seen (named once).
+#[derive(Default)]
+struct Counts {
+    by_reason: HashMap<Key, u64>,
+    by_pipeline: HashMap<(Key, usize), u64>,
+    names: HashMap<usize, String>,
+}
+
+static COUNTS: Mutex<Option<Counts>> = Mutex::new(None);
 /// Frames presented at the last line.
 static FRAMES_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -38,8 +54,25 @@ pub(crate) fn set(why: &'static str) {
     }
 }
 
-/// Counts a drop at `site` (draw, indexed, mesh, dispatch, indirect) for
-/// the reason last noted on this thread.
+/// Notes the title pipeline of the indirect execution recorded now on this
+/// thread (its drop is counted where the pipeline is not at hand).
+pub(crate) fn pipeline(this: usize) {
+    if on() {
+        PIPELINE.set(this);
+    }
+}
+
+/// Counts a drop at `site` (draw, indexed, mesh, dispatch) of title
+/// pipeline `this` for the reason last noted on this thread.
+pub(crate) fn count_of(site: &'static str, this: usize) {
+    if on() {
+        PIPELINE.set(this);
+        count(site);
+    }
+}
+
+/// Counts a drop at `site` for the reason and pipeline last noted on this
+/// thread.
 pub(crate) fn count(site: &'static str) {
     if !on() {
         return;
@@ -48,12 +81,17 @@ pub(crate) fn count(site: &'static str) {
         "" => "unclassified",
         why => why,
     };
-    *COUNTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .entry((site, why))
-        .or_default() += 1;
+    let this = PIPELINE.replace(0);
+    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let counts = counts.get_or_insert_with(Counts::default);
+    *counts.by_reason.entry((site, why)).or_default() += 1;
+    *counts.by_pipeline.entry(((site, why), this)).or_default() += 1;
+    // Named while it is bound (alive); a pipeline made later at the same
+    // address before the next line keeps this name.
+    counts
+        .names
+        .entry(this)
+        .or_insert_with(|| crate::pipeline::shaders_of(this as crate::object::This));
 }
 
 /// Logs the drops counted since the last call, per frame presented.
@@ -62,22 +100,42 @@ pub(crate) fn line(presented: u64) {
         return;
     }
     let frames = presented.saturating_sub(FRAMES_AT.swap(presented, Ordering::Relaxed));
-    let counts = COUNTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default();
-    if counts.is_empty() {
+    let Some(counts) = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if counts.by_reason.is_empty() {
         return;
     }
     tracing::info!(
         "drop reasons per frame (VICTORY_DROP_REASONS=1, over {frames} frames): {}",
-        summary(counts, frames)
+        summary(counts.by_reason, frames)
+    );
+    tracing::info!(
+        "drop reasons per frame, by pipeline (VICTORY_DROP_REASONS=1): {}",
+        by_pipeline(counts.by_pipeline, &counts.names, frames)
     );
 }
 
+/// `site: reason [shaders] count`, most first, per frame, joined by `; `.
+fn by_pipeline(counts: HashMap<(Key, usize), u64>, names: &HashMap<usize, String>, frames: u64) -> String {
+    let mut all: Vec<_> = counts
+        .into_iter()
+        .map(|((key, this), n)| {
+            let name = names.get(&this).map_or("?", String::as_str);
+            ((key, name), n)
+        })
+        .collect();
+    all.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let frames = frames.max(1) as f64;
+    all.iter()
+        .take(NAMED)
+        .map(|(((site, why), name), n)| format!("{site}: {why} {name} {:.1}", *n as f64 / frames))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// `site: reason count`, most first, per frame, joined by `; `.
-fn summary(counts: HashMap<(&'static str, &'static str), u64>, frames: u64) -> String {
+fn summary(counts: HashMap<Key, u64>, frames: u64) -> String {
     let mut all: Vec<_> = counts.into_iter().collect();
     // Ties in a fixed order, so lines compare from run to run.
     all.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -103,6 +161,20 @@ mod tests {
         assert_eq!(
             summary(counts, 10),
             "indirect: ray-only skinning 30.0; dispatch: no host pipeline 3.0; draw: IndexBuffer 3.0"
+        );
+    }
+
+    #[test]
+    fn pipelines_are_named_most_first() {
+        let names = HashMap::from([(1, "[compute aa]".to_owned()), (2, "[mesh bb, pixel cc]".to_owned())]);
+        let counts = HashMap::from([
+            ((("dispatch", "ray-tracing structure builder off"), 1), 50),
+            ((("mesh", "RootSrvSlot"), 2), 20),
+            ((("draw", "unclassified"), 3), 10),
+        ]);
+        assert_eq!(
+            by_pipeline(counts, &names, 10),
+            "dispatch: ray-tracing structure builder off [compute aa] 5.0; mesh: RootSrvSlot [mesh bb, pixel cc] 2.0; draw: unclassified ? 1.0"
         );
     }
 

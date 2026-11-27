@@ -751,8 +751,8 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
 }
 
 /// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// pixel 4567..]` (diagnostics, `crate::drop_why`); "no pipeline" for none.
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".to_owned();
