@@ -781,11 +781,16 @@ impl Lower<'_> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
+                // (the paired form: a wave64 lane select takes the low six bits;
+                // `VICTORY_WRITELANE_MASK=1`: every form takes S1 masked to the wave)
                 let lane = match self.twin {
                     Some(_) => {
                         let k63 = self.s.m.i32(63);
                         self.s.m.bin(c, Bin::And, lane, k63)
+                    }
+                    None if super::isa_fixes::Fix::WritelaneMask.on() => {
+                        let k = self.s.m.i32(self.wave() - 1);
+                        self.s.m.bin(c, Bin::And, lane, k)
                     }
                     None => lane,
                 };

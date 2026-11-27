@@ -108,6 +108,10 @@ mod lds_loop;
 #[path = "lds_first.rs"]
 mod lds_first;
 
+/// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
+#[path = "isa_fixes.rs"]
+pub(super) mod isa_fixes;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -6201,6 +6205,25 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
+                let cmp = props.0 & 0x8000 != 0;
+                if isa_fixes::Fix::CmpSamplerSplit.on() {
+                    // one slot per (constant, comparison or not)
+                    let slot = self.samplers.iter().enumerate().position(|(n, w)| {
+                        *w == words && (self.s.cmp_samplers >> n & 1 != 0) == cmp
+                    });
+                    let n = match slot {
+                        Some(n) => n,
+                        None if self.samplers.len() >= u64::BITS as usize => {
+                            return Err("more than 64 immediate sampler slots");
+                        }
+                        None => {
+                            self.samplers.push(words);
+                            self.s.cmp_samplers |= u64::from(cmp) << (self.samplers.len() - 1);
+                            self.samplers.len() - 1
+                        }
+                    };
+                    return Ok(self.s.sampler_handle(self.cur, n as u32));
+                }
                 let n = match self.samplers.iter().position(|w| *w == words) {
                     Some(n) => n,
                     None => {
@@ -6208,7 +6231,7 @@ impl<'a> Lower<'a> {
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
+                if cmp {
                     // shortcut: one sampler used with and without comparison
                     // would need two static samplers; it becomes a comparison one.
                     self.s.cmp_samplers |= 1 << n;
@@ -8569,6 +8592,37 @@ mod tests {
         assert_eq!(shader.samplers.len(), 2);
         assert!(shader.samplers.contains(&[0, 0, 0, 0]));
         assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
+    }
+
+    #[test]
+    fn a_sampler_constant_used_with_and_without_comparison_takes_a_slot_for_each() {
+        // One constant (all zeros) used by image_sample_lz and image_sample_c_lz.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE88_0380, 0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 0-3
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0xF0BC_0108, 0x0043_1002,       // image_sample_c_lz v16, v[2:4], s[12:19], s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            0xD834_0000, 0x0000_1000,       // ds_write_b32 v0, v16
+            S_ENDPGM,
+        ];
+        let lowered = |split| {
+            super::isa_fixes::set_for_test(super::isa_fixes::Fix::CmpSamplerSplit, Some(split));
+            let (layout, mut used) = texture_tables();
+            used.truncate(1);
+            let l = lower_with(&words, layout, used);
+            super::isa_fixes::set_for_test(super::isa_fixes::Fix::CmpSamplerSplit, None);
+            l.unwrap()
+        };
+        // Off: one comparison sampler for both uses.
+        let off = lowered(false);
+        assert_eq!(off.samplers, [[0u32; 4]]);
+        assert_eq!(off.cmp_samplers, 0b1);
+        // On: the plain sample keeps an ordinary sampler.
+        let on = lowered(true);
+        assert_eq!(on.samplers, [[0u32; 4]; 2]);
+        assert_eq!(on.cmp_samplers, 0b10);
     }
 
     #[test]
