@@ -7955,8 +7955,9 @@ impl Meter {
             );
             let [ahead, in_place, raw] = [0, 1, 2]
                 .map(|i| crate::draw::CLAMPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let split_raw = crate::indirect::SPLIT_RAW.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
-                "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2)"
+                "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2), of which {split_raw:.0} dispatches in one piece (VICTORY_SPLIT_RAW=1)"
             );
             let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4]
                 .map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
