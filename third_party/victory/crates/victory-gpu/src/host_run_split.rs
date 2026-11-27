@@ -1,0 +1,286 @@
+//! Diagnostics: what `run_other` on the "preparing breakdown" line is made
+//! of (`VICTORY_RUN_SPLIT=1`, off by default).
+//!
+//! `run_other` is the time of `HostList::run_deferred` for every list of a
+//! submission and of its prelude (`HostList::prelude`), less the flushes of
+//! one step: the list's steps walked in order (fills, refreshes and shaders'
+//! writes noted for the flush, textures checked), the title's buffer copies
+//! and steps of ours done on the CPU (each flushing what came before it,
+//! `Batch::title_written`), the textures due refreshed at the end of each
+//! list (`Batch::flush_textures`), their uploads claimed
+//! (`PreludeUpload::finish_refresh`), and the prelude recorded (transitions,
+//! texture uploads, clamps ahead; an allocator and list reset and a close).
+//! With the switch each step is timed from its start to the next one's, so
+//! the line's "noting" part carries the timing's own cost (a clock read a
+//! step).
+
+use super::{Batch, HostList, Step};
+use crate::texture::PreludeUpload;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
+
+pub(super) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RUN_SPLIT").is_some_and(|v| v == "1"))
+}
+
+/// The parts, by place in [`NS`] and [`COUNT`].
+const FILL: usize = 0;
+const REFRESH: usize = 1;
+const GPU_WRITE: usize = 2;
+const TEXTURE: usize = 3;
+const COPY: usize = 4;
+const RUN: usize = 5;
+const HOST: usize = 6;
+/// The textures due refreshed at the end of a list.
+pub(super) const TEXTURES: usize = 7;
+/// Their uploads claimed.
+pub(super) const FINISH: usize = 8;
+/// The prelude recorded.
+const PRELUDE: usize = 9;
+/// Lists, and the uploads their preludes record.
+const LISTS: usize = 10;
+const PARTS: usize = 11;
+
+const NAMES: [&str; PARTS] = [
+    "fills noted",
+    "refreshes noted",
+    "shader writes noted",
+    "textures checked",
+    "title copies (with their flushes)",
+    "steps of ours on title memory (with their flushes)",
+    "host steps",
+    "textures due refreshed",
+    "uploads claimed",
+    "preludes recorded",
+    "lists",
+];
+
+/// Since the last line: nanoseconds and counts by part.
+static NS: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+static COUNT: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+
+fn kind(step: &Step) -> usize {
+    match step {
+        Step::Fill(..) => FILL,
+        Step::Refresh(..) => REFRESH,
+        Step::GpuWrite(..) => GPU_WRITE,
+        Step::Texture(..) => TEXTURE,
+        Step::Copy(..) => COPY,
+        Step::Run(..) => RUN,
+        Step::Host(..) => HOST,
+    }
+}
+
+/// The time of one list's `run_deferred`, part by part: each interval is
+/// charged to the part that opened it.
+pub(super) struct Laps(Option<(Instant, usize)>);
+
+impl Laps {
+    pub(super) fn start() -> Self {
+        Laps(on().then(|| (Instant::now(), usize::MAX)))
+    }
+
+    fn to(&mut self, part: usize) {
+        if let Some((at, open)) = &mut self.0 {
+            let now = Instant::now();
+            if *open < PARTS {
+                NS[*open].fetch_add((now - *at).as_nanos() as u64, Relaxed);
+            }
+            if part < PARTS {
+                COUNT[part].fetch_add(1, Relaxed);
+            }
+            (*at, *open) = (now, part);
+        }
+    }
+
+    /// A step begins.
+    pub(super) fn step(&mut self, step: &Step) {
+        if self.0.is_some() {
+            self.to(kind(step));
+        }
+    }
+
+    /// One of the parts after the steps begins ([`TEXTURES`], [`FINISH`]).
+    pub(super) fn part(&mut self, part: usize) {
+        self.to(part);
+    }
+
+    /// The submission's held textures are done ([`hold`]); `uploads` claimed.
+    fn uploads(mut self, uploads: usize) {
+        if self.0.is_some() {
+            self.to(usize::MAX);
+            NS[LISTS].fetch_add(uploads as u64, Relaxed);
+        }
+    }
+
+    /// The list's steps are done; `uploads` claimed for its prelude.
+    pub(super) fn end(mut self, uploads: usize) {
+        if self.0.is_some() {
+            self.to(usize::MAX);
+            COUNT[LISTS].fetch_add(1, Relaxed);
+            NS[LISTS].fetch_add(uploads as u64, Relaxed);
+        }
+    }
+}
+
+/// Times a prelude's recording, from now until it is dropped.
+pub(super) struct Prelude(Option<Instant>);
+
+pub(super) fn prelude() -> Prelude {
+    Prelude(on().then(Instant::now))
+}
+
+impl Drop for Prelude {
+    fn drop(&mut self) {
+        if let Some(at) = self.0 {
+            NS[PRELUDE].fetch_add(at.elapsed().as_nanos() as u64, Relaxed);
+            COUNT[PRELUDE].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Whether the textures due in a submission are refreshed once for all its
+/// lists, after every list's steps (`VICTORY_TEXTURES_ONCE=1`, off by
+/// default), instead of at the end of each list.
+///
+/// Each list ended with its own refresh of the textures it found due
+/// (`Batch::flush_textures`, one wide pass each with `VICTORY_WIDE_REFRESH`),
+/// the submitting thread waiting for every pass before it went on to the
+/// next list. With the switch the steps of all the lists run first, then one
+/// pass refreshes every texture due, then each list's uploads are claimed
+/// and its prelude recorded, in the lists' order. A step that writes title
+/// memory still refreshes what is due before it (`Batch::title_written`),
+/// as before. The lists' preludes copy out of the staging buffers when the
+/// card runs them, after all of this, so what they upload is the same.
+pub(super) fn textures_once() -> bool {
+    #[cfg(test)]
+    if tests::ONCE.load(Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURES_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// With [`textures_once`]: every list's steps run, the textures due
+/// refreshed once, and each list's claimed uploads, in the lists' order.
+/// Empty without the switch (the caller runs each list as before).
+pub(super) fn hold(
+    runs: &[&HostList],
+    batch: &mut Batch,
+    heap_rounds: &mut crate::heap_rounds::Rounds,
+) -> Vec<Vec<(PreludeUpload, bool)>> {
+    if !textures_once() {
+        return Vec::new();
+    }
+    batch.held = Some(Vec::with_capacity(runs.len()));
+    for list in runs {
+        let (wrote_heap, _) = list.run_deferred(batch, heap_rounds.asked());
+        if wrote_heap {
+            heap_rounds.wrote();
+        }
+    }
+    let held = batch.held.take().unwrap_or_default();
+    let mut laps = Laps::start();
+    laps.part(TEXTURES);
+    batch.flush_textures();
+    laps.part(FINISH);
+    let claimed: Vec<Vec<(PreludeUpload, bool)>> = held.into_iter().map(claim).collect();
+    laps.uploads(claimed.iter().map(Vec::len).sum());
+    claimed
+}
+
+/// The uploads of `textures` (refreshed) that are this list's to record.
+fn claim(textures: Vec<PreludeUpload>) -> Vec<(PreludeUpload, bool)> {
+    textures
+        .into_iter()
+        .filter_map(|upload| upload.finish_refresh().map(|first| (upload, first)))
+        .collect()
+}
+
+/// The parts per frame over `frames`: (name, ms, count).
+fn parts(frames: f64) -> Vec<(&'static str, f64, f64)> {
+    (0..LISTS)
+        .map(|i| {
+            let ns = NS[i].swap(0, Relaxed) as f64;
+            let n = COUNT[i].swap(0, Relaxed) as f64;
+            (NAMES[i], ns / 1e6 / frames, n / frames)
+        })
+        .collect()
+}
+
+/// The frame line's, with the switch on.
+pub(super) fn line(frames: f64) {
+    if !on() {
+        return;
+    }
+    let parts = parts(frames);
+    let lists = COUNT[LISTS].swap(0, Relaxed) as f64 / frames;
+    let uploads = NS[LISTS].swap(0, Relaxed) as f64 / frames;
+    let total: f64 = parts.iter().map(|p| p.1).sum();
+    let text: Vec<String> = parts
+        .iter()
+        .map(|(name, ms, n)| format!("{name} {ms:.2} ms ({n:.0})"))
+        .collect();
+    tracing::info!(
+        "run_other split per frame (VICTORY_RUN_SPLIT=1): {total:.2} ms over {lists:.1} lists and {uploads:.1} texture uploads: {}",
+        text.join(", ")
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`textures_once`], on for the test that needs it.
+    pub(super) static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// With the switch every list's steps run before any upload is claimed,
+    /// each list gets its own (here empty) uploads back in order, and the
+    /// batch holds nothing afterwards; without it nothing is held.
+    #[test]
+    fn held_lists_come_back_in_order_and_the_batch_lets_go() {
+        let Some(host) = super::super::host() else {
+            return;
+        };
+        let lists: Vec<HostList> = (0..3).map(|_| host.new_list().unwrap()).collect();
+        let memory = vec![0u8; 4096];
+        let mut scratch = vec![0u8; 4096];
+        for list in &lists {
+            list.defer_fill(scratch.as_mut_ptr(), memory.as_ptr(), 64);
+            list.defer_host(|| {});
+        }
+        let runs: Vec<&HostList> = lists.iter().collect();
+        let mut batch = Batch::default();
+        let mut rounds = crate::heap_rounds::Rounds::NONE;
+        assert!(hold(&runs, &mut batch, &mut rounds).is_empty() || textures_once());
+        ONCE.store(true, Relaxed);
+        let held = hold(&runs, &mut batch, &mut rounds);
+        ONCE.store(false, Relaxed);
+        assert_eq!(held.len(), 3);
+        assert!(held.iter().all(Vec::is_empty));
+        assert!(batch.held.is_none());
+        // The fills were taken for the batch's flush, as without the switch.
+        assert_eq!(batch.pending_fills.len(), 3);
+        drop((lists, scratch));
+    }
+
+    #[test]
+    fn every_part_has_a_name_and_laps_charge_the_part_that_opened_them() {
+        assert_eq!(NAMES.len(), PARTS);
+        // Charged by hand as `to` does with the switch on.
+        let mut laps = Laps(Some((Instant::now(), usize::MAX)));
+        let before = (NS[HOST].load(Relaxed), COUNT[HOST].load(Relaxed));
+        laps.to(HOST);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        laps.to(FINISH);
+        assert!(NS[HOST].load(Relaxed) - before.0 >= 1_000_000);
+        assert!(COUNT[HOST].load(Relaxed) > before.1);
+        laps.to(usize::MAX);
+        // Off: nothing is timed.
+        let mut off = Laps(None);
+        off.to(HOST);
+        off.end(3);
+    }
+}

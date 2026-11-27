@@ -7292,12 +7292,20 @@ impl Host {
         }
         let t_def = std::time::Instant::now();
         let flush_one_before = PREP_PARTS[4].load(Ordering::Relaxed);
+        let mut held = run_split::hold(runs, &mut batch, &mut heap_rounds).into_iter();
         for list in runs {
-            let (list_wrote_heap, uploads) = list.run_deferred(&mut batch, heap_rounds.asked());
-            if list_wrote_heap {
-                heap_rounds.wrote();
-            }
+            let uploads = match held.next() {
+                Some(uploads) => uploads,
+                None => {
+                    let (list_wrote_heap, uploads) = list.run_deferred(&mut batch, heap_rounds.asked());
+                    if list_wrote_heap {
+                        heap_rounds.wrote();
+                    }
+                    uploads
+                }
+            };
             firsts.push(lists.len());
+            let _laps = run_split::prelude();
             if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
@@ -9039,7 +9047,9 @@ impl HostList {
         use crate::copystat::{C, add};
         let mut wrote_heap = false;
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        let mut laps = run_split::Laps::start();
         for step in &self.deferred().copies {
+            laps.step(step);
             let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
                     let started = std::time::Instant::now();
@@ -9126,13 +9136,21 @@ impl HostList {
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        laps.part(run_split::TEXTURES);
+        if let Some(held) = &mut batch.held {
+            held.push(textures);
+            laps.end(0);
+            return (wrote_heap, Vec::new());
+        }
         batch.flush_textures();
+        laps.part(run_split::FINISH);
         let mut uploads = Vec::new();
         for upload in textures {
             if let Some(first_upload) = upload.finish_refresh() {
                 uploads.push((upload, first_upload));
             }
         }
+        laps.end(uploads.len());
         (wrote_heap, uploads)
     }
 }
@@ -9357,6 +9375,8 @@ struct Batch {
     /// Disjoint upload-memory fills (`dst`, `src`, `len`) deferred until the
     /// next title write or flush so large batches copy in parallel.
     pending_fills: Vec<(usize, usize, usize)>,
+    /// (`run_split::hold`) Each list's textures, their uploads not claimed yet.
+    held: Option<Vec<Vec<crate::texture::PreludeUpload>>>,
 }
 
 impl Batch {
@@ -10646,6 +10666,7 @@ impl Meter {
             crate::card_constants::line(frames);
             step_reads::line(frames);
             crate::port_order::line(frames);
+            run_split::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
@@ -11846,6 +11867,8 @@ fn pump() {
 mod flush;
 #[path = "host_step_reads.rs"]
 mod step_reads;
+#[path = "host_run_split.rs"]
+mod run_split;
 use step_reads::blocked_by;
 
 #[cfg(test)]
