@@ -85,6 +85,7 @@
 
 mod bitcode;
 mod container;
+pub mod glass_record;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
@@ -102,6 +103,8 @@ mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
 mod ray_query;
+#[cfg(all(test, windows))]
+mod ray_query_warp_tests;
 mod rect;
 mod sampler;
 mod shader;

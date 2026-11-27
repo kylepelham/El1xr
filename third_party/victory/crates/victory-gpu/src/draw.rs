@@ -3619,6 +3619,10 @@ impl State {
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
         use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: reflections (`miss_views`).
+        if role == Role::Miss {
+            return self.ambient_miss(list, p);
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3658,6 +3662,7 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Miss => crate::ambient::MISS_LIGHT,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(
@@ -3684,7 +3689,7 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air => None,
+            Role::Radiance | Role::Air | Role::Miss => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
@@ -3705,6 +3710,7 @@ impl State {
                 depth,
                 size: [of.Width as u32, of.Height],
                 slices: u32::from(of.DepthOrArraySize),
+                depth_size: [of.Width as u32, of.Height],
             },
         )
     }
@@ -3823,6 +3829,10 @@ impl State {
     /// its kind and pipeline.
     #[cfg(windows)]
     fn cost_title(&self, list: &HostList, kind: &'static str) {
+        crate::dred::op(list, kind, self.pipeline, || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map_or_else(|| "(no host pipeline)".to_owned(), |p| p.name.clone())
+        });
         if !crate::gpucost::fine() {
             crate::gpucost::mark(&list.list, || crate::gpucost::TITLE);
             return;
@@ -5036,6 +5046,18 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too.
+        if ran
+            && kind == 2
+            && crate::ambient::specular().is_some()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
         // geometry missing; an empty one is no loss).
@@ -5319,7 +5341,11 @@ impl State {
                 );
             }
         }
-        if after_writer || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
+        // (El1xr) `VICTORY_SPLIT_RAW=1`: and a dispatch split into parts, in one piece.
+        let split_raw = split && crate::indirect::split_raw();
+        if after_writer
+            || split_raw
+            || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
         {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5371,6 +5397,9 @@ impl State {
                 self.mesh_scissor(list, false);
             }
             CLAMPS[2].fetch_add(1, Ordering::Relaxed);
+            if split_raw {
+                crate::indirect::SPLIT_RAW.fetch_add(1, Ordering::Relaxed);
+            }
             if kind == DISPATCH {
                 DISPATCHED.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -5681,6 +5710,8 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 
 #[cfg(all(test, windows))]
 mod indirect_signature_tests;
+
+mod miss_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

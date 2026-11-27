@@ -859,6 +859,7 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+    super::eager::log();
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through

@@ -11,8 +11,8 @@ type HostCopy = ShadowBatch<Arc<crate::shadow::Shadow>>;
 
 /// Refresh steps this long or longer are cut into pieces of [`SPLIT_CHUNK`]
 /// so that one large copy (the 174 MB world heap) spreads over the threads.
-const SPLIT_MIN: usize = 2 << 20;
-const SPLIT_CHUNK: usize = 1 << 20;
+pub(super) const SPLIT_MIN: usize = 2 << 20;
+pub(super) const SPLIT_CHUNK: usize = 1 << 20;
 
 /// One piece of work of a pass: a copy's steps in order, or a piece of one
 /// long refresh.
@@ -117,7 +117,12 @@ pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
         let prep_us = prep.elapsed().as_micros() as u64;
         PREPARING[0].fetch_add(prep_us, Ordering::Relaxed);
         add(F::AskAheadUs, prep_us);
+        let wide = Instant::now();
         refresh_wide(copies);
+        let one = &super::one_pass::STATS;
+        one[super::one_pass::FLUSHES].fetch_add(1, Ordering::Relaxed);
+        one[super::one_pass::WALL_US]
+            .fetch_add(wide.elapsed().as_micros() as u64, Ordering::Relaxed);
     } else {
         for copy in copies {
             copy.run();
@@ -138,9 +143,19 @@ fn refresh_wide(copies: Vec<HostCopy>) {
             add(F::AloneUs, alone.elapsed().as_micros() as u64);
             break;
         }
+        if super::one_pass::on() {
+            refresh_one_pass(pending);
+            return;
+        }
         let pass = Instant::now();
         let (tasks, next) = split_pass(pending, crate::watch::PAGE);
         add(F::Passes, 1);
+        let one = &super::one_pass::STATS;
+        one[super::one_pass::RUNS].fetch_add(1, Ordering::Relaxed);
+        one[super::one_pass::PIECES].fetch_add(
+            tasks.iter().filter(|t| matches!(t, Task::Chunk(..))).count() as u64,
+            Ordering::Relaxed,
+        );
         add(F::Tasks, tasks.len() as u64);
         add(
             F::Chunks,
@@ -211,6 +226,47 @@ fn refresh_wide(copies: Vec<HostCopy>) {
         stats()[F::PassMaxUs as usize].fetch_max(us, Ordering::Relaxed);
         pending = next;
     }
+}
+
+/// [`refresh_wide`] in one run of the kept threads (`VICTORY_FLUSH_ONE_PASS=1`).
+fn refresh_one_pass(copies: Vec<HostCopy>) {
+    let started = Instant::now();
+    add(F::Passes, 1);
+    super::one_pass::STATS[super::one_pass::RUNS].fetch_add(1, Ordering::Relaxed);
+    let run = Arc::new(super::one_pass::Run::new(
+        copies,
+        SPLIT_MIN,
+        SPLIT_CHUNK,
+        crate::watch::PAGE,
+    ));
+    let threads = crate::shadow::wide_threads() + 1;
+    crate::shadow::wide_chunks(threads, 1, move |_, _| {
+        let copied = AtomicU64::new(0);
+        run.work(
+            |copy| {
+                add(F::Tasks, 1);
+                copied.fetch_add(copy.run_wide() as u64, Ordering::Relaxed);
+            },
+            |shadow, from, to| {
+                add(F::Tasks, 1);
+                add(F::Chunks, 1);
+                #[cfg(feature = "diagnostics")]
+                let diag_t = Instant::now();
+                let bytes = shadow.update(from, to - from);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, diag_t.elapsed().as_micros() as u64, 0);
+                copied.fetch_add(bytes as u64, Ordering::Relaxed);
+            },
+        );
+        let copied = copied.into_inner();
+        if copied > 0 {
+            PREPARING[1].fetch_add(copied, Ordering::Relaxed);
+            add(F::Bytes, copied);
+        }
+    });
+    let us = started.elapsed().as_micros() as u64;
+    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+    stats()[F::PassMaxUs as usize].fetch_max(us, Ordering::Relaxed);
 }
 
 /// The account's counters, summed since the last frame line (maxima kept).
@@ -289,6 +345,7 @@ pub(super) fn last<R>(flush: impl FnOnce() -> R) -> R {
 
 /// The account's line, per frame, for both kinds of flush.
 pub(super) fn log(frames: f64) {
+    super::one_pass::line(frames);
     crate::refresh_prof::log(frames);
     if !crate::refresh_prof::on() {
         for arr in &STATS_BY {
