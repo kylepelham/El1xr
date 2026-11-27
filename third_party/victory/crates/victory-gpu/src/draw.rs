@@ -3823,6 +3823,10 @@ impl State {
     /// its kind and pipeline.
     #[cfg(windows)]
     fn cost_title(&self, list: &HostList, kind: &'static str) {
+        crate::dred::op(list, kind, self.pipeline, || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .map_or_else(|| "(no host pipeline)".to_owned(), |p| p.name.clone())
+        });
         if !crate::gpucost::fine() {
             crate::gpucost::mark(&list.list, || crate::gpucost::TITLE);
             return;
