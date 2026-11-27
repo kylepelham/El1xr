@@ -2710,8 +2710,10 @@ impl State {
         // Several slots can show the same texture from the same mip. The list
         // holds each upload even after its staging entry is removed. Reuse
         // it within this pass, where there are no intervening title copies.
-        let mut uploaded: std::collections::HashMap<(usize, u32), Option<((u64, u64), u64)>> =
-            std::collections::HashMap::new();
+        let mut uploaded: std::collections::HashMap<
+            (usize, u32),
+            Option<((u64, u64), u64, bool)>,
+        > = std::collections::HashMap::new();
         for (index, write) in due {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
@@ -2966,9 +2968,14 @@ impl State {
                     .push((std::ptr::from_ref(heap) as usize, index, handle, key));
             }
             if let Some(recheck) = previous {
-                host.texture_slot_done(index, write, None);
-                if let Some((memory, print)) = recheck {
-                    host.texture_slot_recheck(index, frame, memory, print);
+                let live = host.texture_slot_done(index, write, None);
+                if let Some((memory, print, was_live)) = recheck {
+                    let print = if was_live == live {
+                        print
+                    } else {
+                        crate::texture::fingerprint_for(memory.0, memory.1, live)
+                    };
+                    host.texture_slot_recheck(index, frame, memory, print, live);
                 }
                 if prepare {
                     crate::texture::prepare::served(index, resource);
@@ -3017,11 +3024,17 @@ impl State {
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             uploads += 1;
-            host.texture_slot_done(index, write, again);
+            let live = host.texture_slot_done(index, write, again);
             // Whole and uploaded: looked at again (`texture_slots_rechecked`).
-            let recheck = memory.map(|(at, len)| ((at, len), crate::texture::fingerprint(at, len)));
-            if let Some((memory, print)) = recheck {
-                host.texture_slot_recheck(index, frame, memory, print);
+            let recheck = memory.map(|(at, len)| {
+                (
+                    (at, len),
+                    crate::texture::fingerprint_for(at, len, live),
+                    live,
+                )
+            });
+            if let Some((memory, print, live)) = recheck {
+                host.texture_slot_recheck(index, frame, memory, print, live);
             }
             if again.is_none() {
                 uploaded.insert(key, recheck);
