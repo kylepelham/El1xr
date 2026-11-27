@@ -3730,7 +3730,7 @@ impl State {
             }
             return;
         }
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         self.cost_title(list, "dispatch");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -3769,8 +3769,12 @@ impl State {
 
     /// A GPU cost stamp before a title command (`crate::gpucost`), named by
     /// its kind and pipeline.
-    #[cfg(feature = "diagnostics")]
+    #[cfg(windows)]
     fn cost_title(&self, list: &HostList, kind: &'static str) {
+        if !crate::gpucost::fine() {
+            crate::gpucost::mark(&list.list, || crate::gpucost::TITLE);
+            return;
+        }
         crate::gpucost::mark(&list.list, || {
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) => crate::gpucost::title(kind, &p.name),
@@ -4110,7 +4114,7 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     self.cost_title(list, "mesh");
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
@@ -4768,7 +4772,7 @@ impl State {
             } else {
                 (vertices, first)
             };
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             self.cost_title(list, "draw");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
@@ -4882,7 +4886,7 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             self.cost_title(list, "indexed");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -5111,7 +5115,7 @@ impl State {
                 why("prepare failed");
                 return false;
             }
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             self.cost_title(list, "indirect");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
@@ -5158,7 +5162,7 @@ impl State {
         let written = shape && list.gpu_written(arguments as usize, len as usize);
         let after_writer = written && {
             args.refresh(list, arguments, len);
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             crate::gpucost::mark(&list.list, || "ours: indirect sanitize after writer");
             let (safe, ran) = crate::indirect::sanitized(list, &args, arguments, kind);
             if ran {
@@ -5209,7 +5213,7 @@ impl State {
                 why("prepare failed");
                 return false;
             }
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             self.cost_title(list, "indirect");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
@@ -5280,7 +5284,7 @@ impl State {
                     why("prepare failed");
                     return false;
                 }
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 self.cost_title(list, "indirect");
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| {
@@ -5384,7 +5388,7 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 crate::gpucost::mark(&list.list, || "ours: indirect clamp in place");
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
@@ -5447,7 +5451,7 @@ impl State {
             why("prepare failed");
             return false;
         }
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         self.cost_title(list, "indirect");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

@@ -22,7 +22,7 @@ mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod gpucost;
 #[cfg(feature = "mimalloc")]
 pub mod heap;

@@ -5426,7 +5426,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::begin(list, "ours: card sync copies (into the card's copies)");
                     // Resolve each dirty copy's card sides once and execute in
                     // 3 batched phases (Copy -> CARD_PATCH -> Rehash) to
@@ -5474,7 +5474,7 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(total_ranges, Ordering::Relaxed);
                     }
                     // Phase 2: masked CARD_PATCH dispatches (batched barriers + single PSO bind).
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::mark(list, || "ours: card CARD_PATCH");
                     if let (Some((root, pso)), Some((mask_buffer, _, _))) =
                         (work.patch.as_ref(), masks.as_ref())
@@ -5534,7 +5534,7 @@ impl Host {
                     // `ExecuteCommandLists` as the title's lists; `COPY_DEST`/`UAV` ->
                     // `NON_PIXEL_SHADER_RESOURCE` for copies with `before`) followed by a
                     // single rehash PSO bind and a final `NON_PIXEL_SHADER_RESOURCE` -> `COMMON`.
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::mark(
                         list,
                         || "ours: card rehash (CARD_COMPARE hashing of the before copies)",
@@ -5632,7 +5632,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(pass_count, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(piece_count, Ordering::Relaxed);
                     }
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
@@ -5723,7 +5723,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::begin(
                         list,
                         "ours: card check (CARD_COMPARE of shader-written ranges)",
@@ -5835,7 +5835,7 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
@@ -6230,6 +6230,7 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
+                    crate::gpucost::begin(&list, "ours: copy-back fetch (relay)");
                     for (shadow, lo, hi, at) in
                         crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
                     {
@@ -6241,6 +6242,7 @@ impl Host {
                             (hi - lo) as u64,
                         );
                     }
+                    crate::gpucost::end(&list);
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     // In the order of the queue: the sends of title bytes so
@@ -6714,6 +6716,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::gpucost::begin(list, "ours: copy-back fetch (waited)");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(
                             fetched,
@@ -6723,6 +6726,7 @@ impl Host {
                             (hi - lo) as u64,
                         );
                     }
+                    crate::gpucost::end(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -7847,7 +7851,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::mark(
             &self.list,
             || "ours: list end (twins to depth, textures back, indirect args back)",
@@ -7855,7 +7859,7 @@ impl HostList {
         self.twins_to_depth();
         self.textures_back();
         self.indirect_args_back();
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -7923,8 +7927,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::begin(&self.list, "list start");
+        #[cfg(windows)]
+        crate::gpucost::begin(&self.list, crate::gpucost::TITLE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
@@ -7997,7 +8001,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             crate::gpucost::mark(
                 &self.list,
                 || "ours: texture state transitions (and the setup after)",
@@ -8170,7 +8174,7 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::mark(
             &self.list,
             || "ours: twin copy inline (and the setup after)",
@@ -8367,7 +8371,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 crate::gpucost::begin(list, "ours: prelude twin copies (and their transitions)");
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
@@ -8375,7 +8379,7 @@ impl HostList {
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 crate::gpucost::mark(list, || "ours: prelude texture uploads");
                 for (upload, _) in uploads {
                     upload.record(self, list);
@@ -8384,12 +8388,12 @@ impl HostList {
                     list.ResourceBarrier(&barriers);
                 }
                 if let Some(budget) = budget {
-                    #[cfg(feature = "diagnostics")]
+                    #[cfg(windows)]
                     crate::gpucost::mark(list, || "ours: prelude indirect clamps ahead");
                     let mut chunks = self.ahead_chunks.lock().unwrap_or_else(|e| e.into_inner());
                     crate::indirect::record_ahead(list, budget, &mut chunks, &ahead);
                 }
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 crate::gpucost::end(list);
                 list.Close()
             })
@@ -10713,6 +10717,7 @@ impl Meter {
         }
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::gpucost::log(frames);
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
@@ -10993,7 +10998,6 @@ impl Meter {
             crate::defrag::log_progress();
             #[cfg(feature = "diagnostics")]
             {
-                crate::gpucost::log(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

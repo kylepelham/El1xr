@@ -413,14 +413,14 @@ def parse_victory_log(text: str) -> dict[str, object]:
             if draws >= WORLD_DRAWS_MIN:
                 world_rows.append((fps, gpu_ms, prep_ms))
                 frame_ms = float(m_frame.group(2))
+                if first_world_ts is None and line_ts is not None:
+                    first_world_ts = line_ts
             else:
                 frame_ms = None
         m_card = CARD_CLOCK_RE.search(line)
         if m_card and frame_ms is not None:
             # GPU busy: the share of the frame the card had work of ours queued.
             busy_rows.append(frame_ms * float(m_card.group(1)) / 100.0)
-                if first_world_ts is None and line_ts is not None:
-                    first_world_ts = line_ts
         pacing = parse_pacing_line(line)
         if pacing:
             pacing_windows.append(pacing)

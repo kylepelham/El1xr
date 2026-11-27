@@ -875,7 +875,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             crate::gpucost::mark(&list.list, || "title barrier");
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
@@ -905,7 +905,7 @@ pub(crate) fn ensure_held_state(
     if let Some((before, state)) = list.transition_held(copy, state) {
         let barrier =
             crate::host::transition(&copy.texture, State(before as i32), State(state as i32));
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::mark(
             &list.list,
             || "ours: texture state transitions (and the setup after)",
@@ -1095,7 +1095,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::card_writes(list, dst, to, None);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             crate::gpucost::mark(&list.list, || "title copy resource");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -1388,7 +1388,7 @@ fn read_back(
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
     let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
-    #[cfg(feature = "diagnostics")]
+    #[cfg(windows)]
     crate::gpucost::mark(&list.list, || "title copy into a read-back buffer");
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
@@ -1467,7 +1467,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::mark(&list.list, || "title resolve");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -1554,7 +1554,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            #[cfg(feature = "diagnostics")]
+            #[cfg(windows)]
             crate::gpucost::mark(&list.list, || "title clear render target");
             host.output_views(|views| {
                 let rtv = views.rtv(Some(texture), record.desc().as_ref());
@@ -1606,7 +1606,7 @@ extern "system" fn clear_dsv(
             let dsv = views.dsv(texture, record.depth_desc().as_ref());
             // SAFETY: an open list, a fresh view of a live texture.
             unsafe {
-                #[cfg(feature = "diagnostics")]
+                #[cfg(windows)]
                 crate::gpucost::mark(&list.list, || "title clear depth");
                 list.list.ClearDepthStencilView(
                     dsv,
@@ -2307,7 +2307,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         crate::gpucost::mark(
             &list.list,
             || "title barrier group (one wait for every shader write)",

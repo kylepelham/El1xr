@@ -35,11 +35,32 @@ const UNWRITTEN: u64 = u64::MAX;
 /// Lines of the top table.
 const TOP: usize = 15;
 
-/// Whether the breakdown is on (`VICTORY_GPU_COST`, not `0`).
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COST").is_some_and(|v| v != "0"))
+/// `VICTORY_GPU_COST`: 0 (or unset) off; 1 the coarse split (the title's
+/// passes as one label, our own work by kind, the idle gaps between timed
+/// lists), few stamps so the card runs as without them; 2 also every
+/// title command by kind and shader hashes.
+fn level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("VICTORY_GPU_COST")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0)
+    })
 }
+
+/// Whether the breakdown is on.
+pub(crate) fn on() -> bool {
+    level() > 0
+}
+
+/// Whether title commands get their own labels (level 2).
+pub(crate) fn fine() -> bool {
+    level() > 1
+}
+
+/// The title's work in coarse mode, and the first label of a host list.
+pub(crate) const TITLE: &str = "title passes";
 
 /// A list's timestamp heap, where it is resolved, and the labels of the
 /// stamps written since the list's last reset.
@@ -59,6 +80,10 @@ static LISTS: Mutex<Option<HashMap<usize, Stamps>>> = Mutex::new(None);
 
 /// Since the last line, by label: stretches, ticks, and the longest one.
 static TOTALS: Mutex<Option<HashMap<Label, (u64, u64, u64)>>> = Mutex::new(None);
+
+/// Since the last line: each counted list run's first and last stamp, and
+/// its first label (what kind of list it is).
+static INTERVALS: Mutex<Vec<(u64, u64, Label)>> = Mutex::new(Vec::new());
 
 /// Since the last line: runs of lists counted, and runs not counted (not
 /// run, or stamps out of order).
@@ -198,6 +223,10 @@ fn collect(s: &mut Stamps) {
         return;
     }
     RUNS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    INTERVALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((stamps[0], stamps[n - 1], labels[0].clone()));
     let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
     let totals = totals.get_or_insert_with(HashMap::new);
     for (label, w) in labels.into_iter().zip(stamps.windows(2)) {
@@ -244,7 +273,10 @@ pub(crate) fn mark<L: Into<Label>>(list: &ID3D12GraphicsCommandList, label: impl
     if at == 0 || s.closed || at >= STAMPS - 1 {
         return;
     }
-    let label = label().into();
+    let mut label = label().into();
+    if !fine() && !label.starts_with("ours") {
+        label = Cow::Borrowed(TITLE);
+    }
     if s.labels.last() == Some(&label) {
         return;
     }
@@ -294,8 +326,11 @@ pub(crate) fn log(frames: f64) {
     let [counted, skipped] = [0, 1].map(|i| RUNS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let ms = |ticks: u64| ticks as f64 * 1e3 / frequency() as f64 / frames;
     let mut rows: Vec<(Label, (u64, u64, u64))> = totals.into_iter().collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
     let all: u64 = rows.iter().map(|r| r.1.1).sum();
+    let (gaps, long) = gaps();
+    let idle: u64 = gaps.values().map(|g| g.1).sum();
+    rows.extend(gaps);
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
     let ours: u64 = rows
         .iter()
         .filter(|r| r.0.starts_with("ours:"))
@@ -312,11 +347,14 @@ pub(crate) fn log(frames: f64) {
     }
     kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
     tracing::info!(
-        "gpu cost per frame (VICTORY_GPU_COST): {:.2} ms timed, ours {:.2} ms, the title's {:.2} ms; \
+        "gpu cost per frame (VICTORY_GPU_COST): {:.2} ms timed, ours {:.2} ms, the title's {:.2} ms, \
+         idle between timed lists {:.2} ms ({:.1} gaps over 100 ms a frame left out); \
          {:.1} list runs a frame counted, {:.1} not ({} labels); ours by kind: {}",
         ms(all),
         ms(ours),
         ms(all - ours),
+        ms(idle),
+        long as f64 / frames,
         counted as f64 / frames,
         skipped as f64 / frames,
         rows.len(),
@@ -331,8 +369,8 @@ pub(crate) fn log(frames: f64) {
             "gpu cost top {:>2}: {:6.2} ms/frame {:5.1}% in {:7.1}/frame (longest {:.2} ms): {}",
             i + 1,
             ms(*ticks),
-            if all > 0 {
-                100.0 * *ticks as f64 / all as f64
+            if all + idle > 0 {
+                100.0 * *ticks as f64 / (all + idle) as f64
             } else {
                 0.0
             },
@@ -341,4 +379,42 @@ pub(crate) fn log(frames: f64) {
             label.chars().take(300).collect::<String>()
         );
     }
+}
+
+/// The card's time between the timed list runs since the last line, by the
+/// kinds of the lists before and after (stretches, ticks, longest), and how
+/// many gaps of over 100 ms were left out (lists counted late, or the title
+/// not submitting).
+fn gaps() -> (HashMap<Label, (u64, u64, u64)>, u64) {
+    let mut runs = std::mem::take(&mut *INTERVALS.lock().unwrap_or_else(|e| e.into_inner()));
+    runs.sort_by_key(|r| r.0);
+    let most = frequency() / 10;
+    let kind = |l: &Label| l.split(" (").next().unwrap_or(l).to_owned();
+    let mut out: HashMap<Label, (u64, u64, u64)> = HashMap::new();
+    let mut long = 0;
+    let mut end = None::<(u64, &Label)>;
+    for (from, to, label) in &runs {
+        if let Some((last, before)) = end {
+            if *from > last {
+                let gap = from - last;
+                if gap > most {
+                    long += 1;
+                } else {
+                    let key = Cow::Owned(format!(
+                        "idle: after {} before {}",
+                        kind(before),
+                        kind(label)
+                    ));
+                    let e = out.entry(key).or_insert((0, 0, 0));
+                    e.0 += 1;
+                    e.1 += gap;
+                    e.2 = e.2.max(gap);
+                }
+            }
+        }
+        if end.is_none_or(|(last, _)| *to > last) {
+            end = Some((*to, label));
+        }
+    }
+    (out, long)
 }
