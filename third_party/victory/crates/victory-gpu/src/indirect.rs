@@ -173,9 +173,11 @@ unsafe impl Send for Clamp {}
 unsafe impl Sync for Clamp {}
 
 fn clamp() -> Option<&'static Clamp> {
-    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
-    CLAMP
-        .get_or_init(|| match make() {
+    static CLAMP: [std::sync::OnceLock<Option<Clamp>>; 3] =
+        [const { std::sync::OnceLock::new() }; 3];
+    let taking = rest::mode();
+    CLAMP[taking as usize]
+        .get_or_init(|| match make(taking) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -185,13 +187,14 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+fn make(taking: rest::Rest) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+    make_for(device, taking)
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    make_from(device, &budget::clamp_source(SOURCE, budget::log2()), s!("clamp"))
+fn make_for(device: &ID3D12Device, taking: rest::Rest) -> windows::core::Result<Clamp> {
+    let source = budget::clamp_source(SOURCE, budget::log2());
+    make_from(device, &rest::clamp_source(&source, taking), s!("clamp"))
 }
 
 fn make_from(
@@ -381,6 +384,8 @@ pub(crate) fn learn(at: usize, kind: u32) {
 mod san_tests;
 
 pub(crate) mod budget;
+
+pub(crate) mod rest;
 
 /// What a list knows of its records: the writes it declared (range, with the order number of
 /// its latest declaration), the order number of each copy's last pass (by [`Shadow::id`]), and
@@ -981,6 +986,9 @@ void main() {
     #[path = "../budget_tests.rs"]
     mod budget_tests;
 
+    #[path = "../rest_tests.rs"]
+    mod rest_tests;
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
@@ -1031,7 +1039,8 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp = make_for(&device, rest::Rest::Unset)
+                    .expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,

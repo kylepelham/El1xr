@@ -6143,7 +6143,9 @@ impl HostList {
                 // And the records its budget emptied (`VICTORY_INDIRECT_BUDGET_LOG2`).
                 crate::indirect::budget::EMPTIED
                     .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
-                for k in 0..7 {
+                // And its records over the budget (`VICTORY_INDIRECT_REST`).
+                crate::indirect::rest::take(words, crate::indirect::budget::log2().unwrap_or(27));
+                for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7814,6 +7816,7 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         crate::indirect::budget::line(frames);
+        crate::indirect::rest::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
