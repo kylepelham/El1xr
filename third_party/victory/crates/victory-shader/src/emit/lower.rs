@@ -80,6 +80,9 @@ pub(super) mod exchange_pairs;
 /// Each exchange of two host waves its own LDS dwords (`VICTORY_EXCHANGE_SITES=1`).
 #[path = "exchange_sites.rs"]
 pub(super) mod exchange_sites;
+/// The wave-wide form before the deep form without skips (`VICTORY_WAVE_WIDE_AUTO=1`).
+#[path = "wide_auto.rs"]
+pub(super) mod wide_auto;
 pub(crate) use halves::nan_scrub;
 use halves::{all_lane_blocks, lane_constant_masks, lane_scalars, lds_meetings, whole_masks};
 pub(super) use halves::{branches_around, lane_uniform};
@@ -4168,6 +4171,7 @@ impl<'a> Lower<'a> {
         {
             self.meet.group_barriers += 1;
         }
+        self.note_barrier(block);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s
@@ -5548,6 +5552,9 @@ impl<'a> Lower<'a> {
                     }
                     self.cur = self.order_waves(self.cur, false);
                 } else {
+                    if waits {
+                        self.note_barrier(self.cur);
+                    }
                     let mode = self.s.m.i32(mode);
                     let void = self.s.t.void;
                     self.s

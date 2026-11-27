@@ -995,6 +995,48 @@ fn mask_or_on_empty(block: &Block) -> Option<[(Value, Value); 2]> {
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+    let out = skips_left_out(p, deep);
+    if out.is_empty() {
+        return None;
+    }
+    let mut blocks = p.blocks.clone();
+    for &(b, next, _) in &out {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(next);
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// Whether the place `at` (a machine instruction's offset) lies in the region of a skip that
+/// only the `deep` form of [`without_skips`] leaves out (`VICTORY_WAVE_WIDE_AUTO=1`).
+///
+/// Where the forms without skips stop at an exchange between the two host waves (a lane mask
+/// read as a number, a first-lane read) where not every lane runs, and only a deep-only skip
+/// (an inner `s_cbranch_execz` skip ending together with an outer one) keeps that place from
+/// every lane, the "without skips, scalars followed" form places the exchange after per-lane
+/// branching with no group barrier since. On 32-lane hosts the 18 cascade-shadow raster
+/// variants (`CS_ShadowRenderTiledCascades*`, `CS_ShadowRenderTiledMisc*`) drew an 8-pixel
+/// shadow staircase and lit-through tiles in that form, whereas the wave-wide form drew them
+/// cleanly (Mikey970, PR #281 of trustno1-coder/VIctory-NVIDIA).
+pub(crate) fn deep_skip_holds(p: &Program, at: usize) -> bool {
+    let holds = |b: &Block| b.insts.iter().any(|i| i.machine.offset == at);
+    let Some(block) = p.blocks.iter().position(holds) else {
+        return false;
+    };
+    let shallow: Vec<usize> = skips_left_out(p, false).into_iter().map(|(b, ..)| b).collect();
+    skips_left_out(p, true)
+        .into_iter()
+        .any(|(b, _, region)| !shallow.contains(&b) && region.get(block).copied().unwrap_or(false))
+}
+
+/// The branches [`without_skips`] leaves out: the block each closes, where its code goes on
+/// instead, and the region it skipped (empty for an early-out).
+fn skips_left_out(p: &Program, deep: bool) -> Vec<(usize, usize, Vec<bool>)> {
     let n = p.blocks.len();
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
@@ -1108,31 +1150,20 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         Some(inside)
     };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
+    let mut out = Vec::new();
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
         };
-        let next = early_out_continuation(p, b).or_else(|| {
-            let skip = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
-            (skip && skipped(b, taken, not_taken).is_some()).then_some(not_taken)
-        });
-        if let Some(next) = next {
-            blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(next);
-            any = true;
+        if let Some(next) = early_out_continuation(p, b) {
+            out.push((b, next, Vec::new()));
+        } else if p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && let Some(region) = skipped(b, taken, not_taken)
+        {
+            out.push((b, not_taken, region));
         }
     }
-    if !any {
-        return None;
-    }
-    for block in &mut blocks {
-        block.phis.clear();
-    }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    out
 }
 
 /// The value `v` is a copy of, followed to the end of `copy`'s chains.

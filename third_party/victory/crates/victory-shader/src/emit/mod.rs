@@ -739,6 +739,17 @@ fn emit_forms(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // Where the last of these forms stopped at code the two host waves exchange through (a
+        // lane mask, a first lane...) where not every lane runs (`VICTORY_WAVE_WIDE_AUTO=1`).
+        let exchange_at = |r: &Result<(HostShader, Option<u32>), ShaderError>| match r {
+            Err(ShaderError::Unsupported { offset, what })
+                if what.ends_with("where not every lane runs") =>
+            {
+                Some(*offset)
+            }
+            _ => None,
+        };
+        let mut stopped_at = exchange_at(&original);
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
@@ -746,6 +757,7 @@ fn emit_forms(
                 if done(&again) {
                     return again;
                 }
+                stopped_at = exchange_at(&again);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
@@ -763,6 +775,14 @@ fn emit_forms(
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.
         let wide_last = wide_option.as_ref().is_some_and(|v| v == "last");
+        // `VICTORY_WAVE_WIDE_AUTO=1` (only while `VICTORY_WAVE_WIDE` is unset): the wave-wide
+        // form before "without skips, scalars followed" where the forms above stopped at a
+        // cross-half exchange kept from every lane only by a deep-only skip
+        // ([`ir::deep_skip_holds`]: the 18 cascade-shadow rasters), unless it puts a translator
+        // barrier into a loop ([`lower::wide_auto`]).
+        let wide_auto = lower::wide_auto::enabled()
+            && wide_option.is_none()
+            && stopped_at.is_some_and(|at| ir::deep_skip_holds(p, at));
         // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
@@ -816,6 +836,33 @@ fn emit_forms(
         for exact in [true, false] {
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
+                if wide_auto {
+                    let deep = forms[1].1.as_ref().map(|f| &f.0);
+                    let shallow = forms[0].1.as_ref().map(|f| &f.0);
+                    if let Some(base) = [deep, shallow, Some(p)].into_iter().flatten().next() {
+                        let (again, looped) = lower::wide_auto::watch_loop_barriers(|| {
+                            widen(c, native, base, why, false)
+                        });
+                        report("wave-wide branches (auto)", &again);
+                        let taken = done(&again) && !looped;
+                        if why {
+                            let hex: String = c.digest.iter().map(|b| format!("{b:02x}")).collect();
+                            eprintln!(
+                                "WAVE64-WIDE-AUTO {hex} stopped at {:#x}: {}",
+                                stopped_at.unwrap_or(0),
+                                match (looped, taken) {
+                                    (true, _) => "a barrier in a loop, not taken",
+                                    (false, true) => "taken",
+                                    (false, false) => "refused",
+                                }
+                            );
+                        }
+                        lower::wide_auto::note_taken(taken);
+                        if taken {
+                            return again;
+                        }
+                    }
+                }
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
@@ -1072,6 +1119,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        lower::wide_auto::reset_loop_barriers();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not

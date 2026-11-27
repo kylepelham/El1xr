@@ -367,6 +367,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_WAVE_OWN_BITS", Apply::Retranslate),
     ("VICTORY_WAVE_PAIRS_FP32", Apply::Retranslate),
     ("VICTORY_WAVE_WIDE", Apply::Retranslate),
+    ("VICTORY_WAVE_WIDE_AUTO", Apply::Retranslate),
     ("VICTORY_WAVE_WIDE_ONLY", Apply::Retranslate),
     ("VICTORY_WAVE_ZERO_MASK", Apply::Retranslate),
     ("VICTORY_WIDE_BACK", Apply::Restart),
