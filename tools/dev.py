@@ -629,11 +629,24 @@ def _count(value: int | None) -> str:
     return "?" if value is None else str(value)
 
 
-def _quiet(args: argparse.Namespace, what: str):
-    """`--quiet`: hold every build slot for the run so no build competes with the game."""
-    if getattr(args, "quiet", False):
-        return dev_throttle.all_build_slots(LOCKS_DIR, f"{JOB or 'main'}:quiet-{what}")
-    return contextlib.nullcontext()
+@contextlib.contextmanager
+def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
+    """`--quiet`: hold every build slot for the run so no build competes with the game.
+    Otherwise: hold the slots free right now without waiting (writers keep at least one), and run
+    the builds already going at idle priority, until the run ends."""
+    quiet = getattr(args, "quiet", False)
+    tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
+    if quiet:
+        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+            yield
+        return
+    with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:
+        print(
+            f"DEV {what}: holding {len(held)} of {dev_throttle.build_slots()} build slots for the run; "
+            f"{idled} build processes at idle priority",
+            flush=True,
+        )
+        yield
 
 
 def _print_driver_warning(before: int | None, after: int | None) -> None:
@@ -675,7 +688,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock(f"capture:{safe_tag}"):
+        with acquire_gpu_lock(f"capture:{safe_tag}"), _quiet(args, "capture"):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
