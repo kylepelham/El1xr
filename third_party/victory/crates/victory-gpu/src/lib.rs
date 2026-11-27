@@ -74,6 +74,8 @@ mod port;
 #[cfg(windows)]
 mod port_cbv;
 pub mod list;
+#[cfg(windows)]
+pub mod native_rt;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
