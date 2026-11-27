@@ -9389,12 +9389,12 @@ impl Batch {
             && !crate::watch::ask_once_active();
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = copies
-                .iter()
-                .filter(|c| !c.shadow.unwatched())
-                .filter_map(|c| c.refresh_span)
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            crate::watch::ask_ahead(
+                copies
+                    .iter()
+                    .filter(|c| !c.shadow.unwatched())
+                    .filter_map(|c| c.refresh_span),
+            );
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && copies.len() >= 2 {

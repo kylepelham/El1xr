@@ -1627,16 +1627,21 @@ pub(crate) fn ask_once_active() -> bool {
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`. Check before allocating/scanning/sorting.
+    // hold is left to `writes`. Check before consuming/filtering/sorting
+    // (ZigZagBoi1/ScarlettPort 23870346; XaviFortes/VIctory-RDNA 56638976).
     if ask_once_active() {
         return;
     }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1 && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .into_iter()
+        .filter(|r| {
+            r.0 < r.1
+                && !(light() && published_all(r.0 / BLOCK, r.1.div_ceil(BLOCK)))
+                && !refused_as_view(r.0, r.1)
+        })
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -7664,5 +7669,28 @@ mod mapping_tests {
         });
         assert_eq!(answer.recv().unwrap(), (false, true));
         drop(changing);
+    }
+
+    /// While a submission-wide asking stands (`ask_once`), `ask_ahead` returns
+    /// before consuming its range iterator.
+    #[test]
+    fn ask_ahead_does_not_consume_ranges_when_asking_stands() {
+        use super::{JOURNAL, KEPT, ask_ahead, ask_once_end};
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ask_once_end();
+            }
+        }
+        let _reset = Reset;
+        {
+            let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+            j.kept = true;
+            KEPT.store(true, Ordering::Release);
+        }
+        ask_ahead(std::iter::from_fn(|| {
+            panic!("a kept asking must not consume another range plan")
+        }));
     }
 }
