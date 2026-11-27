@@ -11087,6 +11087,7 @@ impl Host {
             let shot = shot_now
                 .then(|| crate::screenshot::read_back(&self.device, list, texture))
                 .flatten();
+            let snap = crate::snap::record(&self.device, list, texture, frame);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -11130,6 +11131,7 @@ impl Host {
                 }
                 None => self.execute(&[copy]),
             }
+            crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
                 crate::screenshot::finish(shot);
             }

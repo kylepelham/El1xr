@@ -60,6 +60,8 @@ mod relay_runs;
 #[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
+mod snap;
+#[cfg(windows)]
 mod scratch_spare;
 #[cfg(windows)]
 mod indirect;

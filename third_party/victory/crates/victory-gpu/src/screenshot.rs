@@ -123,7 +123,7 @@ fn save(png: &[u8]) -> std::io::Result<std::path::PathBuf> {
 
 /// 8-bit RGB rows of a readback in DXGI format `format`; `None` for a format not handled.
 /// Float formats are clamped to 0..1 (no tone mapping).
-fn to_rgb(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn to_rgb(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 3);
     let half = |b: &[u8]| {
         let v = f32_from_half(u16::from_le_bytes([b[0], b[1]]));
@@ -188,7 +188,7 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 }
 
 /// A PNG of 8-bit RGB `rgb` (`w * h * 3` bytes): per-row filters, deflated by zlib-rs at level 6.
-fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
     let raw = crate::pixels::filter_image(rgb, w as usize * 3, 3);
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
