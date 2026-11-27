@@ -165,6 +165,7 @@ pub(crate) fn check_textures(due: Vec<Arc<crate::texture::Staging>>) {
 pub(crate) fn log(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::texture::blind_hash::log(frames);
+    crate::texture::staged_ask::log(frames);
     let [batches, textures, sum_us, wall_us] =
         [0, 1, 2, 3].map(|i| WINDOW_STATS[i].swap(0, Relaxed));
     if batches == 0 {

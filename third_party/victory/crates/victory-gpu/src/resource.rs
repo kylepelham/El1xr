@@ -3322,6 +3322,14 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Whether resource `this` lies in memory the title mapped itself (made at
+/// an address): the only resource memory that can be unmapped while the
+/// resource lives. A committed resource's memory and a heap's are ours,
+/// allocated whole when they were made (`crate::texture::staged_ask`).
+pub(crate) fn at_title_address(this: This) -> bool {
+    !this.is_null() && matches!(resource(this).backing, Backing::Address(_))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -4371,6 +4379,34 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// Only a resource made at an address the title mapped can lose its
+    /// memory while it lives (`crate::texture::staged_ask`).
+    #[test]
+    fn only_resources_at_a_title_address_may_lose_their_memory() {
+        let null = std::ptr::null();
+        let committed = crate::resource::test_lazy_texture();
+        assert!(!at_title_address(committed));
+        let heap = heap(KIB_64);
+        let mut placed = null;
+        assert_eq!(
+            create_placed(null, heap, 0, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut placed),
+            S_OK
+        );
+        assert!(!at_title_address(placed));
+        let title = vec![0u8; KIB_64 as usize];
+        let mut at = null;
+        assert_eq!(
+            create_at_address(null, title.as_ptr() as u64, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut at),
+            S_OK
+        );
+        assert!(at_title_address(at));
+        assert!(!at_title_address(null));
+        for r in [placed, at, heap] {
+            slot::<Release>(r, 0x10)(r);
+        }
+        crate::resource::test_release_texture(committed);
     }
 
     #[test]
