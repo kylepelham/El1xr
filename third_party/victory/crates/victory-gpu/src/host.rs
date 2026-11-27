@@ -4708,9 +4708,11 @@ impl Host {
                 *f += 1;
             }
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        let apart = crate::compare_apart::split(
+            card.as_ref().and_then(|c| c.check.clone()),
+            &mut lists,
+            crate::compare_apart::on(),
+        );
         PREP_PARTS[8].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::texture::alias_skip::submitted(runs);
         let t_heaps = std::time::Instant::now();
@@ -4732,6 +4734,7 @@ impl Host {
                 // SAFETY: closed lists; the fence is ours.
                 let signalled = unsafe {
                     self.queue.ExecuteCommandLists(&lists);
+                    crate::compare_apart::send(&self.queue, &apart);
                     self.queue.Signal(&self.fence, *submitted)
                 };
                 self.card_sent();
@@ -4803,6 +4806,9 @@ impl Host {
                 let waited = {
                     let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
                     self.queue.ExecuteCommandLists(group);
+                    if i + 1 == groups.len() {
+                        crate::compare_apart::send(&self.queue, &apart);
+                    }
                     self.card_sent();
                     self.queue.Signal(&self.fence, *submitted).and_then(|()| {
                         self.submitted_fence.store(*submitted, Ordering::Release);

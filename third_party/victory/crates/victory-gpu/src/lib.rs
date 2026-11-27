@@ -197,6 +197,8 @@ mod sweep_every;
 #[cfg(windows)]
 mod card_prof;
 #[cfg(windows)]
+mod compare_apart;
+#[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
 mod timeline;
