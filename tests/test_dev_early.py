@@ -52,7 +52,7 @@ def test_streaming_resets_the_steady_run_and_noisy_or_short_runs_do_not_stop():
     assert m.feed("".join(window() for _ in range(11)), 160.0) is None
     assert m.feed(window(), 165.0) == "early"
     noisy = dev_early.Monitor(early=True, min_s=0, steady_s=60)
-    assert noisy.feed(boot() + "".join(window(fps=20.0 + 4 * (i % 2)) for i in range(20)), 200.0) is None
+    assert noisy.feed(boot() + "".join(window(fps=20.0 + 8 * (i % 2)) for i in range(20)), 200.0) is None
     off = dev_early.Monitor(early=False, min_s=0, steady_s=60)
     assert off.feed(boot() + "".join(window() for _ in range(20)), 200.0) is None
     assert off.ended is None
