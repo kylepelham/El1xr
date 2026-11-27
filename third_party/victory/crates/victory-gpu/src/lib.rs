@@ -88,6 +88,7 @@ mod scratch_spare;
 mod indirect;
 #[cfg(windows)]
 mod launch;
+mod load_rate;
 #[cfg(windows)]
 mod indirect_fit;
 #[cfg(windows)]

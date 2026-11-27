@@ -362,7 +362,30 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(buffer, read, common)]);
     });
     list.keep(buffer);
+    if alias_pins() {
+        list.keep(from);
+        list.keep(to);
+    }
     restore(list, source, before)
+}
+
+/// `VICTORY_ALIAS_PINS=1`: an alias copy keeps its source and placed host
+/// textures alive until the list is reset, as it keeps the buffer between
+/// them (off: the buffer only). A texture the title releases while the
+/// list waits to run was freed under the copy: random texels, or a removed
+/// device. (Belobug/VIctory-Belobug-AMD PR #559)
+pub(crate) fn alias_pins() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ALIAS_PINS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_PINS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_ALIAS_PINS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A draw that also writes the source (a view of it handled before an
