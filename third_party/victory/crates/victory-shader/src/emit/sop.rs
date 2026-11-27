@@ -445,7 +445,9 @@ impl Lower<'_> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC: the first operand chosen (`VICTORY_SCC_MINMAX=1`; off: `D != 0`)
+                let carry = super::isa_fixes::Fix::SccMinMax.on().then_some(t);
+                (self.s.m.select(c, t, a, b), carry)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;

@@ -82,6 +82,7 @@ mod land_aside;
 mod list_reap;
 #[cfg(windows)]
 mod output_views;
+pub mod menu;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -136,6 +137,7 @@ mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
+pub mod upscale_live;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -165,6 +167,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod tex_check;
+mod tex_early;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

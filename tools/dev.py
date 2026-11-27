@@ -476,13 +476,19 @@ def parse_victory_log(text: str) -> dict[str, object]:
     }
 
 
+def release_build_cmd(env: dict[str, str] | None = None) -> list[str]:
+    """The release build; `--features dlss` when VICTORY_DLSS_SDK names the NVIDIA DLSS SDK
+    (kept outside the repository), so VICTORY_UPSCALE=dlss runs DLSS instead of a stretch."""
+    env = os.environ if env is None else env
+    cmd = ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)]
+    if env.get("VICTORY_DLSS_SDK", "").strip():
+        cmd += ["--features", "dlss"]
+    return cmd
+
+
 @throttled("build")
 def cmd_build(args: argparse.Namespace) -> int:
-    rel_step = (
-        "cargo build release",
-        ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)],
-        REPO_ROOT,
-    )
+    rel_step = ("cargo build release", release_build_cmd(), REPO_ROOT)
     diag_step = (
         "cargo build diag",
         [
