@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="250" viewBox="0 0 900 250" role="img" aria-labelledby="title desc">
-  <title id="title">El1xr performance at a glance, RTX 5090, 4K, 27 November 2026</title>
-  <desc id="desc">Four tiles. Settled frame rate 24 to 25 fps (three quiet runs: 24.9, 25.2 and 24.2 fps). 0 refused GPU pipelines, no device loss in benchmark runs. 31 to 33 seconds from launch to the first world frame, was 41 to 54 seconds. Worst freeze when entering the world 1.5 to 1.9 seconds, was 7.6 to 8.1 seconds.</desc>
+  <title id="title">El1xr performance at a glance, RTX 5090, 4K, batch 3, 27 November 2026</title>
+  <desc id="desc">Four tiles. In-world frame rate 23.5 fps (median of a quiet run; the goal is 30). 0 refused GPU pipelines in every batch 3 run. 32 seconds from launch to the first world frame, was 58 to 67 seconds without pooled blocks. 7 hitches over 1 second per 200-second run, was 26 to 35.</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -29,31 +29,31 @@
     <rect width="900" height="4" fill="url(#sunset)"/>
   </g>
   <rect x=".5" y=".5" width="899" height="249" rx="18" fill="none" stroke="#2c2048"/>
-  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Performance, 27 Nov 2026</text>
+  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Performance, batch 3, 27 Nov 2026</text>
   <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">At a glance</text>
   <g class="fade t1">
     <polygon points="36,104 218,104 234,120 234,222 36,222" fill="#170f2b" stroke="#2c2048"/>
-    <text class="d" x="56" y="154" font-size="40" font-style="italic" fill="#ffd36e">24-25<tspan font-size="20" fill="#a99bc6" dx="4">FPS</tspan></text>
-    <text class="s up" x="56" y="180" font-size="12" font-weight="700" fill="#f6eefe">settled frame rate</text>
-    <text class="s" x="56" y="203" font-size="13" fill="#a99bc6">quiet runs: 24.9, 25.2, 24.2</text>
+    <text class="d" x="56" y="154" font-size="40" font-style="italic" fill="#ffd36e">23.5<tspan font-size="20" fill="#a99bc6" dx="4">FPS</tspan></text>
+    <text class="s up" x="56" y="180" font-size="12" font-weight="700" fill="#f6eefe">in-world frame rate</text>
+    <text class="s" x="56" y="203" font-size="13" fill="#a99bc6">median; the goal is 30</text>
   </g>
   <g class="fade t2">
     <polygon points="246,104 428,104 444,120 444,222 246,222" fill="#170f2b" stroke="#2c2048"/>
     <text class="d" x="266" y="154" font-size="40" font-style="italic" fill="#2de2e6">0</text>
     <text class="s up" x="266" y="180" font-size="12" font-weight="700" fill="#f6eefe">refused GPU pipelines</text>
-    <text class="s" x="266" y="203" font-size="13" fill="#a99bc6">no device loss in bench runs</text>
+    <text class="s" x="266" y="203" font-size="13" fill="#a99bc6">in every batch 3 run</text>
   </g>
   <g class="fade t3">
     <polygon points="456,104 638,104 654,120 654,222 456,222" fill="#170f2b" stroke="#2c2048"/>
-    <text class="d" x="476" y="154" font-size="40" font-style="italic" fill="#ff8a3d">31-33<tspan font-size="20" fill="#a99bc6" dx="4">S</tspan></text>
+    <text class="d" x="476" y="154" font-size="40" font-style="italic" fill="#ff8a3d">32<tspan font-size="20" fill="#a99bc6" dx="4">S</tspan></text>
     <text class="s up" x="476" y="180" font-size="12" font-weight="700" fill="#f6eefe">launch to world</text>
-    <text class="s" x="476" y="203" font-size="13" fill="#a99bc6">was 41-54 s</text>
+    <text class="s" x="476" y="203" font-size="13" fill="#a99bc6">was 58-67 s</text>
   </g>
   <g class="fade t4">
     <polygon points="666,104 848,104 864,120 864,222 666,222" fill="#170f2b" stroke="#2c2048"/>
-    <text class="d" x="686" y="154" font-size="40" font-style="italic" fill="#ff3d8b">1.5-1.9<tspan font-size="20" fill="#a99bc6" dx="4">S</tspan></text>
-    <text class="s up" x="686" y="180" font-size="12" font-weight="700" fill="#f6eefe">worst entry freeze</text>
-    <text class="s" x="686" y="203" font-size="13" fill="#a99bc6">was 7.6-8.1 s</text>
+    <text class="d" x="686" y="154" font-size="40" font-style="italic" fill="#ff3d8b">7</text>
+    <text class="s up" x="686" y="180" font-size="12" font-weight="700" fill="#f6eefe">hitches over 1 s</text>
+    <text class="s" x="686" y="203" font-size="13" fill="#a99bc6">per run, was 26-35</text>
   </g>
-  <text class="s" x="864" y="78" font-size="13" text-anchor="end" fill="#a99bc6">RTX 5090, 4K, 200 s runs</text>
+  <text class="s" x="864" y="78" font-size="13" text-anchor="end" fill="#a99bc6">RTX 5090, 4K, quiet 200 s runs</text>
 </svg>

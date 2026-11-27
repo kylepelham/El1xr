@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="276" viewBox="0 0 900 276" role="img" aria-labelledby="title desc">
   <title id="title">El1xr milestones as of 27 November 2026</title>
-  <desc id="desc">Six-step progress bar. Done: boots, main menu and in-game (all by 24 November 2026), playable (24 to 25 fps at 4K on an RTX 5090, 27 November 2026). Next: 30 fps, about 82 percent of the way at 24 to 25 fps. Ahead: stable, with no device loss but visual faults left.</desc>
+  <desc id="desc">Six-step progress bar. Done: boots, main menu and in-game (all by 24 November 2026), playable (23.5 fps in the world at 4K on an RTX 5090, 27 November 2026). Next: 30 fps, about 78 percent of the way at 23.5 fps. Ahead: stable, with no device loss but visual faults left.</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -59,16 +59,16 @@
     <text class="d" x="455.0" y="116" font-size="15" font-style="italic" fill="#ff3d8b">04</text>
     <text class="d" x="455.0" y="142" font-size="25" fill="#f6eefe">Playable</text>
     <rect x="455.0" y="156" width="129.7" height="12" rx="3" fill="#251a40"/><rect class="grow t4" x="455.0" y="156" width="129.7" height="12" rx="3" fill="url(#sunset)"/>
-    <text class="s" x="455.0" y="196" font-size="13" fill="#ddd3ee">24-25 fps at 4K,</text>
+    <text class="s" x="455.0" y="196" font-size="13" fill="#ddd3ee">23.5 fps at 4K,</text>
     <text class="s" x="455.0" y="214" font-size="13" fill="#ddd3ee">missions completed</text>
     <text class="s up" x="455.0" y="244" font-size="11.5" font-weight="700" fill="#2de2e6">27 Nov 2026</text>
   </g>
   <g class="fade t5">
     <text class="d" x="594.7" y="116" font-size="15" font-style="italic" fill="#ffd36e">05</text>
     <text class="d" x="594.7" y="142" font-size="25" fill="#f6eefe">30 fps</text>
-    <rect x="594.7" y="156" width="129.7" height="12" rx="3" fill="#251a40"/><rect class="grow t5" x="594.7" y="156" width="105.9" height="12" rx="3" fill="#ffd36e"/>
-    <text class="s" x="594.7" y="196" font-size="13" fill="#ddd3ee">now 24-25 fps,</text>
-    <text class="s" x="594.7" y="214" font-size="13" fill="#ddd3ee">~40 ms a frame</text>
+    <rect x="594.7" y="156" width="129.7" height="12" rx="3" fill="#251a40"/><rect class="grow t5" x="594.7" y="156" width="101.6" height="12" rx="3" fill="#ffd36e"/>
+    <text class="s" x="594.7" y="196" font-size="13" fill="#ddd3ee">now 23.5 fps,</text>
+    <text class="s" x="594.7" y="214" font-size="13" fill="#ddd3ee">~42 ms a frame</text>
     <text class="s up" x="594.7" y="244" font-size="11.5" font-weight="700" fill="#ffd36e">next</text>
   </g>
   <g class="fade t6">
@@ -79,5 +79,5 @@
     <text class="s" x="734.3" y="214" font-size="13" fill="#ddd3ee">visual faults left</text>
     <text class="s up" x="734.3" y="244" font-size="11.5" font-weight="700" fill="#a99bc6">in progress</text>
   </g>
-  <g class="fade t8"><path d="M694.6 148h12l-6 7z" fill="#ffd36e"/></g>
+  <g class="fade t8"><path d="M690.2 148h12l-6 7z" fill="#ffd36e"/></g>
 </svg>
