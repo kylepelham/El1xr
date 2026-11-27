@@ -53,6 +53,8 @@ mod pacing;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+mod relay_runs;
+#[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
 mod scratch_spare;
@@ -91,6 +93,10 @@ mod memory;
 mod ramline;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod copy_profile;
+#[cfg(windows)]
+mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

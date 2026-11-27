@@ -346,25 +346,30 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
-extern "system" fn unknown_pipeline<const SLOT: usize>(
+/// Device method 0x128 (`GetDeviceRemovedReason`): reports the host device's
+/// removal status instead of returning `E_NOTIMPL` on a healthy device.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: the host owns the live device while its removal status is queried.
+        if let Err(error) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return error.code().0;
+        }
+    }
+    S_OK
+}
+
+/// Device method 0x1c8 asks for a pipeline state. The description is
+/// still unknown. Keep the first samples so its layout can be identified.
+extern "system" fn unknown_pipeline(
     _: This,
     desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -389,7 +394,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             .as_ref()
             .and_then(|w| words(w[0] as usize));
         tracing::warn!(
-            slot = format_args!("{:#x}", SLOT),
+            slot = "0x1c8",
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
@@ -431,14 +436,15 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = unknown_pipeline as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::cached_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -583,5 +589,12 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn device_removed_reason_reports_ok_on_healthy_device() {
+        let this = super::device();
+        let method = slot::<extern "system" fn(This) -> HRESULT>(this, 0x128);
+        assert_eq!(method(this), S_OK);
     }
 }

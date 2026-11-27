@@ -12,6 +12,9 @@
 
 use std::mem::offset_of;
 
+#[cfg(windows)]
+mod uav_clear;
+
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
@@ -202,7 +205,7 @@ pub(crate) fn is_list(this: This) -> bool {
     }
     // SAFETY: a title object's first word is its table; only read.
     let table = unsafe { (*this).table() };
-    table == LIST_FUNCTIONS.0.as_ptr() || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+    table == list_functions(false).0.as_ptr() || table == list_functions(true).0.as_ptr()
 }
 
 /// Runs `f` with the host list behind `this` and the draw state the title
@@ -687,11 +690,7 @@ fn new_list(
     }
     tracing::debug!(kind, "command list");
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
-        },
+        object: Object::new(list_functions(crate::device::newer())),
         kind,
         put: [0; 5],
         reserved: [0; 64],
@@ -2530,6 +2529,25 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+fn list_functions(newer: bool) -> &'static Table<160> {
+    #[cfg(windows)]
+    {
+        static CLEARS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_CONSOLE_UAV_CLEAR").is_none_or(|v| v != "0")
+        });
+        if *CLEARS {
+            static OLD: Table<160> = Table(uav_clear::table(false));
+            static NEW: Table<160> = Table(uav_clear::table(true));
+            return if newer { &NEW } else { &OLD };
+        }
+    }
+    if newer {
+        &NEWER_LIST_FUNCTIONS
+    } else {
+        &LIST_FUNCTIONS
+    }
+}
 
 #[cfg(test)]
 mod tests {

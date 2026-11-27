@@ -19,7 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import dev_driver
 import dev_gate
+import dev_throttle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -106,48 +108,31 @@ def parse_overrides(items: list[str]) -> dict[str, str]:
 @contextlib.contextmanager
 def acquire_gpu_lock(tag: str, timeout_s: float = 4 * 3600.0) -> Iterator[None]:
     ensure_coord_dirs()
-    deadline = time.monotonic() + timeout_s
-    fd = os.open(str(GPU_LOCK), os.O_CREAT | os.O_RDWR)
-    locked = False
-    try:
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Timed out waiting for GPU lock {GPU_LOCK}")
-                time.sleep(0.25)
-
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()} tag={tag} started={stamp}\n".encode("utf-8"))
+    with dev_throttle.hold_first_free([GPU_LOCK], tag, timeout_s):
         yield
-    finally:
-        if locked:
-            try:
-                if os.name == "nt":
-                    import msvcrt
 
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
 
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
+def throttled(name: str):
+    """Build/test/gate/policy: refuse on a nearly full drive, run below normal priority, and wait
+    for one of the machine-wide build slots so parallel worktree jobs cannot swamp the CPU."""
+
+    def wrap(func):
+        def run(args: argparse.Namespace) -> int:
+            free_gb = dev_throttle.disk_free_gb(REPO_ROOT)
+            if free_gb < dev_throttle.MIN_FREE_GB:
+                print(
+                    f"DEV {name} FAIL disk_free_gb={free_gb:.0f} "
+                    f"need={dev_throttle.MIN_FREE_GB:.0f} (clear target/ of merged worktrees)"
+                )
+                return 1
+            ensure_coord_dirs()
+            dev_throttle.below_normal_priority()
+            with dev_throttle.build_slot(LOCKS_DIR, f"{JOB or 'main'}:{name}"):
+                return func(args)
+
+        return run
+
+    return wrap
 
 
 def run_logged_steps(
@@ -349,6 +334,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
     }
 
 
+@throttled("build")
 def cmd_build(args: argparse.Namespace) -> int:
     rel_step = (
         "cargo build release",
@@ -381,6 +367,7 @@ def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
     return f"DEV {cmd} {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={v}" for k, v in fields.items())
 
 
+@throttled("test")
 def cmd_test(args: argparse.Namespace) -> int:
     ensure_coord_dirs()
     ok, _build, fields = dev_gate.gate(VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate)
@@ -388,6 +375,7 @@ def cmd_test(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@throttled("gate")
 def cmd_gate(args: argparse.Namespace) -> int:
     """The merge gate: every workspace test, policy and pytest, and no compiler warning."""
     ensure_coord_dirs()
@@ -408,6 +396,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@throttled("policy")
 def cmd_policy(_args: argparse.Namespace) -> int:
     ok, outputs = run_logged_steps(
         [("cargo xtask policy", ["cargo", "xtask", "policy"], VICTORY_DIR)],
@@ -436,7 +425,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     overrides, mute = apply_mute_default(overrides, args.unmute)
     cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides, mute=mute)
     with acquire_gpu_lock("bench"):
+        resets_before = dev_driver.resets_since_boot()
         run_timed_victory(cmd, log_path, args.seconds)
+        resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     ok = int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
@@ -454,9 +445,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"sd_ms={float(stats['sd_ms']):.1f} "
         f"jitter_ms={float(stats['jitter_ms']):.1f} "
         f"over50={int(stats['over50'])} "
-        f"hitches={int(stats['hitches'])}"
+        f"hitches={int(stats['hitches'])} "
+        f"driver_resets={_count(resets_after)}"
     )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
+
+
+def _count(value: int | None) -> str:
+    return "?" if value is None else str(value)
+
+
+def _print_driver_warning(before: int | None, after: int | None) -> None:
+    line = dev_driver.warning(before, after)
+    if line:
+        print(line)
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -481,13 +484,19 @@ def cmd_capture(args: argparse.Namespace) -> int:
     overrides, mute = apply_mute_default(overrides, args.unmute)
     cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides, mute=mute)
     with acquire_gpu_lock(f"capture:{safe_tag}"):
+        resets_before = dev_driver.resets_since_boot()
         run_timed_victory(cmd, log_path, args.seconds)
+        resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     frames = len(list(cap_dir.glob("*.png")))
     ok = frames > 0 and not bool(stats["device_removed"])
     status = "PASS" if ok else "FAIL"
-    print(f"DEV capture {status} frames={frames} refused={int(stats['refused'])} dir={cap_dir}")
+    print(
+        f"DEV capture {status} frames={frames} refused={int(stats['refused'])} "
+        f"driver_resets={_count(resets_after)} dir={cap_dir}"
+    )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
 
 
