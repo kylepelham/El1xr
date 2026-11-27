@@ -128,7 +128,7 @@ The target is a steady 30 fps at 4K on the RTX 5090, then no hitches and no visu
 
 | Figure | What |
 |---|---|
-| 1600+ automated tests | Python tools and Rust crates, run by `dev.py gate` |
+| 1800+ automated tests | Python tools and Rust crates, run by `dev.py gate` |
 | 26,148 shader programs | translated from RDNA 2 to DXIL, cached on disk |
 | 0 refused pipelines | on the RTX 5090 |
 

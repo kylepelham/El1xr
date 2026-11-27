@@ -128,7 +128,7 @@ L'obiettivo sono 30 fps stabili in 4K sulla RTX 5090, poi nessuno scatto e nessu
 
 | Dato | Cosa |
 |---|---|
-| 1600+ test automatizzati | strumenti Python e crate Rust, eseguiti da `dev.py gate` |
+| 1800+ test automatizzati | strumenti Python e crate Rust, eseguiti da `dev.py gate` |
 | 26.148 programmi shader | tradotti da RDNA 2 a DXIL, in cache su disco |
 | 0 pipeline rifiutate | sulla RTX 5090 |
 
