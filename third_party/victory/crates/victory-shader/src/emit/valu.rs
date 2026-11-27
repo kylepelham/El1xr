@@ -3,7 +3,7 @@
 
 use super::{
     Attr, Bin, Cast, FIRST_HALF, Fields, HashSet, HwStage, Inst, Lower, MaskData, NULL, Operand,
-    Reg, V, Val, Why, flags, need, pred, uniform_lane,
+    Reg, V, Val, Why, flags, need, pred, uniform_all, uniform_lane,
 };
 
 impl Lower<'_> {
@@ -825,6 +825,7 @@ impl Lower<'_> {
                                 x,
                                 &mut HashSet::new(),
                             ) == uniform_lane::Uniform::Yes
+                                && (!uniform_all::on() || self.strict_uniform(inst, x))
                     }),
                     _ => true,
                 };

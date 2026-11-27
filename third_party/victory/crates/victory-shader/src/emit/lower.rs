@@ -55,6 +55,10 @@ mod permlane;
 #[path = "uniform_lane.rs"]
 mod uniform_lane;
 
+/// The stricter first-lane value proof (`VICTORY_UNIFORM_STRICT_ALL=1`).
+#[path = "uniform_all.rs"]
+mod uniform_all;
+
 /// RDNA2 LDS bounds-check, narrow-wave barrier policy, and quadmask helpers.
 #[path = "lds_bounds.rs"]
 mod lds_bounds;
