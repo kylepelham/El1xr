@@ -38,6 +38,8 @@ mod alloc_backoff;
 mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod ambient_miss;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
