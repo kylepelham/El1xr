@@ -160,10 +160,21 @@ struct CopiedPages {
     /// sorted, non-overlapping byte spans `(lo, hi, stamp)` within the 64 KiB
     /// page that are current as of `stamp`.
     partial: std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+    /// First 64 KiB page of the shadow (`start / PAGE`), for chunk indexing.
+    base: usize,
+    /// With `VICTORY_COLD_SKIP`: per 2 MiB chunk, the journal's mark when a
+    /// walk last left every page of it fresh (`crate::cold_skip::Chunks`);
+    /// empty until the first cold-skip walk.
+    verified: Vec<u64>,
 }
 
 impl CopiedPages {
+    #[cfg(test)]
     fn new(pages: usize) -> Self {
+        Self::with_base(pages, 0)
+    }
+
+    fn with_base(pages: usize, base: usize) -> Self {
         let words = pages.div_ceil(64);
         let mut uncopied_bits = vec![u64::MAX; words];
         let rem = pages % 64;
@@ -175,6 +186,8 @@ impl CopiedPages {
             uncopied_bits,
             uncopied: pages,
             partial: std::collections::HashMap::new(),
+            base,
+            verified: Vec::new(),
         }
     }
 
@@ -182,17 +195,27 @@ impl CopiedPages {
         self.at.get(index).copied()
     }
 
+    fn forget_page(&mut self, page: usize) {
+        if !self.verified.is_empty() {
+            crate::cold_skip::forget(&mut self.verified, self.base, page);
+        }
+    }
+
     fn set(&mut self, index: usize, now: u64) {
         if let Some(slot) = self.at.get_mut(index) {
-            if *slot == 0 && now != 0 {
+            let old = *slot;
+            if old == 0 && now != 0 {
                 self.uncopied -= 1;
                 self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
-            } else if *slot != 0 && now == 0 {
+            } else if old != 0 && now == 0 {
                 self.uncopied += 1;
                 self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
             }
             *slot = now;
             self.partial.remove(&index);
+            if !self.verified.is_empty() && (now == 0 || now < old) {
+                crate::cold_skip::forget(&mut self.verified, self.base, self.base + index);
+            }
         }
     }
 
@@ -478,6 +501,89 @@ impl CopiedPages {
         if let Some((run_start, run_end)) = run {
             runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
         }
+        runs
+    }
+
+    /// [`Self::plan_stale_filtered`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// `marks` are the 2 MiB chunk marks read before `written`. Chunks with no
+    /// write note since a walk left every page of them fresh are passed over.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_cold(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        marks: &[(usize, u64)],
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> SmallRuns {
+        let mut runs = SmallRuns::new();
+        let from = from.max(start);
+        let to = to.min(end);
+        if from >= to {
+            return runs;
+        }
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let pages = base..base + self.at.len();
+        let mut verified = std::mem::take(&mut self.verified);
+        let mut chunks = crate::cold_skip::Chunks::new(&mut verified, pages, marks);
+        let mut wi = if written.len() > 8 {
+            written.partition_point(|&(p, _)| p < first_page)
+        } else {
+            0
+        };
+        let mut run: Option<(usize, usize)> = None;
+        let (mut walked, mut passed) = (0u64, 0u64);
+        for span in crate::cold_skip::spans(first_page, last) {
+            if chunks.unchanged(&span) {
+                if let Some((run_start, run_end)) = run.take() {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                }
+                passed += span.len() as u64;
+                continue;
+            }
+            walked += span.len() as u64;
+            let mut all_fresh = true;
+            for page in span.clone() {
+                while wi < written.len() && written[wi].0 < page {
+                    wi += 1;
+                }
+                let write = if wi < written.len() && written[wi].0 == page {
+                    let w = written[wi].1;
+                    wi += 1;
+                    w
+                } else {
+                    0
+                };
+                let idx = page - base;
+                if skip_idx(idx) {
+                    if let Some((run_start, run_end)) = run.take() {
+                        runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    }
+                    all_fresh = false;
+                    continue;
+                }
+                let taken = self.at[idx];
+                if taken == 0 || write > taken {
+                    self.plan_page(
+                        &mut runs, &mut run, base, start, end, from, to, now, page, write,
+                    );
+                } else if let Some((run_start, run_end)) = run.take() {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                }
+                all_fresh &= crate::cold_skip::fresh(self.at[idx], write);
+            }
+            chunks.walked(&span, all_fresh);
+        }
+        if let Some((run_start, run_end)) = run {
+            runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+        }
+        self.verified = verified;
+        crate::cold_skip::count(walked, passed);
         runs
     }
 
@@ -3336,6 +3442,9 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "mimalloc")]
+    crate::heap::log_once();
+    crate::cold_skip::line(frames);
     let c: Vec<f64> = BACK_CLASS
         .iter()
         .map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames)
@@ -4518,6 +4627,83 @@ mod stale_tests {
         );
         assert!(r2.is_empty());
     }
+
+    #[test]
+    fn plan_stale_cold_matches_plan_stale_and_respects_forget_and_lazy_skip() {
+        let base = 40usize;
+        let pages = 96usize;
+        let start = base * PAGE;
+        let end = start + pages * PAGE;
+        let mut cold = CopiedPages::with_base(pages, base);
+        let mut plain = CopiedPages::with_base(pages, base);
+
+        // Initial full refresh marks all 3 chunks verified (marks empty -> 0).
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 1, &[], &[], |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 1, &[])
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(start, end)]);
+
+        // Unchanged chunks produce empty runs.
+        assert!(
+            cold.plan_stale_cold(base, start, end, start, end, 2, &[], &[], |_| false)
+                .iter()
+                .next()
+                .is_none()
+        );
+
+        // Write page 70 (chunk 2) -> only chunk 2 walked and copied.
+        let marks = [(70 / crate::cold_skip::CHUNK_PAGES, 1u64)];
+        let written = [(70usize, 3u64)];
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 3, &written, &marks, |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 3, &written)
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(70 * PAGE, 71 * PAGE)]);
+
+        // Invalidating page 45 via `set(..., 0)` automatically forgets its chunk.
+        cold.set(45 - base, 0);
+        plain.set(45 - base, 0);
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 4, &written, &marks, |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 4, &written)
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(45 * PAGE, 46 * PAGE)]);
+
+        // Lazy-deferred page 70 keeps chunk 2 unverified so it is re-walked once cleared.
+        let marks2 = [(70 / crate::cold_skip::CHUNK_PAGES, 2u64)];
+        let written2 = [(70usize, 5u64)];
+        assert!(
+            cold.plan_stale_cold(base, start, end, start, end, 5, &written2, &marks2, |i| {
+                i == 70 - base
+            })
+            .iter()
+            .next()
+            .is_none()
+        );
+        let r_after: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 6, &written2, &marks2, |_| {
+                false
+            })
+            .iter()
+            .collect();
+        assert_eq!(r_after, vec![(70 * PAGE, 71 * PAGE)]);
+    }
 }
 
 /// Copies of windows outside buffers let go since the start, and their
@@ -4775,7 +4961,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(CopiedPages::new(pages)),
+            copied: Mutex::new(CopiedPages::with_base(pages, (start / PAGE as u64) as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
@@ -5746,6 +5932,7 @@ impl Shadow {
                 if all_read && (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     copied.set(page - base, now);
+                    copied.forget_page(page);
                 }
             }
         }
@@ -5831,10 +6018,20 @@ impl Shadow {
         }
         let w = self.watched.load(Ordering::Relaxed);
         if w != NOT_WATCHED {
+            let skip = crate::cold_skip::on();
             if w == 1 {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let clean =
-                    crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at);
+                let clean = if skip {
+                    crate::watch::nothing_new_cold(
+                        from,
+                        to,
+                        self.start as usize / PAGE,
+                        &copied.at,
+                        &copied.verified,
+                    )
+                } else {
+                    crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at)
+                };
                 drop(copied);
                 if clean {
                     self.refresh_check(from, to);
@@ -5847,11 +6044,21 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let mut marks = Vec::new();
+            let answer = if skip {
+                crate::watch::writes_marked(from, to, true, &mut marks)
+            } else {
+                crate::watch::writes(from, to, true)
+            };
+            if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, &subs);
+                let copied = if skip {
+                    self.copy_stale_cold(from, to, now, &written, &subs, &marks)
+                } else {
+                    self.copy_stale(from, to, now, &written, &subs)
+                };
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
@@ -6093,6 +6300,46 @@ impl Shadow {
         let mut bytes = 0;
         for (a, b) in bytes_runs {
             bytes += self.copy(a, b);
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// skips 2 MiB chunks whose mark has not moved since a walk left every page
+    /// of them fresh; delegates to [`Shadow::copy_stale`] when sub-page
+    /// tracking (`VICTORY_WATCH_4K` / `VICTORY_DIRTY_4K`) is active.
+    fn copy_stale_cold(
+        self: &Arc<Self>,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+        marks: &[(usize, u64)],
+    ) -> usize {
+        if crate::watch::watch_4k() || crate::watch::dirty4k_kept() {
+            return self.copy_stale(from, to, now, written, subs);
+        }
+        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        let runs = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if has_deferred {
+                copied.plan_stale_cold(base, start, end, from, to, now, written, marks, |idx| {
+                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+                })
+            } else {
+                copied.plan_stale_cold(base, start, end, from, to, now, written, marks, |_| false)
+            }
+        };
+        let total: usize = runs.iter().map(|(a, b)| b - a).sum();
+        if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
+            return self.copy_runs_wide(runs.iter());
+        }
+        let mut bytes = 0;
+        for (run_from, run_to) in runs.iter() {
+            bytes += self.copy(run_from, run_to);
         }
         bytes
     }
@@ -6985,22 +7232,29 @@ pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 /// the title's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// A window nothing names any more is let go ([`let_go_idle`]).
-/// shortcut: a window is 4 MiB however little of it is read (the memory
-/// line says how much was ever asked for, and how much was ever copied);
-/// [`window`] cuts the windows of asks that give a length on a finer grid.
+/// shortcut: a window is a whole cell of this however little of it is
+/// read (the memory line says how much was ever asked for, and how much was
+/// ever copied); [`window`] cuts the windows of asks that give a length on
+/// a finer grid, and [`tails`] those of asks without one.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: 1 MiB
+/// ([`GRID`]) unless `VICTORY_WINDOW_KB` names another power of two from 64
+/// to 4096 (4096: whole 4 MiB windows, as before).
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
 /// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
 /// window ends nearer to what is read. An ask without a length keeps the
 /// 4 MiB grid whatever is set: a root view reads from its address to its
 /// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// The default since three pairs of runs (RTX 3060 12 GB, 32 GB of RAM, the
+/// prison yard; 1 MiB with tails against 4 MiB, measured over the first
+/// 120 s in the world): windows 2.5-3.1 GB -> 1.6-1.8 GB, the process's
+/// private bytes 25.5-27.1 GB -> 23.4-24.8 GB, page faults in frames over
+/// a second 4.4-7.2 -> 1.4-3.6 million, and those frames 41-75 s -> 28-52
+/// s; the usual frame was no slower (103-152 ms -> 82-131 ms).
+/// shortcut: the same memory asked for with different ranges then lies in
+/// more than one window.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -7012,13 +7266,16 @@ fn window() -> u64 {
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB, [`GRID`] for anything else.
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
+        _ => GRID,
     }
 }
+
+/// The window grid unless said otherwise ([`window`]).
+const GRID: u64 = 1 << 20;
 
 /// The window (start, bytes) of title memory for an ask of `[address,
 /// end)` on a grid of `grid` bytes.
@@ -7036,16 +7293,21 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
+/// On by default with the 1 MiB grid ([`window`]);
+/// `VICTORY_WINDOW_TAILS=0` turns it off. A longer tail is another
 /// host buffer than the shorter one: what was bound to the shorter stays
 /// right only because every list brings up to date the copy it bound
 /// (`draw.rs` keeps a root view's copy with its slot). It pays only
 /// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
 /// with a length in the same cell makes the whole cell's window, and the
 /// tail is that.
+fn tails_enabled(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| tails_enabled(std::env::var_os("VICTORY_WINDOW_TAILS").as_deref()))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -7720,17 +7982,25 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// leaves the grid at its default, 1 MiB.
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
+        assert_eq!(grid(None), 1 << 20);
         assert_eq!(grid(Some(4096)), WINDOW);
         assert_eq!(grid(Some(1024)), 1 << 20);
         assert_eq!(grid(Some(256)), 256 << 10);
         assert_eq!(grid(Some(64)), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(grid(Some(bad)), 1 << 20, "{bad}");
         }
+    }
+
+    #[test]
+    fn window_tails_default_on_and_zero_turns_them_off() {
+        use std::ffi::OsStr;
+        assert!(super::tails_enabled(None));
+        assert!(super::tails_enabled(Some(OsStr::new("1"))));
+        assert!(!super::tails_enabled(Some(OsStr::new("0"))));
     }
 
     /// A window holds its ask and is cut on the grid; on the default grid

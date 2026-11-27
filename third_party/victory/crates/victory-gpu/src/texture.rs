@@ -904,8 +904,10 @@ impl PreludeUpload {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some((levels, bytes)) = prefill {
-            prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes);
+        if let Some((levels, bytes)) = prefill
+            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
+        {
+            crate::descriptor::host::levels_changed(self.staging.memory as u64);
         }
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the list's
@@ -1691,6 +1693,48 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let mut first = [0u8; 8];
         first.copy_from_slice(&hash.as_bytes()[..8]);
         // 0 says "none" to the texture queue (`Recheck`, `checked`).
+        u64::from_le_bytes(first) | 1
+    })
+}
+
+/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+
+/// [`fingerprint`], or for a live slot (one found changing after its upload)
+/// no larger than 4 MiB, one of all of its memory. The sampled 4 KiB pieces
+/// miss a video plane's change when its sampled rows are a still background
+/// (a TV news shot: the reporter moves between them), so a plane looked
+/// unchanged and waited while the other planes of the same video frame were
+/// uploaded: one frame's luma under another's chroma.
+pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
+    if !live || len > LIVE_WHOLE_BYTES {
+        return fingerprint(at, len);
+    }
+    const CHUNK: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(CHUNK, 0);
+        let mut hasher = blake3::Hasher::new();
+        let mut from = 0;
+        while from < len {
+            let bytes = CHUNK.min(len - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
+            hasher.update(&read[..bytes]);
+            from += bytes;
+        }
+        let hash = hasher.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&hash.as_bytes()[..8]);
         u64::from_le_bytes(first) | 1
     })
 }
