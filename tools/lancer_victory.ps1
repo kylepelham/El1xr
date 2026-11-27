@@ -63,6 +63,18 @@
   Optional. Starts the title with its Windows audio session muted (VICTORY_MUTE=1) without touching XAudio2 or game
   timing. Set before -Override so -Override @{ VICTORY_MUTE = '0' } still wins.
 
+.PARAMETER SkipIntro
+  Optional. Skips the title's startup intro movie straight to the initial interactive screen (VICTORY_SKIP_INTRO=1,
+  equivalent to prepending -skipToIIS to the title arguments) without affecting story cutscenes. Set before -Override
+  so -Override @{ VICTORY_SKIP_INTRO = '0' } still wins.
+
+.PARAMETER DataDir
+  Optional. Isolated data directory for saves and persistent local storage (VICTORY_DATA_DIR). Set before -Override so
+  -Override @{ VICTORY_DATA_DIR = '...' } still wins.
+
+.PARAMETER TitleArgs
+  Optional. Arguments forwarded to the title executable after `--` (e.g. -TitleArgs @('-skipToIIS')).
+
 .NOTES
   The switch set is Neptune (VIctory Edit.) 2026-11-25c's play.ps1 for the Series X path (no PC FidelityFX DLL, no
   VICTORY_AUTO_A unless -AutoA), with the measured changes of 2026-11-25 on top (heap pass on dirty slots, copy
@@ -95,6 +107,9 @@ param(
     [switch]$BatchCardRehash,
     [switch]$Quality,
     [switch]$Mute,
+    [switch]$SkipIntro,
+    [string]$DataDir,
+    [string[]]$TitleArgs = @(),
     [hashtable]$Override = @{}
 )
 
@@ -232,6 +247,12 @@ if ($Quality) {
 if ($Mute) {
     $env:VICTORY_MUTE = '1'
 }
+if ($SkipIntro) {
+    $env:VICTORY_SKIP_INTRO = '1'
+}
+if ($PSBoundParameters.ContainsKey('DataDir') -and $DataDir) {
+    $env:VICTORY_DATA_DIR = $DataDir
+}
 foreach ($name in $Override.Keys) {
     if ($name -notlike 'VICTORY_*') { throw "-Override takes VICTORY_* names only: '$name'." }
     Set-Item -Path "Env:$name" -Value ([string]$Override[$name])
@@ -300,7 +321,12 @@ if ($Precompile) {
 $prevErrorAction = $ErrorActionPreference
 try {
     $ErrorActionPreference = 'Continue'
-    & $exe run $gameExe --execute
+    if ($TitleArgs.Count -gt 0) {
+        $titleTail = @('--') + $TitleArgs
+        & $exe run $gameExe --execute @titleTail
+    } else {
+        & $exe run $gameExe --execute
+    }
 } finally {
     $ErrorActionPreference = $prevErrorAction
 }

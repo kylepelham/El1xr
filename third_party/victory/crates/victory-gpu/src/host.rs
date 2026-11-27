@@ -3295,8 +3295,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it.
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -3606,7 +3606,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+pub(crate) fn late_signal(fence: crate::object::This, value: u64) -> bool {
     if !late() {
         return false;
     }
@@ -3621,7 +3621,8 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if line.line.is_empty() && !line.settling {
         return false;
     }
-    line.line.push(Late::Signal(fence, value));
+    line.line
+        .push(Late::Signal(crate::fence::FenceRef::retain(fence), value));
     line.pushed += 1;
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
@@ -3857,6 +3858,7 @@ fn relay_wait_inner(why: usize, holds_submitted: bool, done: impl Fn(&Line) -> b
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    let _hitch = crate::hitch::span(crate::hitch::Phase::CardWait);
     let was_working = holds_submitted && working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -6158,8 +6160,10 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (_, lo, hi, at, from, _) in &kept {
-                        list.CopyBufferRegion(&buffer, *at, snaps, *from, (*hi - *lo) as u64);
+                    for (at, from, len) in
+                        crate::relay_runs::relay_kept_runs(&kept, crate::relay_runs::enabled())
+                    {
+                        list.CopyBufferRegion(&buffer, at, snaps, from, len);
                     }
                     list.Close()?;
                     own.queue
@@ -6198,13 +6202,15 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &pieces {
+                    for (shadow, lo, hi, at) in
+                        crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
+                    {
                         list.CopyBufferRegion(
                             &buffer,
-                            *at,
+                            at,
                             &shadow.buffer,
-                            *lo as u64,
-                            (*hi - *lo) as u64,
+                            lo as u64,
+                            (hi - lo) as u64,
                         );
                     }
                     list.Close()?;
@@ -6565,9 +6571,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value)
-                }
+                Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
         if last > 0 {
@@ -7078,9 +7082,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => {
-                        crate::fence::set(fence as crate::object::This, value)
-                    }
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
@@ -7379,7 +7381,13 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let tex_back = runs
                 .iter()
-                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .flat_map(|l| {
+                    l.deferred()
+                        .texture_backs
+                        .iter()
+                        .map(crate::texback::Back::range)
+                        .collect::<Vec<_>>()
+                })
                 .collect();
             let sent = Sent {
                 number: this_submission,
@@ -8148,7 +8156,9 @@ impl HostList {
             return;
         }
         let wanted = &mut self.deferred().back_wanted;
-        crate::texback::want(wanted, resource as usize, || crate::texback::Target::new(resource));
+        crate::texback::want(wanted, resource as usize, || {
+            crate::texback::Target::new(resource)
+        });
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
@@ -9456,6 +9466,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let _hitch = crate::hitch::span(crate::hitch::Phase::Copies);
         let copies = self.ops.take();
         let flush_started = std::time::Instant::now();
         flush::add(flush::F::Flushes, 1);

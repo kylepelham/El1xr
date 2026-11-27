@@ -82,7 +82,10 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
 pub(crate) fn add_ref_alive(this: This) -> bool {
     // SAFETY: `this` is one of our objects, not freed yet.
     let refs = &unsafe { &*this }.refs;
-    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n > 0).then(|| n + 1)
+    })
+    .is_ok()
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
@@ -147,7 +150,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
-            private_data().retain(|&(object, _), _| object != this as usize);
+            clear_private_data(&mut private_data(), this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
@@ -159,6 +162,20 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
 
 /// Private data of every object, by object address and id.
 static PRIVATE: Mutex<BTreeMap<(usize, Iid), Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+/// On final release, entries for one object occupy a single contiguous key
+/// range in `PRIVATE`. Seeking to that range is O(log N) when the object has
+/// no private data instead of scanning every live object under the lock.
+fn clear_private_data(data: &mut BTreeMap<(usize, Iid), Vec<u8>>, address: usize) {
+    let range = (address, [0; 16])..=(address, [u8::MAX; 16]);
+    if data.range(range.clone()).next().is_none() {
+        return;
+    }
+    let keys: Vec<_> = data.range(range).map(|(k, _)| *k).collect();
+    for key in keys {
+        data.remove(&key);
+    }
+}
 
 fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u8>>> {
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -394,5 +411,20 @@ mod tests {
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+    }
+
+    #[test]
+    fn final_release_clears_only_the_released_object_private_data() {
+        let mut data = BTreeMap::new();
+        for address in [0, 17, usize::MAX] {
+            for key in [[0; 16], [4; 16], [u8::MAX; 16]] {
+                data.insert((address, key), vec![5]);
+            }
+        }
+        for address in [17, 17, 1] {
+            clear_private_data(&mut data, address);
+        }
+        assert_eq!(data.len(), 6);
+        assert!(data.keys().all(|&(address, _)| address != 17));
     }
 }

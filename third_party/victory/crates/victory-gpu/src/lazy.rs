@@ -340,6 +340,7 @@ fn lazy_record_materialize_us(us: u64) {
     }
     LAZY_EXTRA_STATS[1].fetch_add(us, Ordering::Relaxed);
     LAZY_METER_STATS[4].fetch_add(us, Ordering::Relaxed);
+    crate::hitch::add(crate::hitch::Phase::Lazy, us);
 }
 
 /// Unconditionally records one actual `VirtualProtect` syscall and accumulates

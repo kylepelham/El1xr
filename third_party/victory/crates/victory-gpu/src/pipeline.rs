@@ -260,6 +260,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let _hitch = crate::hitch::span(crate::hitch::Phase::ShaderTranslate);
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -424,11 +425,22 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// And the tracing itself against the structures, with the hair's geometry
 /// made for them (8 % of the card's time in the opening cutscene): the
 /// `bvh_skinning_smh` program `CSGenerateHairVB`, the screen probes'
-/// `CS_ScreenProbes_TraceRays*_BVH*` and the reflections'
-/// `CS_RaytraceVBuffer*`. Their `Fallback` and `Voxels` forms march through
-/// the title's voxels, not the structures, and light the picture: they run.
-/// `CSGenerateHairVB` is grouped with `RayOnly::Trace` so `CSComputeSkinning`
-/// remains on by default (opt-in skip only via `VICTORY_SKIP_RT_SKIN=1`).
+/// `CS_ScreenProbes_TraceRays*_BVH*`. Their `Fallback` and `Voxels` forms
+/// march through the title's voxels, not the structures, and light the
+/// picture: they run. `CSGenerateHairVB` is grouped with `RayOnly::Trace`
+/// so `CSComputeSkinning` remains on by default (opt-in skip only via
+/// `VICTORY_SKIP_RT_SKIN=1`).
+///
+/// The reflections' `CS_RaytraceVBuffer*` (`RayOnly::VBuffer`) also traces
+/// the structures. A frame dispatches it twice, each on its own list: after
+/// `CS_RayPrePass_Opaque*`, for `CS_Primary_GatherVBuffer*`, and after
+/// `CS_RayPrePass_Alpha*`, for the alpha fallbacks and
+/// `CS_GatherAlphaVBuffer*`. The alpha one runs: left out, its hit records
+/// keep stale values and the diner's window glass shows blotchy frosted
+/// splotches and blue patches; run with every ray a miss, it writes clean
+/// no-hit records. The opaque one stays out: with every ray a miss, skin
+/// indoors reflects the sky and looks oily. `VICTORY_SKIP_RT_VBUFFER=1`
+/// leaves out the alpha one too.
 #[cfg(windows)]
 fn for_rays(bytes: &[u8]) -> RayOnly {
     let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
@@ -438,10 +450,9 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         RayOnly::Resolve
     } else if has(b"CS_ScreenProbes_ActivateRays") {
         RayOnly::Activate
-    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH"))
-        || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels"))
-        || has(b"CSGenerateHairVB")
-    {
+    } else if has(b"CS_RaytraceVBuffer") && !has(b"Voxels") {
+        RayOnly::VBuffer
+    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH")) || has(b"CSGenerateHairVB") {
         RayOnly::Trace
     } else {
         RayOnly::No
@@ -457,6 +468,7 @@ enum RayOnly {
     Resolve,
     Activate,
     Trace,
+    VBuffer,
 }
 
 #[cfg(all(test, windows))]
@@ -497,7 +509,13 @@ fn ray_programs_are_known_by_name() {
     );
     assert_eq!(
         for_rays(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."),
-        RayOnly::Trace
+        RayOnly::VBuffer
+    );
+    assert_eq!(
+        for_rays(
+            b"..\0CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar_ca043b62_Wrapped\0.."
+        ),
+        RayOnly::VBuffer
     );
     assert_eq!(
         for_rays(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."),
@@ -515,29 +533,92 @@ fn ray_programs_are_known_by_name() {
 /// deterministic `0x887A0006` GPU hang at world entry on Series X); opt-in
 /// skip only via `VICTORY_SKIP_RT_SKIN=1`.
 #[cfg(windows)]
-pub(crate) fn skips_rt_skin(this: This) -> bool {
-    fn off(switch: &str) -> bool {
-        (std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
-            || std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
-            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
-            && std::env::var_os(switch).is_none_or(|v| v != "1")
-    }
-    static SKIN: OnceLock<bool> = OnceLock::new();
-    static RESOLVE: OnceLock<bool> = OnceLock::new();
-    static ACTIVATE: OnceLock<bool> = OnceLock::new();
-    static TRACE: OnceLock<bool> = OnceLock::new();
+pub(crate) fn skips_rt_skin(this: This, alpha_rays: bool) -> bool {
+    static SKIPS: [[OnceLock<bool>; 2]; 6] = [const { [const { OnceLock::new() }; 2] }; 6];
     if this.is_null() {
         return false;
     }
-    match pipeline(this).rt_only {
-        RayOnly::No => false,
-        RayOnly::Skin => {
-            *SKIN.get_or_init(|| std::env::var_os("VICTORY_SKIP_RT_SKIN").is_some_and(|v| v == "1"))
-        }
-        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
-        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
-        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+    let kind = pipeline(this).rt_only;
+    *SKIPS[kind as usize][alpha_rays as usize].get_or_init(|| {
+        ray_kind_skipped(kind, alpha_rays, |name| {
+            std::env::var_os(name).is_some_and(|v| v == "1")
+        })
+    })
+}
+
+/// Whether `this` is a `CS_RayPrePass*`: `Some(true)` for the alpha one,
+/// `Some(false)` for the others (see [`for_rays`]).
+#[cfg(windows)]
+pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
+    if this.is_null() {
+        return None;
     }
+    pipeline(this).pre_pass
+}
+
+/// [`ray_pre_pass`] of a compute program's container.
+#[cfg(windows)]
+fn pre_pass_of(bytes: &[u8]) -> Option<bool> {
+    let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    has(b"CS_RayPrePass_").then(|| has(b"CS_RayPrePass_Alpha"))
+}
+
+/// Whether dispatches of `kind` are left out, `alpha_rays` telling whether
+/// the list last ran the alpha ray pre-pass and `on(name)` whether the
+/// switch `name` is `1` ([`skips_rt_skin`]).
+#[cfg(windows)]
+fn ray_kind_skipped(kind: RayOnly, alpha_rays: bool, on: impl Fn(&str) -> bool) -> bool {
+    let off = |switch: &str| {
+        (on("VICTORY_BVH_NO_HIT") || on("VICTORY_RT_MISS"))
+            && !on("VICTORY_BVH_BUILDER")
+            && !on(switch)
+    };
+    match kind {
+        RayOnly::No => false,
+        RayOnly::Skin => on("VICTORY_SKIP_RT_SKIN"),
+        RayOnly::Resolve => off("VICTORY_RT_RESOLVE"),
+        RayOnly::Activate => off("VICTORY_ACTIVATE_RAYS"),
+        RayOnly::Trace => off("VICTORY_RT_TRACE"),
+        RayOnly::VBuffer => {
+            off("VICTORY_RT_TRACE") && (!alpha_rays || on("VICTORY_SKIP_RT_VBUFFER"))
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn the_alpha_vbuffer_trace_runs_when_every_ray_misses() {
+    let with = |set: &'static [&'static str]| move |name: &str| set.contains(&name);
+    let no_hit = with(&["VICTORY_BVH_NO_HIT"]);
+    assert!(!ray_kind_skipped(RayOnly::VBuffer, true, no_hit));
+    assert!(ray_kind_skipped(RayOnly::VBuffer, false, no_hit));
+    for alpha in [false, true] {
+        assert!(ray_kind_skipped(RayOnly::Trace, alpha, no_hit));
+        assert!(ray_kind_skipped(RayOnly::Resolve, alpha, no_hit));
+        assert!(ray_kind_skipped(RayOnly::Activate, alpha, no_hit));
+        assert!(!ray_kind_skipped(RayOnly::Skin, alpha, no_hit));
+    }
+    assert!(ray_kind_skipped(
+        RayOnly::VBuffer,
+        true,
+        with(&["VICTORY_BVH_NO_HIT", "VICTORY_SKIP_RT_VBUFFER"])
+    ));
+    for alpha in [false, true] {
+        assert!(!ray_kind_skipped(
+            RayOnly::VBuffer,
+            alpha,
+            with(&["VICTORY_BVH_NO_HIT", "VICTORY_SKIP_RT_VBUFFER", "VICTORY_RT_TRACE"])
+        ));
+        assert!(!ray_kind_skipped(RayOnly::VBuffer, alpha, with(&[])));
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn ray_pre_passes_are_known_by_name() {
+    assert_eq!(pre_pass_of(b"..\0CS_RayPrePass_Alpha_a80bdf75_Wrapped\0.."), Some(true));
+    assert_eq!(pre_pass_of(b"..\0CS_RayPrePass_Opaque_SSR_a80bdf75_Wrapped\0.."), Some(false));
+    assert_eq!(pre_pass_of(b"..\0CS_RaytraceVBuffer_Mixed_WithFar\0.."), None);
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -655,6 +736,9 @@ struct Pipeline {
     /// ([`for_rays`]).
     #[cfg(windows)]
     rt_only: RayOnly,
+    /// [`ray_pre_pass`].
+    #[cfg(windows)]
+    pre_pass: Option<bool>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -955,6 +1039,11 @@ fn hand_out(
             .map(|s| for_rays(&s.container))
             .find(|k| *k != RayOnly::No)
             .unwrap_or(RayOnly::No),
+        #[cfg(windows)]
+        pre_pass: shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .find_map(|s| pre_pass_of(&s.container)),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1016,6 +1105,30 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Slot 0x218 tries a precompiled compute pipeline. On a miss the caller
+/// retries at 0x1f0 with its full shader container.
+pub(crate) extern "system" fn cached_compute(
+    _: This,
+    _desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    if !out.is_null() {
+        // SAFETY: the caller supplies the pipeline out pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if misses.is_power_of_two() {
+        tracing::info!(
+            misses,
+            "precompiled compute cache miss at 0x218; the caller can retry with its shader at 0x1f0"
+        );
+    }
+    object::E_NOTIMPL
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -1274,6 +1387,53 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn cached_compute_miss_falls_back_to_the_compute_container() {
+        use crate::object::slot;
+        type Cached = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        type Compute = extern "system" fn(
+            This,
+            *const ComputeHead,
+            u32,
+            *const u8,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        let device = crate::device::device();
+        let pair_data = [0u32; 7];
+        let mut entry = [0usize; 9];
+        for pair in entry[1..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&[pair_data.as_ptr() as usize, size_of_val(&pair_data)]);
+        }
+        let mut p = device;
+        assert!(
+            slot::<Cached>(device, 0x218)(device, entry.as_ptr().cast(), &PIPELINE_IIDS[0], &mut p)
+                < 0
+        );
+        assert!(p.is_null());
+        let code = [1u8, 2, 3, 4];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+        };
+        assert_eq!(
+            slot::<Compute>(device, 0x1f0)(
+                device,
+                &desc,
+                0,
+                std::ptr::null(),
+                &PIPELINE_IIDS[0],
+                &mut p
+            ),
+            S_OK
+        );
+        assert_eq!(shaders(p), [("compute", code.to_vec())]);
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

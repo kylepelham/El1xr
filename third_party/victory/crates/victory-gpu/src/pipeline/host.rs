@@ -350,6 +350,33 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// The lane bounds in the translated shader's pipeline validation data.
+/// Valid DXIL can still require a wave wider than the device supports.
+fn wave_lanes(dxil: &[u8]) -> Option<[u32; 2]> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    Some([
+        u32::from_le_bytes(info.get(16..20)?.try_into().ok()?),
+        u32::from_le_bytes(info.get(20..24)?.try_into().ok()?),
+    ])
+}
+
+/// Records the translated DXIL digest and declared wave lanes beside the
+/// original shader hash when a host pipeline is refused.
+fn log_refused_stage(shader: &Shader) {
+    if let Some(t) = shader.translated() {
+        let dxil = &t.host.dxil;
+        tracing::warn!(
+            ?shader,
+            host_dxil = %blake3::hash(dxil),
+            wave_lanes = ?wave_lanes(dxil),
+            "translated stage of a refused pipeline"
+        );
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -596,6 +623,7 @@ impl HostPipeline {
                         static_samplers = samplers.len(),
                         "host pipeline refused"
                     );
+                    log_refused_stage(stages[0].0);
                     return None;
                 }
             };
@@ -661,6 +689,9 @@ impl HostPipeline {
                     // The state too: the shaders alone make a pipeline
                     // with another state (`victory translate` pairs).
                     tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
+                    for (shader, _) in &stages {
+                        log_refused_stage(shader);
+                    }
                     host.log_messages();
                     return None;
                 }
