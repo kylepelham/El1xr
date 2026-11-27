@@ -1337,6 +1337,9 @@ pub(crate) fn is_texture(this: This) -> bool {
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
+pub(crate) mod placed_inside;
+
+#[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -1481,7 +1484,7 @@ pub(crate) fn alias_of(this: This) -> Option<Held> {
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let count = changes.load(Relaxed);
-    let found = target_at(&targets, r, one);
+    let found = target_at(&targets, r, one).or_else(|| placed_inside::linked(&targets, this, r));
     if found.is_none() {
         r.host
             .no_target
@@ -3413,6 +3416,7 @@ fn hand_out_resource(
             targets.insert(resource.data() as u64, at);
             target_changes(resource.data() as u64)
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+            placed_inside::cover(resource.data() as u64, &desc);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
