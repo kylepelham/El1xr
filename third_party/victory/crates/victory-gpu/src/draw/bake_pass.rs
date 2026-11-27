@@ -56,8 +56,13 @@ impl State {
             ONLY.set(false);
             add(C::OwnUs, began.elapsed().as_micros() as u64);
         }
+        let waited_ms = self.bake_wait(list, heap, host);
         let mine = PINNED.take();
-        let pending = host.texture_slots_pick(&mine).len() as u64;
+        let left = host.texture_slots_pick(&mine);
+        if crate::bake_why::why() {
+            self.bake_why(p, heap, host, &left, waited_ms);
+        }
+        let pending = left.len() as u64;
         add(C::Bakes, 1);
         add(C::Inputs, mine.len() as u64);
         add(C::Uploaded, before.saturating_sub(pending));
@@ -65,6 +70,96 @@ impl State {
             add(C::Short, 1);
             add(C::Pending, pending);
         }
+    }
+
+    /// (`VICTORY_BAKE_WAIT_MS=N`) The bake draw's own textures whose memory the title has not
+    /// (all) mapped: waits up to N ms for all of it, then uploads them alone. The ms waited.
+    fn bake_wait(
+        &mut self,
+        list: &HostList,
+        heap: &'static crate::descriptor::Heap,
+        host: &'static crate::descriptor::host::HostHeap,
+    ) -> u64 {
+        let ms = crate::bake_why::wait_ms();
+        if ms == 0 {
+            return 0;
+        }
+        let waiting: Vec<(u64, u64)> = PINNED.with_borrow(|mine| {
+            host.texture_slots_pick(mine)
+                .iter()
+                .filter_map(|&(index, _)| {
+                    let (address, len, _) = placed(heap, index)?;
+                    let mapped = mapped(address, len);
+                    crate::bake_why::lack(mapped, len)
+                        .waits_for_title()
+                        .then_some((address, len))
+                })
+                .collect()
+        });
+        if waiting.is_empty() {
+            return 0;
+        }
+        let ms = crate::bake_why::wait_left(crate::frame::current(), ms);
+        if ms == 0 {
+            return 0;
+        }
+        let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
+        let (_, took) = crate::bake_why::wait_for(ms, || {
+            waiting.iter().all(|&(address, len)| mapped(address, len) >= len)
+        });
+        crate::bake_why::waited(took.max(1));
+        ONLY.set(true);
+        PASS_BUDGET.set(Some((0, 0, true)));
+        self.heap_textures(list, heap, host);
+        PASS_BUDGET.set(None);
+        ONLY.set(false);
+        took
+    }
+
+    /// (`VICTORY_BAKE_WHY=1`) A line for each of the bake draw's textures still pending, and
+    /// for each found pending before that has been uploaded since.
+    fn bake_why(
+        &self,
+        p: &HostPipeline,
+        heap: &'static crate::descriptor::Heap,
+        host: &'static crate::descriptor::host::HostHeap,
+        left: &[(u32, u64)],
+        waited_ms: u64,
+    ) {
+        let frame = crate::frame::current();
+        crate::bake_why::landed(frame, |slots| {
+            host.texture_slots_pick(slots).into_iter().map(|(i, _)| i).collect()
+        });
+        if left.is_empty() {
+            return;
+        }
+        let seen: Vec<crate::bake_why::Seen> = left
+            .iter()
+            .map(|&(slot, _)| {
+                let (address, len, shape) = placed(heap, slot).unwrap_or((0, 0, [0; 4]));
+                let mapped = if len == 0 { 0 } else { mapped(address, len) };
+                crate::bake_why::Seen {
+                    slot,
+                    lack: if len == 0 {
+                        crate::bake_why::Lack::Other
+                    } else {
+                        crate::bake_why::lack(mapped, len)
+                    },
+                    mapped,
+                    len,
+                    address,
+                    shape,
+                    state: host.texture_slot_state(slot, frame),
+                }
+            })
+            .collect();
+        crate::bake_why::pending(
+            frame,
+            bake_hash(p),
+            self.targets.first().copied().unwrap_or(0),
+            waited_ms,
+            &seen,
+        );
     }
 
     /// The first view heap bound that is not a sampler heap, with its host heap.
@@ -122,4 +217,31 @@ impl State {
                 .map(|w| w[0])
         }))
     }
+}
+
+/// The title address, the bytes from the first mip shown and the shape of the texture placed in
+/// memory that slot `index` views (None: another kind of view).
+fn placed(heap: &crate::descriptor::Heap, index: u32) -> Option<(u64, u64, [u32; 4])> {
+    let Some(View::Placed(false, resource, desc)) =
+        heap.handle(index).and_then(crate::descriptor::view)
+    else {
+        return None;
+    };
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let len =
+        crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+    Some((address, len, crate::bake_why::shape(&resource)))
+}
+
+fn mapped(address: u64, len: u64) -> u64 {
+    crate::texture::mapped_bytes(address as *const u8, len as usize)
+}
+
+/// The bake pixel shader of `p`, as [`BAKE_PIXEL_SHADERS`] names it.
+fn bake_hash(p: &HostPipeline) -> &'static str {
+    p.stages
+        .iter()
+        .find_map(|s| BAKE_PIXEL_SHADERS.iter().find(|&&h| h == s.shader.hash.as_str()))
+        .copied()
+        .unwrap_or("?")
 }

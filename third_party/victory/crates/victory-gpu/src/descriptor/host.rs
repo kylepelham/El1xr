@@ -3664,8 +3664,7 @@ impl HostHeap {
     }
 
     /// What the queue of textures picked by index knows of title slot
-    /// `index` at `frame`, in a few words (diagnostics).
-    #[cfg(feature = "diagnostics")]
+    /// `index` at `frame`, in a few words (diagnostics, `VICTORY_BAKE_WHY`).
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match textures.slots.get(&index) {
