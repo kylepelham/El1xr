@@ -466,19 +466,24 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = victory_gpu::priority::dstorage_workers();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
                     .spawn(|| {
                         victory_gpu::topology::pin_background("dstorage");
+                        victory_gpu::priority::dstorage_worker();
                         work(scheduler);
                     })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            priority = ?victory_gpu::priority::dstorage_priority(),
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)"
+        );
     });
     Some(scheduler)
 }
