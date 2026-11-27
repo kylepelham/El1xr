@@ -1183,6 +1183,7 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    let map_const = crate::resource::constant_page_mapper();
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1198,18 +1199,71 @@ extern "system" fn copy_page_mappings(
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
+        let mut i = 0;
+        while i < ranges.len() {
+            let r = &ranges[i];
+            let inside =
+                |start: u32, pages: u32| start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let mut pages = r.count;
+            let mut next = i + 1;
+            match r.kind {
+                0 => {
+                    while next < ranges.len()
+                        && ranges[next].kind == 0
+                        && r.start.checked_add(pages) == Some(ranges[next].start)
+                        && pages.checked_add(ranges[next].count).is_some()
+                    {
+                        pages += ranges[next].count;
+                        next += 1;
+                    }
+                    let len = u64::from(pages) * PAGE;
+                    let source = pool + u64::from(r.start) * PAGE;
+                    ok &= inside(r.start, pages) && map(at, source, len);
+                    at += len;
+                }
+                1 => {
+                    while next < ranges.len()
+                        && ranges[next].kind == 1
+                        && ranges[next].start == r.start
+                        && pages.checked_add(ranges[next].count).is_some()
+                    {
+                        pages += ranges[next].count;
+                        next += 1;
+                    }
+                    let len = u64::from(pages) * PAGE;
+                    let source = pool + u64::from(r.start) * PAGE;
+                    ok &= if inside(r.start, 1) {
+                        if let Some(fill) = map_const {
+                            fill(at, source, len)
+                        } else {
+                            (0..u64::from(pages)).all(|k| map(at + k * PAGE, source, PAGE))
+                        }
+                    } else {
+                        false
+                    };
+                    at += len;
+                }
+                2 => {
+                    while next < ranges.len()
+                        && ranges[next].kind == 2
+                        && pages.checked_add(ranges[next].count).is_some()
+                    {
+                        pages += ranges[next].count;
+                        next += 1;
+                    }
+                    let len = u64::from(pages) * PAGE;
+                    ok &= map(at, 0, len);
+                    at += len;
+                }
+                3 => {
+                    at += u64::from(pages) * PAGE;
+                }
+                _ => {
+                    ok = false;
+                    at += u64::from(pages) * PAGE;
+                }
+            }
+            i = next;
         }
     }
     if !ok {

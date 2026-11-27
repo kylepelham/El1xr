@@ -33,6 +33,7 @@ use windows_sys::core::BOOL;
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
@@ -1154,12 +1155,12 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
 /// covered all title memory, each page waited for every in-place read under
 /// way and the refreshes queued behind each (run amd-F).
 ///
-/// Such a run is unmapped at once, and its consecutive slices of one
-/// section mapped as one view ([`map_scattered`]): page by page, each page
-/// inside a view of several took the whole view away and mapped what stays
-/// of it again. Addresses that follow one another can lie in different
-/// placeholders, which one view cannot span (run amd-H: error 487, and the
-/// title stopped): there each page is mapped on its own ([`map_run`]).
+/// Such a run is unmapped at once, and consecutive slices of one section are
+/// mapped as one view ([`map_scattered`]): page by page, each page inside an
+/// existing view of several took the whole view away and mapped what stays of
+/// it again. Unchanged pages inside the run are left untouched, and
+/// [`TailSplitGuard`] shields concurrent title threads accessing surviving
+/// tails during a partial view split.
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -1231,9 +1232,10 @@ fn scatter_run(
 }
 
 /// [`map_pages`] for a run of a scatter: `want[k]` (a page, or none to
-/// unmap) at `base + k` pages. Pages there already at either end are left
-/// as they are, as `map_pages` leaves them; the rest of the run is unmapped
-/// once, then mapped one view per run of consecutive slices of one section.
+/// unmap) at `base + k` pages. Any page already showing what is wanted is
+/// left untouched; each contiguous sub-run of pages that actually change is
+/// unmapped once under one remapping lock, then mapped one view per run of
+/// consecutive slices of one section ([`map_run`]).
 fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     WORK[7].fetch_add(want.len() as u64, Relaxed);
@@ -1246,69 +1248,68 @@ fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -
                 None => shows_nothing(physical, at, PAGE),
             }
     };
-    let mut lo = 0;
-    while lo < want.len() && there(physical, lo) {
-        lo += 1;
-    }
-    let mut hi = want.len();
-    while hi > lo && there(physical, hi - 1) {
-        hi -= 1;
-    }
-    for k in (0..lo).chain(hi..want.len()) {
-        if want[k].is_some() {
-            WORK[8].fetch_add(1, Relaxed);
-            if mode == 1 {
-                victory_gpu::kernel_will_write(base + k * PAGE, PAGE);
+    let mut i = 0;
+    while i < want.len() {
+        if there(physical, i) {
+            if want[i].is_some() {
+                WORK[8].fetch_add(1, Relaxed);
+                if mode == 1 {
+                    victory_gpu::kernel_will_write(base + i * PAGE, PAGE);
+                }
+            } else {
+                WORK[9].fetch_add(1, Relaxed);
             }
-        } else {
-            WORK[9].fetch_add(1, Relaxed);
-        }
-    }
-    if lo == hi {
-        return true;
-    }
-    SCATTER[0].fetch_add((hi - lo) as u64, Relaxed);
-    SCATTER[1].fetch_add(1, Relaxed);
-    let (start, len) = (base + lo * PAGE, (hi - lo) * PAGE);
-    let _changing = changing(physical, start, len);
-    unmap(physical, start, len);
-    let mut k = lo;
-    while k < hi {
-        let Some(page) = want[k] else {
-            k += 1;
+            i += 1;
             continue;
-        };
-        let Some(first) = physical.pages.get(&page).cloned() else {
-            tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
-            return false;
-        };
-        let run = 1 + want[k + 1..hi]
-            .iter()
-            .zip(1..)
-            .take_while(|&(page, j)| {
-                page.and_then(|p| physical.pages.get(&p)).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + j
-                })
-            })
-            .count();
-        if !map_run(physical, base + k * PAGE, run, first) {
-            return false;
         }
-        k += run;
+        let lo = i;
+        i += 1;
+        while i < want.len() && !there(physical, i) {
+            i += 1;
+        }
+        let hi = i;
+        SCATTER[0].fetch_add((hi - lo) as u64, Relaxed);
+        SCATTER[1].fetch_add(1, Relaxed);
+        let (start, len) = (base + lo * PAGE, (hi - lo) * PAGE);
+        let _changing = changing(physical, start, len);
+        unmap(physical, start, len);
+        let mut k = lo;
+        while k < hi {
+            let Some(page) = want[k] else {
+                k += 1;
+                continue;
+            };
+            let Some(first) = physical.pages.get(&page).cloned() else {
+                tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+                return false;
+            };
+            let run = 1 + want[k + 1..hi]
+                .iter()
+                .zip(1..)
+                .take_while(|&(page, j)| {
+                    page.and_then(|p| physical.pages.get(&p)).is_some_and(|s| {
+                        Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + j
+                    })
+                })
+                .count();
+            if !map_run(physical, base + k * PAGE, run, first) {
+                return false;
+            }
+            k += run;
+        }
     }
     true
 }
 
 /// Maps `n` slices from `first` on at `base`: one view where the run lies
-/// in one placeholder, else (error 487, nothing changed) one view per page.
+/// in one placeholder (or adjacent placeholders that coalesce), else one
+/// view per page.
 fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool {
     if n > 1 {
         match map_view(physical, base, n * PAGE, first.clone(), true) {
             Ok(()) => return true,
             Err(None) => return false,
-            Err(Some(_)) => {
-                SCATTER[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            Err(Some(_)) => {}
         }
     }
     (0..n).all(|k| {
@@ -1320,16 +1321,16 @@ fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool
     })
 }
 
-/// (Neptune) Whether a scatter maps a run of addresses at once
+/// (Neptune) Whether a scatter unmaps a run of addresses at once
 /// (`VICTORY_SCATTER_RUNS=0`: page by page, as before).
 fn scatter_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_none_or(|v| v != "0"))
 }
 
-/// Since the last line ([`work_line`]): pages of scatters mapped or unmapped
-/// as runs, those runs, pages of them mapped one by one at placeholder
-/// edges, and views made with no commit (their pages committed already).
+/// Since the last line ([`work_line`]): pages of scatters handled as runs,
+/// those runs, views mapped without splitting a placeholder, and views
+/// mapped without committing (their pages committed already).
 static SCATTER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1410,7 +1411,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             {
                 run += 1;
             }
-            if !map(&mut physical, to + k * PAGE, run * PAGE, first) {
+            if !map_run(&mut physical, to + k * PAGE, run, first) {
                 return false;
             }
             k += run;
@@ -1436,6 +1437,74 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         };
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
+        }
+    }
+    true
+}
+
+/// Maps the single physical page shown at `from` across every page of
+/// `[to, to + len)` (`CopyPageMappingsBatchX` range kind 1: constant page).
+/// Pages already showing that slice are left untouched; each contiguous
+/// sub-run that changes is unmapped once under one remapping lock so
+/// multi-page views are torn down once instead of once per page.
+pub fn map_alias_constant(to: u64, from: u64, len: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (to, from, len) = (to as usize, from as usize, len as usize);
+    let pages = len / PAGE;
+    if pages == 0 {
+        return true;
+    }
+    let _call = Call::begin();
+    let mut physical = physical();
+    WORK[4].fetch_add(pages as u64, Relaxed);
+    let Some(source) = physical
+        .views
+        .range(..=from)
+        .next_back()
+        .filter(|(base, (size, _))| from < *base + size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (from - base) / PAGE,
+            section: s.section.clone(),
+        })
+    else {
+        return false;
+    };
+    let mode = remap_same();
+    let shows_source = |physical: &Physical, at: usize| {
+        mode != 0
+            && physical
+                .views
+                .range(..=at)
+                .next_back()
+                .is_some_and(|(base, (size, s))| {
+                    at < base + size
+                        && Arc::ptr_eq(&s.section, &source.section)
+                        && s.index + (at - base) / PAGE == source.index
+                })
+    };
+    let mut i = 0;
+    while i < pages {
+        let at = to + i * PAGE;
+        if shows_source(&physical, at) {
+            WORK[10].fetch_add(1, Relaxed);
+            if mode == 1 {
+                victory_gpu::kernel_will_write(at, PAGE);
+            }
+            i += 1;
+            continue;
+        }
+        let lo = i;
+        i += 1;
+        while i < pages && !shows_source(&physical, to + i * PAGE) {
+            i += 1;
+        }
+        let (start, sub_len) = (to + lo * PAGE, (i - lo) * PAGE);
+        let _changing = changing(&physical, start, sub_len);
+        unmap(&mut physical, start, sub_len);
+        for k in 0..(i - lo) {
+            if !map(&mut physical, start + k * PAGE, PAGE, source.clone()) {
+                return false;
+            }
         }
     }
     true
@@ -1517,8 +1586,9 @@ fn work_line() {
     *last = Some(now);
     let w = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| WORK[i].swap(0, Relaxed));
     let s = [0, 1, 2, 3].map(|i| SCATTER[i].swap(0, Relaxed));
+    let rescued = TAIL_RESCUED.swap(0, Relaxed);
     tracing::info!(
-        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already); scatters: {:.0} pages in {:.0} runs ({:.0} mapped one by one at placeholder edges); {:.0} views made with their pages committed already",
+        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already); scatters: {:.0} pages in {:.0} runs; {:.0} views mapped without placeholder split, {:.0} without commit, {rescued} tail faults rescued",
         w[0] as f64 / secs,
         w[1] as f64 / 1e3 / secs,
         w[2] as f64 / secs,
@@ -1664,15 +1734,12 @@ fn map_view(
     let made = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+    // SAFETY: maps the section directly when `[base, base + len)` is already
+    // an exact placeholder (recycled slot after `UnmapViewOfFile2`), skipping
+    // the `VirtualFree` split syscall. Otherwise splits an enclosing
+    // placeholder (or, for multi-page views, coalesces adjacent placeholders
+    // inside the same reservation) and retries once.
+    let map_once = || unsafe {
         MapViewOfFile3(
             slice.section.handle,
             GetCurrentProcess(),
@@ -1685,6 +1752,28 @@ fn map_view(
             0,
         )
     };
+    let mut view = map_once();
+    if view.Value as usize == base {
+        SCATTER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        // SAFETY: both `VirtualFree` forms act only on placeholders and leave
+        // mapped views and unrelated regions untouched if they fail.
+        unsafe {
+            let split = VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+            if split == 0 && len > PAGE {
+                VirtualFree(
+                    base as *mut c_void,
+                    len,
+                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                );
+            }
+        }
+        view = map_once();
+    }
     if view.Value as usize != base {
         return Err(Some(std::io::Error::last_os_error()));
     }
@@ -1818,7 +1907,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             unshow(physical, &slice, k, at + k * PAGE);
         }
         victory_gpu::titlemem::title_range_free(at);
-        victory_gpu::title_memory_remapped(at, size);
+        // Only the unmapped intersection is invalidated here; surviving tails
+        // are invalidated in `map_again` when their views are mapped anew.
+        victory_gpu::title_memory_remapped(at + lo, hi - lo);
+        let _tail_guard = TailSplitGuard::enter(at, base, end, at + size);
         let taken = std::time::Instant::now();
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1870,6 +1962,157 @@ fn map_again(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
         for k in 0..len / PAGE {
             unshow(physical, &slice, k, base + k * PAGE);
         }
+    }
+}
+
+/// Lock-free guard for partial view splits in [`unmap`].
+///
+/// Windows `UnmapViewOfFile2` tears down a whole multi-page view at once,
+/// briefly turning its surviving prefix/suffix tails into `MEM_RESERVE`
+/// placeholders until `map_again` restores them. Any concurrent title thread
+/// reading or writing a live page in those tails faults during that microsecond
+/// window; [`tail_split_veh`] waits for `TAIL_GEN` to turn even, verifies via
+/// `VirtualQueryEx` that the tail page is committed with matching access again,
+/// and resumes the faulting instruction with zero data loss.
+const TAIL_RING: usize = 32;
+static TAIL_GEN: AtomicU64 = AtomicU64::new(0);
+static TAIL_CURSOR: AtomicUsize = AtomicUsize::new(0);
+static TAIL_RESCUED: AtomicU64 = AtomicU64::new(0);
+static TAIL_RANGES: [(AtomicUsize, AtomicUsize); TAIL_RING] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; TAIL_RING];
+
+thread_local! {
+    static IN_TAIL_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct TailSplitGuard;
+
+impl TailSplitGuard {
+    fn enter(view_start: usize, cut_start: usize, cut_end: usize, view_end: usize) -> Option<Self> {
+        let has_prefix = view_start < cut_start;
+        let has_suffix = view_end > cut_end;
+        if !has_prefix && !has_suffix {
+            return None;
+        }
+        install_tail_split_veh();
+        if has_prefix {
+            record_tail_range(view_start, cut_start);
+        }
+        if has_suffix {
+            record_tail_range(cut_end, view_end);
+        }
+        IN_TAIL_SPLIT.with(|c| c.set(true));
+        TAIL_GEN.fetch_add(1, Ordering::Release);
+        Some(Self)
+    }
+}
+
+impl Drop for TailSplitGuard {
+    fn drop(&mut self) {
+        TAIL_GEN.fetch_add(1, Ordering::Release);
+        IN_TAIL_SPLIT.with(|c| c.set(false));
+    }
+}
+
+fn record_tail_range(start: usize, end: usize) {
+    let slot = TAIL_CURSOR.fetch_add(1, Ordering::Relaxed) % TAIL_RING;
+    let (s, e) = &TAIL_RANGES[slot];
+    // Clear `end` first so concurrent VEH readers never see a torn `(start, end)`.
+    e.store(0, Ordering::Release);
+    s.store(start, Ordering::Release);
+    e.store(end, Ordering::Release);
+}
+
+fn install_tail_split_veh() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `tail_split_veh` touches only lock-free atomics and `VirtualQueryEx`.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(tail_split_veh));
+        }
+    });
+}
+
+unsafe extern "system" fn tail_split_veh(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    };
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READONLY, PAGE_WRITECOPY,
+    };
+
+    // SAFETY: Windows passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let kind = record.ExceptionInformation[0];
+    if kind != 0 && kind != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if IN_TAIL_SPLIT.with(|c| c.get()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let epoch = TAIL_GEN.load(Ordering::Acquire);
+    if epoch == 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if epoch & 1 != 0 {
+        while TAIL_GEN.load(Ordering::Acquire) & 1 != 0 {
+            std::hint::spin_loop();
+        }
+    }
+    let addr = record.ExceptionInformation[1];
+    let in_tail = TAIL_RANGES.iter().any(|(s, e)| {
+        let start = s.load(Ordering::Acquire);
+        let end = e.load(Ordering::Acquire);
+        start < end && addr >= start && addr < end
+    });
+    if !in_tail {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let mut mbi = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+    // SAFETY: queries virtual memory state of `addr` in the current process.
+    let queried = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            addr as *const c_void,
+            mbi.as_mut_ptr(),
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: filled by `VirtualQueryEx`.
+    let mbi = unsafe { mbi.assume_init() };
+    if mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let base_prot = mbi.Protect & 0xff;
+    let allowed = if kind == 1 {
+        matches!(base_prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+    } else {
+        matches!(
+            base_prot,
+            PAGE_READONLY
+                | PAGE_READWRITE
+                | PAGE_WRITECOPY
+                | PAGE_EXECUTE_READ
+                | PAGE_EXECUTE_READWRITE
+                | PAGE_EXECUTE_WRITECOPY
+        )
+    };
+    if allowed {
+        TAIL_RESCUED.fetch_add(1, Ordering::Relaxed);
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
     }
 }
 
@@ -2707,11 +2950,12 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, written.as_ptr()), 1);
     }
 
-    /// A scatter of consecutive slices at consecutive addresses is one
-    /// view; unmapping the middle of it in one call keeps both ends, bytes
-    /// and shown pages; a run across placeholders is mapped page by page.
+    /// Unmapping the middle of a multi-page view via scatter tears down the
+    /// view once, keeping both ends' bytes and `shown` entries; consecutive
+    /// slices scattered back are one view, across placeholders too (they are
+    /// coalesced); unchanged pages in the middle of a run are untouched.
     #[test]
-    fn a_scatter_maps_a_run_as_one_view() {
+    fn a_scatter_unmaps_a_run_once_and_keeps_pages_independent() {
         let pages = allocate(8);
         let a = reserve(8);
         let at = |k: usize| a.wrapping_byte_add(k * PAGE);
@@ -2719,7 +2963,7 @@ mod tests {
         let scatter = |from: usize, wanted: &[usize]| {
             XMemMapPhysicalPagesScatter(addresses[from..].as_ptr(), wanted.len(), wanted.as_ptr())
         };
-        assert_eq!(scatter(0, &pages), 1);
+        assert_eq!(XMemMapPhysicalPages(a, 8, pages.as_ptr()), a);
         assert_eq!(views_in(a, 8), [(0, 8)]);
         for k in 0..8 {
             // SAFETY: mapped read-write.
@@ -2733,6 +2977,8 @@ mod tests {
             physical.shown.get(&key).cloned().unwrap_or_default()
         };
 
+        // Unmapping 4 pages in the middle of the 8-page view tears it down
+        // once and keeps both 2-page tails intact (bytes + shown).
         assert_eq!(scatter(2, &[0; 4]), 1);
         assert_eq!(views_in(a, 8), [(0, 2), (6, 2)]);
         for k in 2..6 {
@@ -2744,36 +2990,215 @@ mod tests {
             assert_eq!(shown(pages[k]), [at(k) as usize], "page {k}");
         }
 
-        // Back into the hole, one placeholder: one view.
+        // Scatter mapping consecutive slices into the hole coalesces into one
+        // 4-page view.
         assert_eq!(scatter(2, &pages[2..6]), 1);
         assert_eq!(views_in(a, 8), [(0, 2), (2, 4), (6, 2)]);
         assert_eq!((2..6).map(read).collect::<Vec<_>>(), [12, 13, 14, 15]);
 
-        // All of it again over three placeholders: a page each.
+        // Unmapping all 8 pages leaves 3 placeholders; mapping all 8 pages
+        // again coalesces them back into a single 8-page view.
         assert_eq!(scatter(0, &[0; 8]), 1);
         assert!(views_in(a, 8).is_empty());
         assert_eq!(scatter(0, &pages), 1);
-        assert_eq!(views_in(a, 8), (0..8).map(|k| (k, 1)).collect::<Vec<_>>());
+        assert_eq!(views_in(a, 8), [(0, 8)]);
         assert_eq!(
             (0..8).map(read).collect::<Vec<_>>(),
             (10..18).collect::<Vec<_>>()
         );
 
-        // Pages there already at the start are left; the rest swapped.
-        assert_eq!(scatter(0, &[pages[0], pages[1], pages[3], pages[2]]), 1);
-        assert_eq!((0..4).map(read).collect::<Vec<_>>(), [10, 11, 13, 12]);
-        assert_eq!(shown(pages[3]), [at(2) as usize]);
-        assert_eq!(shown(pages[2]), [at(3) as usize]);
+        // Unchanged page in the middle of a scatter run (`pages[3]` at slot 3)
+        // is left untouched while slots 2 and 4 are swapped.
+        assert_eq!(scatter(2, &[pages[4], pages[3], pages[2]]), 1);
+        assert_eq!((2..5).map(read).collect::<Vec<_>>(), [14, 13, 12]);
+        assert_eq!(shown(pages[4]), [at(2) as usize]);
+        assert_eq!(shown(pages[3]), [at(3) as usize]);
+        assert_eq!(shown(pages[2]), [at(4) as usize]);
 
         // An unknown page fails the call after what comes before it.
-        assert_eq!(scatter(0, &[0, 0, 0x10, 0]), 0);
-        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
-        assert_eq!(read(3), 12, "after the unknown page: as it was");
+        assert_eq!(scatter(2, &[0, 0, 0x10, 0]), 0);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(3)).host.State, MEM_RESERVE);
+        assert_eq!(read(5), 15, "after the unknown page: as it was");
 
         assert_eq!(scatter(0, &[0; 8]), 1);
         assert!(views_in(a, 8).is_empty());
         assert!(pages.iter().all(|&p| shown(p).is_empty()));
         assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
+    }
+
+    /// A scatter-mapped run is one view, and unchanged middle pages are never
+    /// unmapped: a title thread writing a live page never faults while
+    /// another thread unmaps or remaps the pages around it (splitting the view).
+    #[test]
+    fn scatter_unmapping_a_neighbor_never_faults_a_concurrent_writer() {
+        use std::sync::atomic::AtomicBool;
+        let pages = allocate(4);
+        let a = reserve(4);
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let addresses = [at(0), at(1), at(2), at(3)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, pages.as_ptr()),
+            1
+        );
+        assert_eq!(views_in(a, 4), [(0, 4)]);
+        let live_addr = at(1) as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let started_w = started.clone();
+        let writer = std::thread::spawn(move || {
+            let mut writes = 0u64;
+            started_w.store(true, Ordering::Release);
+            while !stop_w.load(Ordering::Relaxed) {
+                // SAFETY: page 1 stays mapped for the entire loop; neither
+                // neighbor unmaps nor unchanged-middle scatters may unmap it.
+                unsafe { (live_addr as *mut u64).write_volatile(writes) };
+                writes += 1;
+            }
+            writes
+        });
+        while !started.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        for _ in 0..200 {
+            // Unmap neighbors 0 and 2 while passing page 1 unchanged in the middle.
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, [0, pages[1], 0].as_ptr()),
+                1
+            );
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(
+                    addresses.as_ptr(),
+                    3,
+                    [pages[0], pages[1], pages[2]].as_ptr()
+                ),
+                1
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(writer.join().expect("writer never faulted") > 0);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()),
+            1
+        );
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Repeatedly splitting a multi-page view from both ends while another
+    /// thread continuously writes and verifies a surviving interior page never
+    /// faults out and preserves every write (`TailSplitGuard` + VEH).
+    #[test]
+    fn tail_split_veh_rescues_concurrent_writer_during_partial_unmap() {
+        use std::sync::atomic::AtomicBool;
+        const N: usize = 32;
+        const LIVE: usize = 16;
+        let pages = allocate(N);
+        let a = reserve(N);
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let addresses: Vec<*mut c_void> = (0..N).map(at).collect();
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), N, pages.as_ptr()),
+            1
+        );
+        assert_eq!(views_in(a, N), [(0, N)]);
+        let live_addr = at(LIVE) as usize;
+        // SAFETY: mapped read-write.
+        unsafe { (live_addr as *mut u64).write_volatile(0) };
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let started_w = started.clone();
+        let writer = std::thread::spawn(move || {
+            let mut expected = 0u64;
+            started_w.store(true, Ordering::Release);
+            while !stop_w.load(Ordering::Relaxed) {
+                // SAFETY: page `LIVE` is never in any unmap range; if a split
+                // transiently unmaps its enclosing view, `tail_split_veh` waits
+                // for `map_again` and resumes the access with zero data loss.
+                let got = unsafe { (live_addr as *const u64).read_volatile() };
+                assert_eq!(got, expected, "surviving tail lost a write");
+                expected += 1;
+                unsafe { (live_addr as *mut u64).write_volatile(expected) };
+            }
+            expected
+        });
+        while !started.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        // Peel off pages 0..LIVE and (LIVE+1)..N one at a time, forcing N-1
+        // real multi-page view splits right under the hammering writer thread.
+        for k in (0..LIVE).chain((LIVE + 1..N).rev()) {
+            assert_eq!(
+                XMemMapPhysicalPagesScatter(addresses[k..=k].as_ptr(), 1, std::ptr::null()),
+                1
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        let writes = writer.join().expect("writer never faulted");
+        assert!(writes > 0);
+        assert_eq!(views_in(a, N), [(LIVE, 1)]);
+        // SAFETY: page `LIVE` is still mapped.
+        assert_eq!(unsafe { (live_addr as *const u64).read_volatile() }, writes);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses[LIVE..=LIVE].as_ptr(), 1, std::ptr::null()),
+            1
+        );
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    /// `map_alias_constant` unmaps a multi-page view once, leaves surviving
+    /// tails and already-matching pages intact, and a subsequent `map_alias`
+    /// coalesces adjacent 1-page placeholders back into one multi-page view.
+    #[test]
+    fn map_alias_constant_unmaps_once_and_coalesces_placeholders() {
+        let pages = allocate(6);
+        let pool = reserve(6);
+        let dest = reserve(6);
+        let at = |base: *mut c_void, k: usize| base.wrapping_byte_add(k * PAGE);
+        assert_eq!(XMemMapPhysicalPages(pool, 6, pages.as_ptr()), pool);
+        for k in 0..6 {
+            // SAFETY: mapped read-write.
+            unsafe { at(pool, k).cast::<u8>().write(20 + k as u8) };
+        }
+        assert!(map_alias(dest as u64, pool as u64, (6 * PAGE) as u64));
+        assert_eq!(views_in(dest, 6), [(0, 6)]);
+
+        // Fill middle 4 pages with constant page 0.
+        assert!(map_alias_constant(
+            at(dest, 1) as u64,
+            pool as u64,
+            (4 * PAGE) as u64
+        ));
+        assert_eq!(
+            views_in(dest, 6),
+            [(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+        );
+        // SAFETY: all 6 pages are mapped read-write.
+        let bytes: Vec<u8> = (0..6)
+            .map(|k| unsafe { at(dest, k).cast::<u8>().read() })
+            .collect();
+        assert_eq!(bytes, [20, 20, 20, 20, 20, 25]);
+
+        // Repeating the same constant fill is a no-op (all pages already match).
+        assert!(map_alias_constant(
+            at(dest, 1) as u64,
+            pool as u64,
+            (4 * PAGE) as u64
+        ));
+
+        // Mapping the 6 consecutive pool pages back over the 6 1-page views
+        // coalesces their placeholders into a single 6-page view.
+        assert!(map_alias(dest as u64, pool as u64, (6 * PAGE) as u64));
+        assert_eq!(views_in(dest, 6), [(0, 6)]);
+        let restored: Vec<u8> = (0..6)
+            .map(|k| unsafe { at(dest, k).cast::<u8>().read() })
+            .collect();
+        assert_eq!(restored, [20, 21, 22, 23, 24, 25]);
+
+        assert!(map_alias(dest as u64, 0, (6 * PAGE) as u64));
+        assert_eq!(XMemMapPhysicalPages(pool, 6, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(6, pages.as_ptr()), 1);
     }
 
     #[test]
