@@ -262,6 +262,8 @@ fn tell(this: This, r: &Resource, target: This, parts: Option<&[u32]>, link: boo
         tracing::warn!(
             view = ?this,
             texture = ?target,
+            address = format_args!("{:#x}", r.data() as u64),
+            target_address = format_args!("{:#x}", o.data() as u64),
             offset = format_args!("{:#x}", r.data() as u64 - o.data() as u64),
             target_flags = format_args!("{:#x}", od.flags),
             view_layout = format_args!("{:#x}", rd.layout),
