@@ -270,6 +270,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_SLOT_EVICT_PERCENT", Apply::Restart),
     ("VICTORY_SLOT_WAIT_ALL", Apply::Live),
     ("VICTORY_SNAP_DIR", Apply::Restart),
+    ("VICTORY_SNAP_FULL", Apply::Restart),
     ("VICTORY_SOFT_VIEWS_PROBE", Apply::Restart),
     ("VICTORY_SPLIT_WAITS", Apply::Restart),
     ("VICTORY_STACKS", Apply::Restart),
