@@ -681,6 +681,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.0 == target && state.1.is_none() {
             state.1 = Some((std::time::Instant::now(), worked()));
+            crate::card_awake::idle();
         }
     }
 }
@@ -704,6 +705,7 @@ fn card_clock_line(frames: f64, ms: f64) {
             0.0
         }
     );
+    crate::card_awake::line(frames, ms, idle);
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -3768,6 +3770,7 @@ impl Host {
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        crate::card_awake::sent(&self.device);
         if let Some((since, worked_then)) = state.1.take() {
             crate::timeline::card_idle(since.elapsed());
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);

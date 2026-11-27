@@ -57,6 +57,8 @@ pub mod frametime;
 pub mod hitch;
 pub mod host_facts;
 #[cfg(windows)]
+pub mod card_awake;
+#[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
 mod joined_apart;

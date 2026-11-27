@@ -251,6 +251,8 @@ fn log_title_exit(call: &str, code: u32, from: &str) -> i32 {
     let (line, code) = title_exit(call, code, from);
     tracing::warn!("{line}");
     flush_log();
+    #[cfg(windows)]
+    victory_gpu::card_awake::stop();
     code
 }
 
