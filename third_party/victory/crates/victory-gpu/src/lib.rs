@@ -92,6 +92,8 @@ mod ramline;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod copy_profile;
+#[cfg(windows)]
 mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;

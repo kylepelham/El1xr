@@ -1524,17 +1524,31 @@ fn found_set(address: usize, now: u64) {
 /// copied (`at == 0`), written without a 4 KiB answer, or nothing found.
 pub(crate) fn stale_mask(page: usize, at: u64) -> Option<u16> {
     use std::sync::atomic::Ordering::Acquire;
-    if !watch_4k() || at == 0 {
+    if !watch_4k() {
+        if at != 0 {
+            crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::NoWatch4k);
+        }
+        return None;
+    }
+    if at == 0 {
         return None;
     }
     if part_of(&WHOLE, page, false).is_some_and(|p| p.0[page % PART].load(Acquire) > at) {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::WholeStamp);
         return None;
     }
     let sub = page * (PAGE / KERNEL_PAGE);
-    let part = part_of(&SUBS, sub, false)?;
+    let Some(part) = part_of(&SUBS, sub, false) else {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::NoSubsPart);
+        return None;
+    };
     let stamps: [u64; PAGE / KERNEL_PAGE] =
         std::array::from_fn(|k| part.0[(sub + k) % PART].load(Acquire));
-    mask_of(&stamps, at)
+    let m = mask_of(&stamps, at);
+    if m.is_none() {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::ZeroMask);
+    }
+    m
 }
 
 /// The sub-pages stamped after `at`; `None` if there are none (the page's stamp then rests on
@@ -2864,6 +2878,11 @@ impl Tracked {
         }
         ranges
     }
+}
+
+/// Whether the block holding `start` is view memory the guards hold ([`known_view`]).
+pub(crate) fn is_known_view(start: usize) -> bool {
+    known_view(start)
 }
 
 /// Guarded blocks of view memory.

@@ -9092,7 +9092,9 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            crate::copy_profile::step_copy(copied, us);
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
         batch.flush_textures();
@@ -9415,7 +9417,9 @@ impl Batch {
                 }
             }
         }
-        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let us = started.elapsed().as_micros() as u64;
+        crate::copy_profile::fill(total_bytes, us);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
         flush::fills(started.elapsed().as_micros() as u64, total_bytes);
     }
@@ -10625,6 +10629,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::submit_chunk::line(frames);
+        crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =

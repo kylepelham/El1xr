@@ -5983,6 +5983,43 @@ impl Shadow {
         self.update_free(from, to, &[])
     }
 
+    /// Which kind of copy this is, for `crate::copy_profile`.
+    fn profile_kind(&self) -> crate::copy_profile::ShadowKind {
+        use crate::copy_profile::ShadowKind;
+        match (self.window, self.rebar, self.transient(), self.card.is_some()) {
+            (true, true, _, _) => ShadowKind::WinRebar,
+            (true, _, true, _) => ShadowKind::WinTransient,
+            (true, _, _, true) => ShadowKind::WinCard,
+            (true, _, _, false) => ShadowKind::WinHost,
+            (false, _, _, true) => ShadowKind::BufCard,
+            (false, _, _, false) => ShadowKind::BufHost,
+        }
+    }
+
+    /// The end of a refresh of `[from, to)` that copied `copied` bytes, for
+    /// `crate::copy_profile` (`started` when it is on).
+    fn profiled(
+        &self,
+        started: Option<std::time::Instant>,
+        from: usize,
+        to: usize,
+        copied: usize,
+        unwatched: bool,
+    ) {
+        if let Some(started) = started {
+            crate::copy_profile::end(
+                self.id,
+                self.start,
+                self.len,
+                self.profile_kind(),
+                to - from,
+                copied,
+                started.elapsed().as_micros() as u64,
+                unwatched,
+            );
+        }
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(
@@ -5991,6 +6028,10 @@ impl Shadow {
         to: usize,
         skip_busy: &[(usize, usize)],
     ) -> usize {
+        let profiled = crate::copy_profile::enabled().then(|| {
+            crate::copy_profile::begin(crate::watch::is_known_view(from));
+            std::time::Instant::now()
+        });
         // Detect any overlapping OTHER shadow's deferred pages WITHOUT flushing
         // or unprotecting them: marking those pages stale (`copied = 0`) makes
         // `copy_stale` -> `copy` -> `host::copy_mapped` read their fresh GPU
@@ -6082,6 +6123,7 @@ impl Shadow {
                     }
                 }
                 self.refresh_check(from, to);
+                self.profiled(profiled, from, to, copied, false);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -6111,6 +6153,7 @@ impl Shadow {
         } else {
             self.copy(from, to)
         };
+        self.profiled(profiled, from, to, bytes, true);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);
@@ -6288,7 +6331,7 @@ impl Shadow {
                 written,
                 subs,
                 |page, prev, sub| {
-                    if four_k {
+                    let mask = if four_k {
                         let m = crate::watch::stale_mask(page, prev);
                         crate::watch::note_4k(m);
                         m
@@ -6298,7 +6341,9 @@ impl Shadow {
                             .map(|(_, bits)| bits);
                         crate::watch::dirty4k_count(found, narrow && found.is_some());
                         if narrow { found } else { None }
-                    }
+                    };
+                    crate::copy_profile::page(prev, mask);
+                    mask
                 },
                 |idx| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
             )
@@ -6433,8 +6478,10 @@ impl Shadow {
                     off += len;
                 }
                 COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
+                let differing: usize = runs.iter().map(|&(_, m)| m).sum();
+                crate::copy_profile::diff(n, differing);
                 if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
-                    let copied: usize = runs.iter().map(|&(_, m)| m).sum();
+                    let copied = differing;
                     COPY_CHANGED[1].fetch_add(copied as u64, Ordering::Relaxed);
                     self.changed(from - start + first.0, from - start + last.0 + last.1);
                     self.card_changed_runs(from - start, &runs, true);
