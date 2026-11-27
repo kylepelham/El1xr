@@ -3193,61 +3193,7 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
-    static MOST: OnceLock<(bool, usize)> = OnceLock::new();
-    let (explicit, most) = *MOST.get_or_init(|| {
-        match std::env::var("VICTORY_LATE_WAIT_LISTS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            Some(n) => (true, n.max(1)),
-            None => (false, 256),
-        }
-    });
-    if explicit {
-        most
-    } else if settle_room() {
-        most * 2
-    } else {
-        most
-    }
-}
-
-/// Whether flights get twice the room before "lists in the air" settles them
-/// ([`late_most`]: 256 -> 512) and eight times the changed runs before the
-/// merge under shaders' writes gives up and settles them ([`under_writes_runs`]:
-/// 512 -> 4096) (`VICTORY_SETTLE_ROOM`: on by default; `0`: off, the base
-/// caps; `alt`: twenty seconds with, twenty without, in turn, each change said
-/// in the log). Explicit `VICTORY_LATE_WAIT_LISTS`, `VICTORY_UNDER_WRITES_RUNS`,
-/// or `VICTORY_MERGE_RUNS` overrides are always respected.
-fn settle_room() -> bool {
-    /// 0 off, 1 on, 2 in turn.
-    static MODE: OnceLock<u8> = OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
-        Ok("0") => 0,
-        Ok("alt") => 2,
-        _ => 1,
-    }) {
-        0 => false,
-        1 => true,
-        _ => {
-            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-            let on = (EPOCH
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_secs()
-                / 20)
-                % 2
-                == 1;
-            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
-                tracing::info!(
-                    "flights get more room (lists in the air x2, changed runs merged x8) before they are settled from now (VICTORY_SETTLE_ROOM=alt): {}",
-                    if on { "ON" } else { "off, the caps as set" }
-                );
-            }
-            on
-        }
-    }
+    crate::flight_settle::late_most()
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3476,25 +3422,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// 512 ran out in nearly every frame: the submitting thread stood 64-73 ms a
 /// frame in those settles.
 fn under_writes_runs() -> usize {
-    static RUNS: OnceLock<(bool, usize)> = OnceLock::new();
-    let (explicit, runs) = *RUNS.get_or_init(|| {
-        let parsed = std::env::var("VICTORY_UNDER_WRITES_RUNS")
-            .or_else(|_| std::env::var("VICTORY_MERGE_RUNS"))
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(1, 1 << 16));
-        match parsed {
-            Some(n) => (true, n),
-            None => (false, 512),
-        }
-    });
-    if explicit {
-        runs
-    } else if settle_room() {
-        (runs * 8).min(1 << 16)
-    } else {
-        runs
-    }
+    crate::flight_settle::under_writes_runs()
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -7279,16 +7207,34 @@ impl Host {
         }
         let t_def = std::time::Instant::now();
         let flush_one_before = PREP_PARTS[4].load(Ordering::Relaxed);
+        let mut pending_preludes: Vec<(&HostList, Vec<crate::texture::PreludeUpload>)> =
+            Vec::with_capacity(runs.len());
+        let mut finalize_preludes =
+            |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
+                for (list, textures) in pending.drain(..) {
+                    let mut uploads = Vec::new();
+                    for upload in textures {
+                        if let Some(first_upload) = upload.finish_refresh() {
+                            uploads.push((upload, first_upload));
+                        }
+                    }
+                    firsts.push(lists.len());
+                    if let Some(prelude) = list.prelude(&uploads) {
+                        lists.push(Some(prelude));
+                    }
+                    lists.push(list.list.cast().ok());
+                }
+            };
         for list in runs {
-            let (list_wrote_heap, uploads) = list.run_deferred(&mut batch, heap_rounds.asked());
+            if list.cbv_epoch() > 0 && !pending_preludes.is_empty() {
+                batch.flush_textures();
+                finalize_preludes(&mut pending_preludes);
+            }
+            let (list_wrote_heap, textures) = list.run_deferred(&mut batch, heap_rounds.asked());
             if list_wrote_heap {
                 heap_rounds.wrote();
             }
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
+            pending_preludes.push((list, textures));
         }
         let def_us = t_def.elapsed().as_micros() as u64;
         let flush_one_delta = PREP_PARTS[4]
@@ -7299,6 +7245,9 @@ impl Host {
         flush::last(|| batch.flush());
         crate::watch::ask_once_end();
         PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let t_pre = std::time::Instant::now();
+        finalize_preludes(&mut pending_preludes);
+        PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -9015,7 +8964,7 @@ impl HostList {
         &self,
         batch: &mut Batch,
         check_heap_writes: bool,
-    ) -> (bool, Vec<(crate::texture::PreludeUpload, bool)>) {
+    ) -> (bool, Vec<crate::texture::PreludeUpload>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut wrote_heap = false;
@@ -9029,7 +8978,6 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.flush_textures();
                     batch.title_written();
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -9066,8 +9014,11 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
-                        batch.flush_textures();
                         batch.title_written();
+                    } else if !batch.pending_textures.is_empty() {
+                        // Host callbacks can use a refresh result, including the
+                        // mip mask that maps a reserved texture for this upload.
+                        batch.flush_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -9096,7 +9047,11 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        batch.pending_textures.push(upload.staging.clone());
+                        if crate::tex_check::parallel_refresh() {
+                            batch.pending_textures.push(upload.staging.clone());
+                        } else {
+                            upload.staging.refresh();
+                        }
                     }
                     textures.push(upload.clone());
                     continue;
@@ -9107,14 +9062,7 @@ impl HostList {
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
-        batch.flush_textures();
-        let mut uploads = Vec::new();
-        for upload in textures {
-            if let Some(first_upload) = upload.finish_refresh() {
-                uploads.push((upload, first_upload));
-            }
-        }
-        (wrote_heap, uploads)
+        (wrote_heap, textures)
     }
 }
 
@@ -9434,24 +9382,12 @@ impl Batch {
         flush::fills(started.elapsed().as_micros() as u64, total_bytes);
     }
 
-    /// Refreshes any queued due textures, in parallel when `VICTORY_WIDE_REFRESH=1`.
+    /// Refreshes any queued due textures side by side (`crate::tex_check`).
     fn flush_textures(&mut self) {
         if !self.pending_textures.is_empty() {
             let started = std::time::Instant::now();
             let textures = self.pending_textures.len();
-            if wide_refresh() && self.pending_textures.len() >= 2 {
-                let textures = std::sync::Arc::new(std::mem::take(&mut self.pending_textures));
-                let total = textures.len();
-                crate::shadow::wide_chunks(total, 1, move |start, end| {
-                    for staging in &textures[start..end] {
-                        staging.refresh();
-                    }
-                });
-            } else {
-                for staging in self.pending_textures.drain(..) {
-                    staging.refresh();
-                }
-            }
+            crate::tex_check::check_textures(std::mem::take(&mut self.pending_textures));
             flush::textures(textures, started.elapsed().as_micros() as u64);
         }
     }
@@ -10557,6 +10493,7 @@ impl Meter {
         }
         crate::port::log(frames);
         crate::port_cbv::log(frames);
+        crate::tex_check::log(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         crate::resource::room_line();
