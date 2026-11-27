@@ -3193,6 +3193,11 @@ impl State {
         let ([made_before, made_us_before], staged_before) =
             (crate::resource::made_here(), crate::texture::staged_here());
         HEAP_TEXTURE_PARTS[14].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // (bootfast) `VICTORY_BAKE_PARALLEL=N`: a bake draw's run makes its
+        // textures' host copies on N threads first (`crate::bake_ahead`).
+        if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
+            crate::bake_ahead::host_copies(heap, &due, budget);
+        }
         let mut laps = Laps::new();
         let began = std::time::Instant::now();
         let mut uploaded_this_pass = 0u64;
