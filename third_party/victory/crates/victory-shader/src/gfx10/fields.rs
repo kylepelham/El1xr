@@ -727,7 +727,16 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
 
 /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
 fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
-    let parts: Vec<&str> = name.split('_').collect();
+    // The first four `_` parts and how many there are (no allocation: this
+    // runs for every VALU instruction).
+    let mut parts = [""; 4];
+    let mut count = 0;
+    for (k, part) in name.split('_').enumerate() {
+        if let Some(slot) = parts.get_mut(k) {
+            *slot = part;
+        }
+        count = k + 1;
+    }
     match name {
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
@@ -737,11 +746,11 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
         "v_frexp_exp_i32_f64" => (1, [2; 3]),
-        _ if parts.len() == 4 && parts[1] == "cvt" => {
+        _ if count == 4 && parts[1] == "cvt" => {
             (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
         }
         _ => {
-            let n = type_dwords(parts.last().copied().unwrap_or(""));
+            let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
             (n, [n; 3])
         }
     }
@@ -811,5 +820,27 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
     } else {
         whole + 2 * derivs + packed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valu_dwords;
+
+    #[test]
+    fn valu_dwords_matches_special_cvt_and_fallback_opcodes() {
+        assert_eq!(valu_dwords("v_lshlrev_b64"), (2, [1, 2, 2]));
+        assert_eq!(valu_dwords("v_ldexp_f64"), (2, [2, 1, 2]));
+        assert_eq!(valu_dwords("v_mad_u64_u32"), (2, [1, 1, 2]));
+        assert_eq!(valu_dwords("v_mqsad_u32_u8"), (4, [2, 1, 4]));
+        assert_eq!(valu_dwords("v_frexp_exp_i32_f64"), (1, [2; 3]));
+        assert_eq!(valu_dwords("v_cvt_f64_i32"), (2, [1; 3]));
+        assert_eq!(valu_dwords("v_cvt_i32_f64"), (1, [2; 3]));
+        assert_eq!(valu_dwords("v_cvt_f32_f64"), (1, [2; 3]));
+        // More than 4 parts: falls through to last token.
+        assert_eq!(valu_dwords("v_cvt_pk_u16_f32"), (1, [1; 3]));
+        assert_eq!(valu_dwords("v_add_f64"), (2, [2; 3]));
+        assert_eq!(valu_dwords("v_add_f32"), (1, [1; 3]));
+        assert_eq!(valu_dwords(""), (1, [1; 3]));
     }
 }

@@ -11,6 +11,7 @@ impl RootSlots {
         self.0[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0
     }
 
+    #[cfg(test)]
     pub(super) fn ordered(self) -> impl Iterator<Item = u8> {
         self.0.into_iter().enumerate().flat_map(|(i, mut bits)| {
             std::iter::from_fn(move || {

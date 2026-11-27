@@ -348,6 +348,15 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -1355,6 +1364,162 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// A pixel shader with `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12)
+    /// and no depth/stencil export emits DXIL `EARLY_DEPTH` (`[earlydepthstencil]`)
+    /// without setting any `SFI0` bit, and validates cleanly. When depth is
+    /// exported, `EARLY_DEPTH` is suppressed so validation still succeeds.
+    #[test]
+    fn depth_before_shader_emits_valid_early_depth_flag() {
+        let emit_ps = |db_shader_control: u32, depth_export: bool| -> Vec<u8> {
+            let words: Vec<u32> = if depth_export {
+                vec![
+                    0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                    0xF800_1881,
+                    0x0000_0000, // exp mrtz v0, off, off, off done vm
+                    0xBF81_0000,
+                ]
+            } else {
+                vec![
+                    0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                    0xF800_180F,
+                    0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
+                    0xBF81_0000,
+                ]
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let out_el = if depth_export {
+                SigElement {
+                    name: "SV_Depth".into(),
+                    index: 0,
+                    kind: 17,
+                    comp: 9,
+                    interp: 0,
+                    row: None,
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                }
+            } else {
+                SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0xF,
+                    half: false,
+                }
+            };
+            let osg1 = container::signature(&[out_el], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            out.dxil
+        };
+
+        let plain = emit_ps(0, false);
+        let early = emit_ps(1 << 12, false);
+        assert_ne!(plain, early, "DEPTH_BEFORE_SHADER should emit EARLY_DEPTH metadata");
+        let early_host = Container::parse(&early).unwrap();
+        let early_sfi0 =
+            u64::from_le_bytes(early_host.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_eq!(early_sfi0, 0, "EARLY_DEPTH has no SFI0 feature bit");
+
+        // Depth export with bit 12 set must suppress EARLY_DEPTH (identical to bit 12 clear).
+        let depth_plain = emit_ps(1, true);
+        let depth_with_bit12 = emit_ps((1 << 12) | 1, true);
+        assert_eq!(depth_plain, depth_with_bit12);
+    }
+
+    /// A pixel shader that kills lanes in whole-quad mode (`s_wqm`) and exports
+    /// two colour targets under the same live-lane guard translates cleanly:
+    /// the earlier colour export shares the final export's guard.
+    #[test]
+    fn live_quad_kill_with_multiple_colour_exports_translates() {
+        let words = [
+            0xBECC_037Eu32, // s_mov_b32 s76, exec_lo
+            0x7C28_00F2,    // v_cmpx_gt_f32 exec_lo, 1.0, v0
+            0x8A4C_7E4C,    // s_andn2_b32 s76, s76, exec_lo
+            0xBF84_0008,    // s_cbranch_scc0 -> end
+            0xBE81_094C,    // s_wqm_b32 s1, s76
+            0xBEFE_0301,    // s_mov_b32 exec_lo, s1
+            0x7E02_02F2,    // v_mov_b32 v1, 1.0
+            0xBEFE_034C,    // s_mov_b32 exec_lo, s76
+            0xF800_100F,
+            0x0101_0101,    // exp mrt0 v1, v1, v1, v1 vm (not done)
+            0xF800_181F,
+            0x0101_0101,    // exp mrt1 v1, v1, v1, v1 done vm
+            0xBF81_0000,    // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = |index, row| SigElement {
+            name: "SV_Target".into(),
+            index,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[target(0, 0), target(1, 1)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword

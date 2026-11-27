@@ -2250,8 +2250,9 @@ impl Shadow {
 
         // Filter 1: whole-page initialized (`copied_at != 0`) under ONE `self.copied` lock.
         {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             cands.retain_mut(|c| {
-                let at = self.copied.get(c.page_idx).unwrap_or(0);
+                let at = copied.get(c.page_idx).unwrap_or(0);
                 c.copied_at = at;
                 at != 0
             });
@@ -2791,7 +2792,8 @@ impl Shadow {
                 0
             };
             self.copy(p_lo, p_hi);
-            self.copied.set(idx, if whole { now } else { 0 });
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.set(idx, if whole { now } else { 0 });
         }
     }
 
@@ -2828,8 +2830,9 @@ impl Shadow {
             return;
         }
         {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             for &idx in &resynced {
-                self.copied.set(idx, 0);
+                copied.set(idx, 0);
             }
         }
         let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2891,7 +2894,8 @@ impl Shadow {
                 u64::from(whole)
             };
             self.copy(p_lo, p_hi);
-            self.copied.set(idx, if whole { now } else { 0 });
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.set(idx, if whole { now } else { 0 });
         }
     }
 

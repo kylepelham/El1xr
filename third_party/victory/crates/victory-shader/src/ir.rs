@@ -296,6 +296,11 @@ fn unspill(
             _ => None,
         }
     }
+    // Nothing parked (most programs): nothing to undo, and no need to work
+    // out every instruction's effects.
+    if !list.iter().any(|i| matches!(i.name(), Some("v_writelane_b32" | "v_readlane_b32"))) {
+        return Vec::new();
+    }
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
@@ -947,6 +952,46 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
 /// reads shows no one the difference (a restore of EXEC that the next one overwrites reads
 /// nothing); and the join may have other ways in (an inner branch that ends together with an
 /// outer one).
+/// The two dwords of `dst = old | VCC` when VCC comes directly from a
+/// comparison under empty EXEC. In that case both VCC dwords are zero.
+/// SCC and VCC themselves may change and are still checked at the join.
+fn mask_or_on_empty(block: &Block) -> Option<[(Value, Value); 2]> {
+    let [cmp, or] = block.insts.as_slice() else {
+        return None;
+    };
+    if cmp.machine.encoding != gfx10::Encoding::Vopc
+        || !cmp.name().starts_with("v_cmp_")
+        || or.name() != "s_or_b64"
+    {
+        return None;
+    }
+    let Fields::Sop {
+        dst: Some(Operand::Scalar { code: dst, .. }),
+        src,
+        ..
+    } = &or.fields
+    else {
+        return None;
+    };
+    let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src.as_slice() else {
+        return None;
+    };
+    // Both dwords must be ordinary SGPRs, including for an unaligned encoding.
+    if *dst >= VCC - 1 {
+        return None;
+    }
+    let old = match (*a, *b) {
+        (VCC, other) | (other, VCC) if other < VCC - 1 => other,
+        _ => return None,
+    };
+    let word = |i| {
+        let mask = Reg::S(VCC + i);
+        (cmp.write(mask)? == or.read(mask)?)
+            .then_some((or.write(Reg::S(*dst + i))?, or.read(Reg::S(old + i))?))
+    };
+    Some([word(0)?, word(1)?])
+}
+
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
@@ -1028,6 +1073,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
+        let empty = if deep && p.blocks[first].exit == Exit::Jump(target) {
+            mask_or_on_empty(&p.blocks[first])
+        } else {
+            None
+        };
         for phi in &join.phis {
             let scalar = match phi.reg {
                 Reg::S(c) => c != 126 && c != 127,
@@ -1041,7 +1091,12 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             let before: Vec<Value> =
                 join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
             let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
-            if within.into_iter().any(|a| !before.contains(&a)) {
+            if within.into_iter().any(|a| {
+                !before.contains(&a)
+                    && !empty.as_ref().is_some_and(|words| {
+                        words.iter().any(|&(out, old)| out == a && before.contains(&root(old)))
+                    })
+            }) {
                 return None;
             }
         }
@@ -1955,6 +2010,26 @@ mod tests {
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
     }
 
+    #[test]
+    fn removing_an_empty_mask_or_preserves_each_observed_scalar() {
+        const CMP: u32 = 0x7D88_00B7; // v_cmp_gt_u32 vcc, 55, v0
+        const OR: u32 = 0x8886_066A; // s_or_b64 s[6:7], vcc, s[6:7]
+        const USE_S6: u32 = 0x7E02_0206;
+        let identity = skip(&[CMP, OR], &[USE_S6]);
+        assert_eq!(skips(&without_skips(&identity, true).expect("unchanged when empty")), 0);
+
+        for used in [0x7E04_026A, 0x7E04_02FD] {
+            // v_mov_b32 v2, vcc_lo / scc
+            assert!(without_skips(&skip(&[CMP, OR], &[USE_S6, used]), true).is_none());
+        }
+        // The OR would copy s[8:9] to s[6:7] even with an empty mask.
+        assert!(without_skips(&skip(&[CMP, 0x8886_086A], &[USE_S6]), true).is_none());
+        // Pair starting at s105 overlaps VCC_LO as its second dword.
+        for or in [0x88E9_686A, 0x8886_696A] {
+            assert!(mask_or_on_empty(&skip(&[CMP, or], &[USE_S6]).blocks[1]).is_none());
+        }
+    }
+
     /// A POPS wait: past it when SCC says so (`s_cbranch_scc1`), else a loop that sleeps
     /// until `src_pops_exiting_wave_id` passes s1; `after` follows.
     fn pops_wait(after: &[u32]) -> Program {
@@ -2247,5 +2322,22 @@ mod tests {
         };
         assert!(opaque(&alone), "two scalars make an opaque mask");
         assert!(!opaque(&shared), "the pair is the compare's mask");
+    }
+
+    #[test]
+    fn unspill_early_outs_when_no_lane_is_parked() {
+        let code: Vec<u8> = [
+            0x7E00_0280u32, // v_mov_b32 v0, 0
+            0x7E02_0281,    // v_mov_b32 v1, 1
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut list = gfx10::decode(&code).unwrap();
+        let orig = list.clone();
+        let edits = unspill(&mut list, &[0], false, 1, 4);
+        assert!(edits.is_empty());
+        assert_eq!(list.len(), orig.len());
     }
 }

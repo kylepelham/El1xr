@@ -1,6 +1,7 @@
-//! Opt-in (`VICTORY_FLUSH_PROF=1`) breakdown of where `Batch::flush`,
-//! `Shadow::update_free`, `Shadow::copy`, and `watch::writes` spend their time
-//! across all worker threads. Zero overhead when the env var is unset.
+//! Opt-in (`VICTORY_FLUSH_PROF=1`) account of where host copy refreshes
+//! (`Shadow::update_free`, `watch::writes`, `watch::prepare_flush`) spend
+//! their time, summed over every thread since the last frame line. Off, it
+//! costs one cached load per call.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,10 +19,7 @@ pub(crate) enum P {
     CleanUs,
     AskCalls,
     AskUs,
-    StandingCalls,
-    StandingUs,
     PublishedCalls,
-    PublishedUs,
     KernelCalls,
     KernelUs,
     GuardCalls,
@@ -30,28 +28,11 @@ pub(crate) enum P {
     PrepareViewsUs,
     PreparePrivCalls,
     PreparePrivUs,
-    StalePlanUs,
     StaleCopyUs,
     StaleBytes,
-    CopyTransientUs,
-    CopyTransientBytes,
-    CopyRebarUs,
-    CopyRebarBytes,
-    CopyDiffUs,
-    CopyDiffBytes,
-    CopyDiffFaults,
-    CopyDirtyLockUs,
-    CopyPlainUs,
-    CopyPlainBytes,
-    WholeCalls,
-    WholeBytes,
-    WholeUs,
-    LazyUs,
-    BusyCalls,
-    BusyPieces,
 }
 
-const COUNT: usize = P::BusyPieces as usize + 1;
+const COUNT: usize = P::StaleBytes as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -84,12 +65,10 @@ pub(crate) fn log(frames: f64) {
     let mb = |p: P| s[p as usize] as f64 / (frames * (1 << 20) as f64);
     tracing::info!(
         "host copy refreshes per frame (all threads): {:.0} calls over {:.0} MB; \
-         prepare_flush [views {:.0}/{:.2} ms, priv {:.0}/{:.2} ms]; \
+         flush prepass [views {:.0}/{:.2} ms, private {:.0}/{:.2} ms]; \
          clean {:.0} in {:.2} ms; ask {:.0} in {:.2} ms \
-         [standing {:.0}/{:.2} ms, published {:.0}/{:.2} ms, kernel {:.0}/{:.2} ms, guard {:.0}/{:.2} ms]; \
-         stale plan {:.2} ms, copy {:.2} ms ({:.1} MB) \
-         [transient {:.1} MB/{:.2} ms, rebar {:.1} MB/{:.2} ms, diff {:.1} MB/{:.2} ms (faults {:.0}, dirty_lock {:.2} ms), plain {:.1} MB/{:.2} ms]; \
-         whole {:.0}/{:.1} MB/{:.2} ms; lazy {:.2} ms; busy {:.0}->{:.0} pieces",
+         [published {:.0}, kernel {:.0}/{:.2} ms, guard {:.0}/{:.2} ms]; \
+         stale copy {:.2} ms ({:.1} MB)",
         per(P::Calls),
         mb(P::Span),
         per(P::PrepareViewsCalls),
@@ -100,32 +79,12 @@ pub(crate) fn log(frames: f64) {
         ms(P::CleanUs),
         per(P::AskCalls),
         ms(P::AskUs),
-        per(P::StandingCalls),
-        ms(P::StandingUs),
         per(P::PublishedCalls),
-        ms(P::PublishedUs),
         per(P::KernelCalls),
         ms(P::KernelUs),
         per(P::GuardCalls),
         ms(P::GuardUs),
-        ms(P::StalePlanUs),
         ms(P::StaleCopyUs),
         mb(P::StaleBytes),
-        mb(P::CopyTransientBytes),
-        ms(P::CopyTransientUs),
-        mb(P::CopyRebarBytes),
-        ms(P::CopyRebarUs),
-        mb(P::CopyDiffBytes),
-        ms(P::CopyDiffUs),
-        per(P::CopyDiffFaults),
-        ms(P::CopyDirtyLockUs),
-        mb(P::CopyPlainBytes),
-        ms(P::CopyPlainUs),
-        per(P::WholeCalls),
-        mb(P::WholeBytes),
-        ms(P::WholeUs),
-        ms(P::LazyUs),
-        per(P::BusyCalls),
-        per(P::BusyPieces),
     );
 }

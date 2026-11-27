@@ -11,16 +11,22 @@ mod translate;
 mod discord;
 
 /// Counts the Rust heap's live bytes and their peak for the resident line. Not in diagnostics
-/// builds, where `victory-gpu`'s allocator does the counting.
+/// builds, where `victory-gpu`'s allocator does the counting. With the `mimalloc` feature the
+/// blocks come from mimalloc instead of the process heap, unless `VICTORY_ALLOC=system`.
 #[cfg(not(feature = "diagnostics"))]
 struct Counting;
 
-// SAFETY: every call goes to the system's allocator unchanged; only counters are kept beside it.
+#[cfg(all(not(feature = "diagnostics"), not(feature = "mimalloc")))]
+const INNER: std::alloc::System = std::alloc::System;
+#[cfg(all(not(feature = "diagnostics"), feature = "mimalloc"))]
+const INNER: victory_gpu::heap::Chosen = victory_gpu::heap::Chosen;
+
+// SAFETY: every call goes to the inner allocator unchanged; only counters are kept beside it.
 #[cfg(not(feature = "diagnostics"))]
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { INNER.alloc(layout) };
         if !at.is_null() {
             victory_core::heapcount::grow(layout.size());
         }
@@ -29,7 +35,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { INNER.alloc_zeroed(layout) };
         if !at.is_null() {
             victory_core::heapcount::grow(layout.size());
         }
@@ -39,12 +45,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         victory_core::heapcount::shrink(layout.size());
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { INNER.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { INNER.realloc(at, layout, size) };
         if !moved.is_null() {
             if size > layout.size() {
                 victory_core::heapcount::grow(size - layout.size());
@@ -184,7 +190,7 @@ enum Unimplemented {
     Zero,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Console {
     SeriesX,
     SeriesS,
@@ -271,6 +277,8 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => {
+            let env_console = std::env::var("VICTORY_CONSOLE").ok();
+            let console = resolve_console(console, env_console.as_deref());
             let result = run::run(&exe, unimplemented, strict, execute, console);
             // The process's own end, as `main`'s Result maps it: Ok is 0,
             // Err is 1. A title that ends the process itself logs its own
@@ -327,4 +335,22 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+fn resolve_console(flag: Console, env: Option<&str>) -> Console {
+    match env {
+        Some("series-s") => Console::SeriesS,
+        Some("series-x") => Console::SeriesX,
+        _ => flag,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn victory_console_env_overrides_flag_only_when_explicit() {
+    assert_eq!(resolve_console(Console::SeriesX, Some("series-s")), Console::SeriesS);
+    assert_eq!(resolve_console(Console::SeriesS, Some("series-x")), Console::SeriesX);
+    assert_eq!(resolve_console(Console::SeriesX, None), Console::SeriesX);
+    assert_eq!(resolve_console(Console::SeriesS, Some("")), Console::SeriesS);
+    assert_eq!(resolve_console(Console::SeriesX, Some("unknown")), Console::SeriesX);
 }

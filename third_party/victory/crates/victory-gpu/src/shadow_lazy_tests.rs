@@ -10,7 +10,9 @@ fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
     let end = (base + PAGES) * PAGE - 77;
 
     let mut oracle_at = vec![0u64; PAGES];
-    let fast = CopiedPages::new(PAGES);
+    let mut oracle_partial: std::collections::HashMap<usize, Vec<(u32, u32, u64)>> =
+        std::collections::HashMap::new();
+    let mut fast = CopiedPages::new(PAGES);
     assert!(!fast.all_copied());
 
     // Initialize scattered pages including across 64-page word boundaries.
@@ -43,35 +45,57 @@ fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
         let now = 30 + step as u64;
         let skip_fn = |idx: usize| idx == 65 || idx == 127;
 
-        // Oracle walk page by page.
-        let mut expected = Vec::new();
-        let mut run: Option<(usize, usize)> = None;
+        // Oracle walk page by page (including partial-page span stamps).
+        let mut expected: Vec<(usize, usize)> = Vec::new();
+        let push_expected = |out: &mut Vec<(usize, usize)>, a: usize, b: usize| {
+            if let Some(last) = out.last_mut()
+                && last.1 == a
+            {
+                last.1 = b;
+            } else {
+                out.push((a, b));
+            }
+        };
         for page in from / PAGE..=(to - 1) / PAGE {
             let idx = page - base;
             if skip_fn(idx) {
                 continue;
             }
-            let stale = oracle_at[idx] == 0
-                || written
-                    .binary_search_by_key(&page, |&(p, _)| p)
-                    .is_ok_and(|i| written[i].1 > oracle_at[idx]);
+            let write = written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .map_or(0, |i| written[i].1);
+            let stale = oracle_at[idx] == 0 || write > oracle_at[idx];
             if !stale {
                 continue;
             }
-            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                oracle_at[idx] = now;
-            }
-            match run {
-                Some((rs, re)) if page == re => run = Some((rs, page + 1)),
-                Some((rs, re)) => {
-                    expected.push(((rs * PAGE).max(from), (re * PAGE).min(to)));
-                    run = Some((page, page + 1));
+            let page_base = page * PAGE;
+            let page_lo = page_base.max(start);
+            let page_hi = (page_base + PAGE).min(end);
+            let req_lo = page_lo.max(from);
+            let req_hi = page_hi.min(to);
+            let r_lo = (req_lo - page_base) as u32;
+            let r_hi = (req_hi - page_base) as u32;
+            let full_page = req_lo == page_lo && req_hi == page_hi;
+            let gaps = match oracle_partial.get_mut(&idx) {
+                Some(spans) => {
+                    let g = stale_gaps_in_page(spans, write, r_lo, r_hi);
+                    if spans.is_empty() {
+                        oracle_partial.remove(&idx);
+                    }
+                    g
                 }
-                None => run = Some((page, page + 1)),
+                None => vec![(r_lo, r_hi)],
+            };
+            if full_page {
+                oracle_at[idx] = now;
+                oracle_partial.remove(&idx);
             }
-        }
-        if let Some((rs, re)) = run {
-            expected.push(((rs * PAGE).max(from), (re * PAGE).min(to)));
+            for (g_lo, g_hi) in gaps {
+                push_expected(&mut expected, page_base + g_lo as usize, page_base + g_hi as usize);
+                if !full_page {
+                    insert_partial_span(oracle_partial.entry(idx).or_default(), g_lo, g_hi, now);
+                }
+            }
         }
 
         let got: Vec<(usize, usize)> = fast
@@ -79,8 +103,7 @@ fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
             .iter()
             .collect();
         assert_eq!(got, expected, "step {step} [{from:#x}..{to:#x})");
-        let fast_at: Vec<u64> = fast.at.iter().map(|a| a.load(Ordering::Acquire)).collect();
-        assert_eq!(fast_at, oracle_at, "copied timestamps diverged at step {step}");
+        assert_eq!(fast.at, oracle_at, "copied timestamps diverged at step {step}");
     }
 }
 
@@ -2227,7 +2250,7 @@ fn bench_shadow_and_rebar() {
     {
         const PAGES: usize = 2560;
         let base = 0x1000usize;
-        let cp = CopiedPages::new(PAGES);
+        let mut cp = CopiedPages::new(PAGES);
         for i in 0..PAGES {
             cp.set(i, 1);
         }
