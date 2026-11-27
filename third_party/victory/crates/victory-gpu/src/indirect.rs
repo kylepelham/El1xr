@@ -619,11 +619,12 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
 /// clamped ahead ([`record_ahead`]) instead of by a pass of its own before it
 /// (default: in place, as before). In place, each of some 287 a frame was a dispatch of
 /// ours between two waits for every earlier shader write (1.49 ms of the
-/// card a frame in `VICTORY_GPU_COST`).
+/// card a frame in `VICTORY_GPU_COST`). Its values and guards: [`split_ahead`](mod@split_ahead).
 pub(crate) fn split_ahead() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_AHEAD").is_some_and(|v| v == "1"))
+    split_ahead::guards().is_some()
 }
+
+pub(crate) mod split_ahead;
 
 /// (El1xr) `VICTORY_SPLIT_RAW=1` (off by default): a dispatch that would be split into parts
 /// ([`bound_split`]) runs in one piece from the title's own record, as the other indirect
@@ -1925,6 +1926,96 @@ void main() {
         // SAFETY: the budget the clamps charged.
         let spent = unsafe { (budget_ptr as *const u32).read_volatile() };
         assert_ne!(spent, 0, "dispatches clamped ahead are charged");
+    }
+
+    /// (El1xr) The late change batch 4 found under `VICTORY_SPLIT_AHEAD`: a
+    /// record a shader rewrites after the list's prelude and before its
+    /// dispatch comes out of its ahead slot with the groups it had at the
+    /// prelude, and clamped in place with the new ones. Such records stay in
+    /// place (`split_ahead::may_go_ahead`).
+    #[test]
+    fn warp_record_changed_after_the_prelude_is_stale_ahead() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let (init_buf, init_ptr, _) = warp.shared_buffer(64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(64);
+        let record = warp.default_uav(64);
+        let in_place = warp.default_uav(64);
+        let chunk = warp.default_uav(AHEAD_SLOTS * AHEAD_SLOT);
+        let (before, after) = ([5u32, 1, 1], [9u32, 2, 1]);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::write_bytes(init_ptr, 0, 64);
+            std::ptr::copy_nonoverlapping(before.as_ptr().cast(), init_ptr, 12);
+            std::ptr::copy_nonoverlapping(after.as_ptr().cast(), init_ptr.add(16), 12);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 64);
+        }
+        // The title's record, made by a pass of the list.
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&record, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&init_buf, 0),
+            None,
+            (2, 12, 1),
+            0,
+        ));
+        done_on(&warp.list, &record);
+        // The prelude clamps it ahead.
+        let mut chunks = [(chunk.clone(), false)];
+        record_ahead_with(
+            &warp.clamp,
+            &warp.list,
+            budget_gpu,
+            &mut chunks,
+            &[(record.clone(), 0, 2, 12)],
+        );
+        // A later pass rewrites it, before the dispatch.
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&record, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&init_buf, 16),
+            None,
+            (2, 12, 1),
+            0,
+        ));
+        done_on(&warp.list, &record);
+        // At the dispatch's place.
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&in_place, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&record, 0),
+            None,
+            (2, 12, 1),
+            IN_PARTS,
+        ));
+        done_on(&warp.list, &in_place);
+        done_on(&warp.list, &chunk);
+        // SAFETY: an open list and live buffers.
+        unsafe {
+            warp.list.CopyBufferRegion(&readback_buf, 0, &chunk, 0, 24);
+            warp.list.CopyBufferRegion(&readback_buf, 32, &in_place, 0, 24);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mapping holds what the copies wrote.
+        let (ahead, placed): ([u32; 6], [u32; 6]) = unsafe {
+            (
+                readback_ptr.cast::<[u32; 6]>().read_volatile(),
+                readback_ptr.add(32).cast::<[u32; 6]>().read_volatile(),
+            )
+        };
+        assert_eq!(ahead, [5, 1, 1, 0, 1, 1], "ahead: the groups at the prelude");
+        assert_eq!(placed, [9, 2, 1, 0, 2, 1], "in place: the new groups");
+        let guards = split_ahead::guards_of(Some("1")).unwrap();
+        assert!(!split_ahead::may_go_ahead(guards, true));
     }
 
     /// A window of mesh records clamped ahead: the filled ones come out as
