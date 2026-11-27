@@ -1,259 +1,147 @@
-# El1xr — Xbox Series X 模拟器（原型）
+<div align="center">
 
+# El1xr
+
+**在 Windows PC 上运行 Grand Theft Auto VI（Xbox Series，版本 1.0.2.1）。**<br>
+RTX 5090 上 4K 约 25 fps，并且仍在提升。
+
+[![许可证: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](../../LICENSE)
+[![平台: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](../running-gta6.md)
+[![使用 Rust 构建](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white)](../../third_party/victory)
 [![Discord](https://img.shields.io/badge/Discord-AnyXboxX-5865F2?logo=discord&logoColor=white)](https://discord.gg/TcX42vRyPU)
 
 [English](../../README.md) · [Français](README.fr.md) · [Español](README.es.md) · [Deutsch](README.de.md) · [Italiano](README.it.md) · [Português](README.pt-BR.md) · [日本語](README.ja.md) · **中文** · [Русский](README.ru.md)
 
-**El1xr** 是 Bone/Nevaa 的项目，是基于 [VIctory](https://github.com/Marvisak/VIctory) 的 [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) 分支。参见[致谢](#致谢)。
+</div>
+
+---
+
+El1xr 是 Bone/Nevaa 的 GTA VI 模拟项目：它是 [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) 的分支，构建于 [VIctory](https://github.com/Marvisak/VIctory) 以及各个 VIctory 分支的最佳成果之上（所有来源都在 [THIRD_PARTY.md](../../THIRD_PARTY.md) 中注明）。游戏自身的 x86-64 代码以原生方式运行；它的主机系统调用、Direct3D 12.X 命令和 RDNA 2 着色器则被实时翻译为 PC 可用的形式。
 
 > [!NOTE]
-> **当前进展（2026-11-25）**
+> **现状，2026 年 11 月 27 日**
 >
-> 在 i7-13700KF + RTX 4070 SUPER、Windows 11 上实测，使用 VIctory 的分支仓库 `LooperSalty/victory` 的提交 `80d58f8` (branch `anyxboxx/fork-7b0-lot9-murs`)（`third_party/victory`），通过 `tools/lancer_victory.ps1 -GameDir <游戏文件夹>` 启动：
->
-> - 🆕 **世界中约 14 fps（Series X，RTX 4070 SUPER，2026-11-25 测得）**：`third_party/victory` 以 Neptune (VIctory Edit.) 2026-11-25c 为基础，并采用当天测得的一组设置（中位数 13.8 fps，最后一分钟 15.6–17 fps，每帧 72.5 ms；此前在 `main` 的启动器设置下中位数为 10.9 fps，均为 Series X 上的自动 13 分钟运行，无崩溃）。下面的数字是用旧基础 `80d58f8` 测得的。
-> - 🆕 **画质优先模式（维护者于 2026-11-25 实测）**：`tools\lancer_victory.ps1 -Quality`（每帧重新读取窗口副本，使用更小的池）光照和纹理明显更好，约 7-9 fps，纹理拒绝次数大幅减少（51-93，对比约 300）。默认仍是快速配置（约 14-17 fps，使用 PR #272 在世界中 7 分钟的中位数为 13.7）。通过 `-Override @{ VICTORY_X = '...' }`，任何人都可以在不修改启动器的情况下尝试某项设置。
-> - ✅ **船可以浮起来了**（Exorion1er 的 PR #263：海洋高度图会被拷回，供游戏的 CPU 使用）。
-> - 🦀 **Rust 移植，分支 `rust/full`（尚未并入 `main`）**：原生启动器（PR #249）和 GPU 运行器 `anyxboxx_gpu_run.exe`（PR #266）现已改用 Rust；RDNA 2 参考解释器已移植到 Rust（crate `anyxboxx-rdna2-ref`），能逐字节一致地执行 Python 模型执行的所有指令（LLVM 的 1,490 种编码中的 1,060 种），并带有 28 个一致性测试；xgameruntime 的存档、本地存储、商店以及 HDR/DXGI 对象已移植。待移植：HLSL 重编译器、xgameruntime 的其余部分，然后移除 C++ 和 Python。状态：[docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/rust/full/docs/rust-full-status.md)。
-> - ⛔ **已知限制（进行中）**：在 32 GB 内存的 PC 上，系统内存是瓶颈（进程占用约 22-25 GB：游戏自身的内存，加上 CPU 镜像，再加上溢出到共享内存的显存）；12 GB 显卡的纹理空间不足（每次会话数百次拒绝），导致世界流式加载时帧率跌到 1-6 fps。
-> - ✅ GTA VI 的 Xbox Series 1.0.2.1 版本**可以在 PC 上启动**：启动、档案界面、首次运行设置、法律声明界面、加载、暂停菜单。菜单为 30 fps。
-> - ✅ 已**到达游戏世界并显示**：角色可在玩家控制下移动，3D 画面可显示，约 4 分 20 秒的测试中为 4.8 到 5.4 帧/秒，每帧约 6,550 次绘制（维护者实测，Windows 11，RTX 4070 Super，VIctory 日志）。启动动画不再闪烁（观察）。此前从未被点亮的辐照度缓存（过场动画某一帧的 PIX 捕获中调度为 0 次），现在其两个着色 shader 已能翻译，对应的管线在游戏中创建并绑定（观察）。
-> - ✅ **所有过场动画都能完整播放**（维护者于 11 月 25 日使用启动脚本设置和固定提交 `80d58f8` 观察），部分地方仍缺少一些画面（光线追踪结构构建器已关闭）。维护者在过场动画中观察到峰值 9 fps、稳定 7 至 8 fps（窗口标题，11 月 25 日）；在一次脚本化运行中，日志测得的中位数较低，视场景为 2 至 3 fps。
-> - ✅ **前两个任务已完整通关**：项目的一位贡献者以约 2 fps 游玩了约 45 分钟，完成了前两个任务（11 月 25 日向维护者报告；并非来自我们日志的测量）。
-> - ✅ **在 Linux 上越过序章、进入第 1 章**（船上的 Jason）：11 月 25 日在 Proton（GE-Proton11-12，加上 wineserver 的社区补丁）和 AMD RX 9070 XT 上以提交 `890a83a` 游玩，一次 23 分钟的运行无崩溃，全程约 3 到 5 fps（VIctory 日志：中位数 3.7 fps，80% 的时间在 2.2 到 4.5 之间）。阴影处和室内仍是黑的（没有光线追踪）。
-> - ⛔ 当前限制：仍有 6 个 shader 无法翻译（此前为 9 个），驱动拒绝 16 条管线（分支仓库的 issue #75 报告在 RTX 3070 上还多约 80 条，在 4070 Super 上未观察到），光线追踪照明缺失（BVH 构建器仍关闭，每帧约丢弃 350 次调度），使用 `VICTORY_LATE_WAIT` 设置时第一个房间的部分墙壁可能变透明（分支 issue #168，修复进行中：#191、#206），长时间稳定性仅测得约 4 分 20 秒内无设备丢失。`VICTORY_RELAY` 默认关闭：分支的 issue #89 报告它会让角色皮肤消失并使字幕重叠。
-> - 👁 11 月 24 日的历程（维护者实测或观察，VIctory 日志）：`d279e69` 约 4 fps，在监狱 13 分钟后丢失设备 → `7b0f736` + `VICTORY_RELAY=2` 约 4.5 fps → PR #172 的启动器设置（无 DRED）约 5.5 fps → 第 4 批（3 个 pull request）使用 `VICTORY_RELAY=2` 约 6.6 fps，启动闪烁已修复 → 本批次（7 个 pull request，无 `VICTORY_RELAY`）约 5.4 fps，但每帧 6,449 次绘制，画面为迄今最佳 → 批次 8（批次 5 加一个拉取请求 #11）约 4.8 到 5.4 fps，每帧约 6,550 次绘制，辐照度缓存的 shader 现已可翻译。
-> - 🆕 VIctory 现已复制到本仓库中（`third_party/victory`，不再是子模块），作为我们自己的代码，不再同步或固定：`80d58f8` 加上面向 Proton（Wine）和 AMD 显卡的 57 个提交，来自分支仓库 `fxceless/victory-fork`、VIctory、klbf-lab、JoshuuDev 和 myokex 的 `victory-amd`，以及我们自己（作者见 THIRD_PARTY.md）。仅在 Linux 上实测（Fedora 44、RX 9070 XT、RADV、带社区 wineserver 补丁的 GE-Proton11-12，一次约 23 分钟运行的 VIctory 日志）：约 3.7 fps（游戏世界帧中位数 266 ms），无崩溃、无设备丢失；面部、皮肤和几何体完整（观察）；室内和阴影区域为黑色，光线追踪未运行。尚未在 Windows 上实测；启动脚本的设置不变。已有的克隆须在 pull 之前运行 `git submodule deinit -f third_party/victory`，并删除 `third_party/victory` 和 `.git/modules/third_party/victory`（见指南）。
-> - 📌 自分支 `anyxboxx/fork-7b0-lot9-murs` 的提交 `80d58f8` 起固定：第 8 批加上我们的 3 个 `xg:` 提交（`xg_xs.dll` 的布局现在与 Microsoft 的库完全一致：父模式下带位置的尾部 mip、按子资源索引的 64 KiB 平铺；测试将 54 个描述与真实 DLL 比较，维护者在游戏中实测差异为 0，因此 `-XgDll` 现在只是校验基准）、着色器与管线的离线预编译（移植自分支仓库 `fxceless/victory-fork` 的拉取请求 #282，t4l03）：`victory translate --cache --pipelines`，启动器开关 `-Precompile`（实测：约 4.5 分钟翻译 25,689 个着色器，296 个被拒绝，缓存 13 GB），以及该分支仓库的另外 7 个拉取请求（#349、#355、#396、#386、#358、#353、#374）。维护者实测（VIctory 日志，11 月 24 日至 25 日夜间）：4.8 至 5.1 fps，每帧约 12.7% 的 draw 被丢弃（此前为 11% 至 14%）；过场动画被评为更好（观察）。另加来自该分支 Yorivel 的两个提交（`e49864a`、`bf870de`）：DirectStorage 对物理页的写入现在会通知 GPU 端（`VICTORY_DSTORAGE_NOTIFY=1`，由启动脚本设置），GPU 端不再保留第一个房间墙壁的过期副本。维护者实测（VIctory 日志，11 月 25 日约 02:41 至 02:50）：从新存档进入世界约 9 分钟，5.3 至 6.9 fps，每帧 4,200 至 6,300 次绘制，无设备丢失；过场动画完整播放，被评为“难以置信”（观察）；部分地方仍缺少画面。大部分被丢弃的绘制来自已关闭的光线追踪结构构建器（某份日志中 15,444 次里有 14,943 次），而不是 NVIDIA 拒绝的 15 个 wave64 计算管线（约 300 次绘制）。
-> - 📌 自分支 `anyxboxx/fork-7b0-lot8-xg` 的提交 `19feca8` 起固定：第 8 批加上我们的一个提交，把纹理布局交给 Microsoft 自己的库：`tools/lancer_victory.ps1 -GameDir <游戏文件夹> -XgDll <xg_xs.dll 的路径>`，其中 `xg_xs.dll` 是你自己的 GDK 中的离线 PC 版本（绝不放入本仓库）。不加 `-XgDll` 则一切不变。维护者实测（VIctory 日志，11 月 25 日）：该库的回答与 VIctory 在 84 个纹理描述上不同（64 KiB 纹理的尾部 mip、纹理数组的 64 KiB 平铺；大小和偏移一致）；使用该库时，世界中运行 5.4 至 7.1 fps（不使用时 5.1 至 5.6），本次运行被评为迄今最佳（观察）。`-XgMode compare` 保留 VIctory 的布局并记录每处差异。
-> - 📌 自我们的 VIctory 分支仓库 `LooperSalty/victory` 的分支 `anyxboxx/fork-7b0-lot8` 的提交 `d138351` 起固定：批次 5（分支仓库 `fxceless/victory-fork` 的 `7b0f736` 加其七个拉取请求，见指南）再加一个用 `cherry-pick -x` 引入的拉取请求：#11（cxchhh，恢复相隔几条指令的已停放 lane 掩码对，相对 VGPR 读取保留已停放的 lane；辐照度缓存的两个着色 shader 现已可翻译）。维护者实测（VIctory 日志、PIX 捕获、`main` 的启动器设置）：4.8 到 5.4 fps，每帧约 6,550 次绘制，6 个 shader 未翻译（批次 5 为 9 个），驱动拒绝 16 条管线（与批次 5 相同），约 4 分 20 秒内无设备丢失。已有的副本须运行 `git submodule sync third_party/victory`，再运行 `git submodule update --init third_party/victory`：子模块的 URL 随 PR #178 变更。
-> - 要求：你自己的游戏副本、支持 SM 6.6 和 mesh shader 的 NVIDIA 或 AMD GPU、Rust。本仓库不包含任何游戏文件。
-> - 运行方法：[docs/running-gta6.md](../running-gta6.md)。
+> - 🎮 **在 RTX 5090 上，世界已可在 4K 下游玩，稳定后 24-25 fps**（三次无其他负载的基准测试：24.9、25.2 和 24.2 fps）。目标是稳定的 30 fps。
+> - ✅ 基准测试运行中 **被拒绝的 GPU 管线为 0**，也没有出现 GPU 设备丢失。
+> - ✅ 过场动画可以完整播放，最初的几个任务已经通关；启动后 46-52 秒出现世界的第一帧。
+> - 🚧 另有约 **60 项提速改动已经写好，正在测试中**（见[测试中](#测试中)）。
 
-El1xr 加载 Xbox GDK 可执行文件（PE32+ x86-64 格式），并用 Unicorn 执行其代码。主机的系统函数在原生模式下由 C++ 运行时替代，在隔离的虚拟机中由 Python 代码替代（高级别模拟，与 WinDurango 或 Wine 类似）。该程序会表现为一台 Xbox Series X：`XSystemGetDeviceType` 返回 `XboxScarlettAnaconda`。
+## 概览
 
-## 目标与现状
+| 指标（RTX 5090，4K） | 当前 | 目标 |
+|---|---|---|
+| 稳定后的帧率 | **24-25 fps** | 30+ fps |
+| 帧时间中位数 | ~40 ms | ≤ 33.3 ms |
+| 第 99 百分位帧 | 68-73 ms | 无卡顿 |
+| 准备一帧的 CPU 时间 | 25-26 ms | 低于 GPU 时间 |
+| 被拒绝的 GPU 管线 | **0** | 0 |
+| 从启动到世界第一帧 | 46-52 s | |
+| 进入世界后的流式加载 | 52-63 s | 几秒 |
 
-El1xr 专注于一个版本：**Xbox Series 版《Grand Theft Auto VI》，版本 1.0.2.1**。只翻译这款游戏需要的部分（它导入的系统函数、它使用的着色器和 Direct3D 12.x 方法）。待这部分翻译完成后，再尝试其他游戏。本项目基于面向同一版本的 [VIctory](https://github.com/Marvisak/VIctory)（Marvisak，GPL-3.0 或更高版本）：它复制在 `third_party/victory` 中，以分支仓库 `fxceless/victory-fork`（GPL-3.0）的提交 `7b0f736` 为起点。感谢 Marvisak 和这些 pull request 的作者，逐一致谢见 [THIRD_PARTY.md](../../THIRD_PARTY.md)。
+测量方式：`python tools/dev.py bench --quiet --seconds 200`，从固定的存档点快速启动，机器上不运行其他任何程序，数据读取自模拟器自身的帧日志。
+
+## 测试机器
+
+| 部件 | 型号 |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090，32 GB，驱动 621.24 |
+| CPU | AMD Ryzen 9 9950X3D，16 核 / 32 线程 |
+| 内存 | 64 GB DDR5-6000 |
+| 主板 | MSI PRO B650-P WIFI |
+| 存储 | NVMe SSD（Samsung 990 EVO Plus） |
+| 操作系统 | Windows 11（版本 26200） |
+| 游戏 | Xbox Series 版 GTA VI，版本 1.0.2.1（你自己的副本） |
+
+## 一帧的时间去向
+
+![每帧 GPU 时间：游戏渲染通道 22.8 ms，模拟器工作 7.0 ms，未计时 3.8 ms，空闲 6.2 ms](../images/frame-budget.svg)
+
+稳定后的一帧约需 40 ms。游戏自身的渲染通道占用 22.8 ms 的 GPU 时间，因此 30 fps 触手可及。其余时间花在：
+
+- **我们自己的 GPU 工作**（7 ms）：间接绘制的边界检查、不同格式之间的纹理复制、对 GPU 写入内容的检查；
+- **GPU 空闲**（6-10 ms）：显卡在等待一个 CPU 线程准备下一批工作。
+
+测试中的工作正是针对这两项。
+
+## 本周变化
+
+**修复**
+- 监狱窗户上的霜不再绘制在 Lucia 的头发上。
+- 阳光下“所有东西上都有线条”的问题已消失：着色器翻译器曾把某些值当作在 64 通道 wave 的前后两半中相同，而实际上并不相同（31 个着色器）。
+- 餐馆玻璃上的斑块已消失：光线追踪玻璃通道现在按“未命中”运行，而不是被跳过。
+- 音频：更安全的 XMA 解码，以及干净的静音和关闭流程。
+
+**更快**
+- 纹理上传移出了游戏的绘制线程，纹理检查改为并行执行，已释放的列表在专用线程上释放：进入世界时最严重的卡死从 9.5 秒降到 6.6 秒。
+- 在这台机器上，CPU 端由驱动分配一张纹理需要 382-529 µs，而从预先分配好的内存块中分配只需 5-8 µs；纹理和缓冲区的池化正在测试中。
+
+**工具**
+- 测试运行的快速启动：跳过片头动画，从冻结的存档点开始。
+- 每次基准测试都会报告 fps、帧时间百分位、超过 100 ms 和 250 ms 的卡顿、启动和流式加载时间、GPU 驱动重置次数，并保存截图。
+- 每个渲染通道的 GPU 开销、每个线程的帧阶段，以及带栈采样的卡顿日志。
+- 着色器翻译器和 GPU 宿主被拆分为更小的模块；翻译器在游戏全部 26,148 个着色器程序上的输出保持逐字节一致。
+
+## 已知问题
+
+- **每次运行都可能不同的画面错误**：在某些运行中，Lucia 在餐馆时的上衣纹理错误、人脸发黑或出现斑块，或者在监狱窗边头发变成橙色。从其他分支移植的修复正在测试中。
+- **流式加载缓慢**：进入世界后，所有资源到齐大约需要一分钟，在此期间会出现物体突然弹出的现象。
+- **GPU 等待 CPU**：每帧 6-10 ms（见上文）。
+- **光线追踪光照基本关闭**：游戏在软件中构建其光线追踪结构，而这个构建器已被禁用。
+
+## 测试中
+
+工作并行编写，并在唯一的一块 GPU 上分批测试：每项改动都放在各自的 `VICTORY_*` 开关之后，每一批将所有新开关全开与全关的运行进行对比，再根据数据和截图决定每个开关保留还是放弃。
+
+- **第 1 批（进行中）**：纹理和缓冲区的内存池、无锁纹理暂存、减少描述符重建、8 线程内存映射、加载时并行烘焙角色、游戏创建着色器后立即翻译、合并 GPU 提交、更廉价的别名复制，以及人脸和头发的修复。
+- **第 2 批（下一批）**：以 2 MiB 分段管理游戏内存（上游的映射时间 55.5 s → 7.3 s）、将游戏缓冲区保留在 GPU 显存中（上游在 RTX 5090 上帧时间 −15 %）、DLSS 超分辨率、提高模拟器帧线程的优先级、离线预热着色器和管线，以及在 RT 核心上进行硬件光线追踪。
+
+## 运行
+
+你需要自己的游戏副本、Windows 10 或 11、支持 Shader Model 6.6 和网格着色器的 GPU，以及 Rust。
+
+```powershell
+tools\lancer_victory.ps1 -GameDir <游戏文件夹>
+```
+
+完整指南（安装、设置、故障排除）见 [docs/running-gta6.md](../running-gta6.md)。
 
 > [!IMPORTANT]
-> **游戏目前无法游玩。** 当前进展见本页顶部的方框。本仓库不包含任何游戏文件、密钥或可执行文件，也不说明如何获取它们。
+> 本仓库不包含任何游戏文件、密钥或可执行文件，也不说明如何获取它们。
 
-在线状态页面（含所需磁盘空间）：**[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**。
-
-## 翻译进展
-
-![进展地图：每个函数一格，已翻译则为绿色](../images/carte-avancee.svg)
-
-重新生成：`scarlett.py --carte <包文件夹> docs/images/carte-avancee.svg`。
-
-![Xbox Series X 翻译进展](../images/traduction.svg)
-
-- **处理器指令：100%。** Series X 使用 x86-64 的 AMD Zen 2，与 PC 的指令集相同：在原生模式下，游戏代码无需翻译，直接原样运行。
-- **GPU 指令：86%。** 主机游戏的着色器是针对 Series X 的 RDNA 2 GPU 编译的。1,490 种 RDNA 2 编码中已有 1,285 种可在参考解释器中运行，RDNA 2 → DXIL 重编译器已能用 D3D12 绘制首个顶点着色器和像素着色器。
-- **系统函数：66%。** 测试包中各 DLL 导入的 1 337 个函数里，有这个比例在隔离模式下已被解析。
-- **主机专用 DLL**：`xmem.dll`（4/4）和 `d3d12_xs.dll`（2/2）已针对该包用到的函数完成翻译。D3D12.X（设备和 `ID3D12*` 接口）由 TomBox 的 `d3d12_xs.dll` 提供，尚未用游戏测试。
-- **GDK 运行时：396 个函数中的 210 个**是在 El1xr 中用 C++ 编写的：任务队列（`XTaskQueue`、`XAsync`、`XThread`）、用户（`XUser`，一个离线的本地档案）、Xbox Series X 的身份（`XSystem`、Title ID、分析数据、运行时功能）、存档（`XGameSave`、`XGameSaveFiles`、`XPersistentLocalStorage`）游戏包（`XPackage`），离线商店（`XStore`），以及离线的邀请、激活和错误报告（`XGameInvite`、`XGameActivation`、`XGameProtocol`、`XError`），以及 PC 的真实 HDR 状态和网络连接（`XDisplayTryEnableHdrMode`、`XNetworkingGetConnectivityHint`）。当 El1xr 单独管理运行时（没有 Gaming Services，或使用 `ANYXBOXX_SYSTEM_RUNTIME=0`）时，它们才会生效。如果存在 Windows 的 GDK 运行时，则由它提供所有接口（包括任务队列），因为其 API 只接受它自己的队列。跟踪（`ANYXBOXX_TRACE=1`）会列出每个被请求接口的名称。
-
-该图表由 `scarlett.py --traduction <包文件夹> docs/images/traduction.svg` 重新生成。
-
-## 性能（目标：稳定 60 帧/秒）
+开发时，`tools/dev.py` 封装了常用步骤：
 
 ```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc-perf <jeu.exe> [secondes] [courbe.svg]
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <jeu.exe> --fps
+python tools/dev.py build      # release 构建
+python tools/dev.py gate       # 全部测试，出现任何警告即失败
+python tools/dev.py prewarm    # 离线翻译全部着色器（约 45 s）
+python tools/dev.py bench --quiet --seconds 200   # 带测量的游戏运行
+python tools/dev.py train --plan plan.toml        # 运行一次批次计划
 ```
 
-C++ 运行时会为游戏 DXGI 交换链的每次 `Present` 计时，即使 DXGI 是由游戏的某个 DLL（SDL3）动态加载的也一样。它由此得出每秒帧数、单帧平均耗时和“1% 低值”（最慢的 1% 帧的速率，可以反映卡顿）。`--fps` 会把这些数值显示在窗口标题中。`--banc-perf` 测量 N 秒，不计入第一秒（加载），并给出“稳定 60 帧/秒”的结论（未达标时返回码为 2）。不使用这些选项时，不会拦截任何内容。
+## 项目数据
 
-![SimpleTriangle：每秒帧数](../images/fps-simpletriangle.svg)
-
-![testgdk：每秒帧数](../images/fps-testgdk.svg)
-
-两个测试游戏都在关闭垂直同步的情况下运行：原生模式下，SimpleTriangle 约 11,700 帧/秒，testgdk 约 12,600 帧/秒。
-
-## 项目进展
-
-| 步骤 | 状态 |
+| 数字 | 内容 |
 |---|---|
-| 读取 `MicrosoftGame.Config`（TitleId、标识、Scarlett 可执行文件） | ✅ 已完成 |
-| PE32+ 加载：节与保护属性、重定位、导入、导出 | ✅ 已完成 |
-| TLS：模板复制、索引、回调 | ✅ 已完成 |
-| 可通过 GS 寄存器访问 TEB 和 PEB | ✅ 已完成 |
-| HLE 页：模拟了 158 个 GDK、内核、CRT 和数学函数名 | ✅ 已完成 |
-| 未知函数：返回 `E_NOTIMPL` 并写入日志，而不是拒绝 | ✅ 已完成 |
-| 全局 C++ 构造函数（`_initterm`）以客体代码方式运行 | ✅ 已完成 |
-| 兼容性报告（`--rapport`）和测试台（`--banc`） | ✅ 已完成 |
-| 在同一台机器中运行多个相互链接的模块：包中的 DLL、序号、转发、冲突时重定位 | ✅ 已完成 |
-| `GetModuleHandle`、`GetProcAddress`、`LoadLibrary`、`RtlPcToFileHeader` | ✅ 已完成 |
-| Scarlett 包中的 16/16 个 DLL 连同依赖项完成初始化，0 个未模拟的调用 | ✅ 已完成 |
-| 已编译免费测试游戏 `SimpleTriangle`：C 启动代码和 GDK 初始化可在 El1xr 中通过 | ✅ 已完成 |
-| Wine 式原生执行（`--natif`）：**SimpleTriangle 成功显示**，GDK 运行时由 El1xr 提供 | ✅ 已完成 |
-| 第二个自由测试游戏，SDL3 的 `testgdk`：**以原生模式运行**（窗口、精灵、声音） | ✅ 已完成 |
-| 隔离启动游戏包或 exe（`--lancer`），并给出需要模拟的调用列表 | ✅ 已完成 |
-| C++ 运行时（`runtime/`）：`xgameruntime.dll`、`xmem.dll`、`d3d12_xs.dll` 在原生模式下预先加载，并提供给游戏的所有 DLL | ✅ 已完成 |
-| `xmem.dll`：解码 `XALLOC_ATTRIBUTES` 的 `XMemAlloc`、`XMemFree`（ERA 布局：堆内存和图形内存、对齐）、钩子、`XMemVirtualQuery`（图形内存标志） | ✅ 已完成 |
-| `d3d12_xs.dll`：根签名序列化，重定向到电脑的 D3D12 | ✅ 已完成 |
-| 396 个 GDK 函数的表：接口和方法编号，提取自 `xgameruntime.lib`（`tools/gdk_interfaces.py`） | ✅ 已完成 |
-| `XTaskQueue`、`XAsync`、`XThread` 由 El1xr 提供：testgdk 无需 Windows 的运行时即可运行 | ✅ 已完成 |
-| 其他 GDK 接口：委托给 Windows 的 GDK 运行时，由跟踪列出名称 | 🟡 进行中 |
-| 1700+ 个自动化测试 | ✅ 已完成 |
-| D3D12.X：`D3D12XboxCreateDevice`、主机的 `ID3D12*` 接口和 `DXGIXPresentArray`，由 TomBox 的 Rust 版 `d3d12_xs.dll` 提供（MIT，48 个已实现导出，用 `tools/build_tombox.py d3d12_xs` 构建，通过 `ANYXBOXX_D3D12_XS=<路径>` 加载）；没有主机可执行文件，此处无法测试 | 🟡 进行中 |
-| 用 TomBox（Rust，GPL-3.0）的主机库补足 El1xr 缺少的部分：`xg_xs`（纹理布局，23 个导出）和完整的 `xmem`（38 个导出），通过 `ANYXBOXX_TOMBOX_DIR=<文件夹>` 使用；由 `tools/build_tombox.py xg_xs xmem` 构建 | 🟡 进行中 |
-| 离线 `XUser`：始终已登录的本地档案、可设置的游戏玩家标签（`ANYXBOXX_GAMERTAG`）、testgdk 登录成功 | ✅ 已完成 |
-| Xbox Series X 的身份：主机类型（模拟注册表值 `ConsoleMode`，游戏的 DLL 内同样有效）、`XSystem`、从 `MicrosoftGame.config` 读取的 Title ID、“Xbox Series X”分析数据 | ✅ 已完成 |
-| 进展地图：每个函数一格（`--carte`） | ✅ 已完成 |
-| 手柄（`GameInput`）与音频（`XAudio2`）：主机与 PC 使用相同的 API，原生模式下绑定到 Windows 的 DLL | ✅ 完成 |
-| 按 DLL 列出缺失导入与未模拟调用的 Markdown 报告（`--lancer … --md rapport.md`） | ✅ 完成 |
-| 主机可执行文件首次启动工具：清单、每个导入的提供者（游戏包、El1xr、TomBox、Windows、缺失）、隔离运行、可选的原生运行；报告保存在仓库之外：`python tools/jour_j.py <游戏包> [--natif]`（[指南](../day-one.md)，法语） | ✅ 完成 |
-| 帧计数器（`--fps`）与性能测试台，给出“恒定 60 fps”结论和曲线（`--banc-perf`） | ✅ 完成 |
-| `XGameSave` 存档（容器、blob、配额、异步读取）和持久化本地存储，保存在 PC 的磁盘上（`%LOCALAPPDATA%\AnyXboxX\<TitleId>`，或 `ANYXBOXX_SAVE_DIR`） | ✅ 已完成 |
-| `XPackage`：本地安装的包（标识符、语言、已就绪的数据块、挂载到游戏文件夹） | ✅ 已完成 |
-| `kernelx.dll`（主机内核）：2,661 个函数转发到 Windows 的 `kernel32`/`kernelbase` | ✅ 完成 |
-| 原生模式下游戏的隐式 TLS（`thread_local`）：载体 DLL `anyxboxx_tls.dll`，每个线程获得自己的副本（最多 256 KiB） | ✅ 完成 |
-| 不依赖 Python 的 C++ 原生启动器（`runtime/build/bin/anyxboxx.exe <游戏.exe \| 文件夹> [--fps]`）：SimpleTriangle 和 testgdk 约 12,000 帧/秒 | ✅ 完成 |
-| RDNA 2 GPU 反汇编器：1,490 个助记符及 LLVM 语法的操作数（标量、VOP1/VOP2/VOPC/VOP3/VOP3P/SDWA/DPP/SMEM/DS/EXP/MUBUF/MTBUF/MIMG/FLAT 及修饰符），已用 LLVM 的 38,999 条公开编码验证：`scarlett.py --rdna2 <shader.bin> [--liste]` | 🟡 进行中 |
-| RDNA 2 反汇编器的操作数与 LLVM 文本一致：标量和 VOP1/VOPC 100%、DS 100%、EXP 100%、SMEM 96.5%（最大值：其余编码 LLVM 有两种写法） | ✅ 已完成 |
-| 首个 RDNA 2 顶点着色器和像素着色器已用 D3D12 绘制（`anyxboxx_gpu_run.exe --draw`）：每个顶点和每个像素都与参考解释器一致（GPU 和 WARP） | ✅ 已完成 |
-| 重编译的 RDNA 2 着色器中的纹理：T#/S# 描述符和 `image_sample`（2D、最近纹素、wrap 或 clamp-to-edge、8_8_8_8_UNORM 和 32_32_32_32_FLOAT），包括带纹理的像素着色器在内，在 GPU 和 WARP 上与参考解释器一致；描述符布局来自 Leonida 和 Mesa | ✅ 已完成 |
-| 第二个 RDNA 2 → SPIR-V（Vulkan）转换器：Leonida 的转换器（GPL-3.0），原样复制到 `third_party/leonida/`，由 El1xr 自己的反汇编器提供输入，无需 `llvm-mc`；支持顶点、像素和计算着色器；包中 `XboxBvhBuilder.dll` 自带的 52 个主机着色器中有 51 个可转换（用 `tools/fssm_mesure.py` 在本地测量）（`scarlett.py --rdna2 <shader.bin> --spirv ps`） | 🟡 进行中 |
-| TomBox 更新到最新版本（D3D12.X：按他们的统计 200 个方法中已实现 194 个），并额外构建 4 个主机库，从 `ANYXBOXX_TOMBOX_DIR` 提供：`d3d12_x`（ESRAM）、`XAudio2_9`（XMA 声部）、`xapu`、`xgs12`；`tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 进行中 |
-| 将主机 DXIL 转换为 PC DXIL（`dxil-ms-xb2` → `dxil-ms-dx`，无需经过 HLSL）：Xbox2Windows 的工具（MIT），连同其测试原样复制到 `third_party/xbox2windows/`；`python third_party/xbox2windows/tools/dxil_retarget.py <输入> <输出>` 或 `--pe <game.exe>` | ✅ 已完成 |
-| 拉取请求检查：每个拉取请求都运行 lint 并核对 9 个 README 的同步（行、图片、测试数量） | ✅ 已完成 |
-| Rust 实现的主机纹理：从 Xbox2Windows（MIT）移植的 BC7 解码和 GFX10 `SW_4K_S` 去平铺，复现了参考摘要；`anyxboxx_texture bc7 <blocks.bin> <宽> <高> <out.png> [--4k-s]` | 🟡 进行中 |
-| 由 El1xr 自行编写的其他 GDK 接口（`XGameUi`、`XNetworking`…） | ⏳ 待完成 |
-| RDNA 2 → DXIL 着色器重编译器：首批程序已翻译为 HLSL、编译为 DXIL 并通过 D3D12 在 PC 的 GPU 上运行（`--hlsl`、`anyxboxx_gpu_run.exe`，无 GPU 时用 WARP），内存与 wave32 参考解释器的结果完全一致，该解释器可执行 1,490 种编码中的 1,285 种（标量、VOP1/VOP2/VOPC/VOP3/VOP3P、内存：SMEM、LDS、GLOBAL、带 V# 边界和类型化格式的 MUBUF/MTBUF、原子操作、分支、`exec` 分歧）；首个顶点着色器和像素着色器（EXP 导出、VINTRP 插值）已用 D3D12 绘制，逐顶点、逐像素一致：`scarlett.py --rdna2 <shader.bin> --executer` | 🟡 进行中 |
-| 在 wave 为 32 通道的 GPU 上运行 wave64 计算程序（#70）：每个 64 通道 wave 作为一个 64 线程的线程组运行（通道掩码和通道读取通过 groupshared 内存，不用 `WaveSize`），在 RTX（32 通道 wave）和 WARP 上内存与 wave64 参考解释器完全一致；DPP 和 SDWA 比较仍按名称拒绝 | 🟡 进行中 |
-| 着色器缓存：翻译后的着色器只编译一次为 DXIL，之后从磁盘（1.4 ms）或内存（0.8 ms）复用，而不再调用 dxc（22 ms）；`%LOCALAPPDATA%\AnyXboxX\shader-cache` 或 `ANYXBOXX_SHADER_CACHE`，大小有上限 | 🟡 进行中 |
-| 通过 VIctory 运行该作品的 Xbox Series 1.0.2.1 版本（`third_party/victory`，我们自己的代码，基于 Neptune (VIctory Edit.) 2026-11-25c，采用 11 月 25 日的一组设置）：世界中约 14 fps（Series X，RTX 4070 SUPER，2026-11-25 测得，中位数 13.8 fps，最后一分钟 15.6–17 fps，每帧 72.5 ms）；没有光线追踪光照（室内以均匀环境光代替），没有面部动画，替换纹理时物体会短暂变黑 | 🟡 进行中 |
-| x64 SEH 异常（`.pdata`）、多线程 | ⏳ 待完成 |
-| 在运行时动态加载 DLL（`LoadLibrary` + `DllMain`） | ⏳ 待完成 |
-| 将 D3D12.X 图形转换为 Direct3D 12 / Vulkan | ⏳ 待完成 |
-| 主机 XMA2 音频：由 TomBox 将 FFmpeg 解码器移植到 Rust 的版本解码为 WAV（LGPL，在公开 FATE 样本上与 FFmpeg 最多相差 1）；`anyxboxx_xma <in.xma> <out.wav>`，单流文件 | 🟡 进行中 |
+| 1600+ 个自动化测试 | Python 工具和 Rust crate，由 `dev.py gate` 运行 |
+| 26,148 个着色器程序 | 从 RDNA 2 翻译为 DXIL，缓存在磁盘上 |
+| 0 个被拒绝的管线 | 在 RTX 5090 上 |
 
-<table>
-<tr>
-<td><img src="../images/demo-virage.png" alt="汽车向右转弯" width="380"></td>
-<td><img src="../images/rapport-compatibilite.png" alt="演示的兼容性报告" width="380"></td>
-</tr>
-<tr>
-<td align="center">演示会响应键盘方向键。</td>
-<td align="center">日志中显示兼容性报告。</td>
-</tr>
-</table>
+## 历史
 
-## 试用演示
-
-在 Windows 上，安装带有 Tcl/Tk 的 64 位 Python 3.12，然后在仓库根目录打开 PowerShell。
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --demo
-```
-
-原生模式需要 C++ 运行时。可使用 Visual Studio 2022 或 2026（C++ 工作负载）和 CMake 编译：
-
-```powershell
-cmake -S runtime -B runtime/build -A x64
-cmake --build runtime/build --config Release
-```
-
-任务队列沿用了 [libHttpClient](https://github.com/microsoft/libHttpClient) 的 `Task` 模块（MIT 许可证，`runtime/third_party/libhttpclient-task`）。DLL 会输出到 `runtime/build/bin`，或 `ANYXBOXX_RUNTIME` 指定的文件夹。`ANYXBOXX_SYSTEM_RUNTIME=0` 会关闭对 Windows GDK 运行时的委托。
-
-编译好的演示程序是 `PrototypeScarlett/demo.pe`，其源代码是 `PrototypeScarlett/demo.c`。
-
-## 以原生模式运行游戏
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
-```
-
-![由 El1xr 以原生模式启动的 SimpleTriangle](../images/simpletriangle-anyxboxx.png)
-
-El1xr 会加载可执行文件本身，并像 Wine 一样直接在处理器上运行它。Xbox 运行时（`xgameruntime.dll`）由 El1xr 提供；窗口和 DirectX 12 则使用电脑自身的。**注意：在原生模式下，程序没有被隔离。** 请仅对可信的程序使用此模式；`--rapport` 和 `--banc` 仍然在 Unicorn 中隔离运行。`ANYXBOXX_TRACE=1` 会显示被拦截的调用。详情：[docs/test-game.md](../test-game.md)。
-
-## 以隔离模式运行游戏包
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --lancer <dossier du paquet ou fichier .exe> [dossiers de DLL…]
-```
-
-指定文件夹时，El1xr 会读取 `MicrosoftGame.Config`，取出为 `Scarlett` 声明的可执行文件，并在隔离的虚拟机（Unicorn）中运行：程序不会接触电脑。报告先列出未解析的导入，再按出现频率从高到低列出未模拟的调用：这就是补全模拟器的工作清单。如果可执行文件缺失，提示信息会指明它的名称。按 `--md rapport.md` 参数运行时，同一份报告会以 Markdown 写出，缺失的导入按 DLL 分组。
-
-## 分析程序
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --rapport <dossier ou fichier .exe>
-```
-
-测试台会加载文件夹中的所有 PE 模块并运行它们的初始化：
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc <dossier>
-```
-
-![针对 Scarlett 包中 DLL 的测试台](../images/banc-dll.svg)
-
-详细结果：[docs/progress.md](../progress.md)。与原生运行结果对比的免费测试游戏：[docs/test-game.md](../test-game.md)。目标之后可以再跟一个额外的 DLL 文件夹（例如 Visual C++ 的 DLL）：`--rapport <cible> <dossier>`。
-
-报告会列出导入的函数、已模拟的百分比以及缺失的函数。在界面中，**Open an Xbox folder…**（打开 Xbox 文件夹）按钮会读取 `MicrosoftGame.Config`，显示该报告，然后启动程序；每个未模拟的调用都会出现在日志中。
-
-## 架构
-
-![El1xr 模块示意图](../images/architecture.svg)
-
-| 模块 | 作用 |
-|---|---|
-| `emu/config.py` | 读取 GDK 包的清单 |
-| `emu/loader.py` | 加载 PE 映像，并准备导入、导出和 TLS |
-| `emu/machine.py` | Unicorn 处理器、栈、堆、TEB/PEB、调用分发 |
-| `emu/hle/` | 被模拟的函数：`gdk.py`、`kernel.py`、`crt.py`、`libm.py`、`guest.py` |
-| `emu/report.py` | 兼容性报告 |
-| `emu/modules.py` | 加载包中的 DLL、链接导入、安排初始化顺序 |
-| `emu/bench.py` | 针对模块文件夹的测试台 |
-| `emu/native/` | Wine 式原生执行：加载器、真实导入、El1xr 的 GDK 运行时 |
-| `scarlett.py` | Tkinter 界面和命令行 |
-
-要添加一个函数，请在 `emu/hle/` 中为处理函数加上装饰器：
-
-```python
-@hle("gdk")
-def XSystemGetDeviceType(c):
-    return XBOX_SERIES_X
-```
-
-## 调研
-
-- [Xbox Series X 的硬件架构](../research/xbox-series-x-architecture.md)：Zen 2 CPU、RDNA 2 GPU、内存、Velocity Architecture、安全性。
-- [现有的模拟器和兼容层](../research/state-of-the-art.md)：WinDurango、XWine1、Xenia、XVD 工具。
-- [所研究 Scarlett 游戏包的逆向工程笔记](../research/package/README.md)（(由 Codex 撰写）：RDS5/ETPF 表、RPF 文件头、游戏包结构。
-- [TomBox 及其后续项目](../research/tombox.md)：Rust 编写的主机 DLL、Direct3D 12.x、RDNA 2 着色器翻译器，以及 El1xr 复用的内容（MIT，已注明出处）。
-- [Xbox2Windows](../research/xbox2windows.md)：静态重编译研究；El1xr 复用其 BC7 与 GFX10 平铺（MIT，已注明出处）。
-- [可执行文件 1.0.2.1 的首次启动](../research/first-boot-1021.md)：在 Leonida 的 `gta6rt` 下依次测得的停止点、处理这些问题的 Leonida 拉取请求，以及 El1xr 的工作清单。
-
-## 测试
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest
-```
+项目是如何走到今天的，从在模拟器中加载第一批主机 DLL 到世界的第一帧：[docs/history.md](../history.md)。
 
 ## 参与贡献
 
-`main` 分支受到保护：所有贡献都必须经过审阅的 pull request，并且测试必须通过。缺陷和需要模拟的函数请在 issue 中提交。完整规则见 [CONTRIBUTING.md](../../CONTRIBUTING.md)。
-
-讨论、求助和测试报告：[Discord](https://discord.gg/TcX42vRyPU)。
+欢迎提交 issue 和 pull request。提交 pull request 前请先运行 `python tools/dev.py gate`。规则见 [CONTRIBUTING.md](../../CONTRIBUTING.md)。讨论和测试报告：[Discord](https://discord.gg/TcX42vRyPU)。
 
 ## 致谢
 
 - **El1xr**：Bone/Nevaa。
-- **VIctory**：Marvisak 及其贡献者（[VIctory](https://github.com/Marvisak/VIctory)，GPL-3.0 或更高版本），以及组成它的各个分支的作者，包括 Traffic & zm0kie 的 Neptune (VIctory Edit.)。
-- **AnyXboxX**：Looper_Salty 及其贡献者（[AnyXboxX](https://github.com/LooperSalty/AnyXboxX)），El1xr 由此分支而来。
-- 其他所有组件和作者均在 [THIRD_PARTY.md](../../THIRD_PARTY.md) 中注明。
+- **VIctory**：Marvisak 及其贡献者（[VIctory](https://github.com/Marvisak/VIctory)，GPL-3.0 或更高版本），以及组装它所用的各个分支的作者，其中包括 Traffic & zm0kie 的 Neptune (VIctory Edit.)。
+- **AnyXboxX**：Looper_Salty 及其贡献者（[AnyXboxX](https://github.com/LooperSalty/AnyXboxX)），El1xr 即从该项目分支而来。
+- **我们学习并移植过代码的 VIctory 分支**，其中包括 fxceless/victory-fork、Peppacodes、Belobug、stellarr-studio/kelvaroq、uiliannn/VItoriaBr、DoubleGhosty/cool_fox、avatarmanz、3cvil/M1LK、trustno1-coder、TaynanGT/Vice-Tay、Linox-IDK/LNX-victory 和 readmet3xt-lab/foxhound。
+- 每个组件和作者都按每次改动在 [THIRD_PARTY.md](../../THIRD_PARTY.md) 中注明。
 
 ## 许可证
 
-El1xr 以 [GNU GPL 3.0 或更高版本](../../LICENSE) 发布。第三方部分保留各自的许可证：libHttpClient 的 `Task` 模块（MIT，`runtime/third_party/libhttpclient-task`），以及根据 LLVM 公开编码测试生成的 RDNA 2 表（Apache 2.0 附 LLVM 例外，`PrototypeScarlett/emu/rdna2_ops.py` 和 `rdna2_shapes.py`）。
-
-第三方组件与致谢：[THIRD_PARTY.md](../../THIRD_PARTY.md)。
+El1xr 以 [GNU GPL 3.0 或更高版本](../../LICENSE) 发布。第三方部分保留各自的许可证：libHttpClient 的 `Task` 模块（MIT，`runtime/third_party/libhttpclient-task`），以及根据 LLVM 公开编码测试生成的 RDNA 2 表（Apache 2.0 with LLVM exception，`PrototypeScarlett/emu/rdna2_ops.py` 和 `rdna2_shapes.py`）。

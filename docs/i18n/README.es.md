@@ -1,259 +1,147 @@
-# El1xr — emulador de Xbox Series X (prototipo)
+<div align="center">
 
+# El1xr
+
+**Grand Theft Auto VI (Xbox Series, build 1.0.2.1) funcionando en un PC con Windows.**<br>
+En 4K, unos 25 fps y subiendo en una RTX 5090.
+
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](../../LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](../running-gta6.md)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white)](../../third_party/victory)
 [![Discord](https://img.shields.io/badge/Discord-AnyXboxX-5865F2?logo=discord&logoColor=white)](https://discord.gg/TcX42vRyPU)
 
 [English](../../README.md) · [Français](README.fr.md) · **Español** · [Deutsch](README.de.md) · [Italiano](README.it.md) · [Português](README.pt-BR.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Русский](README.ru.md)
 
-**El1xr** es el proyecto de Bone/Nevaa, un fork de [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) construido sobre [VIctory](https://github.com/Marvisak/VIctory). Ver [Créditos](#créditos).
+</div>
+
+---
+
+El1xr es el proyecto de emulación de GTA VI de Bone/Nevaa: un fork de [AnyXboxX](https://github.com/LooperSalty/AnyXboxX), construido sobre [VIctory](https://github.com/Marvisak/VIctory) y sobre lo mejor del trabajo de los forks de VIctory (cada fuente se acredita en [THIRD_PARTY.md](../../THIRD_PARTY.md)). El propio código x86-64 del juego se ejecuta de forma nativa; sus llamadas al sistema de la consola, sus comandos Direct3D 12.X y sus shaders RDNA 2 se traducen al vuelo para PC.
 
 > [!NOTE]
-> **Dónde estamos (25/11/2026)**
+> **Estado a 27 de noviembre de 2026**
 >
-> Medido en un i7-13700KF + RTX 4070 SUPER, Windows 11, con el fork de VIctory `LooperSalty/victory` en el commit `80d58f8` (branch `anyxboxx/fork-7b0-lot9-murs`) (`third_party/victory`) iniciado con `tools/lancer_victory.ps1 -GameDir <carpeta del juego>`:
->
-> - 🆕 **~14 fps en el mundo (Series X, RTX 4070 SUPER), medido el 2026-11-25**: `third_party/victory` ahora se basa en Neptune (VIctory Edit.) 2026-11-25c con el conjunto medido ese mismo día (mediana de 13,8 fps, 15,6 a 17 fps en el último minuto, 72,5 ms por imagen; antes, 10,9 fps de mediana con los ajustes del lanzador de `main`, en ejecuciones automáticas de 13 minutos en Series X, sin cierres). Las cifras de abajo se midieron con la base anterior `80d58f8`.
-> - 🆕 **Modo imagen primero, medido por el mantenedor el 2026-11-25**: `tools\lancer_victory.ps1 -Quality` (las copias de ventana se leen de nuevo en cada fotograma, pools más pequeños) da una iluminación y unas texturas claramente mejores, unos 7-9 fps y muchos menos rechazos de texturas (51-93 frente a unos 300). Por defecto sigue el conjunto rápido (unos 14-17 fps, mediana de 13,7 durante 7 minutos en el mundo con la PR #272). `-Override @{ VICTORY_X = '...' }` permite a cualquiera probar un ajuste sin editar el lanzador.
-> - ✅ **Los barcos flotan** (PR #263 de Exorion1er: los mapas de altura del océano se copian de vuelta para la CPU del título).
-> - 🦀 **Port a Rust, rama `rust/full` (aún no en `main`)**: el lanzador nativo (PR #249) y el ejecutor de GPU `anyxboxx_gpu_run.exe` (PR #266) ya son Rust; el intérprete de referencia de RDNA 2 está portado a Rust (crate `anyxboxx-rdna2-ref`) y ejecuta todas las instrucciones que ejecuta el modelo Python (1.060 de las 1.490 codificaciones de LLVM), byte a byte, con 28 pruebas de paridad; las partidas guardadas, el almacenamiento local, la tienda y los objetos HDR/DXGI de xgameruntime están portados. Falta portar: el recompilador HLSL, el resto de xgameruntime y después eliminar C++ y Python. Estado: [docs/rust-full-status.md](https://github.com/LooperSalty/AnyXboxX/blob/rust/full/docs/rust-full-status.md).
-> - ⛔ **Límites conocidos (en curso)**: la RAM del sistema es el cuello de botella en un PC de 32 GB (el proceso ocupa unos 22-25 GB: la memoria propia del título, más los espejos de CPU, más la VRAM desbordada a memoria compartida), y una tarjeta de 12 GB se queda sin espacio para texturas (cientos de rechazos por sesión), lo que provoca caídas a 1-6 fps mientras el mundo se carga en streaming.
-> - ✅ La versión 1.0.2.1 de Xbox Series de GTA VI **se inicia** en PC: arranque, pantalla de perfil, ajustes del primer inicio, pantallas legales, carga, menú de pausa. Los menús van a 30 fps.
-> - ✅ Alcanza **el mundo y lo muestra**: el personaje se mueve bajo el control del jugador y la imagen 3D se muestra, a entre 4,8 y 5,4 fotogramas por segundo con unos 6.550 draws por imagen (medido por el mantenedor, Windows 11, RTX 4070 Super, registro de VIctory, unos 4 min 20). La animación de inicio no parpadea (observado). La caché de irradiancia, nunca iluminada hasta ahora (0 dispatch en una captura PIX de un fotograma de cinemática), tiene ahora traducidos sus dos shaders de sombreado, con sus pipelines creados y enlazados en el juego (observado).
-> - ✅ **Todas las cinemáticas se reproducen completas** (observado por el mantenedor el 25 de noviembre con los ajustes del lanzador y el commit fijado `80d58f8`), aunque todavía faltan algunos gráficos en ciertos lugares (el constructor de estructuras de ray tracing está desactivado). El mantenedor observó picos de 9 fps y 7 a 8 fps constantes durante las cinemáticas (título de la ventana, 25 de noviembre); en una prueba automatizada, las medianas medidas en el registro fueron más bajas, 2 a 3 fps, según la escena.
-> - ✅ **Las dos primeras misiones se han jugado hasta el final**: un colaborador del proyecto jugó unos 45 minutos a unos 2 fps y completó las dos primeras misiones (comunicado al mantenedor el 25 de noviembre; no medido en nuestros registros).
-> - ✅ **Más allá del prólogo, hasta el capítulo 1, en Linux** (Jason en el barco): jugado el 25 de noviembre en Proton (GE-Proton11-12 con un parche comunitario del wineserver) y una AMD RX 9070 XT con el commit `890a83a`, una sesión de 23 minutos sin fallos, entre 3 y 5 fps todo el tiempo (registro de VIctory: mediana de 3,7 fps, el 80 % del tiempo entre 2,2 y 4,5). Las zonas en sombra y los interiores siguen negros (sin trazado de rayos).
-> - ⛔ Límites actuales: 6 shaders siguen sin traducirse (9 antes), el controlador rechaza 16 pipelines (la issue #75 del fork informa de unos 80 más en una RTX 3070, no vistos en la 4070 Super), la iluminación por ray tracing está ausente (el constructor BVH sigue desactivado, unos 350 dispatches descartados por imagen), con el ajuste `VICTORY_LATE_WAIT` algunas paredes de la primera sala pueden ser transparentes (issue #168 del fork, correcciones en curso: #191, #206), y la estabilidad a largo plazo solo se midió durante unos 4 min 20 sin pérdida del dispositivo. `VICTORY_RELAY` está desactivado por defecto: la issue #89 del fork informa de que hace desaparecer la piel de los personajes y superpone los subtítulos.
-> - 👁 Historial del 24 de noviembre (medido u observado por el mantenedor, registros de VIctory): `d279e69` unos 4 fps, 13 min en la prisión y luego pérdida del dispositivo → `7b0f736` + `VICTORY_RELAY=2` unos 4,5 fps → ajustes del lanzador de la PR #172 sin DRED unos 5,5 fps → lote 4 (3 pull requests) unos 6,6 fps con `VICTORY_RELAY=2`, parpadeo de inicio corregido → este lote (7 pull requests, sin `VICTORY_RELAY`) unos 5,4 fps pero 6.449 draws por imagen y la mejor imagen hasta ahora → lote 8 (lote 5 más una pull request, #11) unos 4,8 a 5,4 fps, unos 6.550 draws por imagen, shaders de la caché de irradiancia ya traducidos.
-> - 🆕 VIctory ahora está copiado en este repositorio (`third_party/victory`, ya no es un submódulo) como código propio, sin sincronizar ni fijar nada: `80d58f8` más 57 commits para Proton (Wine) y tarjetas AMD, del fork `fxceless/victory-fork`, de VIctory, de klbf-lab, de los `victory-amd` de JoshuuDev y de myokex, y nuestros (autores en THIRD_PARTY.md). Medido solo en Linux (Fedora 44, RX 9070 XT, RADV, GE-Proton11-12 con un parche comunitario del wineserver, log de VIctory de una ejecución de unos 23 min): unos 3,7 fps (imagen mediana del mundo de 266 ms), sin cierres ni pérdida del dispositivo; caras, piel y geometría completas (observado); interiores y zonas en sombra negros, el ray tracing no se ejecuta. Aún no medido en Windows; los ajustes del lanzador no cambian. Un clon existente debe ejecutar `git submodule deinit -f third_party/victory` y borrar `third_party/victory` y `.git/modules/third_party/victory` antes del pull (ver la guía).
-> - 📌 Fijado desde el commit `80d58f8` de la rama `anyxboxx/fork-7b0-lot9-murs`: el lote 8 más tres commits `xg:` nuestros (la disposición de `xg_xs.dll` ahora se responde exactamente como la biblioteca de Microsoft: mips de cola en modo padre con posición, mosaico de 64 KiB indexado por subrecurso; una prueba compara 54 descripciones con la DLL real y el mantenedor midió 0 diferencias en el juego, así que `-XgDll` ya solo es un oráculo), la precompilación sin conexión de shaders y pipelines (port de la pull request #282 del fork `fxceless/victory-fork`, t4l03): `victory translate --cache --pipelines`, opción `-Precompile` del lanzador (medido: 25.689 shaders traducidos en unos 4,5 min, 296 rechazados, 13 GB de caché) y otras siete pull requests de ese fork (#349, #355, #396, #386, #358, #353, #374). Medido por el mantenedor (registros de VIctory, noche del 24 al 25 de noviembre): 4,8 a 5,1 fps y cerca del 12,7 % de los draws descartados por imagen (11 a 14 % antes); la cinemática se juzga mejor (observado). Más dos commits de Yorivel procedentes del fork (`e49864a`, `bf870de`): las escrituras de DirectStorage en páginas físicas ahora se notifican al lado GPU (`VICTORY_DSTORAGE_NOTIFY=1`, fijada por el lanzador), que ya no conserva copias obsoletas de las paredes de la primera sala. Medido por el mantenedor (registro de VIctory, 25 de noviembre, hacia las 02:41 a 02:50): de una partida nueva hasta el mundo en unos 9 minutos, 5,3 a 6,9 fps, 4.200 a 6.300 draws por imagen, sin pérdida del dispositivo; cinemáticas completas, juzgado «increíble» (observado); todavía faltan gráficos en algunos lugares. La mayoría de los draws descartados vienen del constructor de estructuras de ray tracing, desactivado (14.943 de 15.444 en un registro), no de los 15 pipelines compute wave64 que NVIDIA rechaza (unos 300 draws).
-> - 📌 Fijado desde el commit `19feca8` de la rama `anyxboxx/fork-7b0-lot8-xg`: el lote 8 más un commit nuestro que deja la disposición de las texturas a la propia biblioteca de Microsoft: `tools/lancer_victory.ps1 -GameDir <carpeta del juego> -XgDll <ruta de xg_xs.dll>`, donde `xg_xs.dll` es la versión para PC sin conexión de tu propia copia del GDK (nunca en este repositorio). Sin `-XgDll` no cambia nada. Medido por el mantenedor (registros de VIctory, 25 de noviembre): sus respuestas difieren de las de VIctory en 84 descripciones de texturas (mips de cola de las texturas de 64 KiB, mosaico de 64 KiB de los arrays de texturas; tamaños y desplazamientos coinciden); con ella, el mundo va a 5,4–7,1 fps (5,1–5,6 sin ella) y la prueba se juzgó la mejor hasta ahora (observado). `-XgMode compare` conserva las disposiciones de VIctory y registra cada diferencia.
-> - 📌 Fijado desde el commit `d138351` de la rama `anyxboxx/fork-7b0-lot8` de nuestro fork de VIctory `LooperSalty/victory`: el lote 5 (el fork `fxceless/victory-fork` en `7b0f736` más siete de sus pull requests, véase la guía) más una pull request aplicada con `cherry-pick -x`: #11 (cxchhh, se restauran los pares de máscaras de lanes aparcados a pocas instrucciones de distancia, las lecturas VGPR relativas conservan los lanes aparcados; los dos shaders de sombreado de la caché de irradiancia ya se traducen). Medido por el mantenedor (registro de VIctory, captura PIX, ajustes del lanzador de `main`): 4,8 a 5,4 fps y unos 6.550 draws por imagen, 6 shaders sin traducir (9 en el lote 5), 16 pipelines rechazados por el controlador (igual que en el lote 5), sin pérdida del dispositivo en unos 4 min 20. Una copia existente debe ejecutar `git submodule sync third_party/victory` y luego `git submodule update --init third_party/victory`: la URL del submódulo cambió con la PR #178.
-> - Requisitos: tu propia copia del juego, una GPU NVIDIA o AMD con SM 6.6 y mesh shaders, Rust. Ningún archivo del juego en este repositorio.
-> - Cómo ejecutarlo: [docs/running-gta6.md](../running-gta6.md).
+> - 🎮 **El mundo es jugable en 4K, a 24-25 fps una vez estabilizado** en una RTX 5090 (tres pruebas de rendimiento con el equipo en reposo: 24,9; 25,2 y 24,2 fps). El objetivo son 30 fps estables.
+> - ✅ **0 pipelines de GPU rechazados** y ninguna pérdida del dispositivo GPU en las pruebas de rendimiento.
+> - ✅ Las cinemáticas se reproducen completas y las primeras misiones se han jugado hasta el final; el primer fotograma del mundo aparece entre 46 y 52 s después del arranque.
+> - 🚧 Unas **60 aceleraciones más están escritas y en pruebas** (ver [En pruebas](#en-pruebas)).
 
-El1xr carga ejecutables de Xbox GDK (formato PE32+ x86-64) y ejecuta su código con Unicorn. Las funciones de sistema de la consola se sustituyen por un runtime C++ en modo nativo, y por código Python en la máquina aislada (emulación de alto nivel, como WinDurango o Wine). El programa se presenta como una Xbox Series X: `XSystemGetDeviceType` devuelve `XboxScarlettAnaconda`.
+## De un vistazo
 
-## Objetivo y estado
+| Medida (RTX 5090, 4K) | Ahora | Objetivo |
+|---|---|---|
+| Tasa de fotogramas estabilizada | **24-25 fps** | 30+ fps |
+| Tiempo de fotograma mediano | ~40 ms | ≤ 33,3 ms |
+| Fotograma del percentil 99 | 68-73 ms | sin tirones |
+| Tiempo de CPU para preparar un fotograma | 25-26 ms | por debajo del tiempo de la GPU |
+| Pipelines de GPU rechazados | **0** | 0 |
+| Del arranque al primer fotograma del mundo | 46-52 s | |
+| Streaming tras entrar en el mundo | 52-63 s | unos pocos segundos |
 
-El1xr está especializado en una sola versión: **Grand Theft Auto VI para Xbox Series, versión 1.0.2.1**. Solo se traduce lo que este juego necesita (las funciones del sistema que importa, los shaders y los métodos de Direct3D 12.x que usa). Otros juegos se probarán cuando esa traducción esté completa. El proyecto se apoya en [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 o posterior), que apunta a la misma versión: está copiado en `third_party/victory`, a partir del fork `fxceless/victory-fork` (GPL-3.0) en el commit `7b0f736`. Gracias a Marvisak y a los autores de esas pull requests, acreditados uno por uno en [THIRD_PARTY.md](../../THIRD_PARTY.md).
+Medido con `python tools/dev.py bench --quiet --seconds 200`: arranque rápido desde un punto de control fijo, nada más ejecutándose en la máquina, cifras leídas del propio registro de fotogramas del emulador.
+
+## Equipo de prueba
+
+| Componente | Modelo |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090, 32 GB, controlador 621.24 |
+| CPU | AMD Ryzen 9 9950X3D, 16 núcleos / 32 hilos |
+| Memoria | 64 GB DDR5-6000 |
+| Placa base | MSI PRO B650-P WIFI |
+| Almacenamiento | SSD NVMe (Samsung 990 EVO Plus) |
+| Sistema operativo | Windows 11 (build 26200) |
+| Juego | GTA VI para Xbox Series, build 1.0.2.1 (tu propia copia) |
+
+## En qué se va un fotograma
+
+![Tiempo de GPU por fotograma: pasadas del juego 22,8 ms, trabajo del emulador 7,0 ms, sin medir 3,8 ms, inactiva 6,2 ms](../images/frame-budget.svg)
+
+Un fotograma estabilizado tarda unos 40 ms. Las pasadas de renderizado del propio juego ocupan 22,8 ms de tiempo de GPU, así que los 30 fps están al alcance. El resto se va en:
+
+- **nuestro propio trabajo de GPU** (7 ms): comprobaciones de límites en los draws indirectos, copias de texturas entre formatos, verificaciones de lo que ha escrito la GPU;
+- **GPU inactiva** (6-10 ms): la tarjeta espera mientras un solo hilo de CPU prepara el siguiente lote de trabajo.
+
+Ambos son el objetivo del trabajo en pruebas.
+
+## Qué ha cambiado esta semana
+
+**Corregido**
+- La escarcha de la ventana de la prisión ya no se dibuja sobre el pelo de Lucia.
+- Han desaparecido las «líneas sobre todo» a la luz del sol: el traductor de shaders trataba algunos valores como iguales en las dos mitades de una wave de 64 lanes cuando no lo eran (31 shaders).
+- Han desaparecido las manchas en el cristal del diner: la pasada de cristal con ray tracing ahora se ejecuta como «sin impacto» en lugar de saltarse.
+- Audio: decodificación XMA más segura y una ruta limpia de silenciado y apagado.
+
+**Más rápido**
+- Las subidas de texturas salieron de los hilos de dibujo del juego, las comprobaciones de texturas se ejecutan en paralelo y las listas liberadas se liberan en su propio hilo: el peor congelamiento al entrar en el mundo bajó de 9,5 s a 6,6 s.
+- La asignación de una textura por el controlador en la CPU cuesta 382-529 µs en esta máquina y 5-8 µs desde un bloque de memoria preasignado; los pools de texturas y búferes están en pruebas.
+
+**Herramientas**
+- Arranque rápido para las pruebas: se salta el vídeo de introducción y empieza desde un punto de control congelado.
+- Cada bench informa de los fps, los percentiles de tiempo de fotograma, los tirones de más de 100 y 250 ms, los tiempos de arranque y de streaming y los reinicios del controlador de la GPU, y guarda capturas de pantalla.
+- Coste de GPU por pasada, fases del fotograma por hilo y un registro de tirones con muestras de pila.
+- El traductor de shaders y el host de GPU se dividieron en módulos más pequeños; la salida del traductor se mantuvo idéntica byte a byte en los 26.148 programas de shaders del juego.
+
+## Problemas conocidos
+
+- **Fallos visuales que varían entre pruebas**: en algunas pruebas, la camiseta de Lucia en el diner tiene la textura equivocada, las caras salen negras o con manchas, o el pelo se vuelve naranja en la ventana de la prisión. Hay correcciones portadas de otros forks en pruebas.
+- **Streaming lento**: tras entrar en el mundo, todos los recursos tardan aproximadamente un minuto en llegar, con elementos que aparecen de golpe mientras tanto.
+- **GPU esperando a la CPU**: 6-10 ms por fotograma (ver arriba).
+- **La iluminación con ray tracing está casi toda desactivada**: el juego construye sus estructuras de ray tracing por software, y ese constructor está desactivado.
+
+## En pruebas
+
+El trabajo se escribe en paralelo y se prueba por lotes en la única GPU: cada cambio va detrás de su propio interruptor `VICTORY_*`, un lote ejecuta todos los interruptores nuevos activados frente a todos desactivados, y cada interruptor se conserva o se descarta según las cifras y las capturas de pantalla.
+
+- **Lote 1 (en marcha)**: pools de memoria para texturas y búferes, preparación de texturas sin bloqueos, menos reconstrucciones de descriptores, mapeo de memoria en 8 hilos, precálculo de personajes en paralelo durante la carga, shaders traducidos en cuanto el juego los crea, envíos a la GPU fusionados, copias de alias más baratas, y las correcciones de caras y pelo.
+- **Lote 2 (el siguiente)**: memoria del título en secciones de 2 MiB (tiempo de mapeo 55,5 s → 7,3 s en el proyecto de origen), búferes del juego mantenidos en la memoria de la GPU (−15 % de tiempo de fotograma en el proyecto de origen en una RTX 5090), escalado DLSS, mayor prioridad para los hilos de fotograma del emulador, precalentamiento sin conexión de shaders y pipelines, y ray tracing por hardware en los núcleos RT.
+
+## Ejecútalo
+
+Necesitas tu propia copia del juego, Windows 10 u 11, una GPU con Shader Model 6.6 y mesh shaders, y Rust.
+
+```powershell
+tools\lancer_victory.ps1 -GameDir <carpeta del juego>
+```
+
+La guía completa (instalación, ajustes, solución de problemas) está en [docs/running-gta6.md](../running-gta6.md).
 
 > [!IMPORTANT]
-> **El juego no es jugable.** Consulta el recuadro de arriba para ver el estado actual. Este repositorio no contiene archivos del juego, claves ni ejecutables, y no explica cómo obtenerlos.
+> Este repositorio no contiene archivos del juego, claves ni ejecutables, y no explica cómo conseguirlos.
 
-Página de estado en línea, con el espacio en disco necesario: **[loopersalty.github.io/AnyXboxX](https://loopersalty.github.io/AnyXboxX/)**.
-
-## Avance de la traducción
-
-![Mapa del avance: una casilla por función, verde si está traducida](../images/carte-avancee.svg)
-
-Regenerar: `scarlett.py --carte <carpeta del paquete> docs/images/carte-avancee.svg`.
-
-![Avance de la traducción de Xbox Series X](../images/traduction.svg)
-
-- **Instrucciones del procesador: 100 %.** La Series X usa un AMD Zen 2 en x86-64, el mismo conjunto de instrucciones que un PC: en modo nativo, el código del juego se ejecuta tal cual, sin traducción.
-- **Instrucciones de la GPU: 86 %.** Los shaders de un juego de consola se compilan para la GPU RDNA 2 de la Series X. 1.285 de las 1.490 codificaciones RDNA 2 se ejecutan en el intérprete de referencia, y el recompilador RDNA 2 → DXIL ya dibuja un primer vertex shader y pixel shader con D3D12.
-- **Funciones de sistema: 66 %** de las 1 337 funciones importadas por las DLL del paquete de prueba se resuelven en modo aislado.
-- **DLL propias de la consola**: `xmem.dll` (4/4) y `d3d12_xs.dll` (2/2) están traducidas para las funciones que usa el paquete. D3D12.X (dispositivo e interfaces `ID3D12*`) lo sirve la `d3d12_xs.dll` de TomBox, aún sin probar con un juego.
-- **Runtime GDK: 210 de las 396 funciones** están escritas en El1xr, en C++: la cola de tareas (`XTaskQueue`, `XAsync`, `XThread`), el usuario (`XUser`, un perfil local sin conexión), la identidad de la Xbox Series X (`XSystem`, Title ID, analítica, funcionalidades del runtime), las partidas guardadas (`XGameSave`, `XGameSaveFiles`, `XPersistentLocalStorage`) el paquete del juego (`XPackage`), la tienda sin conexión (`XStore`) y las invitaciones, activaciones e informes de error sin conexión (`XGameInvite`, `XGameActivation`, `XGameProtocol`, `XError`), además del estado HDR real y la conectividad de red del PC (`XDisplayTryEnableHdrMode`, `XNetworkingGetConnectivityHint`). Se usan cuando El1xr gestiona el runtime por sí solo: sin Gaming Services, o con `ANYXBOXX_SYSTEM_RUNTIME=0`. Si el runtime GDK de Windows está presente, sirve todas las interfaces, incluida la cola de tareas, porque sus API solo aceptan sus propias colas. La traza (`ANYXBOXX_TRACE=1`) nombra cada interfaz solicitada.
-
-El gráfico se regenera con `scarlett.py --traduction <carpeta del paquete> docs/images/traduction.svg`.
-
-## Rendimiento (objetivo: 60 fotogramas por segundo constantes)
+Para el desarrollo, `tools/dev.py` agrupa los pasos habituales:
 
 ```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc-perf <jeu.exe> [secondes] [courbe.svg]
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <jeu.exe> --fps
+python tools/dev.py build      # compilación release
+python tools/dev.py gate       # todos los tests, falla ante cualquier aviso
+python tools/dev.py prewarm    # traduce todos los shaders sin conexión (unos 45 s)
+python tools/dev.py bench --quiet --seconds 200   # partida medida
+python tools/dev.py train --plan plan.toml        # una ejecución de un plan de lote
 ```
 
-El runtime en C++ cronometra cada `Present` de la swap chain DXGI del juego, incluso cuando una DLL del juego carga DXGI de forma dinámica (SDL3). De ahí obtiene los fotogramas por segundo, el tiempo medio de un fotograma y el «1 % bajo» (la cadencia del 1 % de fotogramas más lentos, que revela los tirones). `--fps` muestra estos valores en el título de la ventana. `--banc-perf` mide durante N segundos, sin contar el primero (carga), y emite un veredicto «60 f/s constantes» (código de salida 2 si no se alcanza el objetivo). Sin estas opciones, no se intercepta nada.
+## El proyecto en cifras
 
-![SimpleTriangle: fotogramas por segundo](../images/fps-simpletriangle.svg)
-
-![testgdk: fotogramas por segundo](../images/fps-testgdk.svg)
-
-Los dos juegos de prueba funcionan sin sincronización vertical: unos 11 700 f/s para SimpleTriangle y 12 600 f/s para testgdk, en modo nativo.
-
-## Avance del proyecto
-
-| Etapa | Estado |
+| Cifra | Qué |
 |---|---|
-| Lectura de `MicrosoftGame.Config` (TitleId, identidad, ejecutable Scarlett) | ✅ hecho |
-| Carga PE32+: secciones y protecciones, reubicaciones, importaciones, exportaciones | ✅ hecho |
-| TLS: copia de la plantilla, índice, callbacks | ✅ hecho |
-| TEB y PEB accesibles mediante el registro GS | ✅ hecho |
-| Página HLE: 158 nombres de funciones GDK, kernel, CRT y matemáticas emulados | ✅ hecho |
-| Funciones desconocidas: `E_NOTIMPL` y registro en el diario en lugar de un rechazo | ✅ hecho |
-| Constructores globales de C++ (`_initterm`) ejecutados como código invitado | ✅ hecho |
-| Informe de compatibilidad (`--rapport`) y banco de pruebas (`--banc`) | ✅ hecho |
-| Varios módulos enlazados en una misma máquina: DLL del paquete, ordinales, redirecciones, reubicación en caso de conflicto | ✅ hecho |
-| `GetModuleHandle`, `GetProcAddress`, `LoadLibrary`, `RtlPcToFileHeader` | ✅ hecho |
-| 16/16 DLL de un paquete Scarlett inicializadas con sus dependencias, 0 llamadas no emuladas | ✅ hecho |
-| Juego de prueba libre `SimpleTriangle` compilado: el arranque en C y la inicialización de GDK funcionan en El1xr | ✅ hecho |
-| Ejecución nativa al estilo Wine (`--natif`): **SimpleTriangle se muestra**, runtime GDK proporcionado por El1xr | ✅ hecho |
-| Segundo juego de prueba libre, `testgdk` de SDL3: **funciona en modo nativo** (ventana, sprites, sonido) | ✅ hecho |
-| Lanzamiento aislado de un paquete o de un exe (`--lancer`) con la lista de llamadas por emular | ✅ hecho |
-| Runtime C++ (`runtime/`): `xgameruntime.dll`, `xmem.dll`, `d3d12_xs.dll` precargadas en modo nativo, servidas a todas las DLL del juego | ✅ hecho |
-| `xmem.dll`: `XMemAlloc`, `XMemFree` con `XALLOC_ATTRIBUTES` decodificados (disposición ERA: memoria de montón y gráfica, alineación), ganchos, `XMemVirtualQuery` (indicador de memoria gráfica) | ✅ hecho |
-| `d3d12_xs.dll`: serialización de las firmas raíz, redirigida al D3D12 del PC | ✅ hecho |
-| Tabla de las 396 funciones GDK: interfaz y número de método, extraídos de `xgameruntime.lib` (`tools/gdk_interfaces.py`) | ✅ hecho |
-| `XTaskQueue`, `XAsync`, `XThread` servidas por El1xr: testgdk funciona sin el runtime de Windows | ✅ hecho |
-| Otras interfaces GDK: delegadas al runtime GDK de Windows, nombradas por la traza | 🟡 en curso |
-| 1700+ pruebas automatizadas | ✅ hecho |
-| D3D12.X: `D3D12XboxCreateDevice`, interfaces `ID3D12*` de la consola y `DXGIXPresentArray`, servidos por la `d3d12_xs.dll` en Rust de TomBox (MIT, 48 exportaciones implementadas, compilada con `tools/build_tombox.py d3d12_xs`, cargada con `ANYXBOXX_D3D12_XS=<ruta>`); no se puede probar aquí sin un ejecutable de consola | 🟡 en curso |
-| Bibliotecas de consola de TomBox (Rust, GPL-3.0) para lo que falta en El1xr: `xg_xs` (disposición de texturas, 23 exportaciones) y `xmem` completo (38 exportaciones), con `ANYXBOXX_TOMBOX_DIR=<carpeta>`; compiladas con `tools/build_tombox.py xg_xs xmem` | 🟡 en curso |
-| `XUser` sin conexión: perfil local siempre conectado, gamertag configurable (`ANYXBOXX_GAMERTAG`), inicio de sesión de testgdk correcto | ✅ hecho |
-| Identidad de la Xbox Series X: tipo de consola (valor de registro `ConsoleMode` simulado, también dentro de las DLL del juego), `XSystem`, Title ID leído de `MicrosoftGame.config`, analítica «Xbox Series X» | ✅ hecho |
-| Mapa del avance: una casilla por función (`--carte`) | ✅ hecho |
-| Mando (`GameInput`) y audio (`XAudio2`): la misma API en consola y en PC, enlazados con las DLL de Windows en modo nativo | ✅ hecho |
-| Informe Markdown de las importaciones que faltan por DLL y de las llamadas no emuladas (`--lancer … --md rapport.md`) | ✅ hecho |
-| Herramienta de primer arranque de un ejecutable de consola: inventario, proveedor de cada importación (paquete, El1xr, TomBox, Windows, ausente), ejecuciones aisladas, ejecución nativa opcional; informe fuera del repositorio: `python tools/jour_j.py <paquete> [--natif]` ([guía](../day-one.md), en francés) | ✅ hecho |
-| Contador de fotogramas (`--fps`) y banco de rendimiento con veredicto «60 f/s constantes» y curva (`--banc-perf`) | ✅ hecho |
-| Partidas guardadas `XGameSave` (contenedores, blobs, cuota, lectura asíncrona) y almacenamiento local persistente, en el disco del PC (`%LOCALAPPDATA%\AnyXboxX\<TitleId>`, o `ANYXBOXX_SAVE_DIR`) | ✅ hecho |
-| `XPackage`: paquete instalado en local (identificador, idioma, fragmentos listos, montaje sobre la carpeta del juego) | ✅ hecho |
-| `kernelx.dll` (núcleo de la consola): 2 661 funciones redirigidas a `kernel32`/`kernelbase` de Windows | ✅ hecho |
-| TLS implícito (`thread_local`) de los juegos en modo nativo: DLL portadora `anyxboxx_tls.dll`, cada hilo recibe su copia (hasta 256 KiB) | ✅ hecho |
-| Lanzador nativo en C++ sin Python (`runtime/build/bin/anyxboxx.exe <juego.exe \| carpeta> [--fps]`): SimpleTriangle y testgdk a ~12 000 i/s | ✅ hecho |
-| Desensamblador de GPU RDNA 2: 1.490 mnemónicos y operandos con sintaxis LLVM (escalares, VOP1/VOP2/VOPC/VOP3/VOP3P/SDWA/DPP/SMEM/DS/EXP/MUBUF/MTBUF/MIMG/FLAT con modificadores), verificado con 38.999 codificaciones públicas de LLVM: `scarlett.py --rdna2 <shader.bin> [--liste]` | 🟡 en curso |
-| Operandos del desensamblador RDNA 2 idénticos al texto de LLVM: escalares y VOP1/VOPC 100 %, DS 100 %, EXP 100 %, SMEM 96,5 % (el máximo: LLVM escribe las demás codificaciones de dos maneras) | ✅ hecho |
-| Primeros vertex y pixel shaders RDNA 2 dibujados con D3D12 (`anyxboxx_gpu_run.exe --draw`): cada vértice y cada píxel idénticos al intérprete de referencia, en la GPU y con WARP | ✅ hecho |
-| Texturas en los shaders RDNA 2 recompilados: descriptores T#/S# e `image_sample` (2D, texel más cercano, wrap o clamp-to-edge, 8_8_8_8_UNORM y 32_32_32_32_FLOAT), idénticos al intérprete de referencia en la GPU y con WARP, incluido un pixel shader texturizado; disposición de los descriptores de Leonida y Mesa | ✅ hecho |
-| Segundo traductor RDNA 2 → SPIR-V (Vulkan): el de Leonida (GPL-3.0), copiado sin cambios en `third_party/leonida/` y alimentado por el desensamblador propio de El1xr, sin `llvm-mc`; vertex, pixel y compute shaders; se traducen 51 de los 52 shaders de consola incluidos en `XboxBvhBuilder.dll` del paquete, medido localmente con `tools/fssm_mesure.py` (`scarlett.py --rdna2 <shader.bin> --spirv ps`) | 🟡 en curso |
-| TomBox actualizado a su última versión (D3D12.X: 194 de 200 métodos según su recuento) y 4 bibliotecas de consola más compiladas y servidas desde `ANYXBOXX_TOMBOX_DIR`: `d3d12_x` (ESRAM), `XAudio2_9` (voces XMA), `xapu`, `xgs12`; `tools/build_tombox.py d3d12_xs xg_xs xmem d3d12_x xaudio2_9 xapu xgs12` | 🟡 en curso |
-| Conversión del DXIL de consola en DXIL de PC (`dxil-ms-xb2` → `dxil-ms-dx`, sin pasar por HLSL): la herramienta de Xbox2Windows (MIT), copiada sin cambios con su prueba en `third_party/xbox2windows/`; `python third_party/xbox2windows/tools/dxil_retarget.py <entrada> <salida>` o `--pe <juego.exe>` | ✅ hecho |
-| Comprobaciones de las pull requests: lint y los 9 README sincronizados (filas, imágenes, número de pruebas) en cada pull request | ✅ hecho |
-| Texturas de consola en Rust: decodificación BC7 y desentrelazado GFX10 `SW_4K_S` portados de Xbox2Windows (MIT), resúmenes de referencia reproducidos; `anyxboxx_texture bc7 <bloques.bin> <an> <al> <salida.png> [--4k-s]` | 🟡 en curso |
-| Otras interfaces GDK escritas por El1xr (`XGameUi`, `XNetworking`…) | ⏳ pendiente |
-| Recompilador de shaders RDNA 2 → DXIL: primeros programas traducidos a HLSL, compilados a DXIL y ejecutados en la GPU del PC con D3D12 (`--hlsl`, `anyxboxx_gpu_run.exe`, WARP sin GPU), memoria idéntica a un intérprete de referencia wave32 que ejecuta 1.285 de 1.490 codificaciones (escalares, VOP1/VOP2/VOPC/VOP3/VOP3P, memoria: SMEM, LDS, GLOBAL, MUBUF/MTBUF con límites V# y formatos tipados, atómicas, saltos, divergencia con `exec`); un primer vertex shader y pixel shader (exportaciones EXP, interpolación VINTRP) dibujados con D3D12, idénticos vértice a vértice y píxel a píxel: `scarlett.py --rdna2 <shader.bin> --executer` | 🟡 en curso |
-| Programas de cómputo wave64 en GPU con waves de 32 carriles (#70): cada wave de 64 carriles se ejecuta como un grupo de 64 hilos (máscaras y lecturas de carril mediante memoria groupshared, sin `WaveSize`), memoria idéntica al intérprete de referencia en wave64 en una RTX (waves de 32 carriles) y con WARP; DPP y comparaciones SDWA siguen rechazadas por nombre | 🟡 en curso |
-| Caché de shaders: los shaders traducidos se compilan una vez a DXIL y luego se reutilizan desde disco (1,4 ms) o memoria (0,8 ms) en lugar de dxc (22 ms); `%LOCALAPPDATA%\AnyXboxX\shader-cache` o `ANYXBOXX_SHADER_CACHE`, tamaño limitado | 🟡 en curso |
-| La build Xbox Series 1.0.2.1 del título mediante VIctory (`third_party/victory`, código propio, sobre la base Neptune (VIctory Edit.) 2026-11-25c con el conjunto del 25 de noviembre): ~14 fps en el mundo (Series X, RTX 4070 SUPER), medido el 2026-11-25 (mediana de 13,8 fps, 15,6 a 17 fps en el último minuto, 72,5 ms por imagen); sin iluminación con trazado de rayos (en interiores una luz ambiental uniforme la sustituye), sin animación facial, objetos negros un instante mientras se cambian sus texturas | 🟡 en curso |
-| Excepciones SEH x64 (`.pdata`), múltiples hilos | ⏳ pendiente |
-| Carga dinámica de una DLL durante la ejecución (`LoadLibrary` + `DllMain`) | ⏳ pendiente |
-| Gráficos D3D12.X hacia Direct3D 12 / Vulkan | ⏳ pendiente |
-| Audio XMA2 de consola: decodificado a WAV por el port en Rust del decodificador de FFmpeg hecho por TomBox (LGPL, a 1 LSB de FFmpeg en la muestra pública de FATE); `anyxboxx_xma <entrada.xma> <salida.wav>`, archivos de un flujo | 🟡 en curso |
+| 1600+ pruebas automatizadas | herramientas de Python y crates de Rust, ejecutadas por `dev.py gate` |
+| 26.148 programas de shaders | traducidos de RDNA 2 a DXIL, en caché en disco |
+| 0 pipelines rechazados | en la RTX 5090 |
 
-<table>
-<tr>
-<td><img src="../images/demo-virage.png" alt="El coche gira hacia la derecha" width="380"></td>
-<td><img src="../images/rapport-compatibilite.png" alt="Informe de compatibilidad de la demo" width="380"></td>
-</tr>
-<tr>
-<td align="center">La demo responde a las flechas del teclado.</td>
-<td align="center">El diario muestra el informe de compatibilidad.</td>
-</tr>
-</table>
+## Historia
 
-## Probar la demo
-
-En Windows, instala Python 3.12 de 64 bits con Tcl/Tk y abre PowerShell en la raíz del repositorio.
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --demo
-```
-
-El modo nativo necesita el runtime C++. Se compila con Visual Studio 2022 o 2026 (carga de trabajo de C++) y CMake:
-
-```powershell
-cmake -S runtime -B runtime/build -A x64
-cmake --build runtime/build --config Release
-```
-
-La cola de tareas reutiliza el módulo `Task` de [libHttpClient](https://github.com/microsoft/libHttpClient) (licencia MIT, `runtime/third_party/libhttpclient-task`). Las DLL acaban en `runtime/build/bin`, o en la carpeta indicada por `ANYXBOXX_RUNTIME`. `ANYXBOXX_SYSTEM_RUNTIME=0` desactiva la delegación al runtime GDK de Windows.
-
-El programa de demostración compilado es `PrototypeScarlett/demo.pe`; su código fuente es `PrototypeScarlett/demo.c`.
-
-## Lanzar un juego en modo nativo
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --natif <dossier ou fichier .exe> [dossiers de DLL…]
-```
-
-![SimpleTriangle lanzado por El1xr en modo nativo](../images/simpletriangle-anyxboxx.png)
-
-El1xr carga el propio ejecutable y lo ejecuta directamente en el procesador, como Wine. El runtime de Xbox (`xgameruntime.dll`) lo proporciona El1xr; la ventana y DirectX 12 son los del PC. **Atención: en modo nativo, el programa no está aislado.** Reserva este modo para programas de confianza; `--rapport` y `--banc` siguen aislados dentro de Unicorn. `ANYXBOXX_TRACE=1` muestra las llamadas interceptadas. Detalles: [docs/test-game.md](../test-game.md).
-
-## Lanzar un paquete en modo aislado
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --lancer <dossier du paquet ou fichier .exe> [dossiers de DLL…]
-```
-
-Con una carpeta, El1xr lee `MicrosoftGame.Config`, toma el ejecutable declarado para `Scarlett` y lo lanza en la máquina aislada (Unicorn): el programa no toca el PC. El informe indica las importaciones sin resolver y después las llamadas no emuladas, de la más frecuente a la más rara: es la lista de trabajo para completar el emulador. Si falta el ejecutable, el mensaje lo nombra. Con `--md rapport.md`, el mismo informe se escribe en Markdown, con las importaciones que faltan agrupadas por DLL.
-
-## Analizar un programa
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --rapport <dossier ou fichier .exe>
-```
-
-El banco de pruebas carga todos los módulos PE de una carpeta y ejecuta su inicialización:
-
-```powershell
-.\.venv\Scripts\python.exe .\PrototypeScarlett\scarlett.py --banc <dossier>
-```
-
-![Banco de pruebas sobre las DLL de un paquete Scarlett](../images/banc-dll.svg)
-
-Resultados detallados: [docs/progress.md](../progress.md). Juego de prueba libre comparado con su ejecución nativa: [docs/test-game.md](../test-game.md). Una carpeta de DLL adicional (por ejemplo, las DLL de Visual C++) puede seguir al objetivo: `--rapport <cible> <dossier>`.
-
-El informe enumera las funciones importadas, el porcentaje ya emulado y las funciones que faltan. En la interfaz, el botón **Open an Xbox folder…** (Abrir una carpeta Xbox) lee `MicrosoftGame.Config`, muestra este informe y luego lanza el programa; cada llamada no emulada aparece en el diario.
-
-## Arquitectura
-
-![Esquema de los módulos de El1xr](../images/architecture.svg)
-
-| Módulo | Función |
-|---|---|
-| `emu/config.py` | lee el manifiesto del paquete GDK |
-| `emu/loader.py` | carga la imagen PE y prepara importaciones, exportaciones y TLS |
-| `emu/machine.py` | procesador Unicorn, pila, heap, TEB/PEB, despacho de llamadas |
-| `emu/hle/` | funciones emuladas: `gdk.py`, `kernel.py`, `crt.py`, `libm.py`, `guest.py` |
-| `emu/report.py` | informe de compatibilidad |
-| `emu/modules.py` | carga las DLL del paquete, enlaza las importaciones, ordena las inicializaciones |
-| `emu/bench.py` | banco de pruebas sobre una carpeta de módulos |
-| `emu/native/` | ejecución nativa al estilo Wine: cargador, importaciones reales, runtime GDK de El1xr |
-| `scarlett.py` | interfaz Tkinter y línea de comandos |
-
-Para añadir una función, decora un manejador en `emu/hle/`:
-
-```python
-@hle("gdk")
-def XSystemGetDeviceType(c):
-    return XBOX_SERIES_X
-```
-
-## Investigación
-
-- [Arquitectura de hardware de la Xbox Series X](../research/xbox-series-x-architecture.md): CPU Zen 2, GPU RDNA 2, memoria, Velocity Architecture, seguridad.
-- [Emuladores y capas de compatibilidad existentes](../research/state-of-the-art.md): WinDurango, XWine1, Xenia, herramientas XVD.
-- [Notas de ingeniería inversa del paquete Scarlett estudiado](../research/package/README.md) (escritas por Codex): tablas RDS5/ETPF, cabeceras RPF, organización del paquete.
-- [TomBox y su continuación](../research/tombox.md): DLL de consola en Rust, Direct3D 12.x, traductor de shaders RDNA 2, lo que El1xr reutiliza (MIT, citado).
-- [Xbox2Windows](../research/xbox2windows.md): investigación sobre recompilación estática; BC7 y mosaico GFX10 reutilizados por El1xr (MIT, citado).
-- [Primer arranque del ejecutable 1.0.2.1](../research/first-boot-1021.md): paradas medidas con `gta6rt` de Leonida en orden, las pull requests de Leonida que las tratan, lista de trabajos para El1xr.
-
-## Pruebas
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest
-```
+Cómo ha llegado el proyecto hasta aquí, desde las primeras DLL de consola cargadas en un emulador hasta los primeros fotogramas del mundo: [docs/history.md](../history.md).
 
 ## Contribuir
 
-La rama `main` está protegida: toda contribución pasa por una pull request revisada, y las pruebas deben pasar. Los errores y las funciones por emular se notifican en las issues. Las reglas completas están en [CONTRIBUTING.md](../../CONTRIBUTING.md).
-
-Debate, ayuda e informes de pruebas: [Discord](https://discord.gg/TcX42vRyPU)
+Las issues y las pull requests son bienvenidas. Ejecuta `python tools/dev.py gate` antes de abrir una pull request. Las normas están en [CONTRIBUTING.md](../../CONTRIBUTING.md). Debate e informes de pruebas: [Discord](https://discord.gg/TcX42vRyPU).
 
 ## Créditos
 
 - **El1xr**: Bone/Nevaa.
-- **VIctory**: Marvisak y sus colaboradores ([VIctory](https://github.com/Marvisak/VIctory), GPL-3.0 o posterior), y los autores de los forks a partir de los que se montó, entre ellos Neptune (VIctory Edit.) de Traffic & zm0kie.
+- **VIctory**: Marvisak y sus colaboradores ([VIctory](https://github.com/Marvisak/VIctory), GPL-3.0 o posterior), y los autores de los forks a partir de los que se ensambló, entre ellos Neptune (VIctory Edit.) de Traffic & zm0kie.
 - **AnyXboxX**: Looper_Salty y sus colaboradores ([AnyXboxX](https://github.com/LooperSalty/AnyXboxX)), el proyecto del que El1xr es un fork.
-- Todos los demás componentes y autores se acreditan en [THIRD_PARTY.md](../../THIRD_PARTY.md).
+- **Los forks de VIctory de los que hemos aprendido y portado código**, entre ellos fxceless/victory-fork, Peppacodes, Belobug, stellarr-studio/kelvaroq, uiliannn/VItoriaBr, DoubleGhosty/cool_fox, avatarmanz, 3cvil/M1LK, trustno1-coder, TaynanGT/Vice-Tay, Linox-IDK/LNX-victory y readmet3xt-lab/foxhound.
+- Cada componente y cada autor, cambio por cambio, se acredita en [THIRD_PARTY.md](../../THIRD_PARTY.md).
 
 ## Licencia
 
-El1xr se distribuye bajo la [GNU GPL 3.0 o posterior](../../LICENSE). Las partes de terceros conservan su licencia: el módulo `Task` de libHttpClient (MIT, `runtime/third_party/libhttpclient-task`) y las tablas RDNA 2 generadas a partir de las pruebas de codificación públicas de LLVM (Apache 2.0 con excepción LLVM, `PrototypeScarlett/emu/rdna2_ops.py` y `rdna2_shapes.py`).
-
-Componentes de terceros y créditos: [THIRD_PARTY.md](../../THIRD_PARTY.md).
+El1xr se distribuye bajo la [GNU GPL 3.0 o posterior](../../LICENSE). Las partes de terceros conservan su propia licencia: el módulo `Task` de libHttpClient (MIT, `runtime/third_party/libhttpclient-task`) y las tablas RDNA 2 generadas a partir de las pruebas públicas de codificación de LLVM (Apache 2.0 con excepción LLVM, `PrototypeScarlett/emu/rdna2_ops.py` y `rdna2_shapes.py`).
