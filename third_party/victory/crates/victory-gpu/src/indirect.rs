@@ -990,10 +990,20 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Held for the harness's life, dropped after its D3D12 objects:
+        /// the software adapter's device is one per process, and its
+        /// shader compiler crashed the test binary (access violation in
+        /// `d3d10warp!ShaderJIT`) when these tests dispatched on it at the
+        /// same time (#66).
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
+
+    /// One [`WarpHarness`] at a time.
+    static WARP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let serial = WARP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1032,6 +1042,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _serial: serial,
                 })
             }
         }

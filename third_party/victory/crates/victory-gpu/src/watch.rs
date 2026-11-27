@@ -5566,6 +5566,9 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // Stamps another test left on these addresses (freed without
+        // `before_virtual_free`) are not this allocation's writes (#66).
+        before_virtual_free(p, 4 * PAGE);
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
