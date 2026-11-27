@@ -1647,13 +1647,10 @@ impl State {
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_MEET {
-                    if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list) {
-                        // SAFETY: an open list; the buffer lives for the process.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, gpu);
-                            }
-                        }
+                    if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list)
+                        && compute
+                    {
+                        self.bind_resource(list, compute, param, RootResource::Uav(gpu));
                     }
                     continue;
                 }
