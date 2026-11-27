@@ -162,6 +162,8 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // The settings that can then change live (the in-game menu's).
+        crate::live_hooks::register(take && upscale_mode.is_some());
         // VICTORY_UPSCALE_LIVE_TEST (off without it): live upscale changes on a timer.
         victory_gpu::upscale_live::spawn_test_schedule(|s| {
             if let Err(why) = victory_loader::resolution::request_ffx_scale(s) {

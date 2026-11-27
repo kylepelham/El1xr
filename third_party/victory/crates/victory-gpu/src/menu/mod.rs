@@ -7,7 +7,9 @@
 //! text: it never touches the swap chain, the present path or any GPU state, so closed it costs
 //! one key poll every 30 ms, and F12 screenshots (taken from the back buffer) leave it out.
 //!
-//! It works on a [`model::MenuModel`]; round 1 runs on the demo model.
+//! It works on the settings registry (`victory_core::settings`) through [`model::Registry`]: tabs
+//! are the registry's groups, each row's LIVE / RESTART / REBUILD tag is `apply_of`, changes go
+//! through `settings::set`, and SAVE writes the settings file.
 
 pub mod input;
 pub mod layout;
@@ -143,6 +145,14 @@ impl Driver {
         }
     }
 
+    /// Lays the menu out for a `w` x `h` game picture.
+    pub fn layout(&mut self, w: i32, h: i32) -> layout::Layout {
+        let tabs = self.menu.tabs(&*self.model);
+        let rows = self.menu.rows(&*self.model).len();
+        let pending = !self.model.pending_restart().is_empty();
+        layout::layout(w, h, &mut self.menu, &tabs, rows, pending)
+    }
+
     /// Whether the title's input is blocked.
     pub fn blocked(&self) -> bool {
         self.menu.open || self.draining
@@ -201,11 +211,11 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::input::{PAD_A, PAD_B, PAD_DOWN as DOWN};
-    use super::model::DemoModel;
+    use super::model::{Registry, registry_lock};
     use super::*;
 
     fn driver() -> Driver {
-        Driver::new(Box::new(DemoModel::default()))
+        Driver::new(Box::new(Registry::default()))
     }
 
     #[test]
@@ -248,6 +258,7 @@ mod tests {
 
     #[test]
     fn pad_wheel_and_clicks_navigate() {
+        let _lock = registry_lock();
         let mut d = driver();
         d.tick(0, &[Key::Hotkey], 0, 0);
         d.tick(30, &[], DOWN, 0);
@@ -259,13 +270,17 @@ mod tests {
         assert!(d.click(Some(Hit::ValueRight(0))));
         assert_eq!(
             (d.menu.selected, d.model.get("VICTORY_UPSCALE").as_deref()),
-            (0, Some("dlss"))
+            (0, Some("stretch"))
         );
         assert!(d.click(Some(Hit::ValueLeft(0))));
         assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("off"));
         assert!(d.click(Some(Hit::Tab(state::Tab::Presets))));
         assert!(d.click(Some(Hit::ValueLeft(0))));
         assert_eq!(d.menu.status.as_deref(), Some("Quality preset applied"));
+        let undo = d.menu.rows(&*d.model).len() - 1;
+        assert!(d.click(Some(Hit::ValueLeft(undo))));
+        assert!(d.model.pending_restart().is_empty());
+        assert_eq!(d.model.get("VICTORY_UPSCALE"), d.model.launched("VICTORY_UPSCALE"));
         assert!(!d.click(None));
         assert!(d.click(Some(Hit::Close)));
         assert!(

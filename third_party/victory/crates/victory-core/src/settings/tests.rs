@@ -27,11 +27,10 @@ fn literals(dirs: &[&str]) -> BTreeSet<String> {
         rs_files(&victory_root().join(dir), &mut files);
     }
     let mut names = BTreeSet::new();
-    // Made-up names, not reads: this file's, and the menu's demo model.
+    // Made-up names, not reads: this file's.
     let skip = |f: &Path| {
         let f = f.to_string_lossy().replace('\\', "/");
         f.ends_with("victory-core/src/settings/tests.rs")
-            || f.ends_with("victory-gpu/src/menu/model.rs")
     };
     for file in files.into_iter().filter(|f| !skip(f)) {
         let text = std::fs::read_to_string(&file).unwrap_or_default();

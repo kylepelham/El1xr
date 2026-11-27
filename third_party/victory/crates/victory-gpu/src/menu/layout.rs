@@ -68,16 +68,26 @@ const SHADOW: f32 = 28.0;
 const PAD: f32 = 28.0;
 const HEADER_H: f32 = 76.0;
 const TABS_H: f32 = 46.0;
-const TAB_W: f32 = 158.0;
+/// A tab's width: its title's letters at about this many pixels each, plus padding.
+const TAB_LETTER_W: f32 = 8.6;
+const TAB_PAD_W: f32 = 26.0;
+const TAB_GAP: f32 = 4.0;
 const BANNER_H: f32 = 40.0;
 const FOOTER_H: f32 = 46.0;
 const ROW_H: f32 = 60.0;
 const VALUE_W: f32 = 236.0;
 const BADGE_W: f32 = 98.0;
 
-/// Lays the menu out for a `frame_w` x `frame_h` picture with `rows` rows in the current tab,
-/// and scrolls `menu` so its selected row is visible.
-pub fn layout(frame_w: i32, frame_h: i32, menu: &mut Menu, rows: usize, pending: bool) -> Layout {
+/// Lays the menu out for a `frame_w` x `frame_h` picture with `tabs` and `rows` rows in the
+/// current tab, and scrolls `menu` so its selected row is visible.
+pub fn layout(
+    frame_w: i32,
+    frame_h: i32,
+    menu: &mut Menu,
+    tabs: &[Tab],
+    rows: usize,
+    pending: bool,
+) -> Layout {
     let s = scale(frame_h);
     let px = |v: f32| (v * s).round() as i32;
     let shadow = px(SHADOW);
@@ -117,21 +127,27 @@ pub fn layout(frame_w: i32, frame_h: i32, menu: &mut Menu, rows: usize, pending:
         h: button,
     };
     let mut y = header.bottom();
-    let tab_list: Vec<Tab> = menu.tabs();
-    let (tab_w, tab_gap) = (px(TAB_W), px(6.0));
-    let tabs = tab_list
+    // Tabs as wide as their titles, narrowed together when they would not fit.
+    let wanted: Vec<f32> = tabs
         .iter()
-        .enumerate()
-        .map(|(i, &t)| {
-            (
-                t,
-                Rect {
-                    x: panel.x + pad + i as i32 * (tab_w + tab_gap),
-                    y,
-                    w: tab_w,
-                    h: px(TABS_H),
-                },
-            )
+        .map(|t| t.title().chars().count() as f32 * TAB_LETTER_W + TAB_PAD_W)
+        .collect();
+    let room = (w - 2 * pad) as f32 / s - TAB_GAP * tabs.len().saturating_sub(1) as f32;
+    let fit = (room / wanted.iter().sum::<f32>().max(1.0)).min(1.0);
+    let mut at = 0.0;
+    let tabs = tabs
+        .iter()
+        .zip(wanted)
+        .map(|(&t, want)| {
+            let x = panel.x + pad + px(at);
+            let r = Rect {
+                x,
+                y,
+                w: panel.x + pad + px(at + want * fit) - x,
+                h: px(TABS_H),
+            };
+            at += want * fit + TAB_GAP;
+            (t, r)
         })
         .collect();
     y += px(TABS_H) + px(10.0);
@@ -251,10 +267,15 @@ mod tests {
         }
     }
 
+    /// The tabs of the registry with the expert toggle on (the most there can be).
+    fn tabs() -> Vec<Tab> {
+        super::super::state::tabs(&super::super::model::Registry::default(), true)
+    }
+
     #[test]
     fn panel_scales_with_the_picture_and_fits() {
         for (fw, fh) in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
-            let l = layout(fw, fh, &mut open(), 6, true);
+            let l = layout(fw, fh, &mut open(), &tabs(), 6, true);
             assert!(l.window.w <= fw && l.window.h <= fh, "{fw}x{fh}");
             assert!(l.footer.y >= l.list.bottom());
             assert!(
@@ -263,20 +284,21 @@ mod tests {
                     .all(|(_, r)| r.right() <= l.expert.x || r.y >= l.expert.bottom())
             );
             let last = l.tabs.last().unwrap().1;
-            assert!(last.right() <= l.panel.right(), "{fw}x{fh}");
+            assert!(last.right() <= l.panel.right() - l.px(PAD), "{fw}x{fh}");
+            assert!(l.tabs.iter().all(|(t, r)| r.w >= l.px(t.title().len() as f32 * 7.0)), "{fw}x{fh}: titles fit");
             let row = l.rows[0].1;
             assert!(l.badge(row).x > row.x + row.w / 3, "label room");
         }
-        let small = layout(1920, 1080, &mut open(), 6, false);
-        let big = layout(3840, 2160, &mut open(), 6, false);
+        let small = layout(1920, 1080, &mut open(), &tabs(), 6, false);
+        let big = layout(3840, 2160, &mut open(), &tabs(), 6, false);
         assert_eq!(big.panel.w, small.panel.w * 2);
         assert_eq!(big.visible, small.visible);
     }
 
     #[test]
     fn banner_takes_room_from_the_list() {
-        let without = layout(1920, 1080, &mut open(), 30, false);
-        let with = layout(1920, 1080, &mut open(), 30, true);
+        let without = layout(1920, 1080, &mut open(), &tabs(), 30, false);
+        let with = layout(1920, 1080, &mut open(), &tabs(), 30, true);
         assert!(with.banner.is_some() && without.banner.is_none());
         assert!(with.list.y > without.list.y);
         assert!(with.visible <= without.visible);
@@ -288,7 +310,7 @@ mod tests {
             selected: 25,
             ..open()
         };
-        let l = layout(1920, 1080, &mut m, 30, false);
+        let l = layout(1920, 1080, &mut m, &tabs(), 30, false);
         assert_eq!(l.rows.last().unwrap().0, 25);
         assert_eq!(l.rows.len(), l.visible);
         assert_eq!(m.scroll, 26 - l.visible);
@@ -297,14 +319,14 @@ mod tests {
     #[test]
     fn hits() {
         let mut m = open();
-        let l = layout(1920, 1080, &mut m, 4, false);
+        let l = layout(1920, 1080, &mut m, &tabs(), 4, false);
         let centre = |r: Rect| (r.x + r.w / 2, r.y + r.h / 2);
         let (x, y) = centre(l.close);
         assert_eq!(l.hit(x, y), Some(Hit::Close));
         let (x, y) = centre(l.expert);
         assert_eq!(l.hit(x, y), Some(Hit::Expert));
         let (x, y) = centre(l.tabs[1].1);
-        assert_eq!(l.hit(x, y), Some(Hit::Tab(Tab::Performance)));
+        assert_eq!(l.hit(x, y), Some(Hit::Tab(Tab::Group("Submission"))));
         let row = l.rows[2].1;
         assert_eq!(l.hit(row.x + 5, row.y + 5), Some(Hit::Row(2)));
         let v = l.value(row);
