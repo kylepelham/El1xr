@@ -281,6 +281,7 @@ if (-not $NoTunedSettings) {
         VICTORY_SHARED_BUFFER_BLOCKS     = '1'         # batch 3: shared buffers from pooled blocks
         VICTORY_UPLOAD_BLOCKS            = '1'         # batch 3: uploads from pooled blocks
         VICTORY_GUARD_4K                 = '1'         # batch 3: 4 KiB guards, no crash, neutral
+        VICTORY_BAKE_INPUTS              = '1'         # batch 4: face/skin bakes get their own textures first (0 black faces in 24 diner snaps vs 0-3 per run)
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]
