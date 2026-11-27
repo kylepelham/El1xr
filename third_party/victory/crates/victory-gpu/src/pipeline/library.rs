@@ -49,7 +49,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::collections::HashSet;
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -58,7 +59,12 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.set(super::samplers::cache_dir(dir));
+}
+
+/// The folder of the library and the lists beside it, if one was given.
+pub(super) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -415,11 +421,56 @@ unsafe impl Sync for Library {}
 /// Held by a load of the pipeline named `name`: loads of the same name
 /// wait for each other (the host's one exception to the library's thread
 /// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
+/// locks, so two different names seldom wait. With
+/// `VICTORY_LIBRARY_NAME_LOCK=1` (fxceless #1442) only loads of the very
+/// same name wait ([`exact_name`]): two names on one of the 64 locks no
+/// longer wait for each other's driver call, which can take seconds.
+fn same_name(name: &str) -> NameLoad<'_> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_NAME_LOCK").is_some_and(|v| v == "1")) {
+        NameLoad::Exact(exact_name(name))
+    } else {
+        NameLoad::Striped(striped_name(name))
+    }
+}
+
+/// What [`same_name`] holds until the load is done.
+#[allow(dead_code)]
+enum NameLoad<'a> {
+    Striped(MutexGuard<'static, ()>),
+    Exact(ExactLoad<'a>),
+}
+
+/// One of 64 locks, by the name's hash.
+fn striped_name(name: &str) -> MutexGuard<'static, ()> {
     static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
     let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
     LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The names with a load running now ([`exact_name`]).
+static EXACT_LOADING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static EXACT_DONE: Condvar = Condvar::new();
+
+/// A load of the name it holds, in [`EXACT_LOADING`] until dropped.
+struct ExactLoad<'a>(&'a str);
+
+impl Drop for ExactLoad<'_> {
+    fn drop(&mut self) {
+        EXACT_LOADING.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        EXACT_DONE.notify_all();
+    }
+}
+
+/// Waits while a load of `name` runs, then marks it running; the set's
+/// lock is not held during the host's call.
+fn exact_name(name: &str) -> ExactLoad<'_> {
+    let loading = EXACT_LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut loading = EXACT_DONE
+        .wait_while(loading, |loading| loading.contains(name))
+        .unwrap_or_else(|e| e.into_inner());
+    loading.insert(name.to_owned());
+    ExactLoad(name)
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -444,6 +495,16 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            // A library filled before static samplers were made in a kept
+            // order (`super::samplers`) holds pipelines of any order: a
+            // pipeline loaded from it may sample with other samplers than
+            // its root signature names (fxceless issue #1459). It is let go once.
+            if let Some(d) = DIR.get()
+                && super::samplers::on()
+                && !super::samplers::listed_at_start(d)
+            {
+                unlisted(d);
+            }
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -452,6 +513,23 @@ fn library() -> Option<&'static Library> {
             library
         })
         .as_ref()
+}
+
+/// Removes the library in `dir`, and one a save left beside it: they were
+/// filled with no list of static samplers beside them.
+fn unlisted(dir: &std::path::Path) {
+    for name in [LIBRARY_FILE, NEXT_FILE] {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                file = name,
+                mb = meta.len() >> 20,
+                "the host pipeline library of before the static samplers' kept order is let go: its pipelines are made again"
+            ),
+            Err(e) => tracing::warn!(error = %e, file = name, "an old host pipeline library could not be removed; it is used as it is"),
+        }
+    }
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -486,6 +564,9 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    if prefetch_on() {
+                        prefetch(file.at.Value as usize, file.len);
+                    }
                 }
                 return Some(Library {
                     library,
@@ -509,6 +590,73 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
+}
+
+/// (avatarmanz #443) Whether the mapped library's file is read ahead of
+/// the loads, once, at its opening ([`prefetch`]). Off by default;
+/// `VICTORY_LIBRARY_PREFETCH=1`.
+fn prefetch_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PREFETCH").is_some_and(|v| v == "1"))
+}
+
+/// Free physical memory below which the read ahead stops.
+const PREFETCH_MIN_FREE: u64 = 6 << 30;
+/// Read ahead in parts of this size, between which the free memory is
+/// looked at again.
+const PREFETCH_PART: usize = 64 << 20;
+
+/// The next part to read ahead of `len` bytes, `done` of them read, with
+/// `free` bytes of physical memory free: `None` once all is read or memory
+/// is short.
+fn prefetch_part(done: usize, len: usize, free: Option<u64>) -> Option<usize> {
+    if done >= len || free.is_some_and(|f| f < PREFETCH_MIN_FREE) {
+        return None;
+    }
+    Some(PREFETCH_PART.min(len - done))
+}
+
+/// Reads the mapped library's file (`len` bytes at `at`) into memory on a
+/// thread of its own, in the background mode (lowest CPU, I/O and memory
+/// priority), before the early pipelines' loads fault its pages in one at a
+/// time. The pages go to Windows' file cache (standby, at low memory
+/// priority), not to the process's working set (`PrefetchVirtualMemory`,
+/// Remarks): a load then finds them there. It costs up to the file's size
+/// of the file cache, which Windows gives to whatever wants memory first,
+/// and a read of the whole file while the title loads; it stops when less
+/// than [`PREFETCH_MIN_FREE`] is free.
+fn prefetch(at: usize, len: usize) {
+    let work = move || {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        // SAFETY: a plain call on our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+        let began = std::time::Instant::now();
+        let mut done = 0usize;
+        let mut free = crate::host::available_physical_ram();
+        while let Some(part) = prefetch_part(done, len, free) {
+            let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: (at + done) as *mut _, NumberOfBytes: part };
+            // SAFETY: a range of the view, which lives as long as the
+            // library (never dropped).
+            if unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) } == 0 {
+                break;
+            }
+            done += part;
+            free = crate::host::available_physical_ram();
+        }
+        tracing::info!(
+            bytes = done,
+            of = len,
+            ms = began.elapsed().as_millis() as u64,
+            free_at_end = free,
+            "host pipeline library read ahead (VICTORY_LIBRARY_PREFETCH)"
+        );
+    };
+    if let Err(e) = std::thread::Builder::new().name("victory-library-prefetch".into()).spawn(work) {
+        tracing::warn!(error = %e, "no thread to read the host pipeline library ahead");
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -783,6 +931,65 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (avatarmanz #443) The read ahead goes in parts, the last one short,
+    /// and stops when memory is short (a free amount not known does not
+    /// stop it).
+    #[test]
+    fn the_read_ahead_goes_in_parts_while_memory_is_free() {
+        let plenty = Some(PREFETCH_MIN_FREE);
+        let len = 2 * PREFETCH_PART + 5;
+        assert_eq!(prefetch_part(0, len, plenty), Some(PREFETCH_PART));
+        assert_eq!(prefetch_part(PREFETCH_PART, len, None), Some(PREFETCH_PART));
+        assert_eq!(prefetch_part(2 * PREFETCH_PART, len, plenty), Some(5));
+        assert_eq!(prefetch_part(len, len, plenty), None);
+        assert_eq!(prefetch_part(0, len, Some(PREFETCH_MIN_FREE - 1)), None);
+        assert_eq!(prefetch_part(0, 0, plenty), None);
+    }
+
+    /// (fxceless #1442) Two names on one of the 64 striped locks do not
+    /// wait for each other with the exact-name lock.
+    #[test]
+    fn distinct_names_do_not_wait_with_the_exact_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // These two names fall on the same striped lock.
+        let (a, b) = ("00000000000000000000000000000000", "00000000000000000000000000000022");
+        let stripe = |n: &str| n.bytes().fold(0usize, |h, c| h.wrapping_mul(31).wrapping_add(usize::from(c))) % 64;
+        assert_eq!(stripe(a), stripe(b));
+        let first = exact_name(a);
+        let (loaded, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _second = exact_name(b);
+            loaded.send(()).unwrap();
+        });
+        let result = finished.recv_timeout(Duration::from_secs(2));
+        drop(first);
+        worker.join().unwrap();
+        assert!(result.is_ok(), "loading another name must not wait for the first");
+    }
+
+    /// A second load of the same name waits until the first is done.
+    #[test]
+    fn the_same_name_waits_with_the_exact_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        const NAME: &str = "11111111111111111111111111111111";
+        let first = exact_name(NAME);
+        let (trying, started) = mpsc::channel();
+        let (loaded, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            trying.send(()).unwrap();
+            let _second = exact_name(NAME);
+            loaded.send(()).unwrap();
+        });
+        started.recv().unwrap();
+        let result = finished.recv_timeout(Duration::from_millis(50));
+        drop(first);
+        worker.join().unwrap();
+        assert_eq!(result, Err(mpsc::RecvTimeoutError::Timeout));
+        finished.try_recv().unwrap();
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

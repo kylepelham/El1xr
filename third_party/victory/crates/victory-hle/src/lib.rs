@@ -11,6 +11,8 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+#[cfg(windows)]
+pub mod bvh_hook;
 mod host;
 pub mod modules;
 mod registry;

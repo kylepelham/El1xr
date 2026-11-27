@@ -711,6 +711,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "opus-pure",
  "tempfile",
  "tracing",

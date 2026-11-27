@@ -130,6 +130,65 @@ impl Queue {
         self.outstanding = self.outstanding.saturating_sub(ready.bytes);
         self.unhint(&ready.slots);
     }
+
+    /// [`take_ready`]'s look in the queue: the staging made ready for `key`
+    /// from mip `first` on, and what leaves the queue with the take (to be
+    /// dropped outside its lock). `serving`: the slot the pass serves now.
+    /// `by_table`: a take with no slot served (a draw's table) retires the
+    /// entry it took at once (`crate::texture::take_by_table`): the table of
+    /// staging buffers holds it from now on, and the pass finds it there.
+    fn take(
+        &mut self,
+        key: usize,
+        first: u32,
+        serving: Option<u32>,
+        by_table: bool,
+    ) -> Option<(Option<Arc<Staging>>, Vec<Ready>)> {
+        let all = self.ready.get_mut(&key)?;
+        let best = all
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.first <= first)
+            .max_by_key(|(_, r)| r.first)
+            .map(|(i, _)| i)?;
+        let staging = all[best].staging.clone();
+        // The slot served now waits for none of them any more.
+        let mut served = 0;
+        let mut table_slots = Vec::new();
+        if let Some(slot) = serving {
+            for ready in all.iter_mut() {
+                if let Some(at) = ready.slots.iter().position(|&s| s == slot) {
+                    ready.slots.swap_remove(at);
+                    served += 1;
+                }
+            }
+        } else if by_table {
+            table_slots = std::mem::take(&mut all[best].slots);
+        }
+        // What no slot waits for any more goes (taken now, or not needed).
+        let mut gone = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            if all[i].slots.is_empty() {
+                gone.push(all.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if all.is_empty() {
+            self.ready.remove(&key);
+        }
+        if let Some(slot) = serving {
+            for _ in 0..served {
+                self.unhint(&[slot]);
+            }
+        }
+        self.unhint(&table_slots);
+        for ready in &gone {
+            self.gone(ready);
+        }
+        Some((staging, gone))
+    }
 }
 
 static QUEUE: LazyLock<Mutex<Queue>> = LazyLock::new(Mutex::default);
@@ -233,6 +292,51 @@ pub(crate) fn look(
     budget: u64,
     frame: u64,
 ) -> Look {
+    look_in(slot, resource, first, recorded, budget, frame, false)
+}
+
+/// What the prepare threads hold for title texture `resource` from mip
+/// `first` on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Held {
+    /// Handed out, not made ready yet.
+    Pending,
+    /// Made ready, not taken yet.
+    Ready,
+    Nothing,
+}
+
+pub(crate) fn held(resource: This, first: u32) -> Held {
+    let q = queue();
+    if (0..=first).any(|f| q.pending.contains_key(&(resource as usize, f))) {
+        Held::Pending
+    } else if q
+        .ready
+        .get(&(resource as usize))
+        .is_some_and(|all| all.iter().any(|r| r.first <= first))
+    {
+        Held::Ready
+    } else {
+        Held::Nothing
+    }
+}
+
+/// [`look`] for a draw that binds the texture through a table now
+/// (`crate::table_defer`): handed out ahead of the texture pass's queue,
+/// and past the frame's bytes while what is out stays under twice `budget`.
+pub(crate) fn look_urgent(slot: u32, resource: This, first: u32, budget: u64, frame: u64) -> Look {
+    look_in(slot, resource, first, &HashSet::new(), budget, frame, true)
+}
+
+fn look_in(
+    slot: u32,
+    resource: This,
+    first: u32,
+    recorded: &HashSet<(usize, u32)>,
+    budget: u64,
+    frame: u64,
+    urgent: bool,
+) -> Look {
     if threads() == 0
         || !crate::resource::title_fills(resource)
         || crate::resource::host_refused(resource)
@@ -274,7 +378,7 @@ pub(crate) fn look(
         q.frame = frame;
         q.handed = 0;
     }
-    if q.handed >= budget || q.outstanding >= budget {
+    if over_budget(q.handed, q.outstanding, budget, urgent) {
         return Look::Full;
     }
     crate::resource::keep_alive(resource);
@@ -282,11 +386,16 @@ pub(crate) fn look(
     q.outstanding += bytes;
     q.pending.insert((resource as usize, first), vec![slot]);
     q.wait(slot);
-    q.jobs.push_back(Job {
+    let job = Job {
         resource: resource as usize,
         first,
         bytes,
-    });
+    };
+    if urgent {
+        q.jobs.push_front(job);
+    } else {
+        q.jobs.push_back(job);
+    }
     let start = threads().saturating_sub(q.started);
     q.started += start;
     drop(q);
@@ -295,6 +404,16 @@ pub(crate) fn look(
     }
     WORK.notify_one();
     Look::Handed(bytes)
+}
+
+/// Whether nothing more may be handed out: the frame's bytes or what is out
+/// reached `budget`; for an urgent look only what is out, against twice it.
+fn over_budget(handed: u64, outstanding: u64, budget: u64, urgent: bool) -> bool {
+    if urgent {
+        outstanding >= budget.saturating_mul(2)
+    } else {
+        handed >= budget || outstanding >= budget
+    }
 }
 
 fn start_thread() {
@@ -468,51 +587,12 @@ pub(crate) fn take_ready(resource: This, first: u32, on_demand: bool) -> Option<
     if threads() == 0 {
         return None;
     }
-    let (staging, gone) = {
-        let mut q = queue();
-        let key = resource as usize;
-        let all = q.ready.get_mut(&key)?;
-        let best = all
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.first <= first)
-            .max_by_key(|(_, r)| r.first)
-            .map(|(i, _)| i)?;
-        let staging = all[best].staging.clone();
-        // The slot served now waits for none of them any more.
-        let mut served = 0;
-        let serving = SERVING.get();
-        if let Some(slot) = serving {
-            for ready in all.iter_mut() {
-                if let Some(at) = ready.slots.iter().position(|&s| s == slot) {
-                    ready.slots.swap_remove(at);
-                    served += 1;
-                }
-            }
-        }
-        // What no slot waits for any more goes (taken now, or not needed).
-        let mut gone = Vec::new();
-        let mut i = 0;
-        while i < all.len() {
-            if all[i].slots.is_empty() {
-                gone.push(all.swap_remove(i));
-            } else {
-                i += 1;
-            }
-        }
-        if all.is_empty() {
-            q.ready.remove(&key);
-        }
-        if let Some(slot) = serving {
-            for _ in 0..served {
-                q.unhint(&[slot]);
-            }
-        }
-        for ready in &gone {
-            q.gone(ready);
-        }
-        (staging, gone)
-    };
+    let (staging, gone) = queue().take(
+        resource as usize,
+        first,
+        SERVING.get(),
+        crate::texture::take_by_table::on(),
+    )?;
     drop(gone);
     let staging = staging?;
     if staging.on_demand != on_demand {
@@ -637,6 +717,66 @@ pub(crate) fn census() -> [u64; 3] {
     ]
 }
 
+impl Queue {
+    /// (bootfast) Whether a texture of `resource` from mip `first` on may be
+    /// made ready ahead ([`make_ready_ahead`]): none is handed out for it
+    /// (from that mip or a larger one), and none made ready serves it.
+    fn free_ahead(&self, resource: usize, first: u32) -> bool {
+        !(0..=first).any(|f| self.pending.contains_key(&(resource, f)))
+            && !self
+                .ready
+                .get(&resource)
+                .is_some_and(|all| all.iter().any(|r| r.first <= first))
+    }
+
+    /// (bootfast) Files `ready`, which no slot waits for: the first
+    /// [`take_ready`] of its texture takes it, or [`prune`] lets it go.
+    fn put_ahead(&mut self, resource: usize, ready: Ready) {
+        self.ready.entry(resource).or_default().push(ready);
+    }
+}
+
+/// (bootfast, `VICTORY_BAKE_STAGE_AHEAD=1`) For a bake draw's pass, on one
+/// of `crate::bake_ahead`'s threads: makes title texture `resource` ready
+/// from mip `first` on as a prepare thread does ([`work`]: host copy while
+/// the card has room, staging buffer, the title's memory detiled into it),
+/// and files it for the pass, whose `staging` takes it ([`take_ready`]) and
+/// records its upload in the list before the draw, as before. Nothing is
+/// handed out, so no slot waits for it and the pass never passes a slot
+/// over for it. Needs the prepare threads' table
+/// (`VICTORY_TEXTURE_PREPARE_THREADS`): without it, `false` and nothing
+/// done. The bytes of the staging buffer made ready, if one was.
+pub(crate) fn make_ready_ahead(resource: This, first: u32) -> Option<u64> {
+    if threads() == 0 || !queue().free_ahead(resource as usize, first) {
+        return None;
+    }
+    let job = Job {
+        resource: resource as usize,
+        first,
+        bytes: 0,
+    };
+    let Outcome::Done(Some(staging)) = work(&job) else {
+        return None;
+    };
+    let bytes = staging.bytes;
+    let ready = Ready {
+        first: staging.first,
+        staging: Some(staging),
+        bytes: 0,
+        at: crate::host::moment(),
+        slots: Vec::new(),
+    };
+    let mut q = queue();
+    if !q.free_ahead(job.resource, first) {
+        // A pass handed it out meanwhile: its thread makes it ready.
+        drop(q);
+        drop(ready);
+        return None;
+    }
+    q.put_ahead(job.resource, ready);
+    Some(bytes)
+}
+
 /// Until nothing is handed out and not done, at most `most`: whether that
 /// came (tests).
 #[cfg(test)]
@@ -679,6 +819,114 @@ mod tests {
         assert_eq!(ready_count, 2);
         assert_eq!(skipped, 2);
         assert_eq!(due, [(3, 12), (5, 14), (1, 10)]);
+    }
+
+    fn ready(q: &mut Queue, key: usize, first: u32, bytes: u64, slots: &[u32]) {
+        q.outstanding += bytes;
+        q.hint(slots);
+        q.ready.entry(key).or_default().push(Ready {
+            staging: None,
+            first,
+            bytes,
+            at: 0,
+            slots: slots.to_vec(),
+        });
+    }
+
+    /// A take by a draw's table (no slot served) leaves the entry in the
+    /// queue, its bytes out, until the prune: as before, with the switch off.
+    #[test]
+    fn a_table_take_keeps_the_entry_with_the_switch_off() {
+        let mut q = Queue::default();
+        ready(&mut q, 9, 0, 100, &[7]);
+        let (_, gone) = q.take(9, 0, None, false).unwrap();
+        assert!(gone.is_empty());
+        assert_eq!(q.outstanding, 100);
+        assert!(q.ready_slots.contains_key(&7));
+    }
+
+    /// With it on, the take retires the entry: its bytes and its slot's
+    /// hint leave at once; other entries of the texture stay.
+    #[test]
+    fn a_table_take_retires_the_entry_with_the_switch_on() {
+        let mut q = Queue::default();
+        ready(&mut q, 9, 0, 100, &[7]);
+        ready(&mut q, 9, 2, 30, &[8]);
+        let (_, gone) = q.take(9, 1, None, true).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].first, 0);
+        assert_eq!(q.outstanding, 30);
+        assert!(!q.ready_slots.contains_key(&7));
+        assert!(q.ready_slots.contains_key(&8));
+        assert_eq!(q.ready[&9].len(), 1);
+    }
+
+    /// A take that serves a slot is the same either way: only that slot.
+    #[test]
+    fn a_served_take_is_unchanged_by_the_switch() {
+        for by_table in [false, true] {
+            let mut q = Queue::default();
+            ready(&mut q, 9, 0, 100, &[7, 8]);
+            let (_, gone) = q.take(9, 0, Some(7), by_table).unwrap();
+            assert!(gone.is_empty());
+            assert_eq!(q.outstanding, 100);
+            assert!(!q.ready_slots.contains_key(&7));
+            assert!(q.ready_slots.contains_key(&8));
+            let (_, gone) = q.take(9, 0, Some(8), by_table).unwrap();
+            assert_eq!(gone.len(), 1);
+            assert_eq!(q.outstanding, 0);
+            assert!(q.ready.is_empty());
+        }
+    }
+
+    /// Nothing for the texture, or nothing from that mip on: no take.
+    #[test]
+    fn no_take_without_a_ready_entry_that_serves() {
+        let mut q = Queue::default();
+        assert!(q.take(9, 0, None, true).is_none());
+        ready(&mut q, 9, 3, 10, &[1]);
+        assert!(q.take(9, 2, None, true).is_none());
+        assert_eq!(q.outstanding, 10);
+    }
+
+    /// An urgent look (a table's texture) ignores the frame's bytes and is
+    /// held only by what is out, at twice the budget.
+    #[test]
+    fn urgent_looks_pass_the_frame_budget_but_not_twice_the_outstanding() {
+        assert!(over_budget(100, 0, 100, false));
+        assert!(over_budget(0, 100, 100, false));
+        assert!(!over_budget(99, 99, 100, false));
+        assert!(!over_budget(500, 199, 100, true));
+        assert!(over_budget(0, 200, 100, true));
+    }
+
+    /// (bootfast) A texture is made ready ahead only when nothing is handed
+    /// out for it from that mip or a larger one, and nothing made ready
+    /// serves it; what is filed ahead serves the mip it was made from on.
+    #[test]
+    fn ready_ahead_only_when_nothing_serves_it() {
+        let mut q = Queue::default();
+        assert!(q.free_ahead(7, 2));
+        q.pending.insert((7, 1), vec![3]);
+        assert!(!q.free_ahead(7, 2));
+        assert!(q.free_ahead(7, 0));
+        assert!(q.free_ahead(8, 2));
+        q.put_ahead(
+            8,
+            Ready {
+                staging: None,
+                first: 1,
+                bytes: 0,
+                at: 0,
+                slots: Vec::new(),
+            },
+        );
+        assert!(!q.free_ahead(8, 1));
+        assert!(!q.free_ahead(8, 3));
+        assert!(q.free_ahead(8, 0));
+        // Filed ahead, it is no slot's: nothing is hinted to the pass.
+        assert!(q.ready_slots.is_empty());
+        assert_eq!(q.outstanding, 0);
     }
 
     /// The switch is off unless set: the pass makes its textures itself.

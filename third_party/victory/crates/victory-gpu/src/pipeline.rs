@@ -556,6 +556,38 @@ pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
     pipeline(this).pre_pass
 }
 
+/// For a program that walks the ray-tracing structures (`RayOnly::Trace`,
+/// `RayOnly::VBuffer`): whether it is a `CS_RaytraceVBuffer*`, whether it
+/// is the glass one ([`GLASS_TRACE`]), and the buffer views it reads from
+/// tables as (root parameter, dword in the table) (`crate::rt_bind`).
+/// `None` for any other program.
+#[cfg(windows)]
+pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32)>)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let vbuffer = match p.rt_only {
+        RayOnly::VBuffer => true,
+        RayOnly::Trace => false,
+        _ => return None,
+    };
+    let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
+    let views = shader
+        .translated()?
+        .used
+        .iter()
+        .filter(|u| u.kind == victory_shader::ResourceType::Srv && u.root == victory_shader::RootType::Table && u.dwords == 4)
+        .map(|u| (u.slot, u.table_offset_dwords))
+        .collect();
+    Some((vbuffer, shader.hash.starts_with(GLASS_TRACE), views))
+}
+
+/// `CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar`: the trace
+/// the alpha pass (the window glass) runs.
+#[cfg(windows)]
+pub(crate) const GLASS_TRACE: &str = "6d7fe7745ab9c6d8";
+
 /// [`ray_pre_pass`] of a compute program's container.
 #[cfg(windows)]
 fn pre_pass_of(bytes: &[u8]) -> Option<bool> {
@@ -751,8 +783,8 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
 }
 
 /// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// pixel 4567..]` (diagnostics, `crate::drop_why`); "no pipeline" for none.
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".to_owned();
@@ -1017,6 +1049,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    translate_ahead::ahead(&shaders);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -1241,7 +1275,11 @@ mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+pub(crate) mod samplers;
+#[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod translate_ahead;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
