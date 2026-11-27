@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+pub(crate) mod alias_skip;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
@@ -260,6 +261,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     }
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
+    let predicate = alias_skip::on()
+        .then(|| crate::resource::host_copy(placed).zip(crate::resource::host_copy(source)))
+        .flatten()
+        .and_then(|(p, s)| {
+            let always = crate::resource::host_tiled(placed).is_some()
+                || crate::resource::host_tiled(source).is_some();
+            alias_skip::predicate(list, &p, &s, always)
+        });
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -273,7 +282,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     let Some(buffer) = &through.buffer else {
-        reinterpret::record(&list.list, from, to, through.parts.len());
+        alias_skip::under(&list.list, predicate.as_ref(), || {
+            reinterpret::record(&list.list, from, to, through.parts.len());
+        });
         return restore(list, source, before);
     };
     let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -291,7 +302,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     );
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
-    unsafe {
+    alias_skip::under(&list.list, predicate.as_ref(), || unsafe {
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
@@ -306,7 +317,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, read, common)]);
-    }
+    });
     list.keep(buffer);
     restore(list, source, before)
 }
@@ -788,6 +799,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     {
         return;
     }
+    alias_skip::uploaded(list, resource);
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
