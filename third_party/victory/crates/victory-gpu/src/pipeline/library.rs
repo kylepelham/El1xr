@@ -386,7 +386,10 @@ pub(crate) fn trim() {
         TRIMMED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
         crate::host::trail(|| format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)"));
     };
-    if std::thread::Builder::new().name("victory-library-trim".into()).spawn(work).is_err() {
+    if std::thread::Builder::new().name("victory-library-trim".into()).spawn(move || {
+        crate::topology::pin_background("victory-library-trim");
+        work();
+    }).is_err() {
         TRIMMED.store(false, Ordering::Relaxed);
     }
 }

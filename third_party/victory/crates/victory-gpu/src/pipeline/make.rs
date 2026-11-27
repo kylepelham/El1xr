@@ -684,6 +684,7 @@ fn workers() -> bool {
                 // address space; committed only as used).
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn(|| {
+                    crate::topology::pin_background("victory-pipelines");
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -790,6 +791,7 @@ fn save_library_async() {
                 }
             }
             let _guard = Guard;
+            crate::topology::pin_background("victory-library-save");
             // Below both title threads and pipeline compile workers.
             // SAFETY: a plain call on our own thread.
             unsafe {
