@@ -57,7 +57,7 @@ thread_local! {
 /// in every run. (The idea is fork pull request #994's, which asks a host
 /// word at run time; here it is a translation, since the builder's state
 /// does not change during a run of ours.)
-fn no_hit() -> bool {
+pub(in crate::emit) fn no_hit() -> bool {
     #[cfg(test)]
     if TEST_NO_HIT.get() {
         return true;

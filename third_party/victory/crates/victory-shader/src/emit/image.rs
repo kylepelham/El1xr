@@ -282,6 +282,13 @@ impl Lower<'_> {
                     }
                 })
                 .collect();
+            let mut vals = vals;
+            if let Some(s) = crate::emit::miss_sky::scale_at(inst.machine.offset) {
+                let k = self.s.m.f32(s.to_bits());
+                for v in &mut vals[..3] {
+                    *v = self.s.m.bin(self.cur, Bin::Mul, *v, k);
+                }
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
