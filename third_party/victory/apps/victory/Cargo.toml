@@ -23,6 +23,7 @@ walkdir.workspace = true
 tracing.workspace = true
 
 [features]
+default = ["mimalloc"]
 # NVIDIA DLSS for the title's upscale (`VICTORY_UPSCALE=dlss`); needs `VICTORY_DLSS_SDK`.
 dlss = ["victory-gpu/dlss"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
@@ -33,6 +34,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Rust allocations through mimalloc instead of the process heap the title and
+# the drivers share (VICTORY_ALLOC=system goes back for a run).
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true
