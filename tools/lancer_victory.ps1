@@ -243,6 +243,26 @@ if (-not $NoTunedSettings) {
         VICTORY_PORT_CBV                 = '1'         # bind 16-byte-aligned table CBVs in-place as raw SRVs (skips ~22k scratch copies/frame)
         VICTORY_DIRTY_4K                 = '1'         # narrow write-watched copy spans to dirty 4 KiB subpages (-45% copy bytes)
         VICTORY_PORT_GUARD               = '1'         # concurrent guard lock (GUARDS.read + per-block claims)
+        VICTORY_STAGING_UNLOCKED         = '1'         # batch 1: staging buffers built outside the global lock
+        VICTORY_PREPARE_TAKE_BY_TABLE    = '1'         # batch 1: a table's take frees the prepare entry at once
+        VICTORY_SHADOW_ALLOC_OUTSIDE     = '1'         # batch 1: buffer copies made outside the table lock (Vice-Tay #199)
+        VICTORY_LOOSE_ALLOC_OUTSIDE      = '1'         # batch 1: loose copies made outside the table lock (Vice-Tay #238)
+        VICTORY_SHADOW_READ_LOCKS        = '1'         # batch 1: read-only table walks take read locks (Vice-Tay #238)
+        VICTORY_TABLED_ALL               = '1'         # batch 1: every slot of a bound table marked (fxceless #1414)
+        VICTORY_LIST_VIEWS               = '1'         # batch 1: a fresh table's views made once per list (cool_fox)
+        VICTORY_BAKE_PARALLEL            = '8'         # batch 1: bake textures created on 8 threads
+        VICTORY_BAKE_STAGE_AHEAD         = '1'         # batch 1: bake textures fully prepared ahead
+        VICTORY_TRANSLATE_AHEAD          = '4'         # batch 1: shaders translated when the title creates the pipeline
+        VICTORY_LIBRARY_NAME_LOCK        = '1'         # batch 1: pipeline library loads lock per name (fxceless #1442)
+        VICTORY_LIBRARY_PREFETCH         = '1'         # batch 1: pipeline library read ahead (avatarmanz #443)
+        VICTORY_MAP_LEAN                 = '1'         # batch 1: map straight into freed space
+        VICTORY_STREAM_PRIORITY          = '1'         # batch 1: title streaming thread above normal (cool_fox)
+        VICTORY_REMAP_KEEP               = '1'         # batch 1: a failed remap keeps the old pages (fxceless #1460)
+        VICTORY_BUFFER_AHEAD             = '1'         # batch 1: heap-buffers pass makes its host copies ahead
+        VICTORY_PRELUDE_RECHECK          = '1'         # batch 1: no stale prelude upload over a baked texture (trustno1 #33)
+        VICTORY_SAMPLER_ORDER            = '1'         # batch 1: static samplers in a fixed order (fxceless #1461)
+        VICTORY_ALIAS_AFTER_UPLOAD       = '1'         # batch 1: GPU-written texture copy kept after a CPU upload (Vice-Tay #141)
+        VICTORY_PREFILL_RETRY            = '1'         # batch 1: cached mips kept when upload room runs out (Vice-Tay)
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]
