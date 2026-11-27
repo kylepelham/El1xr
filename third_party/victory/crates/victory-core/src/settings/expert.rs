@@ -116,6 +116,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_FSR_FG_DIR", Apply::Restart),
     ("VICTORY_FULL_CARD_PASS", Apply::Restart),
     ("VICTORY_GAMEPLAY_TEXTURES_MS", Apply::Restart),
+    ("VICTORY_GPU_COST_SLOW_MS", Apply::Restart),
     ("VICTORY_GPU_TIMING", Apply::Restart),
     ("VICTORY_GROUP_SYNC", Apply::Retranslate),
     ("VICTORY_GUARD_ASK", Apply::Restart),
