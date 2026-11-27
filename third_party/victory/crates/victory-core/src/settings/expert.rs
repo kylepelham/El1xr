@@ -317,6 +317,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_UNWIND_CHECKS", Apply::Restart),
     ("VICTORY_UPSCALE_PROBE", Apply::Restart),
     ("VICTORY_VCACHE_PIN", Apply::Restart),
+    ("VICTORY_VIEW_AGES", Apply::Restart),
     ("VICTORY_VIEW_ASK", Apply::Restart),
     ("VICTORY_VIEW_EXTENT", Apply::Restart),
     ("VICTORY_VIEW_GUARD", Apply::Restart),
