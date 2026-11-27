@@ -48,7 +48,8 @@ def warning(before: int | None, after: int | None) -> str:
         return f"WARNING: the GPU driver reset {after - before} time(s) during this run ({after} since boot)."
     if after > 0:
         return (
-            f"WARNING: the GPU driver has reset {after} time(s) since boot; runs on this boot are "
-            "unreliable (hangs regardless of code). Tell the coordinator: the PC needs a reboot."
+            f"NOTE: the GPU driver has reset {after} time(s) since boot. One isolated reset is survivable; "
+            "if this run or the next one hangs (device removed) or crawls under 5 fps settled, stop game runs "
+            "and tell the coordinator: the PC needs a reboot."
         )
     return ""
