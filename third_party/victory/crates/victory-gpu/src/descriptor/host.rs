@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod flicker;
 mod list_views;
 mod slot_wait;
 pub(crate) use list_views::on as list_views;
@@ -2375,6 +2376,7 @@ impl HostHeap {
             return 0;
         }
         slot_wait::drain();
+        self.stale_due();
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
@@ -3518,7 +3520,7 @@ impl HostHeap {
                 batch.as_mut().map(|b| &mut **b),
             );
             for stale in stale {
-                if stale != index {
+                if stale != index && !self.stale_kept(made, stale) {
                     self.unmake(made, stale);
                 }
             }
@@ -3601,6 +3603,9 @@ impl HostHeap {
                     None => {
                         if !self.sampler {
                             null_for(&view, self.cpu(index));
+                            if shows_texture(&view) {
+                                flicker::count(flicker::Count::Unmade);
+                            }
                         }
                         self.keep(index, None);
                     }
@@ -4811,7 +4816,9 @@ pub(crate) fn make(
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
                 // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
+                let first_shown = crate::resource::first_shown(resource);
+                flicker::made_view(&copy, first_shown);
+                if let Some(first) = first_shown
                     && first > 0
                 {
                     // SAFETY: a live resource.
