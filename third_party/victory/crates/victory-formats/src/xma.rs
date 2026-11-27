@@ -151,8 +151,7 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut end = end;
     if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) {
         // The next frame begins in the next packet of this stream.
-        let next =
-            (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
         let header = packet(data, next)?;
         end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
     }
@@ -249,20 +248,10 @@ fn codes() -> &'static Codes {
             scale: pairs(&SCALE, -60),
             scale_rl: pairs(&SCALE_RL, 0),
             coef: [
-                Vlc::new(
-                    COEF0_SYMS
-                        .iter()
-                        .zip(COEF0_LENS)
-                        .map(|(&s, l)| (s as i32, l)),
-                ),
+                Vlc::new(COEF0_SYMS.iter().zip(COEF0_LENS).map(|(&s, l)| (s as i32, l))),
                 pairs(&COEF1, 0),
             ],
-            vec4: Vlc::new(
-                VEC4_SYMS
-                    .iter()
-                    .zip(VEC4_LENS)
-                    .map(|(&s, l)| (s as i32 - 1, l)),
-            ),
+            vec4: Vlc::new(VEC4_SYMS.iter().zip(VEC4_LENS).map(|(&s, l)| (s as i32 - 1, l))),
             vec2: pairs(&VEC2, -1),
             vec1: pairs(&VEC1, 0),
         }
@@ -771,11 +760,7 @@ impl Decoder {
             ch.scale_factors = target;
             if ch.reuse_sf {
                 let from = ch.saved_scale_factors[ch.scale_factor_idx];
-                for (sf, &offset) in ch.saved_scale_factors[target]
-                    .iter_mut()
-                    .zip(&sf_offsets)
-                    .take(self.num_bands)
-                {
+                for (sf, &offset) in ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands) {
                     *sf = from[offset];
                 }
             }
@@ -908,11 +893,7 @@ impl Decoder {
                     }
                     quant += 31;
                 }
-                quant_step += if negative {
-                    -(quant + step)
-                } else {
-                    quant + step
-                };
+                quant_step += if negative { -(quant + step) } else { quant + step };
             }
             if self.channels_for_cur_subframe == 1 {
                 self.ch[self.channel_indexes[0]].quant_step = quant_step;
@@ -955,21 +936,13 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp =
-                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
                     let quant = 10f32.powf(exp as f32 / 20.0);
-                    for (t, &c) in tmp[sfb[band]..end]
-                        .iter_mut()
-                        .zip(&ch.coeffs[sfb[band]..end])
-                    {
+                    for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
                     }
                 }
-                imdct_half(
-                    &tmp[..subframe_len],
-                    &mut ch.out[at..at + subframe_len],
-                    scale,
-                );
+                imdct_half(&tmp[..subframe_len], &mut ch.out[at..at + subframe_len], scale);
             }
         } else {
             for i in 0..self.channels_for_cur_subframe {
@@ -986,10 +959,7 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(
-                &mut ch.out[start..start + winlen],
-                &windows()[log2(winlen) as usize - 7],
-            );
+            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
             ch.prev_block_len = subframe_len;
         }
 
@@ -1153,12 +1123,7 @@ mod tests {
             }
         }
         for i in n..5 * n {
-            assert!(
-                (out[i] - signal[i]).abs() < 1e-3,
-                "{i}: {} vs {}",
-                out[i],
-                signal[i]
-            );
+            assert!((out[i] - signal[i]).abs() < 1e-3, "{i}: {} vs {}", out[i], signal[i]);
         }
     }
 

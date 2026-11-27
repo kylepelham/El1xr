@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The title texture's shape, for `crate::texstore`.
+    shape: crate::texstore::Shape,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a list's prelude last
@@ -891,7 +893,20 @@ impl PreludeUpload {
 
     /// Records `CopyTextureRegion` onto `cmd_list` (the prelude command list).
     /// `self.copy.texture` must already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
-    pub(crate) fn record(&self, _host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+    pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+        // A host copy made whole from the store (`crate::texstore`): its larger
+        // levels, once, before the ones from title memory.
+        let prefill = self
+            .copy
+            .prefill
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((levels, bytes)) = prefill
+            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
+        {
+            crate::descriptor::host::levels_changed(self.staging.memory as u64);
+        }
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
@@ -916,6 +931,75 @@ impl PreludeUpload {
             unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
     }
+}
+
+/// Records copies of levels `0..levels` of `copy` (in the copy destination
+/// state) from `bytes`, laid out as the host lays out those subresources;
+/// its views show them from then on.
+fn prefill_levels(
+    host_list: &HostList,
+    cmd_list: &ID3D12GraphicsCommandList,
+    copy: &crate::resource::HostTexture,
+    levels: u32,
+    bytes: &[u8],
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else {
+        return false;
+    };
+    let texture = &copy.texture;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
+        return false;
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `levels` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            levels,
+            0,
+            Some(footprints.as_mut_ptr()),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    if total as usize > bytes.len() {
+        return false;
+    }
+    let Some((buffer, data)) = host.upload_buffer(total) else {
+        return false;
+    };
+    // SAFETY: the mapping holds `total` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
+    host_list.keep(&buffer);
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: an open prelude list; both locations name live resources.
+        unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    copy.prefilled.store(levels, Relaxed);
+    crate::texstore::PREFILLED.fetch_add(1, Relaxed);
+    true
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1239,15 +1323,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, clean)) = waited(1, || {
-            crate::watch::with_writes(start, start + size, false, |now, written| {
-                (
-                    now,
-                    last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked),
-                )
-            })
-        }) {
-            if clean {
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
+        {
+            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -1278,14 +1356,8 @@ impl Staging {
         // another on the screen).
         let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, unwritten)) = waited(1, || {
-                crate::watch::with_writes(start, start + size, true, |now, written| {
-                    (
-                        now,
-                        last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked),
-                    )
-                })
-            })
+            && let Some((now, written)) =
+                waited(1, || crate::watch::writes(start, start + size, true))
         {
             // (Neptune) `VICTORY_TEXTURE_HASH_EVERY=<frames>` (8): how often a guarded texture is
             // hashed all the same. The hash is for a write the guards did not see; they see
@@ -1299,6 +1371,7 @@ impl Staging {
                     .unwrap_or(8)
                     .max(1)
             });
+            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
@@ -1382,6 +1455,7 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
+                self.keep_whole(tiled, Some(hash));
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1401,6 +1475,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        self.keep_whole(tiled, Some(hash));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1439,31 +1514,46 @@ impl Staging {
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// is not there at this moment. When the staging buffer has never been
+    /// filled (`last.hash.is_none()`), falls back to [`crate::host::copy_mapped`]
+    /// so a partly mapped texture still gets its mapped pages detiled instead
+    /// of staying all zeros; otherwise nothing is taken and the texture is
+    /// looked at again at its next refresh. Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
+        refresh_unlocked_with(self.memory, last, size, |bytes, whole, hash| {
+            self.detile(bytes);
+            if whole {
+                self.keep_whole(bytes, Some(hash));
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
+        })
+    }
+
+    /// `tiled`, read whole, was detiled: a texture of all its levels from
+    /// level 0 is given to the store (`crate::texstore`); detiling, digests
+    /// and disk writes run on the store's own thread.
+    fn keep_whole(&self, tiled: &[u8], hash: Option<blake3::Hash>) {
+        if !crate::texstore::on()
+            || self.first != 0
+            || self.on_demand
+            || self.layout.slices != 1
+            || tiled.len() as u64 != self.layout.size
+            || self.footprints.len() != self.mips as usize
+        {
+            return;
         }
+        let parts: Vec<(u64, u32, u32)> = self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .map(|(f, &rows)| (f.Offset, f.Footprint.RowPitch, rows * f.Footprint.Depth))
+            .collect();
+        crate::texstore::keep(
+            self.shape,
+            &self.layout,
+            tiled,
+            parts,
+            hash.map(crate::texstore::digest_hash),
+        );
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1601,6 +1691,48 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let mut first = [0u8; 8];
         first.copy_from_slice(&hash.as_bytes()[..8]);
         // 0 says "none" to the texture queue (`Recheck`, `checked`).
+        u64::from_le_bytes(first) | 1
+    })
+}
+
+/// Largest texture [`fingerprint_for`] reads whole when its slot is live.
+const LIVE_WHOLE_BYTES: u64 = 4 << 20;
+
+/// [`fingerprint`], or for a live slot (one found changing after its upload)
+/// no larger than 4 MiB, one of all of its memory. The sampled 4 KiB pieces
+/// miss a video plane's change when its sampled rows are a still background
+/// (a TV news shot: the reporter moves between them), so a plane looked
+/// unchanged and waited while the other planes of the same video frame were
+/// uploaded: one frame's luma under another's chroma.
+pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
+    if !live || len > LIVE_WHOLE_BYTES {
+        return fingerprint(at, len);
+    }
+    const CHUNK: usize = 64 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(CHUNK, 0);
+        let mut hasher = blake3::Hasher::new();
+        let mut from = 0;
+        while from < len {
+            let bytes = CHUNK.min(len - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
+            hasher.update(&read[..bytes]);
+            from += bytes;
+        }
+        let hash = hasher.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&hash.as_bytes()[..8]);
         u64::from_le_bytes(first) | 1
     })
 }
@@ -2052,6 +2184,7 @@ fn build_staging_untimed(
         first,
         size,
         bytes: total,
+        shape: desc.shape(),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -2124,9 +2257,92 @@ mod first_mip_tests {
     }
 }
 
+/// Shared body of [`Staging::refresh_unlocked`], separated for unit tests.
+fn refresh_unlocked_with(
+    memory: *const u8,
+    last: &mut Last,
+    size: usize,
+    detile: impl FnOnce(&[u8], bool, blake3::Hash),
+) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read = with_read(size, |read| {
+        if crate::host::read_into(memory, read) {
+            let hash = blake3::hash(read);
+            if last.hash != Some(hash) {
+                last.hash = Some(hash);
+                detile(read, true, hash);
+            }
+            return true;
+        }
+        // If the staging buffer was never filled, a partly mapped streamed
+        // texture would otherwise stay all zeros forever when `no_wait()`
+        // misses the remap lock. Read mapped pages via `copy_mapped` instead.
+        if last.hash.is_none() {
+            crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+            if read.iter().any(|&b| b != 0) {
+                let hash = blake3::hash(read);
+                last.hash = Some(hash);
+                last.partial = Some(crate::frame::current());
+                detile(read, false, hash);
+                return true;
+            }
+        }
+        false
+    });
+    if read {
+        UNLOCKED[0].fetch_add(1, Relaxed);
+        size
+    } else {
+        UNLOCKED[1].fetch_add(1, Relaxed);
+        last.asked = 0;
+        0
+    }
+}
+
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn no_wait_unlocked_falls_back_for_never_filled_partly_mapped_texture() {
+        use windows_sys::Win32::System::Memory::*;
+        const MAPPED: usize = 0x1000;
+        const SIZE: usize = 0x4000;
+        // SAFETY: private reservation owned by this test; committed head has
+        // known bytes, uncommitted tail forces `read_into` to fail.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), MAPPED, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x3c, MAPPED);
+
+            let mut last = super::Last { asked: 7, ..Default::default() };
+            let mut detiled = Vec::new();
+            let mut was_whole = true;
+            let read = super::refresh_unlocked_with(base, &mut last, SIZE, |bytes, whole, _| {
+                detiled = bytes.to_vec();
+                was_whole = whole;
+            });
+            assert!(!was_whole);
+            assert_eq!(read, SIZE);
+            assert!(last.hash.is_some());
+            assert!(last.partial.is_some());
+            assert_eq!(detiled.len(), SIZE);
+            assert!(detiled[..MAPPED].iter().all(|&b| b == 0x3c));
+            assert!(detiled[MAPPED..].iter().all(|&b| b == 0));
+
+            // Once filled, a failed `read_into` does not overwrite the staging buffer.
+            let mut detiled_again = false;
+            let read2 = super::refresh_unlocked_with(base, &mut last, SIZE, |_, _, _| {
+                detiled_again = true;
+            });
+            assert_eq!(read2, 0);
+            assert_eq!(last.asked, 0);
+            assert!(!detiled_again);
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

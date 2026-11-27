@@ -860,13 +860,31 @@ pub(crate) struct Recheck {
     due: u64,
     /// Its memory: address and bytes.
     pub(crate) at: (u64, u64),
-    /// The fingerprint of it at the upload (`crate::texture::fingerprint`).
+    /// The fingerprint of it at the upload (`crate::texture::fingerprint_for`).
     pub(crate) print: u64,
     /// Looks that found it unchanged.
     pub(crate) looks: u8,
     /// The frame of the upload.
     pub(crate) uploaded: u64,
+    /// Whether this slot is kept live (rewritten in place by the title,
+    /// e.g. a TV or phone video plane): looked at every frame and
+    /// fingerprinted whole up to 4 MiB (`VICTORY_LIVE_TEXTURES`).
+    pub(crate) live: bool,
 }
+
+/// Whether a texture found changed after its upload with nothing to tell
+/// of it is kept live: looked at every frame, fingerprinted whole
+/// (`VICTORY_LIVE_TEXTURES=0`: backs off along [`RECHECK_FRAMES`] as
+/// before). A TV's news video showed a colour ghost of an earlier frame:
+/// its luma and chroma planes each waited 12-44 frames on their own count.
+fn live_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Unchanged looks in a row after which a live slot goes back to the plain
+/// looks: some seconds at the world's frame rate.
+const LIVE_LOOKS: u8 = 120;
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -882,6 +900,10 @@ pub(crate) struct TextureQueue {
     /// Kept apart: they wait for nothing, and a slot in here is not one
     /// that will be brought up to date anyway.
     rechecks: std::collections::BTreeMap<u32, Recheck>,
+    /// Slots found changed after their upload with nothing to tell of it
+    /// and currently waiting in `slots` for re-upload: kept live across the
+    /// upload (`VICTORY_LIVE_TEXTURES`).
+    live: std::collections::HashSet<u32>,
     writes: u64,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
@@ -901,6 +923,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.rechecks.remove(&index);
+        self.live.remove(&index);
         self.slots.insert(
             index,
             Waiting {
@@ -916,14 +939,25 @@ impl TextureQueue {
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
         self.rechecks.remove(&index);
+        self.live.remove(&index);
+    }
+
+    /// Whether at least one queued slot is due at `frame`.
+    fn has_due(&self, frame: u64) -> bool {
+        self.slots.values().any(|w| w.due <= frame)
     }
 
     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
-    /// fingerprint is `print`: looked at again ([`RECHECK_FRAMES`]), unless
-    /// it was written again meanwhile and waits in the queue.
-    fn recheck(&mut self, index: u32, frame: u64, at: (u64, u64), print: u64) {
+    /// fingerprint is `print`: looked at again (next frame if `live`, else
+    /// along [`RECHECK_FRAMES`]), unless it was written again meanwhile and
+    /// waits in the queue.
+    fn recheck(&mut self, index: u32, frame: u64, at: (u64, u64), print: u64, live: bool) {
         if !self.slots.contains_key(&index) {
-            let due = frame + RECHECK_FRAMES[0];
+            let due = if live {
+                frame + 1
+            } else {
+                frame + RECHECK_FRAMES[0]
+            };
             self.rechecks.insert(
                 index,
                 Recheck {
@@ -932,13 +966,14 @@ impl TextureQueue {
                     print,
                     looks: 0,
                     uploaded: frame,
+                    live,
                 },
             );
         }
     }
 
-    /// Up to `max` of the slots whose next look is due at `frame`, the ones
-    /// due longest first.
+    /// Up to `max` of the slots whose next look is due at `frame`, live
+    /// slots first so video planes stay in step, then the ones due longest.
     fn rechecks_due(&self, frame: u64, max: usize) -> Vec<(u32, Recheck)> {
         let mut due: Vec<(u32, Recheck)> = self
             .rechecks
@@ -946,21 +981,59 @@ impl TextureQueue {
             .filter(|(_, r)| r.due <= frame)
             .map(|(&index, &r)| (index, r))
             .collect();
-        due.sort_unstable_by_key(|&(index, r)| (r.due, index));
+        due.sort_unstable_by_key(|&(index, r)| (!r.live, r.due, index));
         due.truncate(max);
         due
     }
 
     /// What a look at slot `index` (as [`TextureQueue::rechecks_due`] gave
-    /// it) found: unchanged, and the next look is some frames on, or none;
-    /// changed, and the slot is due now as one written now. A slot written
-    /// or uploaded again since is left alone.
-    fn rechecked(&mut self, index: u32, seen: &Recheck, changed: bool, frame: u64) {
+    /// it) found: unchanged, and the next look is some frames on (every
+    /// frame for a live slot up to [`LIVE_LOOKS`], then back to plain
+    /// looks), or none; changed, and the slot is due now (marked live when
+    /// `live_enabled`). A slot written or uploaded again since is left alone.
+    fn rechecked(
+        &mut self,
+        index: u32,
+        seen: &Recheck,
+        changed: bool,
+        frame: u64,
+        live_enabled: bool,
+        plain_print: Option<u64>,
+    ) {
         if self.rechecks.get(&index) != Some(seen) {
             return;
         }
         if changed {
             self.changed(index, frame, frame);
+            if live_enabled {
+                self.live.insert(index);
+            }
+            return;
+        }
+        if seen.live {
+            if seen.looks < LIVE_LOOKS {
+                self.rechecks.insert(
+                    index,
+                    Recheck {
+                        due: frame + 1,
+                        looks: seen.looks + 1,
+                        ..*seen
+                    },
+                );
+            } else if let Some(print) = plain_print {
+                self.rechecks.insert(
+                    index,
+                    Recheck {
+                        due: frame + RECHECK_FRAMES[1],
+                        print,
+                        looks: 1,
+                        live: false,
+                        ..*seen
+                    },
+                );
+            } else {
+                self.rechecks.remove(&index);
+            }
             return;
         }
         match RECHECK_FRAMES.get(usize::from(seen.looks) + 1) {
@@ -980,7 +1053,9 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
+    /// - first live slots (in-place video planes found changed) so all
+    ///   planes of a video frame upload together;
+    /// - next the ones looked at before (their memory was not mapped, or
     ///   only part of it): the look is a query, and memory that has
     ///   arrived since is what the title streamed in last;
     /// - then the others, the newest write first and the oldest next, in
@@ -989,10 +1064,13 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut live: Vec<(u64, u32, u64)> = Vec::new();
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 {
+            let class = if self.live.contains(&index) {
+                &mut live
+            } else if w.looks > 0 || w.mapped > 0 {
                 &mut again
             } else {
                 &mut fresh
@@ -1001,10 +1079,12 @@ impl TextureQueue {
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        live.sort_unstable_by(newest_first);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again
+        let mut order: Vec<(u32, u64)> = live
             .iter()
+            .chain(again.iter())
             .map(|&(_, index, write)| (index, write))
             .collect();
         let (mut new, mut old) = (0, fresh.len());
@@ -1026,9 +1106,13 @@ impl TextureQueue {
     }
 
     /// Slot `index` is up to date: out of the queue until written again.
-    fn done(&mut self, index: u32, write: u64) {
+    /// Returns whether the slot was marked live.
+    fn done(&mut self, index: u32, write: u64) -> bool {
         if self.same(index, write).is_some() {
             self.slots.remove(&index);
+            self.live.remove(&index)
+        } else {
+            false
         }
     }
 
@@ -1351,16 +1435,29 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
+        // Sampler heaps always back the full 2,048 hardware limit and reserve
+        // slot 2,047 as a permanent null point sampler so `umin(index, 2047)`
+        // in `victory-shader` never reads past smaller title sampler heaps.
+        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            SAMPLERS - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
         let extra = if sampler { 0 } else { dynamic_slots(null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            let fitted = count.min(SAMPLERS - 1);
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -1682,6 +1779,14 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
+    /// Whether any slot in the queue of textures picked by index is due at `frame`.
+    pub(crate) fn texture_slots_has_due(&self, frame: u64) -> bool {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_due(frame)
+    }
+
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -1716,19 +1821,34 @@ impl HostHeap {
     /// The texture view of title slot `index` (as handed out with `write`)
     /// was brought up to date: due again from frame `again` (uploaded with
     /// that many bytes of its memory there, not all), or not until the
-    /// slot is written again.
-    pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+    /// slot is written again. Returns whether the slot was marked live.
+    pub(crate) fn texture_slot_done(
+        &self,
+        index: u32,
+        write: u64,
+        again: Option<(u64, u64)>,
+    ) -> bool {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
-            Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
+            Some((frame, mapped)) => {
+                textures.partly(index, write, frame, mapped);
+                false
+            }
             None => textures.done(index, write),
         }
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    pub(crate) fn texture_slot_recheck(&self, index: u32, frame: u64, at: (u64, u64), print: u64) {
+    pub(crate) fn texture_slot_recheck(
+        &self,
+        index: u32,
+        frame: u64,
+        at: (u64, u64),
+        print: u64,
+        live: bool,
+    ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, frame, at, print);
+        textures.recheck(index, frame, at, print, live);
         self.note_slot(index, SLOT_IN_TEXTURES, true);
     }
 
@@ -1736,10 +1856,12 @@ impl HostHeap {
     /// view, and may fill the texture's memory itself only afterwards, with
     /// no descriptor write and nothing from the runtime to tell of it. The
     /// host copy then kept what the memory held at the first look for the
-    /// rest of the run. A changed one goes back into the queue. Returns how
-    /// many were unchanged and changed, and how many wait for a look.
+    /// rest of the run. A changed one goes back into the queue (and is kept
+    /// live while `VICTORY_LIVE_TEXTURES` is on). Returns how many were
+    /// unchanged and changed, and how many wait for a look.
     pub(crate) fn texture_slots_rechecked(&self, frame: u64) -> [u64; 3] {
-        /// Looks per pass (each reads 48 KiB), and the time they may take.
+        /// Looks per pass (each reads 48 KiB, or up to 4 MiB for live slots),
+        /// and the time they may take.
         const MOST: usize = 256;
         static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
         let span = *SPAN.get_or_init(|| {
@@ -1757,14 +1879,21 @@ impl HostHeap {
                 textures.rechecks.len() as u64,
             )
         };
+        let live_on = live_textures();
         let began = std::time::Instant::now();
         let mut found = [0, 0, waiting];
-        let mut results: Vec<(u32, Recheck, bool)> = Vec::with_capacity(due.len());
+        let mut results: Vec<(u32, Recheck, bool, Option<u64>)> = Vec::with_capacity(due.len());
         for (index, seen) in due {
             if began.elapsed() > span {
                 break;
             }
-            let changed = crate::texture::fingerprint(seen.at.0, seen.at.1) != seen.print;
+            let changed =
+                crate::texture::fingerprint_for(seen.at.0, seen.at.1, seen.live) != seen.print;
+            let plain_print = if !changed && seen.live && seen.looks >= LIVE_LOOKS {
+                Some(crate::texture::fingerprint(seen.at.0, seen.at.1))
+            } else {
+                None
+            };
             found[usize::from(changed)] += 1;
             if changed {
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1776,17 +1905,18 @@ impl HostHeap {
                         bytes = seen.at.1,
                         frames_after_upload = frame.saturating_sub(seen.uploaded),
                         looks = seen.looks,
+                        live = seen.live,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
             }
-            results.push((index, seen, changed));
+            results.push((index, seen, changed, plain_print));
         }
         if !results.is_empty() {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for (index, seen, changed) in results {
-                textures.rechecked(index, &seen, changed, frame);
+            for (index, seen, changed, plain_print) in results {
+                textures.rechecked(index, &seen, changed, frame, live_on, plain_print);
                 if changed {
                     self.note_slot(index, SLOT_IN_TEXTURES, true);
                 }
@@ -4492,7 +4622,8 @@ pub(crate) fn make(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -4550,6 +4681,13 @@ pub(crate) fn make(
                         first,
                         u32::from(own.MipLevels),
                     );
+                }
+                // Made whole from the store (`crate::texstore`): all its levels.
+                let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
+                if prefilled > 0
+                    && let Some(desc) = &mut desc
+                {
+                    show_prefilled(desc, prefilled);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4668,6 +4806,24 @@ pub(crate) fn make(
             }
         }
     }
+}
+
+/// The view `desc` of a host copy whose levels below `levels` the store
+/// filled (`crate::texstore`): from level 0, if it showed from one of them.
+fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return;
+    }
+    // SAFETY: the member its dimension says.
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    if t.MostDetailedMip == 0 || t.MostDetailedMip > levels {
+        return;
+    }
+    if t.MipLevels != u32::MAX {
+        t.MipLevels += t.MostDetailedMip;
+    }
+    t.MostDetailedMip = 0;
+    t.ResourceMinLODClamp = 0.0;
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5454,10 +5610,10 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let at = (0x1000, 64);
         q.written(7, 1, 1, false);
         let write = q.due(1, 1)[0].1;
-        q.recheck(7, 1, at, 5);
+        q.recheck(7, 1, at, 5, false);
         assert!(q.rechecks_due(1000, 9).is_empty(), "it waits in the queue");
-        q.done(7, write);
-        q.recheck(7, 1, at, 5);
+        assert!(!q.done(7, write));
+        q.recheck(7, 1, at, 5, false);
         assert_eq!(q.census(1000)[0], 0, "no slot of the queue");
         let mut frame = 1;
         for wait in RECHECK_FRAMES {
@@ -5465,22 +5621,110 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             frame += wait;
             let due = q.rechecks_due(frame, 9);
             assert_eq!(due.len(), 1);
-            q.rechecked(7, &due[0].1, false, frame);
+            q.rechecked(7, &due[0].1, false, frame, false, None);
         }
         assert!(q.rechecks_due(u64::MAX, 9).is_empty(), "the looks are over");
-        q.recheck(7, frame, at, 5);
+        q.recheck(7, frame, at, 5, false);
         let due = q.rechecks_due(u64::MAX, 9);
-        q.rechecked(7, &due[0].1, true, frame + 4);
+        q.rechecked(7, &due[0].1, true, frame + 4, false, None);
         assert_eq!(q.due(frame + 4, 9)[0].0, 7);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
         // A draw makes the host slot anew: the slot is due although a look
         // at it was still to come.
-        q.recheck(8, 1, at, 5);
+        q.recheck(8, 1, at, 5, false);
         let seen = q.rechecks_due(u64::MAX, 9);
         q.written(8, 2, 2, true);
         assert!(q.due(2, 9).iter().any(|d| d.0 == 8));
-        q.rechecked(8, &seen[0].1, false, 5);
+        q.rechecked(8, &seen[0].1, false, 5, false, None);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
+    }
+
+    /// A slot found changed after its upload becomes live: served ahead of
+    /// regular slots, looked at every frame up to LIVE_LOOKS unchanged looks,
+    /// then downgraded to plain looks; a fresh write or removal clears live.
+    #[test]
+    fn live_slots_check_every_frame_and_downgrade_after_idle() {
+        let mut q = TextureQueue::default();
+        let at = (0x1000, 0x2000);
+        // Slot 1: regular; slot 7: will become live.
+        q.recheck(1, 1, at, 11, false);
+        q.recheck(7, 1, at, 5, false);
+        let due = q.rechecks_due(5, 9);
+        let seen7 = due.iter().find(|(idx, _)| *idx == 7).unwrap().1;
+        // Slot 7 changed -> becomes live and re-enters `slots`.
+        q.rechecked(7, &seen7, true, 5, true, None);
+        assert!(q.live.contains(&7));
+        // Even with another `again` slot queued, live slot 7 is served first.
+        q.written(2, 5, 5, false);
+        let w2 = q.due(5, 9).into_iter().find(|d| d.0 == 2).unwrap().1;
+        q.later(2, w2, 4, 16);
+        let order = q.due(5, 9);
+        assert_eq!(order[0].0, 7, "live slot served first");
+        let w7 = order[0].1;
+        assert!(q.done(7, w7), "done returns live status and clears pending set");
+        assert!(!q.live.contains(&7));
+
+        // Re-entered as live: due on frame + 1 and prioritized ahead of overdue plain rechecks.
+        q.recheck(7, 5, at, 6, true);
+        assert!(q.rechecks_due(5, 9).iter().all(|(idx, _)| *idx != 7));
+        let due6 = q.rechecks_due(6, 9);
+        assert_eq!(due6[0].0, 7, "live slot checked ahead of overdue plain slot 1");
+        assert!(due6[0].1.live);
+
+        // Stays live across LIVE_LOOKS unchanged frames, then downgrades to plain.
+        let mut frame = 6u64;
+        for _ in 0..super::LIVE_LOOKS {
+            let r = q.rechecks_due(frame, 1)[0].1;
+            assert!(r.live);
+            q.rechecked(7, &r, false, frame, true, None);
+            frame += 1;
+        }
+        let last_live = q.rechecks_due(frame, 1)[0].1;
+        assert!(last_live.live);
+        assert_eq!(last_live.looks, super::LIVE_LOOKS);
+        q.rechecked(7, &last_live, false, frame, true, Some(99));
+        assert!(q.rechecks_due(frame + RECHECK_FRAMES[1] - 1, 9).iter().all(|(idx, _)| *idx != 7));
+        let downgraded = q
+            .rechecks_due(frame + RECHECK_FRAMES[1], 9)
+            .into_iter()
+            .find(|(idx, _)| *idx == 7)
+            .expect("downgraded slot still checked on plain schedule")
+            .1;
+        assert!(!downgraded.live);
+        assert_eq!(downgraded.print, 99);
+        assert_eq!(downgraded.looks, 1);
+
+        // Fresh write clears live flag.
+        q.recheck(9, 10, at, 5, true);
+        let r9 = q.rechecks_due(11, 1)[0].1;
+        q.rechecked(9, &r9, true, 11, true, None);
+        assert!(q.live.contains(&9));
+        q.written(9, 12, 12, false);
+        assert!(!q.live.contains(&9));
+    }
+
+    /// `fingerprint_for(..., true)` catches a 1-byte change between the
+    /// sampled 4 KiB windows of `fingerprint` for textures up to 4 MiB.
+    #[test]
+    fn fingerprint_for_live_catches_mid_plane_change() {
+        let mut plane = vec![0x42u8; 256 << 10];
+        let base = plane.as_ptr() as u64;
+        let len = plane.len() as u64;
+        let plain_before = crate::texture::fingerprint(base, len);
+        let live_before = crate::texture::fingerprint_for(base, len, true);
+        assert_eq!(crate::texture::fingerprint_for(base, len, false), plain_before);
+        // Byte at 8 KiB falls in the unsampled gap between piece 0 (0..4K) and piece 1 (~20K).
+        plane[8 << 10] ^= 0x01;
+        assert_eq!(
+            crate::texture::fingerprint(base, len),
+            plain_before,
+            "sampled fingerprint misses gap byte"
+        );
+        assert_ne!(
+            crate::texture::fingerprint_for(base, len, true),
+            live_before,
+            "live whole-plane fingerprint must catch gap byte"
+        );
     }
 
     /// The fingerprint of a texture's memory sees a change at its start, in
@@ -5498,6 +5742,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             memory[at] ^= 1;
         }
         assert_ne!(print(&memory[..100]), print(&memory[..200]));
+    }
+
+    #[test]
+    fn has_due_reports_whether_any_slot_is_ready_at_frame() {
+        let mut q = TextureQueue::default();
+        assert!(!q.has_due(0));
+        q.written(3, 1, 5, false);
+        assert!(!q.has_due(4));
+        assert!(q.has_due(5));
+        let write = q.due(5, 1)[0].1;
+        q.done(3, write);
+        assert!(!q.has_due(10));
     }
 
     #[test]
@@ -6019,7 +6275,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(heap.slot_may(1, SLOT_IN_PLACED));
         let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         heap.texture_slot_done(1, write, None);
-        heap.texture_slot_recheck(1, 10, (at, 64), 0x1234);
+        heap.texture_slot_recheck(1, 10, (at, 64), 0x1234, false);
         assert!(heap.slot_may(1, SLOT_IN_TEXTURES));
         // A wider texture in slot 2 makes slot 1 stale and clears both flags on slot 1.
         assert_eq!(heap.note_buffer(2, Some(&tex_view(128)), false, true), [1]);
@@ -6237,6 +6493,70 @@ mod dynamic_bits_tests {
         assert_eq!(got, Some(fill_b));
         heap.release(heap.id(), fill_a, heap.dynamic - 17);
         heap.release(heap.id(), fill_b, 16);
+    }
+
+    /// Every host sampler heap backs all 2,048 hardware descriptors and
+    /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
+    /// `victory-shader` never reads past smaller title sampler heaps.
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        let Some(small) = super::HostHeap::new(true, 16) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(small.count, 16);
+        let Some(full) = super::HostHeap::new(true, 2048) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(full.count, 2047);
+    }
+
+    #[test]
+    fn show_prefilled_widens_texture2d_view_to_level_zero() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV,
+        };
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 6,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.0,
+                },
+            },
+            ..Default::default()
+        };
+        super::show_prefilled(&mut desc, 3);
+        // SAFETY: Texture2D variant set above.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!(t.MostDetailedMip, 0);
+        assert_eq!(t.MipLevels, 9);
+        assert_eq!(t.ResourceMinLODClamp, 0.0);
+
+        // A view starting past the prefilled range is left unchanged.
+        let mut untouched = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 4,
+                    MipLevels: 5,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 4.0,
+                },
+            },
+            ..Default::default()
+        };
+        super::show_prefilled(&mut untouched, 3);
+        // SAFETY: Texture2D variant set above.
+        let t2 = unsafe { untouched.Anonymous.Texture2D };
+        assert_eq!(t2.MostDetailedMip, 4);
+        assert_eq!(t2.MipLevels, 5);
     }
 
     /// Placed unordered texture views (2D and 3D) mirror onto host unordered

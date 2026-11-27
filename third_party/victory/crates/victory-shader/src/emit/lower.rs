@@ -6,7 +6,9 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::thread::LocalKey;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -466,6 +468,7 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+pub(super) const CONSTANT_MASK: Why = "a constant lane mask";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
@@ -524,16 +527,32 @@ thread_local! {
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Restore the previous mode even when a worker catches a panic and
+/// translates another shader on the same thread.
+fn with_lowering_mode<R>(mode: &'static LocalKey<Cell<bool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        mode: &'static LocalKey<Cell<bool>>,
+        previous: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.mode.set(self.previous);
+        }
+    }
+    let _restore = Restore {
+        mode,
+        previous: mode.replace(true),
+    };
+    f()
+}
+
 /// Runs `f` with LDS reads and writes inside one lane-branch region accepted
 /// ([`lds_meetings`]): the two host waves of a console wave meet only where
 /// such a region is entered and left. APPROXIMATE: a value one half writes and
 /// the other half reads inside the region may be read stale. The last resort
 /// for console wave64 programs a 32-lane host would otherwise refuse.
 pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
-    let was = LDS_LOOSE.replace(true);
-    let r = f();
-    LDS_LOOSE.set(was);
-    r
+    with_lowering_mode(&LDS_LOOSE, f)
 }
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
@@ -553,10 +572,7 @@ pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
 // console's 32-lane programs that share LDS within a wave), the fences only keeping its
 // compiler from moving one thread's accesses past each other.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
-    let was = PAIRED.replace(true);
-    let r = f();
-    PAIRED.set(was);
-    r
+    with_lowering_mode(&PAIRED, f)
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -567,10 +583,7 @@ pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    with_lowering_mode(&LOCAL_ANY, || with_local_waves(f))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -590,10 +603,7 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    with_lowering_mode(&LOCAL_WAVES, f)
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
@@ -649,10 +659,7 @@ thread_local! {
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
 pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
-    let before = FIRST_HALF_PAIRS.replace(true);
-    let result = translate();
-    FIRST_HALF_PAIRS.set(before);
-    result
+    with_lowering_mode(&FIRST_HALF_PAIRS, translate)
 }
 
 /// Whether programs with console lanes in groups of several host waves take their console
@@ -902,6 +909,9 @@ impl<'a> Lower<'a> {
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps { db_shader_control, .. } = x.native.io {
+            s.set_early_depth(db_shader_control);
+        }
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
@@ -3809,7 +3819,7 @@ impl<'a> Lower<'a> {
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Constant(_) => Err(CONSTANT_MASK),
         }
     }
 
@@ -9357,10 +9367,7 @@ impl<'a> Lower<'a> {
                 return self.image_with_sampler(inst, b, i, Some(first));
             }
             let edge = |pred: usize| {
-                self.edges
-                    .get(&(pred, *block))
-                    .copied()
-                    .or(self.tail[pred])
+                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
                     .ok_or("a sampler choice with an unfinished predecessor")
             };
             let (left, right) = (edge(*left)?, edge(*right)?);
@@ -9369,9 +9376,7 @@ impl<'a> Lower<'a> {
             let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
             self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
             self.image_with_sampler(inst, b, i, Some(first))?;
-            let left = inst
-                .writes
-                .iter()
+            let left = inst.writes.iter()
                 .map(|&(_, v)| self.i32_of(v))
                 .collect::<Result<Vec<_>, _>>()?;
             self.image_with_sampler(inst, b, i, Some(second))?;
@@ -10794,7 +10799,13 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            let same_as_done = self.s.pixel
+                && !e.done
+                && (i + 1..self.x.p.blocks[b].insts.len()).any(|k| {
+                    self.exports.get(&(b, k)).is_some_and(|d| d.done)
+                        && self.x.st.guards[b][k] == self.x.st.guards[b][i]
+                });
+            if !(e.done && self.s.pixel || same_as_done) {
                 return Err("a conditional export");
             }
             let t = self.s.m.bool(true);
@@ -11471,6 +11482,56 @@ mod tests {
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     #[test]
+    fn scoped_lowering_modes_restore_after_a_panic() {
+        use super::{
+            FIRST_HALF_PAIRS, LDS_LOOSE, LOCAL_ANY, LOCAL_WAVES, PAIRED, with_first_half_pairs,
+            with_local_waves, with_local_waves_any, with_loose_lds, with_paired_lanes,
+        };
+
+        let modes = || {
+            (
+                LOCAL_WAVES.get(),
+                LOCAL_ANY.get(),
+                FIRST_HALF_PAIRS.get(),
+                LDS_LOOSE.get(),
+                PAIRED.get(),
+            )
+        };
+        assert_eq!(modes(), (false, false, false, false, false));
+
+        with_local_waves(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| {
+                    with_loose_lds(|| {
+                        with_paired_lanes(|| assert_eq!(modes(), (true, true, true, true, true)));
+                        assert_eq!(modes(), (true, true, true, true, false));
+                    });
+                    assert_eq!(modes(), (true, true, true, false, false));
+                });
+                assert_eq!(modes(), (true, true, false, false, false));
+            });
+            assert_eq!(modes(), (true, false, false, false, false));
+        });
+        assert_eq!(modes(), (false, false, false, false, false));
+
+        let failure = std::panic::catch_unwind(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| {
+                    with_loose_lds(|| {
+                        with_paired_lanes(|| {
+                            assert_eq!(modes(), (true, true, true, true, true));
+                            panic!("synthetic lowering panic");
+                        });
+                    });
+                });
+            });
+        })
+        .expect_err("the lowering panic should be caught");
+        assert_eq!(failure.downcast_ref::<&str>(), Some(&"synthetic lowering panic"));
+        assert_eq!(modes(), (false, false, false, false, false));
+    }
+
+    #[test]
     fn packed_pixel_inputs_find_their_second_row() {
         use super::super::container::SigElement;
         use super::half_input_partners;
@@ -11876,23 +11937,15 @@ mod tests {
     fn a_uniform_branch_can_choose_between_immediate_samplers() {
         // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
         let words = [
-            0xBE84_0300,
-            0xBE85_0380, // s[4:5] = texture table
-            0xF40C_0302,
-            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
-            0xBE89_0380,
-            0xBE8A_0380,
-            0xBE8B_0380, // sampler words 1-3
-            0xBF06_8001, // s_cmp_eq_u32 s1, 0
-            0xBF85_0002, // branch to clamp
-            0xBE88_0380,
-            0xBF82_0002, // wrap, skip clamp
-            0xBE88_03FF,
-            0x0000_0092, // clamp all axes
-            0xF09C_0F08,
-            0x0043_0C02, // image_sample_lz v[12:15], ..., s[8:11]
-            0xD834_0000,
-            0x0000_0C00, // ds_write_b32 v0, v12
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
             S_ENDPGM,
         ];
         let (mut layout, mut used) = texture_tables();
