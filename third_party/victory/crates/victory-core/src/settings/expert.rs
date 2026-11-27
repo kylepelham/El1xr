@@ -17,7 +17,6 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_ASYNC_PRESENT", Apply::Restart),
     ("VICTORY_AUDIO_CAPTURE", Apply::Restart),
     ("VICTORY_AUTO_A_PERIOD_MS", Apply::Restart),
-    ("VICTORY_BAKE_INPUTS", Apply::Live),
     ("VICTORY_BAKE_ONE_BUDGET", Apply::Restart),
     ("VICTORY_BARRIER_TEST", Apply::Restart),
     ("VICTORY_BCPACK_CASES", Apply::Restart),
