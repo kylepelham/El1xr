@@ -29,7 +29,6 @@ pub(crate) const PREF_USE_FRAME_BASED_RESOURCE_TAGGING: u64 = 1 << 7;
 pub(crate) const BUFFER_DEPTH: u32 = 0;
 pub(crate) const BUFFER_MOTION_VECTORS: u32 = 1;
 pub(crate) const BUFFER_HUDLESS_COLOR: u32 = 2;
-pub(crate) const BUFFER_UI_COLOR_AND_ALPHA: u32 = 23;
 pub(crate) const BUFFER_BACKBUFFER: u32 = 53;
 
 /// `sl::ResourceLifecycle`.

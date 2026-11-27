@@ -107,6 +107,13 @@ fn constants_from_the_camera() {
 }
 
 #[test]
+fn no_hudless_without_a_copy_of_this_frame() {
+    assert!(hudless_for(None).is_none());
+    // No VICTORY_CAMERA_HUDLESS in tests, and this camera noted no copy.
+    assert!(hudless_for(Some(&still_camera())).is_none());
+}
+
+#[test]
 fn transpose_swaps_rows_and_columns() {
     let mut m = [[0.0; 4]; 4];
     m[0][3] = 7.0;
@@ -257,7 +264,6 @@ fn streamline_probe() {
                     metres_per_unit: 1.0,
                 },
             );
-            assert!(!tag_ui(&list, None, None));
             list.Close().unwrap();
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
             before_present_with(Some(&cam));

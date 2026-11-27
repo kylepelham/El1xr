@@ -28,9 +28,11 @@
 //!    `Present`, then the next frame's token and `slReflexSleep`
 //!    (`VICTORY_DLSSG_SLEEP=0` skips the sleep).
 //!
-//! No HUD-less colour is tagged yet: [`tag_ui`] takes it (and the UI colour
-//! and alpha) once the camera job exposes them; until then the HUD is
-//! interpolated with the scene.
+//! With `VICTORY_CAMERA_HUDLESS=1` the camera job's copy of the picture just
+//! before the title's UI blit (`camera_copy::hudless`) is tagged as the
+//! HUD-less colour, so DLSS-G keeps the HUD out of the interpolation (it finds
+//! the UI from the HUD-less picture and the back buffer). Without it the HUD
+//! is interpolated with the scene.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -48,6 +50,8 @@ use crate::streamline::{self as sl, Api};
 /// The D3D12 state the upscale leaves depth and motion vectors in
 /// (`NON_PIXEL_SHADER_RESOURCE`, `upscale.rs`'s `SHADER_READ`).
 const SHADER_READ: u32 = 0x40;
+/// The state the HUD-less copy rests in (`camera_copy::HUDLESS_STATE`).
+const HUDLESS_STATE: u32 = crate::camera_copy::HUDLESS_STATE.0 as u32;
 /// How often the `DLSS-G: window` line is written (real presents, those with
 /// DLSS-G on, and `frames_per_present`: frames shown for the last real one,
 /// 2 with one generated frame).
@@ -84,6 +88,7 @@ struct Session {
     since: Instant,
     told_constants: bool,
     told_tags: bool,
+    told_hudless: bool,
 }
 
 // SAFETY: Streamline's functions and our plain data, used under the mutex.
@@ -315,6 +320,7 @@ fn start_after_init(
             since: Instant::now(),
             told_constants: false,
             told_tags: false,
+            told_hudless: false,
         });
         ACTIVE.store(true, Ordering::Relaxed);
         tracing::info!(
@@ -405,57 +411,6 @@ pub(crate) fn tag_inputs(list: &ID3D12GraphicsCommandList, inputs: &crate::frame
     }
 }
 
-/// Tags the HUD-less colour and the UI colour and alpha (premultiplied, the
-/// back buffer's size) for this frame, copied now on `list` where they are in
-/// the states given. For the camera job's pre-UI copy; nothing without the
-/// proxy swap chain.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn tag_ui(
-    list: &ID3D12GraphicsCommandList,
-    hudless: Option<(&ID3D12Resource, u32)>,
-    ui: Option<(&ID3D12Resource, u32)>,
-) -> bool {
-    if !active() {
-        return false;
-    }
-    let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(s) = guard.as_ref() else {
-        return false;
-    };
-    let extent = sl::Extent {
-        top: 0,
-        left: 0,
-        width: s.options.color_width,
-        height: s.options.color_height,
-    };
-    let mut resources: Vec<(sl::Resource, u32)> = [
-        (hudless, sl::BUFFER_HUDLESS_COLOR),
-        (ui, sl::BUFFER_UI_COLOR_AND_ALPHA),
-    ]
-    .into_iter()
-    .filter_map(|(r, ty)| r.map(|(r, state)| (sl::Resource::texture(r.as_raw(), state), ty)))
-    .collect();
-    let tags: Vec<sl::ResourceTag> = resources
-        .iter_mut()
-        .map(|(r, ty)| texture_tag(r, *ty, sl::LIFECYCLE_ONLY_VALID_NOW, extent))
-        .collect();
-    if tags.is_empty() {
-        return false;
-    }
-    let token = TOKEN.load(Ordering::Relaxed);
-    // SAFETY: live resources and list; the tags are copied by Streamline.
-    let r = unsafe {
-        (s.api.set_tag_for_frame)(
-            token,
-            &viewport(),
-            tags.as_ptr(),
-            tags.len() as u32,
-            list.as_raw(),
-        )
-    };
-    r == sl::OK
-}
-
 /// A column-vector matrix (`camera.rs`) as Streamline's row-vector one.
 fn transpose(m: &Mat4) -> sl::Float4x4 {
     let mut t = [[0.0; 4]; 4];
@@ -530,6 +485,15 @@ pub(crate) fn constants(
     Ok(c)
 }
 
+/// The camera job's HUD-less copy of this camera's frame, when it made one.
+fn hudless_for(cam: Option<&FrameCamera>) -> Option<crate::camera_copy::Hudless> {
+    let cam = cam?;
+    if !crate::camera_copy::hudless_on() || cam.hudless.is_none() {
+        return None;
+    }
+    crate::camera_copy::hudless().filter(|h| h.frame == cam.frame)
+}
+
 /// Before the proxy's `Present`: the frame's constants (DLSS-G on while they
 /// exist, off otherwise), the backbuffer tag and the markers up to
 /// `ePresentStart`.
@@ -590,21 +554,48 @@ fn before_present_with(cam: Option<&FrameCamera>) {
             tracing::warn!(result = sl::result_name(r), "DLSS-G: constants refused");
         }
     }
+    let back_extent = sl::Extent {
+        top: 0,
+        left: 0,
+        width: s.options.color_width,
+        height: s.options.color_height,
+    };
     let mut back = sl::Resource::texture(std::ptr::null_mut(), 0);
-    let tag = texture_tag(
+    let mut tags = vec![texture_tag(
         &mut back,
         sl::BUFFER_BACKBUFFER,
         sl::LIFECYCLE_VALID_UNTIL_PRESENT,
-        sl::Extent {
-            top: 0,
-            left: 0,
-            width: s.options.color_width,
-            height: s.options.color_height,
-        },
-    );
+        back_extent,
+    )];
+    let hudless = hudless_for(cam);
+    let mut hud_resource;
+    if let Some(h) = &hudless {
+        if !s.told_hudless {
+            s.told_hudless = true;
+            tracing::info!(
+                width = h.width,
+                height = h.height,
+                format = h.format.0,
+                back = ?(back_extent.width, back_extent.height),
+                "DLSS-G: tagging the HUD-less colour (VICTORY_CAMERA_HUDLESS=1)"
+            );
+        }
+        hud_resource = sl::Resource::texture(h.resource.as_raw(), HUDLESS_STATE);
+        tags.push(texture_tag(
+            &mut hud_resource,
+            sl::BUFFER_HUDLESS_COLOR,
+            sl::LIFECYCLE_VALID_UNTIL_PRESENT,
+            sl::Extent {
+                top: 0,
+                left: 0,
+                width: h.width,
+                height: h.height,
+            },
+        ));
+    }
     // SAFETY: Streamline calls with its token and our structures.
     unsafe {
-        let _ = (s.api.set_tag_for_frame)(token, &viewport(), &tag, 1, std::ptr::null_mut());
+        let _ = (s.api.set_tag_for_frame)(token, &viewport(), tags.as_ptr(), tags.len() as u32, std::ptr::null_mut());
         for m in [
             sl::MARKER_SIMULATION_END,
             sl::MARKER_RENDER_SUBMIT_START,
