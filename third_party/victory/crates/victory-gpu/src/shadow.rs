@@ -3336,6 +3336,8 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "mimalloc")]
+    crate::heap::log_once();
     let c: Vec<f64> = BACK_CLASS
         .iter()
         .map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames)
