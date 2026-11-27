@@ -51,6 +51,8 @@ mod boot_prof;
 #[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]
+mod bake_publish;
+#[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
 mod bake_why;

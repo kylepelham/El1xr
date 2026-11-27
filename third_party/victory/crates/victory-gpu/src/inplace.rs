@@ -695,6 +695,64 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
 
+/// Whether the title's views of committed sections show all of `[at, at +
+/// len)`: `Some(true)` if they do, end to end; `None` if any byte of it lies
+/// outside such a view (no view there, a hole, or a view of a section not
+/// made committed), for the caller to ask Windows
+/// (`crate::texture::staged_ask`).
+pub(crate) fn all_shown(at: usize, len: usize) -> Option<bool> {
+    let v = views();
+    all_shown_in(&v, at, len)
+}
+
+fn all_shown_in(v: &Views, at: usize, len: usize) -> Option<bool> {
+    let end = at.checked_add(len.max(1))?;
+    let committed = |section: usize| v.sections.get(&section).is_some_and(|s| s.1);
+    let (&base, &(bytes, section, _)) = v.views.range(..=at).next_back()?;
+    if base + bytes <= at || !committed(section) {
+        return None;
+    }
+    let mut reached = base + bytes;
+    while reached < end {
+        let &(bytes, section, _) = v.views.get(&reached)?;
+        if bytes == 0 || !committed(section) {
+            return None;
+        }
+        reached += bytes;
+    }
+    Some(true)
+}
+
+#[cfg(test)]
+mod all_shown_tests {
+    use super::{BTreeMap, K64, Views, all_shown_in};
+
+    /// The views answer "all there" only where views of committed sections
+    /// show every byte; a hole, a view of a section not committed, or no
+    /// view at all leaves the question to Windows.
+    #[test]
+    fn views_answer_only_where_committed_views_show_it_all() {
+        let mut v = Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() };
+        let base = 0x1000_0000usize;
+        v.sections.insert(1, (1 << 30, true));
+        v.sections.insert(2, (1 << 30, false));
+        // Two views of section 1 back to back, a hole, then one of section 2.
+        v.views.insert(base, (K64, 1, 0));
+        v.views.insert(base + K64, (2 * K64, 1, 5 * K64 as u64));
+        v.views.insert(base + 4 * K64, (K64, 2, 0));
+        assert_eq!(all_shown_in(&v, base, 3 * K64), Some(true));
+        assert_eq!(all_shown_in(&v, base + 100, K64), Some(true));
+        assert_eq!(all_shown_in(&v, base + 2 * K64, K64), Some(true));
+        assert_eq!(all_shown_in(&v, base, 3 * K64 + 1), None, "a hole");
+        assert_eq!(all_shown_in(&v, base + 4 * K64, 16), None, "not committed");
+        assert_eq!(all_shown_in(&v, base + 3 * K64, 16), None, "no view");
+        assert_eq!(all_shown_in(&v, base - 16, 32), None, "starts before a view");
+        // A section whose handle is not known is not taken as committed.
+        v.views.insert(base + 8 * K64, (K64, 9, 0));
+        assert_eq!(all_shown_in(&v, base + 8 * K64, 16), None);
+    }
+}
+
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)

@@ -1,113 +1,156 @@
-//! (readmet3xt-lab, trustno1-coder/VIctory-NVIDIA `36c4c37`)
-//! `VICTORY_STAGED_TITLE_ONLY=1`: whether a staged texture's memory is all
-//! there ([`super::staged`]) is asked of Windows only for a texture made at
-//! an address the title mapped ([`crate::resource::at_title_address`]); the
-//! memory of a committed or heap resource is ours, allocated whole when it
-//! was made, and is all there while it lives.
+//! (trustno1 `36c4c37`, `6b3960d`) Whether a staged texture's memory is all
+//! there, asked by the pass over textures picked by index for every texture
+//! it uploads or finds staged ([`super::staged`]).
 //!
-//! The pass over textures picked by index asks it of every texture object it
-//! uploads, tabled slots among them (a `QueryWorkingSetEx` per 256 pages and
-//! a read of each page not in the working set: 18-111 us for 1-16 MB, and
-//! milliseconds where the pages had been trimmed). Upstream counted 20,000
-//! to 57,000 such questions per 5 s, 66 of them "not all there" in a whole
-//! run, and the pass's unattributed time growing by about 13 us for each.
-//! Unset: asked of every texture, as before (the answer for ours is the
-//! same; only the time differs).
+//! `VICTORY_STAGED_ASK_ALL=0`: asked only of a texture made at an address the
+//! title mapped ([`crate::resource::at_title_address`]). A committed
+//! resource's memory and a heap's are ours, allocated whole when made, and
+//! cannot lose pages while they live. Unset: asked of every texture, as
+//! before. Upstream measured 20,000-57,000 questions per 5 s, one
+//! `QueryWorkingSetEx` per 256 pages each (18-111 us for 1-16 MB resident,
+//! milliseconds when trimmed), and the pass's unattributed time going with
+//! their count, 13 us each.
+//!
+//! `VICTORY_MAPPED_BY_VIEWS=1`: of a texture that is asked, the runtime's
+//! views of committed sections answer "all there" when they show the whole
+//! range ([`crate::inplace::all_shown`]); anything else (no view, a hole, a
+//! section not committed) is asked of Windows as before. Here only for this
+//! question, not for `mapped_bytes`.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Questions skipped (the texture's memory is ours) since the start.
-static SKIPPED: AtomicU64 = AtomicU64::new(0);
+use crate::object::This;
+use victory_core::settings::Live;
 
-fn title_only() -> bool {
-    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_STAGED_TITLE_ONLY");
+/// Whether every staged texture is asked (unset or anything but `0`).
+pub(crate) fn ask_all() -> bool {
+    static ALL: Live = Live::new("VICTORY_STAGED_ASK_ALL", |v| {
+        u64::from(v.is_none_or(|v| v.trim() != "0"))
+    });
+    ALL.get_bool()
+}
+
+/// Whether the runtime's views answer first (`VICTORY_MAPPED_BY_VIEWS=1`).
+pub(crate) fn by_views() -> bool {
+    static ON: Live = Live::flag("VICTORY_MAPPED_BY_VIEWS");
     ON.get_bool()
 }
 
-/// Whether Windows is asked whether staged texture `resource`'s memory is
-/// all there.
-pub(super) fn asks(resource: crate::object::This) -> bool {
-    asks_as(title_only(), || crate::resource::at_title_address(resource))
+/// Answers since the last line: not asked (not at a title address), answered
+/// by the views, asked of Windows.
+static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether `[at, at + len)`, the memory of staged texture `resource`, is all
+/// there; `committed` asks Windows.
+pub(super) fn whole(
+    resource: This,
+    at: *const u8,
+    len: usize,
+    committed: impl FnOnce(*const u8, usize) -> bool,
+) -> bool {
+    answer(
+        ask_all(),
+        by_views(),
+        || crate::resource::at_title_address(resource),
+        || crate::inplace::all_shown(at as usize, len),
+        || committed(at, len),
+    )
 }
 
-fn asks_as(title_only: bool, at_title_address: impl FnOnce() -> bool) -> bool {
-    if !title_only || at_title_address() {
+fn answer(
+    all: bool,
+    views: bool,
+    title: impl FnOnce() -> bool,
+    shown: impl FnOnce() -> Option<bool>,
+    windows: impl FnOnce() -> bool,
+) -> bool {
+    if !all && !title() {
+        STATS[0].fetch_add(1, Relaxed);
         return true;
     }
-    let n = SKIPPED.fetch_add(1, Relaxed) + 1;
-    if n.is_power_of_two() && n >= 4096 {
-        tracing::info!(
-            "staged textures of our own memory not asked whether all there, since the start: {n} (VICTORY_STAGED_TITLE_ONLY=1)"
-        );
+    if views && shown() == Some(true) {
+        STATS[1].fetch_add(1, Relaxed);
+        return true;
     }
-    false
+    STATS[2].fetch_add(1, Relaxed);
+    windows()
+}
+
+/// Logs [`STATS`] on the frame-meter cadence when either switch is on, and
+/// starts them over.
+pub(crate) fn log(frames: f64) {
+    let stats: [u64; 3] = std::array::from_fn(|i| STATS[i].swap(0, Relaxed));
+    let (all, views) = (ask_all(), by_views());
+    if (all && !views) || frames <= 0.0 || stats.iter().sum::<u64>() == 0 {
+        return;
+    }
+    let per = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "staged textures asked whether all their memory is there, per frame (VICTORY_STAGED_ASK_ALL={}, VICTORY_MAPPED_BY_VIEWS={}): \
+         {:.1} not asked (not at a title address), {:.1} answered by the runtime's views, {:.1} asked of Windows",
+        u8::from(all),
+        u8::from(views),
+        per(stats[0]),
+        per(stats[1]),
+        per(stats[2]),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{S_OK, guid, slot};
-    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-    use windows::core::Interface;
-
-    const RGBA8_64: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0, 0, 0];
 
     #[test]
-    fn the_switch_is_live() {
-        victory_core::settings::check_live("VICTORY_STAGED_TITLE_ONLY", "1", title_only, false, true);
+    fn the_switches_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_STAGED_ASK_ALL", "0", ask_all, true, false);
+        check_live("VICTORY_MAPPED_BY_VIEWS", "1", by_views, false, true);
     }
 
-    /// Unset, every staged texture is asked about and nothing is asked of
-    /// the resource; with the switch, only one at a title address.
+    /// Off (both switches as launched), Windows is asked of every texture
+    /// and its answer is the answer, whatever the views say.
     #[test]
-    fn only_textures_at_a_title_address_are_asked_with_the_switch() {
-        assert!(asks_as(false, || panic!("not asked unless the switch is on")));
-        assert!(asks_as(true, || true));
-        let before = SKIPPED.load(Relaxed);
-        assert!(!asks_as(true, || false));
-        assert!(SKIPPED.load(Relaxed) > before);
-    }
-
-    /// Only a resource made at an address the title mapped can lose its
-    /// memory while it lives.
-    #[test]
-    fn only_resources_at_a_title_address_may_lose_their_memory() {
-        let i = ID3D12Resource::IID;
-        let iid = guid(i.data1, i.data2, i.data3, i.data4);
-        let layout = std::alloc::Layout::from_size_align(64 << 10, 1 << 16).unwrap();
-        // SAFETY: a non-zero size; leaked, as title memory outlives a test.
-        let title = unsafe { std::alloc::alloc_zeroed(layout) as u64 };
-        let mut at = std::ptr::null();
-        let made = crate::resource::create_at_address(
-            std::ptr::null(),
-            title,
-            RGBA8_64.as_ptr().cast(),
-            0,
-            std::ptr::null(),
-            &iid,
-            &mut at,
-        );
-        assert_eq!(made, S_OK);
-        // SAFETY: plain integer structs with matching `#[repr(C)]` layouts.
-        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(RGBA8_64) };
-        let props: crate::resource::HeapProperties = unsafe { std::mem::transmute([1u32, 0, 0, 1, 1]) };
-        let mut committed = std::ptr::null();
-        let made = crate::resource::create_committed(
-            std::ptr::null(),
-            &props,
-            0,
-            &desc,
-            0,
-            std::ptr::null(),
-            &iid,
-            &mut committed,
-        );
-        assert_eq!(made, S_OK);
-        assert!(crate::resource::at_title_address(at));
-        assert!(!crate::resource::at_title_address(committed));
-        assert!(!crate::resource::at_title_address(std::ptr::null()));
-        for r in [at, committed] {
-            let _ = slot::<extern "system" fn(crate::object::This) -> u32>(r, 0x10)(r);
+    fn off_asks_windows_of_every_texture() {
+        for title in [false, true] {
+            for there in [false, true] {
+                let asked = std::cell::Cell::new(false);
+                let got = answer(
+                    true,
+                    false,
+                    || title,
+                    || Some(true),
+                    || {
+                        asked.set(true);
+                        there
+                    },
+                );
+                assert!(asked.get());
+                assert_eq!(got, there);
+            }
         }
+    }
+
+    /// With `VICTORY_STAGED_ASK_ALL=0` a texture not at a title address is
+    /// all there without a question; one at a title address is asked.
+    #[test]
+    fn only_title_addresses_are_asked() {
+        assert!(answer(false, false, || false, || None, || panic!("asked")));
+        assert!(!answer(false, false, || true, || None, || false));
+    }
+
+    /// The views answer only "all there"; anything else asks Windows.
+    #[test]
+    fn the_views_answer_only_when_they_show_it_all() {
+        assert!(answer(
+            true,
+            true,
+            || true,
+            || Some(true),
+            || panic!("asked")
+        ));
+        assert!(!answer(true, true, || true, || None, || false));
+        assert!(answer(true, true, || true, || None, || true));
+        // Without the switch they are not looked at.
+        assert!(!answer(true, false, || true, || panic!("looked"), || false));
     }
 }

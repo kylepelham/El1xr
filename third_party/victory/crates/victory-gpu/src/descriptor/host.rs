@@ -15,10 +15,11 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod flicker;
-mod host_textures;
+pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
 mod list_views;
+pub(crate) mod queue_marks;
 mod recheck_tail;
 mod slot_wait;
 pub(crate) mod view_ages;
@@ -229,6 +230,9 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// What `textures`' slots hold, read without its lock
+    /// ([`queue_marks::QueueMarks`]).
+    marks: std::sync::Arc<queue_marks::QueueMarks>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -362,7 +366,7 @@ pub(crate) fn commit_show(heap: usize, index: u32, handle: u64, expected_key: u6
 }
 
 /// [`commit_show`] now: true if it wrote the slot.
-fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key: u64) -> bool {
+pub(crate) fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key: u64) -> bool {
     let heaps = super::SHADER_HEAPS
         .read()
         .unwrap_or_else(|e| e.into_inner());
@@ -959,9 +963,29 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// What `slots` holds, for reading without the lock (the host heap
+    /// keeps the same; none in tests made without a heap).
+    marks: std::sync::Arc<queue_marks::QueueMarks>,
 }
 
 impl TextureQueue {
+    /// An empty queue whose marks are `marks`.
+    fn with_marks(marks: std::sync::Arc<queue_marks::QueueMarks>) -> Self {
+        TextureQueue {
+            marks,
+            ..Default::default()
+        }
+    }
+
+    /// Slot `index` leaves `slots`; whether it was there.
+    fn take_out(&mut self, index: u32) -> bool {
+        let was = self.slots.remove(&index).is_some();
+        if was {
+            self.marks.set(index, 0);
+        }
+        was
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -984,10 +1008,11 @@ impl TextureQueue {
                 mapped: 0,
             },
         );
+        self.marks.set(index, write);
     }
 
     fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+        self.take_out(index);
         self.rechecks.remove(&index);
         self.live.remove(&index);
     }
@@ -1174,7 +1199,7 @@ impl TextureQueue {
     /// Returns whether the slot was marked live.
     fn done(&mut self, index: u32, write: u64) -> bool {
         if self.reschedule(index, write).is_some() {
-            self.slots.remove(&index);
+            self.take_out(index);
             self.live.remove(&index)
         } else {
             false
@@ -1248,6 +1273,7 @@ impl TextureQueue {
                 mapped: 0,
             },
         );
+        self.marks.set(index, write);
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1586,6 +1612,11 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let marks = std::sync::Arc::new(queue_marks::QueueMarks::new(if sampler {
+            0
+        } else {
+            count as usize
+        }));
         let h = HostHeap {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
@@ -1609,7 +1640,8 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
-            textures: Mutex::default(),
+            textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
+            marks,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1908,7 +1940,18 @@ impl HostHeap {
                 textures.partly(index, write, frame, mapped);
                 false
             }
-            None => textures.done(index, write),
+            None => {
+                let live = textures.done(index, write);
+                // (`VICTORY_QUEUE_MARKS`) Out of the queue altogether: its
+                // flag says so, and notes that would take it out skip the lock.
+                if queue_marks::on()
+                    && !textures.slots.contains_key(&index)
+                    && !textures.rechecks.contains_key(&index)
+                {
+                    self.note_slot(index, SLOT_IN_TEXTURES, false);
+                }
+                live
+            }
         }
     }
 
@@ -2597,9 +2640,23 @@ impl HostHeap {
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
+                let marks = queue_marks::on();
+                // (`VICTORY_QUEUE_MARKS`) Not in the queue: nothing to take out.
+                if marks && self.queued(index) == Some(false) {
+                    queue_marks::not_taken(queue_marks::TABLE);
+                    return;
+                }
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.take_out(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
+                }
+                // Its flag goes once nothing of the queue's is left (a live
+                // mark stays until a write or a removal takes it).
+                if marks
+                    && !textures.rechecks.contains_key(&index)
+                    && !textures.live.contains(&index)
+                {
+                    self.note_slot(index, SLOT_IN_TEXTURES, false);
                 }
             }
         } else if reread && tabled_out() && self.slot_may(index, SLOT_IN_TEXTURES) {
@@ -2607,7 +2664,7 @@ impl HostHeap {
             // since (the title wrote it again, due `TABLED_GRACE` frames
             // on): this draw brought it up to date too.
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            if textures.slots.remove(&index).is_some() {
+            if textures.take_out(index) {
                 TABLED_WRITES[1].fetch_add(1, Relaxed);
                 TABLED_WRITES[2].fetch_add(1, Relaxed);
             }
@@ -2759,6 +2816,12 @@ impl HostHeap {
             .is_none_or(|f| f.load(std::sync::atomic::Ordering::Relaxed) & bit != 0)
     }
 
+    /// Whether the queue's slots hold title slot `index`, by its marks
+    /// ([`queue_marks::QueueMarks`]), without its lock; `None`: ask the queue.
+    fn queued(&self, index: u32) -> Option<bool> {
+        self.marks.get(index).map(|write| write != 0)
+    }
+
     /// Notes in [`HostHeap::slot_flags`] that title slot `index` is
     /// (`there`), or is not, in the set `bit` stands for (nothing for
     /// dynamic slots).
@@ -2791,8 +2854,22 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        let keeps = texture && !read_now;
+        // (`VICTORY_QUEUE_MARKS`) Nothing would change: a slot made (not
+        // written) as the queue holds it stays as it is; a slot to leave a
+        // queue that holds it in neither its slots nor its looks again.
+        if queue_marks::on()
+            && if keeps {
+                seen && self.queued(index) == Some(true)
+            } else {
+                !self.slot_may(index, SLOT_IN_TEXTURES)
+            }
+        {
+            queue_marks::not_taken(queue_marks::WRITE);
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        if texture && !read_now {
+        if keeps {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
@@ -2873,7 +2950,9 @@ impl HostHeap {
                 if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
             {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                host_textures::queued(*r as crate::object::This)
+                // One the host writes: nothing for the pass to bring up to
+                // date (`VICTORY_QUEUE_HOST_TEXTURES=0`).
+                host_textures::queues(*r as crate::object::This)
             }
             _ => false,
         };
@@ -2934,7 +3013,14 @@ impl HostHeap {
             // Not in the spans as far as the flags say: nothing to forget.
             Vec::new()
         };
-        if !stale.is_empty() {
+        if !stale.is_empty()
+            && queue_marks::on()
+            && !stale.iter().any(|&slot| self.slot_may(slot, SLOT_IN_TEXTURES))
+        {
+            // (`VICTORY_QUEUE_MARKS`) None of them in the queue.
+            STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            queue_marks::not_taken(queue_marks::STALE);
+        } else if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
@@ -6479,6 +6565,76 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// With `VICTORY_QUEUE_MARKS` the queue ends as without it through
+    /// writes, makes, table reads, uploads whole and in part, looks again
+    /// and removals, and its marks say which slots it holds.
+    #[test]
+    fn queue_marks_change_nothing_but_the_locks_taken() {
+        let (Some(on), Some(off)) = (HostHeap::new(false, 8), HostHeap::new(false, 8)) else {
+            return; // no host GPU
+        };
+        let f = 300;
+        let write = |heap: &HostHeap, index: u32| {
+            heap.texture_slots_due(u64::MAX, 100)
+                .0
+                .iter()
+                .find(|d| d.0 == index)
+                .map_or(0, |d| d.1)
+        };
+        let step = |what: &dyn Fn(&HostHeap)| {
+            queue_marks::FORCE.set(Some(true));
+            what(&on);
+            queue_marks::FORCE.set(Some(false));
+            what(&off);
+            queue_marks::FORCE.set(None);
+            let (a, b) = (on.textures.lock().unwrap(), off.textures.lock().unwrap());
+            assert_eq!(a.slots, b.slots);
+            assert_eq!(a.rechecks, b.rechecks);
+            assert_eq!(a.live, b.live);
+            assert_eq!(a.writes, b.writes);
+            for heap in [&on, &off] {
+                for i in 0..8 {
+                    assert_eq!(heap.queued(i), Some(a.slots.contains_key(&i)), "slot {i}");
+                    if a.slots.contains_key(&i) || a.rechecks.contains_key(&i) {
+                        assert!(heap.slot_may(i, SLOT_IN_TEXTURES), "slot {i}");
+                    }
+                }
+            }
+        };
+        step(&|h| {
+            for i in 1..5 {
+                h.queue_texture(i, true, false, f);
+            }
+        });
+        step(&|h| h.queue_texture(1, true, true, f));
+        step(&|h| h.queue_texture(5, false, false, f));
+        step(&|h| h.queue_texture(6, true, true, f));
+        step(&|h| h.tabled_in(6, true, f));
+        step(&|h| h.tabled_in(2, true, f));
+        step(&|h| h.tabled_in_as(2, true, f, true));
+        step(&|h| {
+            let w = write(h, 3);
+            let live = h.texture_slot_done(3, w, None);
+            h.texture_slot_recheck(3, f, (0x1000, 64), 7, live);
+        });
+        step(&|h| h.queue_texture(3, true, true, f + 1));
+        step(&|h| h.queue_texture(3, false, false, f + 1));
+        step(&|h| {
+            let w = write(h, 1);
+            h.texture_slot_done(1, w, None);
+        });
+        step(&|h| h.queue_texture(1, false, false, f + 1));
+        step(&|h| h.tabled_in(1, true, f + 1));
+        step(&|h| {
+            let w = write(h, 4);
+            h.texture_slot_done(4, w, Some((f + 5, 100)));
+        });
+        step(&|h| h.queue_texture(4, true, true, f + 2));
+        step(&|h| h.tabled_in(4, true, f + 2));
+        step(&|h| h.queue_texture(4, true, false, f + 3));
+        step(&|h| h.tabled_in(4, true, f + 3));
     }
 
     /// A slot written after its first table read of a frame waits for its
