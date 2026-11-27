@@ -578,6 +578,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → (first
     /// dynamic slot, scratch CBV epoch if backed by scratch constants).
     fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Option<u64>)>,
+    /// This recording of the list, for the views its fresh tables hold
+    /// (`VICTORY_LIST_VIEWS`, `HostHeap::make_listed`; 0: none yet).
+    recording: u64,
     /// (Neptune) Of those, the ones whose views were made ready for a draw
     /// (`readable`) with nothing to do again while the host list's count of state
     /// changes stands: the host list, that count, and the textures the table shows.
@@ -726,6 +729,7 @@ impl State {
         crate::descriptor::release_dynamic_many(&self.dynamic);
         self.dynamic.clear();
         self.fresh_tables.clear();
+        self.recording = 0;
         self.ready_tables.clear();
         self.seen_tables.clear();
         self.root_srv_slots.clear();
@@ -1209,6 +1213,7 @@ impl State {
             scratch_selected,
             scratch_textures,
             fresh_tables,
+            recording,
             ready_tables,
             seen_tables,
             dynamic,
@@ -1273,6 +1278,7 @@ impl State {
         if fresh_tables.capacity() > 4096 {
             fresh_tables.shrink_to(1024);
         }
+        *recording = 0;
         ready_tables.clear();
         if ready_tables.capacity() > 4096 {
             ready_tables.shrink_to(1024);
@@ -4536,6 +4542,10 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if self.recording == 0 && crate::descriptor::host::list_views() {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
             let mut plain = ready_tables_on() && !group.has_uav;
             let mut deferred = false;
             textures.clear();
@@ -4630,7 +4640,18 @@ impl State {
                             .flatten()
                         {
                             Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                            // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
+                            None => {
+                                let listed = crate::descriptor::host::list_views()
+                                    && host.make_listed(
+                                        self.recording,
+                                        crate::descriptor::record_at(table + u64::from(k) * 32),
+                                        index,
+                                    );
+                                if !listed {
+                                    host.make_at(index, &view);
+                                }
+                            }
                         }
                         let kind = entry.map(|u| u.kind).or_else(|| {
                             selected

@@ -14,6 +14,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod list_views;
+pub(crate) use list_views::on as list_views;
+
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
 /// textures picked by index ([`TextureQueue::slots`] or [`TextureQueue::rechecks`]).
 const SLOT_IN_TEXTURES: u8 = 1 << 0;
