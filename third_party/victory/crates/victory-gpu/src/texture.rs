@@ -760,6 +760,28 @@ pub(crate) fn host_written(resource: This) {
                 );
         }
     }
+    if new && crate::bake_watch::on() {
+        // SAFETY: 56 bytes in the description's layout, as above.
+        let words = crate::resource::texture_memory(resource)
+            .map(|(_, desc)| unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() });
+        let [width, height, format] = words.map_or([0; 3], |w| [w[4], w[6], w[8]]);
+        crate::bake_watch::marked(resource as usize, width, height, format);
+    }
+}
+
+/// (`VICTORY_BAKE_WATCH`) The texture the host wrote, other than `except`,
+/// whose memory holds part of `[address, address + len)`: its address
+/// and resource.
+fn in_host_written(address: u64, len: u64, except: usize) -> Option<(u64, usize)> {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let end = address.saturating_add(len);
+    let before = map.range(..=address).next_back();
+    let inside = map.range(address..end);
+    before
+        .into_iter()
+        .chain(inside)
+        .find(|(at, d)| **at < end && address < **at + d.0 && d.5 != except)
+        .map(|(at, d)| (*at, d.5))
 }
 
 /// The title memory of textures the host copied into, by address: bytes
@@ -995,6 +1017,7 @@ impl PreludeUpload {
                     "prelude upload left out: the host wrote the texture after the list that samples it was recorded"
                 );
             }
+            crate::bake_watch::add(crate::bake_watch::C::PreludeSkipped, 1);
             return None;
         }
         let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
@@ -1002,6 +1025,12 @@ impl PreludeUpload {
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
             return None;
         };
+        if crate::bake_watch::on() {
+            let (at, len) = self.staging.memory();
+            if let Some((baked_at, baked)) = in_host_written(at as u64, len as u64, self.resource) {
+                crate::bake_watch::alias_upload(self.resource, at, baked, baked_at);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
         // Levels on demand (`crate::tiles`): after `refresh()` has detiled,
@@ -1304,6 +1333,9 @@ pub(crate) fn card_writes(
         return;
     }
     let fresh = tiled.claim(levels);
+    if fresh != 0 {
+        crate::bake_watch::add(crate::bake_watch::C::ZerosOverBaked, u64::from(host_wrote(resource as usize)));
+    }
     // Of them, the ones whose zeros could not be recorded.
     let mut unzeroed = if host().is_none() { fresh } else { 0 };
     if fresh != 0
@@ -1365,22 +1397,63 @@ pub(crate) fn card_writes(
     // last owner left. The next list that writes it claims it again.
     unzeroed &= fresh;
     if unzeroed != 0 {
-        tiled.unclaim(unzeroed);
+        crate::bake_watch::levels(crate::bake_watch::C::LostNoUpload, resource as usize, unzeroed);
     }
-    let levels = levels & !unzeroed;
+    let (unclaim, levels) = unzeroed_levels(levels, unzeroed, card_write_keep());
+    if unclaim != 0 {
+        tiled.unclaim(unclaim);
+    }
     if levels == 0 {
         return;
     }
     let memory = crate::resource::texture_memory(resource).map_or(0, |(memory, _)| memory as u64);
     let step = Claimed {
         on_demand,
-        fresh: fresh & !unzeroed,
+        fresh: fresh & !unclaim,
         ran: std::sync::atomic::AtomicBool::new(false),
     };
+    let title = resource as usize;
     list.defer_host(move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
+        if crate::bake_watch::on()
+            && let Some(tiled) = step.on_demand.tiled()
+        {
+            let lost = tiled.without(levels);
+            if lost != 0 {
+                crate::bake_watch::levels(crate::bake_watch::C::LostNoTiles, title, lost);
+            }
+        }
     });
+}
+
+/// `VICTORY_CARD_WRITE_KEEP=1`: a card write (a bake's copy, a resolve)
+/// into a new level on demand whose zeros could not be recorded (no
+/// upload memory) still gets the level's tiles, and the write lands; off,
+/// the level is left without tiles and the write is lost (it reads zeros:
+/// a baked skin drawn black).
+fn card_write_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WRITE_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// Of the `levels` a card write names, with `unzeroed` the new ones whose
+/// zeros could not be recorded: the levels to give back unclaimed, and
+/// the levels the write gets tiles for ([`card_write_keep`]).
+fn unzeroed_levels(levels: u32, unzeroed: u32, keep: bool) -> (u32, u32) {
+    if keep { (0, levels) } else { (unzeroed, levels & !unzeroed) }
+}
+
+#[cfg(test)]
+mod card_write_keep_tests {
+    use super::unzeroed_levels;
+
+    #[test]
+    fn a_kept_write_keeps_the_levels_whose_zeros_failed() {
+        assert_eq!(unzeroed_levels(0b111, 0b010, false), (0b010, 0b101));
+        assert_eq!(unzeroed_levels(0b111, 0b010, true), (0, 0b111));
+        assert_eq!(unzeroed_levels(0b111, 0, false), (0, 0b111));
+    }
 }
 
 impl Staging {

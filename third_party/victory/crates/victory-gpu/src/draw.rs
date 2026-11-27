@@ -2027,6 +2027,10 @@ impl State {
         let _whole = BindLap::start(0);
         let _hitch = crate::hitch::span(crate::hitch::Phase::Bind);
         let l = &list.list;
+        if crate::bake_watch::on() {
+            let stages = p.stages.iter().map(|s| s.shader.hash.as_str());
+            crate::bake_watch::binding(list as *const HostList as usize, stages, p.is_bake);
+        }
         // Textures picked by index, before anything asks for them.
         {
             let _lap = BindLap::start(1);
@@ -2888,6 +2892,10 @@ impl State {
         PASS_BUDGET.set(None);
         if is_bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if crate::bake_watch::on() {
+                let due = host.texture_slots_due(frame, 0).1[1];
+                crate::bake_watch::bake_pass(frame, due, began.elapsed().as_millis() as u64, budget.0);
+            }
         }
     }
 
@@ -3703,6 +3711,13 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
+        #[cfg(feature = "diagnostics")]
+        if crate::trace_va::dispatch_barrier() {
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        }
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -3767,6 +3782,7 @@ impl State {
             }
             return;
         }
+        crate::bake_watch::dispatched(list as *const HostList as usize);
         #[cfg(windows)]
         self.cost_title(list, "dispatch");
         #[cfg(feature = "diagnostics")]
@@ -5794,6 +5810,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::view(kind == ResourceType::Uav, address, len);
+        crate::bake_watch::view(address as u64, len as u64, kind == ResourceType::Uav);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

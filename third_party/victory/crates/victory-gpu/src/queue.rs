@@ -279,6 +279,24 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::trace_va::submit(
+        this as usize,
+        queue(this).kind as u32,
+        &lists
+            .iter()
+            .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+            .collect::<Vec<_>>(),
+    );
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -366,6 +384,24 @@ fn submit_split(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::trace_va::submit(
+        this as usize,
+        queue(this).kind as u32,
+        &lists
+            .iter()
+            .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+            .collect::<Vec<_>>(),
+    );
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -816,6 +852,26 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let (taken, order) = crate::list::detach(lists);
             Held::Run(taken, order)
         });
+        #[cfg(windows)]
+        if crate::bake_watch::on() {
+            crate::bake_watch::submit(
+                &lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            crate::trace_va::submit(
+                this as usize,
+                queue(this).kind as u32,
+                &lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                    .collect::<Vec<_>>(),
+            );
+        }
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
         #[cfg(feature = "diagnostics")]

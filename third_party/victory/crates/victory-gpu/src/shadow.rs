@@ -1798,6 +1798,12 @@ pub(crate) fn preparing(number: u64) {
     PREPARED.store(number, Ordering::Relaxed);
 }
 
+/// The submission being prepared last ([`preparing`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn prepared() -> u64 {
+    PREPARED.load(Ordering::Relaxed)
+}
+
 /// With [`relay`]: the number of the last send of changed ranges to the
 /// card (`crate::host`'s order of the queue) that every fetch still to be
 /// merged came after. Notes of sends up to it are of no use any more.
@@ -5049,6 +5055,8 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("refresh asked", address, len, list as *const HostList as u64);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -5198,6 +5206,8 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("gpu writes asked", address, len, list as *const HostList as u64);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -5210,6 +5220,8 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("writing (snapshot)", address as u64, len as u64, 0);
         if self.place.is_some() || self.transient_written(address) {
             return;
         }
@@ -5395,6 +5407,18 @@ impl Shadow {
         len: usize,
         found: Option<Vec<(usize, usize)>>,
     ) -> usize {
+        let n = self.copy_back_inner(address, len, found);
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("copy back", address as u64, len as u64, n as u64);
+        n
+    }
+
+    fn copy_back_inner(
+        self: &Arc<Self>,
+        address: usize,
+        len: usize,
+        found: Option<Vec<(usize, usize)>>,
+    ) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -5530,6 +5554,19 @@ impl Shadow {
         now: &mut Vec<u8>,
         title: &mut Vec<u8>,
     ) -> usize {
+        let written = self.relay_merge_inner(at, n, now, title);
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("relay merge", self.start + at as u64, n as u64, written as u64);
+        written
+    }
+
+    fn relay_merge_inner(
+        &self,
+        at: usize,
+        n: usize,
+        now: &mut Vec<u8>,
+        title: &mut Vec<u8>,
+    ) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || self.rebar || n == 0 || at + n > self.len as usize {
             return 0;
@@ -5649,6 +5686,11 @@ impl Shadow {
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        for &(a, e) in ranges {
+            crate::trace_va::event("copy back done", a as u64, (e - a) as u64, 0);
+            self.trace_differs("after copy back differs", a, e - a);
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
@@ -6051,6 +6093,63 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(self: &Arc<Self>, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        if crate::trace_va::on() {
+            let end = address + len;
+            let busy = if self.has_pending.load(Ordering::Acquire) {
+                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending.iter().filter(|&&(a, e)| a < end && e > address).count() as u64
+            } else {
+                0
+            };
+            crate::trace_va::event("refresh pending", address as u64, len as u64, busy);
+            self.trace_differs("refresh differs", address, len);
+        }
+        let n = self.update_inner(address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("refresh copied", address as u64, len as u64, n as u64);
+        n
+    }
+
+    /// (diagnostics, `VICTORY_TRACE_VA`) Logs how many bytes of title memory
+    /// `[address, address + len)` differ from the copy's CPU side, and where
+    /// the first one is; only for traced ranges of a copy not in place.
+    #[cfg(feature = "diagnostics")]
+    fn trace_differs(&self, what: &str, address: usize, len: usize) {
+        if self.place.is_some()
+            || self.window
+            || self.transient()
+            || self.data.is_null()
+            || !crate::trace_va::watched(address as u64, len as u64)
+        {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into_fast(from as *const u8, &mut title) {
+            return;
+        }
+        // SAFETY: inside the mapping of the copy's CPU side.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        let mut first = None;
+        let mut n = 0u64;
+        for (i, (a, b)) in title.iter().zip(held).enumerate() {
+            if a != b {
+                first.get_or_insert(i);
+                n += 1;
+            }
+        }
+        if let Some(i) = first {
+            let kind = if self.card.is_some() { " (card)" } else { " (host)" };
+            crate::trace_va::event(&format!("{what}{kind}"), (from + i) as u64, 1, n);
+        }
+    }
+
+    fn update_inner(self: &Arc<Self>, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -6656,6 +6755,8 @@ impl Shadow {
         if from >= to {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event("card changed", self.start + from as u64, (to - from) as u64, 0);
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => {
@@ -6683,6 +6784,16 @@ impl Shadow {
             None
         };
         let iter = merged.as_deref().unwrap_or(runs);
+        #[cfg(feature = "diagnostics")]
+        if let (Some(first), Some(last)) = (iter.first(), iter.last()) {
+            let bytes: usize = iter.iter().map(|&(_, m)| m).sum();
+            crate::trace_va::event(
+                if coalesce { "card send (refresh)" } else { "card send (under writes)" },
+                self.start + (at + first.0) as u64,
+                (last.0 + last.1 - first.0) as u64,
+                bytes as u64,
+            );
+        }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         for &(r, m) in iter {
             let (from, to) = (at + r, at + r + m);
@@ -6883,6 +6994,24 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+    ) -> usize {
+        let written = self.card_merge_relay_inner(at, gpu, fetched_after, title);
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::event(
+            "card relay merge",
+            self.start + at as u64,
+            gpu.len() as u64,
+            written as u64,
+        );
+        written
+    }
+
+    fn card_merge_relay_inner(
         &self,
         at: usize,
         gpu: &[u8],

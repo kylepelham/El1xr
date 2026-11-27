@@ -41,6 +41,8 @@ mod ambient;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
+mod bake_watch;
+#[cfg(windows)]
 mod draw;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
@@ -136,6 +138,8 @@ mod ramline;
 mod shadow;
 #[cfg(windows)]
 mod copy_profile;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
 #[cfg(windows)]
