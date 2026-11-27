@@ -471,7 +471,10 @@ fn scheduler() -> Option<&'static Scheduler> {
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        victory_gpu::topology::pin_background("dstorage");
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();

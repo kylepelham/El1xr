@@ -5,7 +5,7 @@
 
 /// The system's processor sets of group 0: each one's id, its efficiency
 /// class (higher is faster) and its core (which two of them may share).
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+pub(crate) fn cpu_sets() -> Vec<(u32, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{
         GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
     };
@@ -52,7 +52,7 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
 
 /// The bytes of the last-level cache each processor set of group 0 shares,
 /// by set id (none known: empty).
-fn l3_of_sets() -> Vec<(u32, u32)> {
+pub(crate) fn l3_of_sets() -> Vec<(u32, u32)> {
     use windows_sys::Win32::System::SystemInformation::{
         CACHE_RELATIONSHIP, GetLogicalProcessorInformationEx, GetSystemCpuSetInformation,
         RelationCache, SYSTEM_CPU_SET_INFORMATION, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
@@ -157,7 +157,7 @@ fn cache_cores() -> bool {
 }
 
 /// The sets of the fastest class, if there are slower ones too.
-fn fast_by_class(sets: &[(u32, u8, u8)]) -> Vec<u32> {
+pub(crate) fn fast_by_class(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
     let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
     if fast.len() == sets.len() {
@@ -169,7 +169,7 @@ fn fast_by_class(sets: &[(u32, u8, u8)]) -> Vec<u32> {
 
 /// The sets on the largest last-level cache (`l3`: bytes by set id), if
 /// another one is smaller and the largest serves at least eight sets.
-fn fast_by_cache(sets: &[(u32, u8, u8)], l3: &[(u32, u32)]) -> Vec<u32> {
+pub(crate) fn fast_by_cache(sets: &[(u32, u8, u8)], l3: &[(u32, u32)]) -> Vec<u32> {
     let size = |id: u32| l3.iter().find(|s| s.0 == id).map_or(0, |s| s.1);
     let sizes: Vec<u32> = sets.iter().map(|s| size(s.0)).collect();
     let (Some(&most), Some(&least)) = (sizes.iter().max(), sizes.iter().min()) else {
@@ -308,12 +308,23 @@ fn stage() -> u32 {
 /// different sizes, [`cache_cores`]). (A selection of processors is a
 /// preference the scheduler keeps unless nothing of it is free.)
 pub(crate) fn keep_on_fast_cores() {
+    if crate::topology::vcache_pin_enabled() {
+        let current = std::thread::current();
+        crate::topology::pin_hot(current.name().unwrap_or("thread"));
+        return;
+    }
     ask(1);
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
 /// a landing shares its work with.
 pub(crate) fn keep_helper_on_fast_cores() {
+    // With V-Cache placement on (`crate::topology`), wide copy/merge worker pools stay unpinned
+    // so 24+ bulk workers never oversubscribe CCD0's 8 cores or evict the
+    // 96 MiB 3D V-Cache.
+    if crate::topology::vcache_pin_enabled() {
+        return;
+    }
     ask(2);
 }
 
