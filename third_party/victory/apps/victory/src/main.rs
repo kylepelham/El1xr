@@ -159,6 +159,11 @@ enum Command {
         /// Only translate: no host pipelines.
         #[arg(long)]
         no_pipelines: bool,
+        /// Then make the host pipeline of every recipe runs wrote down
+        /// (`VICTORY_PIPELINE_RECIPES=1`) into the pipeline library: makes a
+        /// device on the card.
+        #[arg(long)]
+        recipes: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -268,12 +273,13 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => {
+        Command::Warm { paths, jobs, no_pipelines, recipes } => {
             // (bootfast) Translating only, with the host's facts given
             // (`VICTORY_HOST_WAVE`, `VICTORY_VIEW_LIMIT`, as a run's log
             // states them): no device is made on the card, and the
             // translations go under the key a run on that GPU looks for.
             if no_pipelines
+                && !recipes
                 && let (Some(wave), Some(views)) = (
                     std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.trim().parse().ok()),
                     std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.trim().parse().ok()),
@@ -281,7 +287,11 @@ fn main() -> Result<()> {
             {
                 victory_gpu::host_facts::assume_host_facts(wave, views);
             }
-            translate::warm(paths, jobs, !no_pipelines)
+            translate::warm(paths, jobs, !no_pipelines)?;
+            if recipes {
+                translate::warm_recipes(jobs)?;
+            }
+            Ok(())
         }
         Command::Run {
             exe,

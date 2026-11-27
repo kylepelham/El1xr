@@ -982,3 +982,25 @@ mod tests {
         assert_eq!(worker_threads(Some(0), Some(32)), 1);
     }
 }
+
+/// (bootfast) `victory warm --recipes`: the host pipeline of every recipe in
+/// the cache's `pipeline-recipes.bin`, made on `jobs` threads (default:
+/// every logical core) into the pipeline library, which is saved after.
+pub fn warm_recipes(jobs: Option<usize>) -> Result<()> {
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let started = std::time::Instant::now();
+    let w = victory_gpu::pipeline::warm_recipes(threads)?;
+    println!(
+        "warm recipes {} recipes: {} host pipelines ({} compiled, {} from the library), {} refused, {} left out, {} unreadable, {} with another key; {:.0} s",
+        w.recipes,
+        w.made,
+        w.compiled,
+        w.loaded,
+        w.refused,
+        w.left_out,
+        w.unreadable,
+        w.other_key,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}

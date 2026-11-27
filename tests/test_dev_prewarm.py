@@ -49,7 +49,10 @@ def test_translation_only_gives_the_host_facts_and_keeps_the_arms_overrides():
 
 def test_launcher_extra_warms_and_stops_before_the_title():
     assert dev_prewarm.launcher_extra(False, 0) == ["-Precompile", "-NoGame", "-WarmNoPipelines"]
-    assert dev_prewarm.launcher_extra(True, 8) == ["-Precompile", "-NoGame", "-WarmJobs", "8"]
+    # Recipes, not a compute pipeline for every compute shader shipped.
+    assert dev_prewarm.launcher_extra(True, 8) == [
+        "-Precompile", "-NoGame", "-WarmJobs", "8", "-WarmNoPipelines", "-WarmRecipes",
+    ]
 
 
 def test_parse_summary_reads_the_warm_lines():
@@ -57,7 +60,9 @@ def test_parse_summary_reads_the_warm_lines():
         "warm         9123 translated, 41 refused; 0 compute pipelines, 0 refused; 57 s\n"
         "warm cache   3700 from the cache, 5423 translated now\n"
     )
-    assert dev_prewarm.parse_summary(text) == {
+    summary = dev_prewarm.parse_summary(text)
+    assert {k: summary[k] for k in ("shaders", "refused", "pipelines", "pipelines_refused", "warm_s", "hits",
+                                    "translated")} == {
         "shaders": 9123,
         "refused": 41,
         "pipelines": 0,
@@ -66,7 +71,18 @@ def test_parse_summary_reads_the_warm_lines():
         "hits": 3700,
         "translated": 5423,
     }
+    assert summary["recipes"] == 0
     assert dev_prewarm.parse_summary("")["shaders"] == 0
+
+
+def test_parse_summary_reads_the_recipes_line():
+    text = (
+        "warm recipes 3412 recipes: 3390 host pipelines (3101 compiled, 289 from the library), 4 refused, "
+        "18 left out, 0 unreadable, 0 with another key; 96 s\n"
+    )
+    s = dev_prewarm.parse_summary(text)
+    assert (s["recipes"], s["pipelines_made"], s["compiled"], s["from_library"]) == (3412, 3390, 3101, 289)
+    assert (s["recipes_refused"], s["left_out"], s["unreadable"], s["other_key"], s["recipes_s"]) == (4, 18, 0, 0, 96)
 
 
 def test_prewarm_launcher_command_is_the_bench_one_plus_the_warm_switches(tmp_path):
