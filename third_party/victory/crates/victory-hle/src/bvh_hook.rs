@@ -238,6 +238,9 @@ extern "C" fn batched(this: *mut u8, list: *mut u8, count: u32, descs: *const u8
         }
     }
     victory_gpu::native_rt::build(list.cast_const().cast(), &builds);
+    // SAFETY: `count` items of BATCHED_ITEM_SIZE bytes, each a standard
+    // build description first.
+    unsafe { premap(descs, count, BATCHED_ITEM_SIZE) };
     summary();
     // SAFETY: (`this`, ID3D12GraphicsCommandList6*, UINT, const DESC2*).
     let f: extern "C" fn(*mut u8, *mut u8, u32, *const u8) = unsafe { original(&BATCHED) };
@@ -255,6 +258,7 @@ extern "C" fn copy(this: *mut u8, list: *mut u8, dest: u64, source: u64, mode: u
         );
     }
     victory_gpu::native_rt::copy(dest, source, mode);
+    victory_gpu::bvh_premap::ranges(&[dest, source]);
     summary();
     // SAFETY: (`this`, ID3D12GraphicsCommandList4*, u64, u64, COPY_MODE).
     let f: extern "C" fn(*mut u8, *mut u8, u64, u64, u32) = unsafe { original(&COPY) };
@@ -397,6 +401,58 @@ unsafe fn triangles(g: *const u8) -> victory_gpu::native_rt::Triangles {
     }
 }
 
+/// `VICTORY_BVH_PREMAP=1` ([`victory_gpu::bvh_premap`]): the copies of the
+/// ranges `count` build descriptions `size` bytes apart name are made now.
+///
+/// # Safety
+/// `descs` is null or points to `count` descriptions `size` bytes apart,
+/// each a standard build description first.
+unsafe fn premap(descs: *const u8, count: u32, size: usize) {
+    if !victory_gpu::bvh_premap::on() || descs.is_null() {
+        return;
+    }
+    let mut ranges = Vec::new();
+    for i in 0..count as usize {
+        // SAFETY: by the caller.
+        unsafe { build_ranges(descs.add(i * size), &mut ranges) };
+    }
+    victory_gpu::bvh_premap::ranges(&ranges);
+}
+
+/// The ranges a standard build description names: its destination, source
+/// and scratch, and its inputs' instances (top level) or each triangle
+/// geometry's transform, indices and vertices.
+///
+/// # Safety
+/// `d` points to a standard build description.
+unsafe fn build_ranges(d: *const u8, out: &mut Vec<u64>) {
+    // SAFETY: by the caller; destination, inputs at byte 8, source, scratch.
+    unsafe {
+        out.extend([field::<u64>(d, 0), field::<u64>(d, 32), field::<u64>(d, 40)]);
+        let inputs = d.add(8);
+        let (kind, n, layout) = (
+            field::<u32>(inputs, 0),
+            field::<u32>(inputs, 8),
+            field::<u32>(inputs, 12),
+        );
+        let descs = field::<u64>(inputs, 16);
+        if kind == 0 {
+            out.push(descs);
+            return;
+        }
+        let descs = descs as *const u8;
+        if descs.is_null() {
+            return;
+        }
+        for i in 0..n as usize {
+            let g = geometry_at(descs, layout, i);
+            if !g.is_null() && field::<u32>(g, 0) == 0 {
+                out.extend([field::<u64>(g, 8), field::<u64>(g, 32), field::<u64>(g, 40)]);
+            }
+        }
+    }
+}
+
 /// The build `inputs` describe, for the host's own structures
 /// ([`victory_gpu::native_rt`]); `None` for a layout it does not take.
 ///
@@ -518,6 +574,8 @@ extern "C" fn rehydrate(
             .collect();
         victory_gpu::native_rt::build(list.cast_const().cast(), &builds);
     }
+    // SAFETY: `count` standard build descriptions.
+    unsafe { premap(descs, count, BUILD_DESC_SIZE) };
     summary();
     // SAFETY: (`this`, ID3D12GraphicsCommandList8*, UINT, const DESC*, const UINT64*) -> HRESULT.
     let f: extern "C" fn(*mut u8, *mut u8, u32, *const u8, *const u64) -> i32 =
@@ -601,6 +659,38 @@ mod tests {
         );
         assert_eq!((g.index_format, g.vertex_format), (57, 6));
         assert_eq!((g.index_count, g.vertex_count), (36, 8));
+    }
+
+    /// `VICTORY_BVH_PREMAP`: a build description names its destination,
+    /// source and scratch, and a top level its instances or a bottom level
+    /// each triangle geometry's transform, indices and vertices.
+    #[test]
+    fn a_build_names_its_ranges() {
+        let mut geo = [0u8; GEOMETRY_SIZE * 2];
+        for (i, g) in geo.chunks_mut(GEOMETRY_SIZE).enumerate() {
+            let i = i as u64;
+            g[8..16].copy_from_slice(&(0x1000 + i).to_le_bytes());
+            g[32..40].copy_from_slice(&(0x2000 + i).to_le_bytes());
+            g[40..48].copy_from_slice(&(0x3000 + i).to_le_bytes());
+        }
+        geo[GEOMETRY_SIZE..GEOMETRY_SIZE + 4].copy_from_slice(&1u32.to_le_bytes()); // boxes
+        let mut desc = [0u8; BUILD_DESC_SIZE];
+        desc[0..8].copy_from_slice(&0xa000u64.to_le_bytes());
+        desc[8..12].copy_from_slice(&1u32.to_le_bytes()); // bottom
+        desc[16..20].copy_from_slice(&2u32.to_le_bytes());
+        desc[24..32].copy_from_slice(&(geo.as_ptr() as u64).to_le_bytes());
+        desc[32..40].copy_from_slice(&0xb000u64.to_le_bytes());
+        desc[40..48].copy_from_slice(&0xc000u64.to_le_bytes());
+        let mut out = Vec::new();
+        // SAFETY: the description and its geometries live on this frame.
+        unsafe { build_ranges(desc.as_ptr(), &mut out) };
+        assert_eq!(out, [0xa000, 0xb000, 0xc000, 0x1000, 0x2000, 0x3000]);
+        desc[8..12].copy_from_slice(&0u32.to_le_bytes()); // top
+        desc[24..32].copy_from_slice(&0x5000u64.to_le_bytes());
+        out.clear();
+        // SAFETY: as above.
+        unsafe { build_ranges(desc.as_ptr(), &mut out) };
+        assert_eq!(out, [0xa000, 0xb000, 0xc000, 0x5000]);
     }
 
     /// A geometry that is not triangles (boxes) is not taken.

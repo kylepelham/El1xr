@@ -228,24 +228,22 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
                 let (depth, motion) = (input(up.depth), input(up.motion));
                 // SAFETY: a live resource.
                 let max = unsafe { from.GetDesc() };
-                crate::framegen::prepare(
-                    &host.device,
-                    &list.list,
-                    &crate::framegen::Inputs {
-                        depth,
-                        motion,
-                        render: up.render,
-                        max_render: [max.Width as u32, max.Height],
-                        jitter: up.jitter,
-                        motion_scale: up.motion_scale,
-                        frame_ms: up.frame_ms,
-                        reset: up.reset,
-                        near: up.near,
-                        far: up.far,
-                        fov_y: up.fov_y,
-                        metres_per_unit: up.metres_per_unit,
-                    },
-                );
+                let inputs = crate::framegen::Inputs {
+                    depth,
+                    motion,
+                    render: up.render,
+                    max_render: [max.Width as u32, max.Height],
+                    jitter: up.jitter,
+                    motion_scale: up.motion_scale,
+                    frame_ms: up.frame_ms,
+                    reset: up.reset,
+                    near: up.near,
+                    far: up.far,
+                    fov_y: up.fov_y,
+                    metres_per_unit: up.metres_per_unit,
+                };
+                crate::framegen::prepare(&host.device, &list.list, &inputs);
+                crate::dlssg::tag_inputs(&list.list, &inputs);
             }
         }
         state.after_external(list);

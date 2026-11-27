@@ -20,8 +20,8 @@
 //!
 //! No HUD-less colour exists (the title composes its HUD into the frame we
 //! present), so the HUD is interpolated with the scene: moving HUD parts can
-//! ghost. `VICTORY_FRAME_GEN=dlss` is not supported (DLSS-G needs camera
-//! matrices); it stays off and says so.
+//! ghost. `VICTORY_FRAME_GEN=dlss` is NVIDIA DLSS Frame Generation through
+//! Streamline (`dlssg.rs`); [`create_swap_chain`] hands it the swap chain.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -53,34 +53,31 @@ impl Kind {
     }
 }
 
+/// What `VICTORY_FRAME_GEN` asks for.
+pub(crate) fn kind() -> Kind {
+    static KIND: OnceLock<Kind> = OnceLock::new();
+    *KIND.get_or_init(|| {
+        let Ok(v) = std::env::var("VICTORY_FRAME_GEN") else {
+            return Kind::Off;
+        };
+        Kind::parse(&v).unwrap_or_else(|| {
+            tracing::warn!(value = v, "VICTORY_FRAME_GEN: expected off, fsr or dlss; frame generation stays off");
+            Kind::Off
+        })
+    })
+}
+
 /// `VICTORY_FRAME_GEN=fsr`.
 pub(crate) fn asked() -> bool {
-    static ASKED: OnceLock<bool> = OnceLock::new();
-    *ASKED.get_or_init(|| {
-        let Ok(v) = std::env::var("VICTORY_FRAME_GEN") else {
-            return false;
-        };
-        match Kind::parse(&v) {
-            Some(Kind::Fsr) => true,
-            Some(Kind::Off) => false,
-            Some(Kind::Dlss) => {
-                tracing::warn!("VICTORY_FRAME_GEN=dlss is not supported (DLSS-G needs camera matrices); frame generation stays off");
-                false
-            }
-            None => {
-                tracing::warn!(value = v, "VICTORY_FRAME_GEN: expected off, fsr or dlss; frame generation stays off");
-                false
-            }
-        }
-    })
+    kind() == Kind::Fsr
 }
 
 /// Whether the proxy swap chain presents (frame generation is running).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Whether frame generation owns the presents' pacing.
+/// Whether frame generation (FSR's proxy or DLSS-G's) owns the presents' pacing.
 pub(crate) fn active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+    ACTIVE.load(Ordering::Relaxed) || crate::dlssg::active()
 }
 
 // --- The FidelityFX API (public headers, MIT) ---
@@ -95,6 +92,20 @@ pub(crate) const CONFIGURE_FRAMEGENERATION: u64 = EFFECT_FRAMEGENERATION | 0x02;
 pub(crate) const DISPATCH_FRAMEGENERATION_PREPARE: u64 = EFFECT_FRAMEGENERATION | 0x04;
 pub(crate) const CREATE_SWAPCHAIN_FOR_HWND_DX12: u64 =
     BACKEND_DX12 | EFFECT_FRAMEGENERATIONSWAPCHAIN | 0x06;
+/// SDK 2.1+: a version linked to each create description (without it the
+/// 2.1 loader refused the swap chain, `FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE`,
+/// batch 4 part B).
+pub(crate) const CREATE_SWAPCHAIN_VERSION_DX12: u64 =
+    BACKEND_DX12 | EFFECT_FRAMEGENERATIONSWAPCHAIN | 0x0b;
+pub(crate) const CREATE_FRAMEGENERATION_VERSION: u64 = EFFECT_FRAMEGENERATION | 0x0e;
+/// `FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION` (3.1.6) and
+/// `FFX_FRAMEGENERATION_VERSION` (4.0.0) of the headers the structures follow.
+pub(crate) const SWAPCHAIN_DX12_VERSION: u32 = make_version(3, 1, 6);
+pub(crate) const FRAMEGENERATION_VERSION: u32 = make_version(4, 0, 0);
+
+const fn make_version(major: u32, minor: u32, patch: u32) -> u32 {
+    (major << 22) | (minor << 12) | patch
+}
 
 const FG_DEPTH_INVERTED: u32 = 1 << 3;
 const FG_HIGH_DYNAMIC_RANGE: u32 = 1 << 5;
@@ -182,6 +193,14 @@ pub(crate) struct Rect2 {
     pub height: i32,
 }
 
+/// `ffxCreateContextDescFrameGenerationSwapChainVersionDX12` and
+/// `ffxCreateContextDescFrameGenerationVersion`.
+#[repr(C)]
+pub(crate) struct CreateVersion {
+    pub header: Header,
+    pub version: u32,
+}
+
 #[repr(C)]
 pub(crate) struct CreateBackendDx12 {
     pub header: Header,
@@ -264,6 +283,12 @@ pub(crate) struct Api {
 pub(crate) const DLL_NAMES: [&str; 2] =
     ["amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_dx12.dll"];
 
+/// The SDK 2.x effect DLL the loader looks up by name. Loader 2.1 searches
+/// beside the executable, not beside itself, so it is loaded first by its
+/// full path from the loader's folder: the loader's load by name then finds
+/// it already loaded.
+pub(crate) const EFFECT_DLLS: [&str; 1] = ["amd_fidelityfx_framegeneration_dx12.dll"];
+
 pub(crate) fn dir() -> Option<PathBuf> {
     std::env::var_os("VICTORY_FSR_FG_DIR")
         .filter(|d| !d.is_empty())
@@ -294,6 +319,23 @@ fn load() -> Result<Api, String> {
     };
     if module.is_null() {
         return Err(format!("{} would not load", path.display()));
+    }
+    if path.file_name().is_some_and(|n| n == DLL_NAMES[0]) {
+        for name in EFFECT_DLLS {
+            let effect = dir.join(name);
+            let wide: Vec<u16> = effect.as_os_str().encode_wide().chain([0]).collect();
+            // SAFETY: a full path; kept loaded for the process.
+            let m = unsafe {
+                LoadLibraryExW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+            };
+            if m.is_null() {
+                tracing::warn!(dll = %effect.display(), "frame generation: an effect DLL of the FidelityFX loader would not load");
+            }
+        }
     }
     let export = |name: &[u8]| {
         // SAFETY: a loaded module and a NUL-terminated name.
@@ -399,14 +441,19 @@ unsafe impl Send for Fg {}
 static FG: Mutex<Option<Fg>> = Mutex::new(None);
 static FRAME_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The window's swap chain as FidelityFX's proxy, when `VICTORY_FRAME_GEN=fsr`
-/// asked and it could be made; `None` makes the plain one.
+/// The window's swap chain as FidelityFX's proxy (`VICTORY_FRAME_GEN=fsr`) or
+/// Streamline's DLSS-G proxy (`dlss`), when asked and it could be made; `None`
+/// makes the plain one.
 pub(crate) fn create_swap_chain(
     factory: &IDXGIFactory2,
+    device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     hwnd: HWND,
     desc: &DXGI_SWAP_CHAIN_DESC1,
 ) -> Option<IDXGISwapChain3> {
+    if kind() == Kind::Dlss {
+        return crate::dlssg::create_swap_chain(factory, device, queue, hwnd, desc);
+    }
     if !asked() {
         return None;
     }
@@ -431,6 +478,11 @@ pub(crate) fn create_swap_chain(
         factory: factory.as_raw(),
         queue: queue.as_raw(),
     };
+    let mut version = CreateVersion {
+        header: Header::new(CREATE_SWAPCHAIN_VERSION_DX12),
+        version: SWAPCHAIN_DX12_VERSION,
+    };
+    create.header.next = &mut version.header;
     // SAFETY: live descriptions and objects; the proxy is returned with one reference.
     let r = unsafe { (api.create)(&mut *ctx, &mut create.header, std::ptr::null()) };
     if r != RETURN_OK || chain.is_null() {
@@ -494,7 +546,7 @@ pub(crate) fn prepare(
     list: &ID3D12GraphicsCommandList,
     inputs: &Inputs<'_>,
 ) {
-    if !active() {
+    if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     let Ok(api) = api() else {
@@ -535,6 +587,11 @@ pub(crate) fn prepare(
             },
             back_buffer_format: surface_format(fg.back_buffer),
         };
+        let mut version = CreateVersion {
+            header: Header::new(CREATE_FRAMEGENERATION_VERSION),
+            version: FRAMEGENERATION_VERSION,
+        };
+        backend.header.next = &mut version.header;
         create.header.next = &mut backend.header;
         // SAFETY: live descriptions; the context box outlives every use.
         let r = unsafe { (api.create)(&mut *ctx, &mut create.header, std::ptr::null()) };
@@ -671,6 +728,11 @@ mod tests {
         assert_eq!(DISPATCH_FRAMEGENERATION_PREPARE, 0x0002_0004);
         assert_eq!(CREATE_SWAPCHAIN_FOR_HWND_DX12, 0x0003_0006);
         assert_eq!(CREATE_BACKEND_DX12, 0x2);
+        assert_eq!(CREATE_SWAPCHAIN_VERSION_DX12, 0x0003_000b);
+        assert_eq!(CREATE_FRAMEGENERATION_VERSION, 0x0002_000e);
+        assert_eq!(SWAPCHAIN_DX12_VERSION, (3 << 22) | (1 << 12) | 6);
+        assert_eq!(FRAMEGENERATION_VERSION, 4 << 22);
+        assert_eq!(size_of::<CreateVersion>(), 24);
         assert_eq!(Kind::parse("FSR"), Some(Kind::Fsr));
         assert_eq!(Kind::parse("off"), Some(Kind::Off));
         assert_eq!(Kind::parse("dlss"), Some(Kind::Dlss));

@@ -109,6 +109,15 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     if victory_shader::emit::native_glass() {
         h.update(b"VICTORY_NATIVE_GLASS=1");
     }
+    if let Some(key) = victory_shader::emit::miss_sky_key() {
+        h.update(key.as_bytes());
+    }
+    if let Some(key) = crate::rt_hit_only::key() {
+        h.update(key.as_bytes());
+    }
+    if victory_shader::emit::dispatchx_mask() {
+        h.update(b"VICTORY_DISPATCHX_MASK=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -186,6 +195,13 @@ pub fn wave_pairs_vt_listed(container: &[u8]) -> bool {
 /// [`translate_container`], for a container [`allow_wave_pairs_vt`] names inside
 /// `with_wave_pairs_vt`, with one log line saying what the paired form made of it.
 fn translate_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
+    victory_shader::emit::with_rays_missed(crate::rt_hit_only::misses(container), || {
+        translate_paired_vt(container, wide, pairs, vt)
+    })
+}
+
+/// [`translate_vt`] inside `VICTORY_RT_HIT_ONLY`'s choice.
+fn translate_paired_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
     if !vt {
         return translate_container(container, wide, pairs);
     }
@@ -224,8 +240,22 @@ fn parse_hash_list(value: Option<&str>, default: &[&str]) -> Vec<String> {
     }
 }
 
-fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
-    parse_hash_list(value, &WAVE_WIDE_DEFAULT)
+/// `VICTORY_WATER_WIDE=1` (issue #38): the water transmission programs the list above leaves
+/// out, which no other form takes on a 32-lane host: `CS_TransmissionVolumetrics` and
+/// `_Submerged` are refused (their dispatches dropped), `_VolumePortalsOnly` comes out with
+/// 64-lane waves. The wave-wide form gives each 32-lane waves, as it does their tiled siblings.
+const WATER_WIDE: [&str; 3] = ["6871d6e4b3ac9a10", "926c46bab3b86bd6", "a10179ab7eda0dc3"];
+
+fn parse_wave_wide_only(value: Option<&str>, water: bool) -> Vec<String> {
+    let mut list = parse_hash_list(value, &WAVE_WIDE_DEFAULT);
+    if water {
+        for h in WATER_WIDE {
+            if !list.iter().any(|s| s == h) {
+                list.push(h.to_owned());
+            }
+        }
+    }
+    list
 }
 
 fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
@@ -234,7 +264,10 @@ fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
 
 fn wave_wide_list() -> &'static [String] {
     WAVE_WIDE.get_or_init(|| {
-        parse_wave_wide_only(std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref())
+        parse_wave_wide_only(
+            std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref(),
+            std::env::var("VICTORY_WATER_WIDE").is_ok_and(|v| v.trim() == "1"),
+        )
     })
 }
 
@@ -666,19 +699,33 @@ mod tests {
 
     #[test]
     fn wave_wide_only_parses_defaults_disable_and_lists() {
-        let default = parse_wave_wide_only(None);
+        let default = parse_wave_wide_only(None, false);
         assert!(default.contains(&"02384a60fda6f2d0".to_owned()));
         assert!(default.contains(&"6b82bc7d22016cb5".to_owned()));
         assert!(default.contains(&"2da4beb386509b77".to_owned()));
         assert_eq!(default.len(), WAVE_WIDE_DEFAULT.len());
 
         for off in ["0", "none", "NONE", "", "   "] {
-            assert!(parse_wave_wide_only(Some(off)).is_empty(), "{off:?}");
+            assert!(parse_wave_wide_only(Some(off), false).is_empty(), "{off:?}");
         }
         assert_eq!(
-            parse_wave_wide_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
+            parse_wave_wide_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,"), false),
             vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
         );
+    }
+
+    #[test]
+    fn water_wide_adds_the_three_water_programs_once() {
+        let off = parse_wave_wide_only(None, false);
+        for h in WATER_WIDE {
+            assert!(!off.contains(&h.to_owned()), "{h} is in the default list");
+        }
+        let on = parse_wave_wide_only(None, true);
+        assert_eq!(on[..WAVE_WIDE_DEFAULT.len()], off[..]);
+        assert_eq!(on[WAVE_WIDE_DEFAULT.len()..], WATER_WIDE.map(str::to_owned));
+        let named = parse_wave_wide_only(Some("926c46bab3b86bd6"), true);
+        assert_eq!(named, vec!["926c46bab3b86bd6", "6871d6e4b3ac9a10", "a10179ab7eda0dc3"]);
+        assert_eq!(parse_wave_wide_only(Some("none"), true), WATER_WIDE.map(str::to_owned));
     }
 
     #[test]

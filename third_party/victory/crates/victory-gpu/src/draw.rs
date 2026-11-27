@@ -1815,6 +1815,9 @@ impl State {
         if kind == USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return crate::rt_diag::thread_limit();
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2040,7 +2043,7 @@ impl State {
             crate::bake_watch::binding(list as *const HostList as usize, stages, p.is_bake);
         }
         if crate::camera::on() {
-            self.camera_tap(p, compute);
+            self.camera_tap(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
@@ -2812,6 +2815,10 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
+        if !compute && crate::material_demand::on() {
+            self.material_textures(p);
+        }
         // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
         if p.is_bake && !compute && crate::bake_inputs::on() {
             return self.bake_draw_textures(list, p);
@@ -3136,6 +3143,15 @@ impl State {
             }
             None => 0,
         };
+        // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
+        if !only && crate::material_demand::on() {
+            let wanted = host.texture_slots_pick(&crate::material_demand::take());
+            if !wanted.is_empty() {
+                due.retain(|d| !wanted.iter().any(|w| w.0 == d.0));
+                crate::material_demand::add(crate::material_demand::C::Promoted, wanted.len() as u64);
+                due.splice(pinned..pinned, wanted);
+            }
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -3684,6 +3700,10 @@ impl State {
         if role == Role::Miss {
             return self.ambient_miss(list, p);
         }
+        // `crate::ambient_reflect`'s holds (`reflect_views`).
+        if role.holds_image() {
+            return self.ambient_hold(list, p, role);
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3724,6 +3744,8 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Miss => crate::ambient::MISS_LIGHT,
+            Role::Reflect => crate::ambient_reflect::REFLECTIONS[0],
+            Role::Knee => crate::ambient_reflect::KNEE_IMAGE,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(
@@ -3750,7 +3772,7 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air | Role::Miss => None,
+            Role::Radiance | Role::Air | Role::Miss | Role::Reflect | Role::Knee => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
@@ -3777,6 +3799,12 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// `DispatchX`: its dimensions may be thread counts (`crate::rt_diag`).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let ([x, y, z], limit) = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
+        crate::rt_diag::with_thread_limit(limit, || self.dispatch(list, x, y, z));
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
@@ -3808,6 +3836,7 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -3819,6 +3848,9 @@ impl State {
                 self.list_dropped_roots([x, y, z]);
             }
             return;
+        }
+        if crate::rt_diag::on() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::rt_diag::builder(true);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -3879,6 +3911,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
+            && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -5107,12 +5140,16 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
-        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too.
+        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
+        // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
             && kind == 2
-            && crate::ambient::specular().is_some()
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && match role {
+                crate::ambient::Role::Miss => crate::ambient::specular().is_some(),
+                role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
+            }
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
@@ -5216,6 +5253,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             return false;
         }
@@ -5489,6 +5527,15 @@ impl State {
             && count.is_none()
             && crate::indirect::ahead_layout(kind, stride, args.offset(arguments))
             && !list.gpu_written(arguments as usize, len as usize)
+            // (El1xr) A record shaders of any list wrote lately stays in place
+            // (`crate::indirect::split_ahead`).
+            && (kind != DISPATCH
+                || crate::indirect::split_ahead::guards().is_some_and(|g| {
+                    crate::indirect::split_ahead::may_go_ahead(
+                        g,
+                        g.written && crate::host::shader_written(arguments as usize, len as usize),
+                    )
+                }))
         {
             args.refresh(list, arguments, len);
             if let Some((slots, at)) =
@@ -5532,6 +5579,16 @@ impl State {
                     self.mesh_scissor(list, true);
                 }
                 if let Some(((param, dword), parts)) = split_parts {
+                    // (El1xr) The wait for every earlier shader write the pass in place
+                    // stood behind (`crate::indirect::split_ahead`).
+                    if crate::indirect::split_ahead::guards()
+                        .is_some_and(crate::indirect::split_ahead::went_ahead)
+                    {
+                        #[cfg(windows)]
+                        crate::gpucost::mark(&list.list, || "ours: wait before a dispatch clamped ahead");
+                        // SAFETY: an open list.
+                        unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+                    }
                     crate::indirect::execute_parts(&list.list, (param, dword), parts, (&slots, at));
                     CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                     DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -5774,7 +5831,10 @@ mod indirect_signature_tests;
 
 mod miss_views;
 
+mod reflect_views;
+
 mod bake_pass;
+mod material_pass;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

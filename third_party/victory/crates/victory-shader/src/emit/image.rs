@@ -75,6 +75,7 @@ impl Lower<'_> {
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
+        let guard = self.thread_limit_guard(name, guard);
         let c = self.cur;
         static MSAA_INFO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("VICTORY_RESINFO_MSAA").is_none_or(|v| v != "0")
@@ -282,6 +283,13 @@ impl Lower<'_> {
                     }
                 })
                 .collect();
+            let mut vals = vals;
+            if let Some(s) = crate::emit::miss_sky::scale_at(inst.machine.offset) {
+                let k = self.s.m.f32(s.to_bits());
+                for v in &mut vals[..3] {
+                    *v = self.s.m.bin(self.cur, Bin::Mul, *v, k);
+                }
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];

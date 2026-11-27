@@ -41,6 +41,8 @@ mod buffer_ahead;
 mod ambient;
 #[cfg(windows)]
 mod ambient_miss;
+#[cfg(windows)]
+mod ambient_reflect;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 mod boot_prof;
@@ -48,6 +50,8 @@ mod boot_prof;
 mod bake_inputs;
 #[cfg(windows)]
 mod bake_watch;
+#[cfg(windows)]
+mod bake_why;
 #[cfg(windows)]
 mod draw;
 #[cfg(windows)]
@@ -117,6 +121,8 @@ mod popwatch;
 #[cfg(windows)]
 mod present_audit;
 #[cfg(windows)]
+mod hold_frame;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -125,6 +131,10 @@ pub mod list;
 pub mod native_rt;
 #[cfg(windows)]
 mod rt_bind;
+#[cfg(windows)]
+mod rt_diag;
+#[cfg(windows)]
+mod rt_hit_only;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -145,16 +155,28 @@ mod dlss;
 #[cfg(windows)]
 pub mod framegen;
 #[cfg(windows)]
+mod dlssg;
+#[cfg(windows)]
+mod streamline;
+#[cfg(windows)]
 mod ngx;
 pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
 #[cfg(windows)]
+pub mod camera_copy;
+#[cfg(windows)]
+pub mod camera_mv;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod material_demand;
+#[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+pub mod bvh_premap;
 #[cfg(windows)]
 mod ramline;
 #[cfg(windows)]

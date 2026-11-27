@@ -57,7 +57,7 @@ thread_local! {
 /// in every run. (The idea is fork pull request #994's, which asks a host
 /// word at run time; here it is a translation, since the builder's state
 /// does not change during a run of ours.)
-fn no_hit() -> bool {
+pub(in crate::emit) fn no_hit() -> bool {
     #[cfg(test)]
     if TEST_NO_HIT.get() {
         return true;
@@ -161,7 +161,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
-        if no_hit() {
+        if no_hit() || crate::emit::hit_only::missed() {
             // No structures: a box enters no child, anything else is
             // missed ([`no_hit`]). Nothing is read, and nothing asked of
             // the directory of title memory.

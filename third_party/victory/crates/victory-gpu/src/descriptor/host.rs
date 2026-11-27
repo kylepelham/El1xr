@@ -14,8 +14,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod flicker;
+mod keep_shown;
+mod levels_wait;
 mod list_views;
 mod slot_wait;
+pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
@@ -848,9 +852,10 @@ const TABLED_BLOCK: u32 = 64;
 
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
-/// them through a table.
-pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// them through a table; of the latter, those a draw read again in the
+/// frame of their first read ([`tabled_reread`]).
+pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether slots draws read through tables leave the queue of textures
 /// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
@@ -858,6 +863,23 @@ pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
 fn tabled_out() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
+}
+
+/// (Androtim `8625c3a`) Whether a table read of a slot the queue holds
+/// takes it out also when the slot was read through a table before in the
+/// same frame (`VICTORY_TABLED_REREAD=1`; off: once a frame, as before).
+///
+/// A slot leaves the queue at its first table read of a frame only. The
+/// title rewrites tables' slots while it records (a table per draw), so a
+/// slot written after that read waits in the queue [`TABLED_GRACE`] frames
+/// for a draw, and the draws that read it again in the same frame (which
+/// make it and upload its texture) do not take it out: the texture pass
+/// takes it 8 frames later. Asked by the slot's mark
+/// ([`SLOT_IN_TEXTURES`]) first, so a read of a slot not queued takes no
+/// lock. A candidate of the flicker at scene loads.
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_some_and(|v| v == "1"))
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -2375,6 +2397,8 @@ impl HostHeap {
             return 0;
         }
         slot_wait::drain();
+        self.stale_due();
+        self.levels_due();
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
@@ -2511,6 +2535,11 @@ impl HostHeap {
             .collect()
     }
 
+    /// This heap, for `view_ages`.
+    fn ages_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -2555,6 +2584,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in_as(index, read, frame, tabled_reread());
+    }
+
+    /// [`HostHeap::tabled_in`], with [`tabled_reread`] as `reread` says.
+    fn tabled_in_as(&self, index: u32, read: bool, frame: u64, reread: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
@@ -2580,6 +2614,18 @@ impl HostHeap {
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
+            }
+        } else if reread && tabled_out() && self.slot_may(index, SLOT_IN_TEXTURES) {
+            // Read again in the frame of its first read, and maybe queued
+            // since (the title wrote it again, due `TABLED_GRACE` frames
+            // on): this draw brought it up to date too.
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.slots.remove(&index).is_some() {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
+                TABLED_WRITES[2].fetch_add(1, Relaxed);
+            }
+            if !textures.rechecks.contains_key(&index) {
+                self.note_slot(index, SLOT_IN_TEXTURES, false);
             }
         }
     }
@@ -3518,7 +3564,7 @@ impl HostHeap {
                 batch.as_mut().map(|b| &mut **b),
             );
             for stale in stale {
-                if stale != index {
+                if stale != index && !self.stale_kept(made, stale) {
                     self.unmake(made, stale);
                 }
             }
@@ -3567,6 +3613,7 @@ impl HostHeap {
                     && keep_other_views()
                     && shows_texture(&view)
                     && shows_texture(&old)
+                    && keep_shown::may_stand_in(&old, &view)
                     && self
                         .kept
                         .get(index as usize)
@@ -3574,10 +3621,24 @@ impl HostHeap {
                 if same || other {
                     if same { &KEPT_VIEWS } else { &KEPT_OTHER_VIEWS }
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if view_ages::on() {
+                        let kind = if same {
+                            view_ages::Kind::KeptSame
+                        } else {
+                            view_ages::Kind::KeptOther
+                        };
+                        view_ages::waiting(self.ages_key(), index, kind, &view, Some(&old));
+                    }
                     return Some((view, None));
                 }
             }
             if later {
+                if view_ages::on() && !self.sampler && shows_texture(&view) {
+                    let m = made[index as usize];
+                    let old = (m != 0).then(|| view_at(m as u32, (m >> 32) as u32)).flatten();
+                    let kind = view_ages::Kind::Null;
+                    view_ages::waiting(self.ages_key(), index, kind, &view, old.as_ref());
+                }
                 // A slot of ours that never made a view is already null
                 // (`HostHeap::new` makes every slot null, `made` starts 0
                 // and `kept` at `None`): making it null again costs a
@@ -3591,22 +3652,37 @@ impl HostHeap {
                     }
                     self.keep(index, None);
                 }
+            } else if !for_draw && self.levels_wait(made, index, key, &view) {
+                // Shows what it showed until the new texture has a level
+                // (`levels_wait`, `VICTORY_LEVELS_WAIT_SHOWN`).
             } else {
                 made[index as usize] = key;
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
                         self.keep(index, kept);
                         resolved = copy;
+                        if view_ages::on() {
+                            view_ages::shown(self.ages_key(), index);
+                        }
                     }
                     None => {
                         if !self.sampler {
                             null_for(&view, self.cpu(index));
+                            if shows_texture(&view) {
+                                flicker::count(flicker::Count::Unmade);
+                            }
                         }
                         self.keep(index, None);
+                        if view_ages::on() && !self.sampler && shows_texture(&view) {
+                            let kind = view_ages::Kind::Failed;
+                            view_ages::waiting(self.ages_key(), index, kind, &view, None);
+                        }
                     }
                 }
                 self.made_too[index as usize].store(key, std::sync::atomic::Ordering::Release);
             }
+        } else if for_draw {
+            self.levels_read(index, key, &view);
         }
         Some((view, resolved))
     }
@@ -3664,8 +3740,7 @@ impl HostHeap {
     }
 
     /// What the queue of textures picked by index knows of title slot
-    /// `index` at `frame`, in a few words (diagnostics).
-    #[cfg(feature = "diagnostics")]
+    /// `index` at `frame`, in a few words (diagnostics, `VICTORY_BAKE_WHY`).
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match textures.slots.get(&index) {
@@ -4811,7 +4886,9 @@ pub(crate) fn make(
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
                 // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
+                let first_shown = crate::resource::first_shown(resource);
+                flicker::made_view(&copy, first_shown);
+                if let Some(first) = first_shown
                     && first > 0
                 {
                     // SAFETY: a live resource.
@@ -5058,8 +5135,8 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
 /// nothing yet shows magenta: on the screen, a texture that is not there is
 /// told from one whose contents are black. False if it is to be null.
-#[cfg(feature = "diagnostics")]
-fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+/// (In every build since #55: the operator runs release builds.)
+fn magenta_for(desc: &[u32], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
         return false;
@@ -5078,7 +5155,6 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
 }
 
 /// One magenta texel, written by the processor.
-#[cfg(feature = "diagnostics")]
 fn magenta() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
@@ -5153,9 +5229,13 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
+        View::Shader(_, Some(desc)) => {
+            if magenta_for(desc, at) {
+                return;
+            }
+            return null_like(desc, at);
+        }
         View::Placed(false, _, desc) => {
-            #[cfg(feature = "diagnostics")]
             if magenta_for(desc, at) {
                 return;
             }
@@ -6392,6 +6472,44 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A slot written after its first table read of a frame waits for its
+    /// grace frames; a later read in that frame takes it out only with
+    /// `VICTORY_TABLED_REREAD=1` (`tabled_in_as`'s `reread`).
+    #[test]
+    fn a_slot_written_after_its_read_leaves_at_the_next_read_when_asked() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !tabled_out() {
+            return;
+        }
+        let frame = 200;
+        let slots = |at: u64| -> Vec<u32> {
+            heap.texture_slots_due(at, 8)
+                .0
+                .into_iter()
+                .map(|d| d.0)
+                .collect()
+        };
+        heap.tabled_in_as(4, true, frame, true);
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame + TABLED_GRACE - 1), []);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // Read again in that frame, as before: it stays.
+        heap.tabled_in_as(4, true, frame, false);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // With the re-read: out, counted, and its mark cleared.
+        let before = TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed);
+        heap.tabled_in_as(4, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
+        assert!(TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(!heap.slot_may(4, SLOT_IN_TEXTURES));
+        // A slot not queued: nothing to take out.
+        heap.tabled_in_as(5, true, frame, true);
+        heap.tabled_in_as(5, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     #[test]

@@ -323,13 +323,47 @@ fn finish_reads_noted_addresses_and_publishes() {
         texture: 7,
         target: 9,
     });
+    let motion = Surface {
+        title: 4,
+        format: 34,
+        size: [2560, 1440],
+    };
+    note_velocity_targets(None, Some(motion));
+    note_velocity_targets(
+        Some(Surface {
+            title: 3,
+            format: 20,
+            size: [2560, 1440],
+        }),
+        None,
+    );
+    note_hudless(Surface {
+        title: 0,
+        format: 24,
+        size: [3840, 2160],
+    });
+    assert!(hudless_noted());
     frame_end(read);
+    assert!(!hudless_noted());
     let cam = latest().unwrap();
     assert!(cam.valid, "{}", cam.why);
     assert_eq!(cam.sources, [rec_at, cb_at]);
     assert_eq!(cam.ui.unwrap().texture, 7);
+    assert_eq!(cam.motion, Some(motion));
+    assert_eq!(cam.depth.unwrap().title, 3);
+    assert_eq!(cam.hudless.unwrap().size, [3840, 2160]);
+    assert_eq!(cam.mv_scale, [1.0 / 2560.0, 1.0 / 1440.0]);
     assert!(cam.frame > none.frame);
 
     note_view((rec_at, 288), (cb_at, 0x100));
     assert!(finish(read).why.starts_with("short views"));
+}
+
+#[test]
+fn frame_scales_turn_pixels_into_uv_and_jitter_into_pixels() {
+    let (_, _, d) = camera(0.3, 0.3, [0.0; 3], [0.002, -0.004]);
+    let (scale, jitter) = frame_scales(Some(&d), [2000, 1000]);
+    assert_eq!(scale, [1.0 / 2000.0, 1.0 / 1000.0]);
+    assert!(close(jitter[0], 2.0, 1e-3) && close(jitter[1], 2.0, 1e-3), "{jitter:?}");
+    assert_eq!(frame_scales(None, [0, 0]), ([0.0; 2], [0.0; 2]));
 }

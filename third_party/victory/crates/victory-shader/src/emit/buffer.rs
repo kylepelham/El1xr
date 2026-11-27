@@ -35,6 +35,7 @@ impl Lower<'_> {
         }
         let site = (b, i);
         let guard = self.guard(b, i)?;
+        let guard = self.thread_limit_guard(name, guard);
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
