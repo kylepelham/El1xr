@@ -88,13 +88,17 @@ def test_parse_victory_log_reports_boot_seconds_to_first_world_frame():
     assert stats["boot_s"] == pytest.approx(51.25)
 
 
-def test_fast_boot_is_opt_in_and_sets_skip_intro_and_save():
+def test_fast_boot_is_the_default_and_sets_skip_intro_and_save():
     dev = load_dev()
     parser = dev.build_parser()
     for sub in ("bench", "capture"):
-        plain = parser.parse_args([sub])
+        plain = parser.parse_args([sub, "--no-fast-boot"])
         assert dev.apply_fast_boot(plain, {}) == {}
         assert plain.skip_intro is False and plain.save is None
+
+        default = parser.parse_args([sub])
+        dev.apply_fast_boot(default, {})
+        assert default.skip_intro is True and default.save == "default_checkpoint"
 
         fast = parser.parse_args([sub, "--fast-boot"])
         overrides = dev.apply_fast_boot(fast, {})
