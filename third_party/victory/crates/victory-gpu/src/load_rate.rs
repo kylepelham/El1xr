@@ -80,6 +80,12 @@ pub(crate) fn world_frame() {
     }
 }
 
+/// Whether the world's first frame has been seen (set whatever the
+/// switches; before it the title is booting or loading).
+pub(crate) fn in_world() -> bool {
+    WORLD.load(Ordering::Relaxed)
+}
+
 /// Whether a frame wait sleeps on our clock now (`crate::frame::wait`).
 pub(crate) fn paced_now() -> bool {
     paced(unpaced_loading(), WORLD.load(Ordering::Relaxed))

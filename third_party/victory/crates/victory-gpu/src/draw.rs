@@ -3338,11 +3338,15 @@ impl State {
                 break;
             }
             let slot_budget = if is_ready { ready_budget } else { budget };
-            if i >= pinned
-                && (SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                    || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
-                        && began.elapsed() >= slot_budget))
-            {
+            if bake_pass::stops_at(
+                i,
+                pinned,
+                SPENT.load(Ordering::Relaxed) >= bytes_at_most,
+                uploaded_this_pass,
+                checked,
+                slot_budget,
+                || began.elapsed(),
+            ) {
                 break;
             }
             checked += 1;
