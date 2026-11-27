@@ -215,6 +215,7 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     motion: d.motion.resource as u64,
                     exposure: d.exposure.resource as u64,
                     output: d.output.resource as u64,
+                    reactive: d.reactive.resource as u64,
                     render: d.render,
                     jitter: d.jitter,
                     motion_scale: d.motion_scale,
