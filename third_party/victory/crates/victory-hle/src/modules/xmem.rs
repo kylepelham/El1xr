@@ -32,6 +32,7 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod section_mb;
 mod side_by_side;
 
 const MIB: usize = 1 << 20;
@@ -614,61 +615,28 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
+    if n.checked_mul(PAGE).is_none_or(|size| size == 0) {
         return 0;
     }
+    // One section for the whole request unless `VICTORY_SECTION_MB` asks
+    // for smaller ones ([`section_mb`]).
+    let first = match section_mb::allocate_physical(n, section_mb::section_pages_for(n)) {
+        Ok(first) => first,
+        Err(error) => {
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section::new(handle, n));
-    let mut physical = physical();
-    let Some(first) = physical.take(n) else {
-        drop(physical);
-        // The title keeps 21 bits of a number (`FRAMES`).
-        tracing::warn!(n, "XMemAllocatePhysicalPages: out of page numbers");
-        // SAFETY: checked non-null. The section goes with `section`.
-        unsafe { count.write(0) };
-        return 0;
-    };
     for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+        unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
 }
@@ -2331,7 +2299,7 @@ mod tests {
     /// into another range (a view per run), half unmapped by a copy from 0,
     /// and a copy whose source is mapped only in part.
     fn many_pages_and_a_copy_of_them_side_by_side() {
-        let pages = allocate(96);
+        let pages = allocate_whole(96);
         let a = XMemVirtualAlloc(std::ptr::null_mut(), 96 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
         let b = XMemVirtualAlloc(std::ptr::null_mut(), 96 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
         assert!(!a.is_null() && !b.is_null());
@@ -2974,6 +2942,13 @@ mod tests {
         pages
     }
 
+    /// `n` pages of one new allocation in one section, whatever
+    /// `VICTORY_SECTION_MB` says.
+    fn allocate_whole(n: usize) -> Vec<usize> {
+        let first = section_mb::allocate_physical(n, usize::MAX).expect("allocated");
+        (0..n).map(|k| first + k * FRAMES).collect()
+    }
+
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
@@ -3464,7 +3439,7 @@ mod tests {
             "persistent view is enabled by default"
         );
         // 70 pages crosses the 64-bit word boundary in `Section::committed`.
-        let pages = allocate(70);
+        let pages = allocate_whole(70);
         let section = physical().pages[&pages[0]].section.clone();
         let weak = Arc::downgrade(&section);
 

@@ -282,12 +282,14 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed. A map (after
+    /// trustno1-coder #44 / vilocity 0f44a1706): with `VICTORY_SECTION_MB` a
+    /// request is thousands of sections.
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -299,8 +301,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // (Neptune) A view of our own of a section this handle named before is of that one.
     {
         let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = aliases.iter().position(|a| a.0 == section) {
-            let (_, host, _) = aliases.swap_remove(at);
+        if let Some((host, _)) = aliases.remove(&section) {
             if host != 0 {
                 // SAFETY: a view this module mapped.
                 unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: host as *mut c_void }) };
@@ -308,8 +309,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         }
     }
     let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    v.sections.insert(section, (bytes, committed));
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -474,7 +474,7 @@ pub(crate) fn aliases_for_blocks(runs: &[(usize, usize)]) -> Vec<usize> {
 
 /// (Neptune) Views of our own of the title's sections, whole and writable, by the section's
 /// handle: the address (0: it could not be mapped) and the section's bytes.
-static ALIASES: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+static ALIASES: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
 
 /// (Neptune) Where the bytes of title view memory `[at, at + len)` are in a view of our own of
 /// the same section: the same physical pages at an address the guards know nothing of.
@@ -485,15 +485,15 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
     let (within, bytes, section, offset, size) = {
         let v = views();
         let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
-        let size = v.sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+        let size = v.sections.get(&section).map(|s| s.0)?;
         (at.checked_sub(base)?, bytes, section, offset, size)
     };
     if len == 0 || within.checked_add(len)? > bytes || offset + (within + len) as u64 > size {
         return None;
     }
     let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-    let host = match aliases.iter().find(|a| a.0 == section) {
-        Some(a) => a.1,
+    let host = match aliases.get(&section) {
+        Some(a) => a.0,
         None => {
             // SAFETY: a section handle the runtime gave; the whole section, to read and write.
             let host = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_READ | mem::FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
@@ -503,7 +503,7 @@ pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
                 mapped = host != 0,
                 "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
             );
-            aliases.push((section, host, size));
+            aliases.insert(section, (host, size));
             host
         }
     };
@@ -548,7 +548,7 @@ pub(crate) fn single_view_pages_batch(addrs: &[usize]) -> Vec<PageViewInfo> {
             out.push(PageViewInfo::Aliased);
             continue;
         }
-        let Some(sec_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+        let Some(sec_bytes) = v.sections.get(&section).map(|s| s.0) else {
             out.push(PageViewInfo::Unknown);
             continue;
         };
@@ -582,8 +582,8 @@ pub(crate) fn write_section_own(
     }
     let host = {
         let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        match aliases.iter().find(|a| a.0 == section) {
-            Some(&(_, base, size)) => (base != 0 && end <= size).then_some(base),
+        match aliases.get(&section) {
+            Some(&(base, size)) => (base != 0 && end <= size).then_some(base),
             None => {
                 // SAFETY: live section handle passed by runtime (remapping flushes
                 // deferred pages before closing). Mapped whole for read/write.
@@ -597,7 +597,7 @@ pub(crate) fn write_section_own(
                     )
                 }
                 .Value as usize;
-                aliases.push((section, base, section_bytes));
+                aliases.insert(section, (base, section_bytes));
                 (base != 0).then_some(base)
             }
         }
@@ -1286,9 +1286,16 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    // Sections alike in one line (`VICTORY_SECTION_MB`: thousands of them);
+    // one of a kind reads as before.
+    let mut alike: BTreeMap<(u64, bool), usize> = BTreeMap::new();
+    for &section in v.sections.values() {
+        *alike.entry(section).or_default() += 1;
+    }
+    for ((bytes, committed), count) in alike {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {} of {} MB, {}",
+            if count == 1 { "a section".to_string() } else { format!("{count} sections") },
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
