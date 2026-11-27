@@ -159,6 +159,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod tex_check;
+mod tex_early;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
