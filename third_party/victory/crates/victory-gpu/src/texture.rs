@@ -27,6 +27,8 @@ pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+mod stage_unlocked;
+pub(crate) mod take_by_table;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -2078,6 +2080,9 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     // (Neptune) A texture made level by level stages every level (zeros for the ones the
     // title does not hold): its upload gives the card's memory by the same answer.
     let first = if on_demand { 0 } else { first };
+    if stage_unlocked::on() {
+        return stage_unlocked::staging(resource, texture, first, on_demand);
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))

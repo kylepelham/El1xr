@@ -87,6 +87,8 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod stretch;
+#[cfg(windows)]
+mod table_defer;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
