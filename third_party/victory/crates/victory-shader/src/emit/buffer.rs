@@ -1,7 +1,9 @@
 //! Buffer loads, stores and atomics (`buffer_*`, `tbuffer_*`), a child module so it shares the
 //! emitter's state.
 
-use super::{Attr, Bin, Fields, Inst, Lower, NULL, Operand, Reg, ResourceType, V, Why, flags, pred};
+use super::{
+    Attr, Bin, Fields, Inst, Lower, NULL, Operand, Reg, ResourceType, V, Why, flags, pred,
+};
 
 impl Lower<'_> {
     pub(super) fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
