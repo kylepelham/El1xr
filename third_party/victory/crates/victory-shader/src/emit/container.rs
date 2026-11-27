@@ -387,27 +387,30 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
     let len = data.len();
     let left = len % 64;
-    let mut tail = Vec::with_capacity(128);
-    if left < 56 {
-        tail.extend(((len as u32) << 3).to_le_bytes());
-        tail.extend(&data[len - left..]);
-        tail.push(0x80);
-        tail.resize(60, 0);
+    let bit_len = (len as u32) << 3;
+    let len_doubled = (len as u32) << 1 | 1;
+    // The final block starts with the bit count and ends with
+    // `2 × bytes + 1`. If the remainder and 0x80 don't fit between them,
+    // they go in a preceding block.
+    let mut tail = [0u8; 128];
+    let tail_len = if left < 56 {
+        tail[..4].copy_from_slice(&bit_len.to_le_bytes());
+        tail[4..4 + left].copy_from_slice(&data[len - left..]);
+        tail[4 + left] = 0x80;
+        tail[60..64].copy_from_slice(&len_doubled.to_le_bytes());
+        64
     } else {
-        tail.extend(&data[len - left..]);
-        tail.push(0x80);
-        tail.resize(64, 0);
-        tail.extend(((len as u32) << 3).to_le_bytes());
-        tail.resize(124, 0);
-    }
-    tail.extend(((len as u32) << 1 | 1).to_le_bytes());
+        tail[..left].copy_from_slice(&data[len - left..]);
+        tail[left] = 0x80;
+        tail[64..68].copy_from_slice(&bit_len.to_le_bytes());
+        tail[124..128].copy_from_slice(&len_doubled.to_le_bytes());
+        128
+    };
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    for block in data[..len - left]
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .chain(tail.as_chunks::<64>().0)
-    {
+    for block in data[..len - left].as_chunks::<64>().0 {
+        md5_block(&mut state, block);
+    }
+    for block in tail[..tail_len].as_chunks::<64>().0 {
         md5_block(&mut state, block);
     }
     let mut out = [0; 16];
@@ -417,33 +420,129 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// One MD5 compression, all four rounds unrolled: every step's message
+/// index, shift and constant is a compile-time literal, allowing fixed
+/// word offsets and immediate rotations.
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
-    const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
-        let (f, g) = match i / 16 {
-            0 => ((b & c) | (!b & d), i),
-            1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-            2 => (b ^ c ^ d, (3 * i + 5) % 16),
-            _ => (c ^ (b | !d), (7 * i) % 16),
+    // One step: a = b + (a + F(b, c, d) + K + x[g]) <<< s. The four macros
+    // are the four rounds' F; each call rotates which variable plays `a`.
+    macro_rules! ff {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $g:literal, $s:literal, $k:literal) => {
+            $a = $b.wrapping_add(
+                $a.wrapping_add(($b & $c) | (!$b & $d))
+                    .wrapping_add($k)
+                    .wrapping_add(x[$g])
+                    .rotate_left($s),
+            );
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
-        let rotated = a
-            .wrapping_add(f)
-            .wrapping_add(k)
-            .wrapping_add(x[g])
-            .rotate_left(S[(i / 16) * 4 + i % 4]);
-        (a, b, c, d) = (d, b.wrapping_add(rotated), b, c);
     }
-    for (s, v) in state.iter_mut().zip([a, b, c, d]) {
-        *s = s.wrapping_add(v);
+    macro_rules! fg {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $g:literal, $s:literal, $k:literal) => {
+            $a = $b.wrapping_add(
+                $a.wrapping_add(($d & $b) | (!$d & $c))
+                    .wrapping_add($k)
+                    .wrapping_add(x[$g])
+                    .rotate_left($s),
+            );
+        };
     }
+    macro_rules! fh {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $g:literal, $s:literal, $k:literal) => {
+            $a = $b.wrapping_add(
+                $a.wrapping_add($b ^ $c ^ $d)
+                    .wrapping_add($k)
+                    .wrapping_add(x[$g])
+                    .rotate_left($s),
+            );
+        };
+    }
+    macro_rules! fi {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $g:literal, $s:literal, $k:literal) => {
+            $a = $b.wrapping_add(
+                $a.wrapping_add($c ^ ($b | !$d))
+                    .wrapping_add($k)
+                    .wrapping_add(x[$g])
+                    .rotate_left($s),
+            );
+        };
+    }
+    ff!(a, b, c, d, 0, 7, 0xd76a_a478);
+    ff!(d, a, b, c, 1, 12, 0xe8c7_b756);
+    ff!(c, d, a, b, 2, 17, 0x2420_70db);
+    ff!(b, c, d, a, 3, 22, 0xc1bd_ceee);
+    ff!(a, b, c, d, 4, 7, 0xf57c_0faf);
+    ff!(d, a, b, c, 5, 12, 0x4787_c62a);
+    ff!(c, d, a, b, 6, 17, 0xa830_4613);
+    ff!(b, c, d, a, 7, 22, 0xfd46_9501);
+    ff!(a, b, c, d, 8, 7, 0x6980_98d8);
+    ff!(d, a, b, c, 9, 12, 0x8b44_f7af);
+    ff!(c, d, a, b, 10, 17, 0xffff_5bb1);
+    ff!(b, c, d, a, 11, 22, 0x895c_d7be);
+    ff!(a, b, c, d, 12, 7, 0x6b90_1122);
+    ff!(d, a, b, c, 13, 12, 0xfd98_7193);
+    ff!(c, d, a, b, 14, 17, 0xa679_438e);
+    ff!(b, c, d, a, 15, 22, 0x49b4_0821);
+    fg!(a, b, c, d, 1, 5, 0xf61e_2562);
+    fg!(d, a, b, c, 6, 9, 0xc040_b340);
+    fg!(c, d, a, b, 11, 14, 0x265e_5a51);
+    fg!(b, c, d, a, 0, 20, 0xe9b6_c7aa);
+    fg!(a, b, c, d, 5, 5, 0xd62f_105d);
+    fg!(d, a, b, c, 10, 9, 0x0244_1453);
+    fg!(c, d, a, b, 15, 14, 0xd8a1_e681);
+    fg!(b, c, d, a, 4, 20, 0xe7d3_fbc8);
+    fg!(a, b, c, d, 9, 5, 0x21e1_cde6);
+    fg!(d, a, b, c, 14, 9, 0xc337_07d6);
+    fg!(c, d, a, b, 3, 14, 0xf4d5_0d87);
+    fg!(b, c, d, a, 8, 20, 0x455a_14ed);
+    fg!(a, b, c, d, 13, 5, 0xa9e3_e905);
+    fg!(d, a, b, c, 2, 9, 0xfcef_a3f8);
+    fg!(c, d, a, b, 7, 14, 0x676f_02d9);
+    fg!(b, c, d, a, 12, 20, 0x8d2a_4c8a);
+    fh!(a, b, c, d, 5, 4, 0xfffa_3942);
+    fh!(d, a, b, c, 8, 11, 0x8771_f681);
+    fh!(c, d, a, b, 11, 16, 0x6d9d_6122);
+    fh!(b, c, d, a, 14, 23, 0xfde5_380c);
+    fh!(a, b, c, d, 1, 4, 0xa4be_ea44);
+    fh!(d, a, b, c, 4, 11, 0x4bde_cfa9);
+    fh!(c, d, a, b, 7, 16, 0xf6bb_4b60);
+    fh!(b, c, d, a, 10, 23, 0xbebf_bc70);
+    fh!(a, b, c, d, 13, 4, 0x289b_7ec6);
+    fh!(d, a, b, c, 0, 11, 0xeaa1_27fa);
+    fh!(c, d, a, b, 3, 16, 0xd4ef_3085);
+    fh!(b, c, d, a, 6, 23, 0x0488_1d05);
+    fh!(a, b, c, d, 9, 4, 0xd9d4_d039);
+    fh!(d, a, b, c, 12, 11, 0xe6db_99e5);
+    fh!(c, d, a, b, 15, 16, 0x1fa2_7cf8);
+    fh!(b, c, d, a, 2, 23, 0xc4ac_5665);
+    fi!(a, b, c, d, 0, 6, 0xf429_2244);
+    fi!(d, a, b, c, 7, 10, 0x432a_ff97);
+    fi!(c, d, a, b, 14, 15, 0xab94_23a7);
+    fi!(b, c, d, a, 5, 21, 0xfc93_a039);
+    fi!(a, b, c, d, 12, 6, 0x655b_59c3);
+    fi!(d, a, b, c, 3, 10, 0x8f0c_cc92);
+    fi!(c, d, a, b, 10, 15, 0xffef_f47d);
+    fi!(b, c, d, a, 1, 21, 0x8584_5dd1);
+    fi!(a, b, c, d, 8, 6, 0x6fa8_7e4f);
+    fi!(d, a, b, c, 15, 10, 0xfe2c_e6e0);
+    fi!(c, d, a, b, 6, 15, 0xa301_4314);
+    fi!(b, c, d, a, 13, 21, 0x4e08_11a1);
+    fi!(a, b, c, d, 4, 6, 0xf753_7e82);
+    fi!(d, a, b, c, 11, 10, 0xbd3a_f235);
+    fi!(c, d, a, b, 2, 15, 0x2ad7_d2bb);
+    fi!(b, c, d, a, 9, 21, 0xeb86_d391);
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
 }
 
 #[cfg(test)]
@@ -550,5 +649,132 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// The original `md5_block` (loop over the K/S tables), kept as the
+    /// reference the unrolled one is compared against.
+    fn md5_block_reference(state: &mut [u32; 4], block: &[u8; 64]) {
+        const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+        const K: [u32; 64] = [
+            0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
+            0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
+            0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
+            0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
+            0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
+            0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
+            0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
+            0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
+            0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
+            0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
+            0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
+            0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
+            0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
+            0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
+            0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
+            0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+        ];
+        let x: [u32; 16] = std::array::from_fn(|i| {
+            u32::from_le_bytes([
+                block[4 * i],
+                block[4 * i + 1],
+                block[4 * i + 2],
+                block[4 * i + 3],
+            ])
+        });
+        let [mut a, mut b, mut c, mut d] = *state;
+        for (i, &k) in K.iter().enumerate() {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let rotated = a
+                .wrapping_add(f)
+                .wrapping_add(k)
+                .wrapping_add(x[g])
+                .rotate_left(S[(i / 16) * 4 + i % 4]);
+            (a, b, c, d) = (d, b.wrapping_add(rotated), b, c);
+        }
+        for (s, v) in state.iter_mut().zip([a, b, c, d]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+
+    /// The original `hash` (heap `Vec` tail), kept verbatim: the padding
+    /// it builds is DXBC's non-standard one, and the optimized `hash` must
+    /// reproduce its output byte for byte at every boundary.
+    fn hash_reference(data: &[u8]) -> [u8; 16] {
+        let len = data.len();
+        let left = len % 64;
+        let mut tail = Vec::with_capacity(128);
+        if left < 56 {
+            tail.extend(((len as u32) << 3).to_le_bytes());
+            tail.extend(&data[len - left..]);
+            tail.push(0x80);
+            tail.resize(60, 0);
+        } else {
+            tail.extend(&data[len - left..]);
+            tail.push(0x80);
+            tail.resize(64, 0);
+            tail.extend(((len as u32) << 3).to_le_bytes());
+            tail.resize(124, 0);
+        }
+        tail.extend(((len as u32) << 1 | 1).to_le_bytes());
+        let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+        for block in data[..len - left]
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .chain(tail.as_chunks::<64>().0)
+        {
+            md5_block_reference(&mut state, block);
+        }
+        let mut out = [0; 16];
+        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+            o.copy_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    /// Deterministic pseudo-random bytes.
+    fn pseudo(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut s = seed | 1;
+        for _ in 0..len {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            out.push((s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn hash_is_byte_exact_with_the_original_at_every_padding_boundary() {
+        // Every length up to 192 covers both tail shapes (`rest < 56` and
+        // `rest >= 56`) and both tail sizes (one and two blocks) over and
+        // over; the larger sizes add multi-block bodies.
+        for len in 0..=192usize {
+            let data = pseudo(len, 42 + len as u64);
+            assert_eq!(hash(&data), hash_reference(&data), "{len} bytes");
+        }
+        for len in [255usize, 256, 1000, 4095, 4096, 65_536, 1_000_003] {
+            let data = pseudo(len, 0xdead_beef + len as u64);
+            assert_eq!(hash(&data), hash_reference(&data), "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn built_containers_carry_the_hash_of_their_body() {
+        // With one part, 24 bytes precede its data in the hashed region.
+        // Test both padding shapes before and after a full block.
+        for dxil_len in [31, 32, 95, 96] {
+            let dxil = pseudo(dxil_len, 8);
+            let bytes = build(&[(b"DXIL", &dxil)]);
+            let expected = hash_reference(&bytes[20..]);
+            let parsed = crate::dxbc::Container::parse(&bytes).unwrap();
+            assert_eq!(parsed.digest, expected, "{dxil_len}-byte DXIL part");
+        }
     }
 }

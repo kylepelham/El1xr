@@ -296,6 +296,11 @@ fn unspill(
             _ => None,
         }
     }
+    // Nothing parked (most programs): nothing to undo, and no need to work
+    // out every instruction's effects.
+    if !list.iter().any(|i| matches!(i.name(), Some("v_writelane_b32" | "v_readlane_b32"))) {
+        return Vec::new();
+    }
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
@@ -2317,5 +2322,22 @@ mod tests {
         };
         assert!(opaque(&alone), "two scalars make an opaque mask");
         assert!(!opaque(&shared), "the pair is the compare's mask");
+    }
+
+    #[test]
+    fn unspill_early_outs_when_no_lane_is_parked() {
+        let code: Vec<u8> = [
+            0x7E00_0280u32, // v_mov_b32 v0, 0
+            0x7E02_0281,    // v_mov_b32 v1, 1
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut list = gfx10::decode(&code).unwrap();
+        let orig = list.clone();
+        let edits = unspill(&mut list, &[0], false, 1, 4);
+        assert!(edits.is_empty());
+        assert_eq!(list.len(), orig.len());
     }
 }

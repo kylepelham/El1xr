@@ -541,10 +541,104 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host heap (keyed by monotonic [`HostHeap::id`]): the host copy and
+/// range each slot's buffer view reads, kept from pass to pass by
+/// [`State::heap_buffers`].
+type PickedRanges = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, PickedRanges>>> =
+    std::sync::Mutex::new(None);
+
+/// Called when the title heap is destroyed, after the shader-heap registry
+/// lock is released. Drop cached resource references outside the cache lock.
+pub(crate) fn forget_heap_ranges(id: u64) {
+    let ranges = RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|heaps| heaps.remove(&id));
+    drop(ranges);
+}
+
+#[cfg(test)]
+#[test]
+fn heap_range_cache_forgets_dropped_heap() {
+    // IDs are allocated monotonically from 1. Reserve synthetic high IDs.
+    let id = u64::MAX - 1;
+    let other = u64::MAX - 2;
+    {
+        let mut ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = ranges.get_or_insert_with(Default::default);
+        heaps.insert(id, PickedRanges::new(false));
+        heaps.insert(other, PickedRanges::new(false));
+    }
+    forget_heap_ranges(id);
+    {
+        let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = ranges.as_ref().unwrap();
+        assert!(!heaps.contains_key(&id));
+        assert!(heaps.contains_key(&other));
+    }
+    forget_heap_ranges(other);
+}
 /// Monotonic lifetime count of [`State::heap_buffers`] passes (never reset by
 /// stats logging), used for boot-vs-gameplay budget cutoffs.
 static HEAP_BUFFER_PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds of [`State::bind`] since the last frame line, on all
+/// threads: the whole of it, then its parts: the early texture pass,
+/// descriptor tables, title memory by address; and the binds counted
+/// (`VICTORY_BIND_SPLIT=0`: not timed).
+pub(crate) static BIND_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether [`BIND_NS`] is kept (`VICTORY_BIND_SPLIT`, on unless `0`).
+pub(crate) fn bind_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_SPLIT").is_none_or(|v| v != "0"))
+}
+
+/// Adds the time from its start to its drop to [`BIND_NS`]`[part]`.
+struct BindLap(Option<(usize, std::time::Instant)>);
+
+impl BindLap {
+    #[inline]
+    fn start(part: usize) -> Self {
+        BindLap(bind_split().then(|| (part, std::time::Instant::now())))
+    }
+}
+
+impl Drop for BindLap {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((part, began)) = self.0 {
+            BIND_NS[part].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if part == 0 {
+                BIND_NS[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// With the frame line: [`BIND_NS`] per frame over `frames`, taken.
+pub(crate) fn bind_split_line(frames: f64) {
+    if !bind_split() {
+        return;
+    }
+    let v: [u64; 5] = std::array::from_fn(|i| BIND_NS[i].swap(0, Ordering::Relaxed));
+    if v[4] == 0 {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1e6 / frames;
+    tracing::info!(
+        "binding draws and dispatches per frame (VICTORY_BIND_SPLIT=0: not timed): {:.0} binds {:.1} ms (all threads), of          them the early texture pass {:.1} ms, descriptor tables {:.1} ms, title memory by address {:.1} ms, the rest (root          views and their refreshes, the heap pass, state) {:.1} ms",
+        v[4] as f64 / frames,
+        ms(v[0]),
+        ms(v[1]),
+        ms(v[2]),
+        ms(v[3]),
+        ms(v[0].saturating_sub(v[1] + v[2] + v[3]))
+    );
+}
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
@@ -1323,9 +1417,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _whole = BindLap::start(0);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        {
+            let _lap = BindLap::start(1);
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1389,7 +1487,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            self.tables(list, &t.tables, compute, &mut made);
+            {
+                let _lap = BindLap::start(2);
+                self.tables(list, &t.tables, compute, &mut made);
+            }
             STORES.set(true);
             if list.take_plane_clobbered() {
                 self.scratch_made = made;
@@ -1415,7 +1516,11 @@ impl State {
                 .root_srvs
                 .contains(&victory_shader::emit::SLOT_MEMORY)
             {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let ready = {
+                    let _lap = BindLap::start(3);
+                    self.memory_ready(list, compute, writes)
+                };
+                let Some(ready) = ready else {
                     self.scratch_made = made;
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
@@ -1840,9 +1945,6 @@ impl State {
         // before its memory had a host copy is only made then.
         // Which slots are looked at is `crate::heap_pass` (the full sweep every
         // 16 passes unless `VICTORY_HEAP_PASS_DIRTY=1`).
-        type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> =
-            std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let heaps = kept.get_or_insert_with(Default::default);
         let forgotten = crate::descriptor::take_forgotten();
@@ -1850,8 +1952,8 @@ impl State {
             picked.note_forgotten(forgotten.as_deref());
         }
         let ranges = heaps
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
+            .entry(host.id())
+            .or_insert_with(|| PickedRanges::new(crate::heap_pass::full_pass()));
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
         // Always take dirty pages (including on pass 0) so `buffer_written`
@@ -4655,6 +4757,31 @@ mod indirect_signature_tests;
 /// once and kept for good. Each thread remembers the last one it asked
 /// for: the title's threads ask for the same few, and the lock and the
 /// object's reference count were shared by all of them.
+/// Looks up `key` in `cache`, calling `create` outside the mutex on a miss
+/// so slow driver `CreateCommandSignature` calls never block other recording
+/// threads on the cache lock.
+fn cached_command_signature<K: Copy + Eq, V: 'static>(
+    cache: &std::sync::Mutex<Vec<(K, &'static V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<V>,
+) -> Option<&'static V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, s)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(s);
+        }
+    }
+    let created = create()?;
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, s)) = made.iter().find(|(k, _)| *k == key) {
+        drop(created);
+        return Some(s);
+    }
+    let leaked: &'static V = Box::leak(Box::new(created));
+    made.push((key, leaked));
+    Some(leaked)
+}
+
 fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
     type Made = ((u32, u32), &'static ID3D12CommandSignature);
     thread_local! {
@@ -4664,38 +4791,34 @@ fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignat
         return Some(s);
     }
     static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&m) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        LAST.set(Some(m));
-        return Some(m.1);
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let m = ((kind, stride), &*Box::leak(Box::new(signature?)));
-    made.push(m);
-    LAST.set(Some(m));
-    Some(m.1)
+    let s = cached_command_signature(&MADE, (kind, stride), || {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        signature
+    })?;
+    LAST.set(Some(((kind, stride), s)));
+    Some(s)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

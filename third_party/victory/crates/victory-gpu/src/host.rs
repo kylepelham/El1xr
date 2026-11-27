@@ -79,6 +79,16 @@ fn retired() -> &'static Mutex<Vec<(u64, Retired)>> {
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started so far ([`STARTED`]).
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished so far ([`FINISHED`]).
+pub(crate) fn submissions_finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Submissions started and not finished yet: lists the card may still be
 /// running, which read the view heap's slots as they run.
 pub(crate) fn submissions_in_flight() -> u64 {
@@ -3717,6 +3727,35 @@ pub(crate) fn land() {
     }
 }
 
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: caller owns the event and fence for the entire wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3755,9 +3794,7 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3931,6 +3968,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("relay fence reported device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3953,14 +3994,7 @@ fn relay_worker() {
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -10638,6 +10672,7 @@ impl Meter {
                 );
             }
         }
+        crate::draw::bind_split_line(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
