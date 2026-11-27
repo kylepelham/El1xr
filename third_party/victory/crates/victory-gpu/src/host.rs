@@ -7223,7 +7223,7 @@ impl Host {
                 }
             };
         for list in runs {
-            if list.deferred().cbv_epoch > 0 && !pending_preludes.is_empty() {
+            if list.cbv_epoch() > 0 && !pending_preludes.is_empty() {
                 batch.flush_textures();
                 finalize_preludes(&mut pending_preludes);
             }
