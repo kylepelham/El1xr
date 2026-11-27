@@ -52,6 +52,8 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
+# The Rust side's blocks from mimalloc (victory-gpu).
+mimalloc = ["victory-gpu/mimalloc"]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
 

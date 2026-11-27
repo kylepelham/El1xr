@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 blake3.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true
@@ -23,6 +24,10 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# The Rust side allocates through mimalloc (per-thread caches) instead of the
+# process heap it shares with the title and the drivers; VICTORY_ALLOC=system
+# goes back to that heap for a run.
+mimalloc = ["dep:mimalloc"]
 # NVIDIA DLSS for the title's upscale (`VICTORY_UPSCALE=dlss`); needs the DLSS
 # SDK (NVIDIA/DLSS: include, lib/Windows_x86_64) at `VICTORY_DLSS_SDK`.
 dlss = []
@@ -31,7 +36,7 @@ dlss = []
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D_Fxc",

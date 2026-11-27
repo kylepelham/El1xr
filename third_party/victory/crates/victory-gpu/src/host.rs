@@ -1012,8 +1012,14 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<IndirectArgs>,
-    /// The host pipeline last kept by [`HostList::holds_pipeline`].
+    /// The host pipeline last kept by [`HostList::bind_pipeline`].
     kept_pipeline: std::sync::atomic::AtomicUsize,
+    /// Incremented on every deferred title write (lock-free mirror of
+    /// constant-buffer snapshot invalidations, read on every draw's table check).
+    cbv_epoch: std::sync::atomic::AtomicU64,
+    /// True only while at least one depth twin in `twins` has `writing = true`,
+    /// avoiding a `twins` mutex lock on every draw and dispatch.
+    twins_writing: std::sync::atomic::AtomicBool,
     /// (Neptune) The buffers the clamps recorded in the prelude write their
     /// records into ([`HostList::clamp_ahead`]), and whether a prelude has
     /// left each in the indirect-argument state. Kept across resets.
@@ -2801,14 +2807,14 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Host pipelines already kept and named by [`HostList::bind_pipeline`].
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Constant-buffer snapshots already copied into this list's scratch
     /// memory since the last title write (`(address, size) -> host GPU address`).
     cbv_snapshots: std::collections::HashMap<(u64, u32), u64>,
-    /// Incremented whenever a deferred title write invalidates `cbv_snapshots`.
-    cbv_epoch: u64,
     /// Pre-aggregated refresh spans per shadow (`ask_once`, `stale_under_flights`).
     refresh_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     refresh_map: std::collections::HashMap<usize, usize>,
@@ -2858,7 +2864,6 @@ impl Deferred {
         self.refreshed.clear();
         self.cbv_snapshots.clear();
         self.filled_root_cbvs.clear();
-        self.cbv_epoch += 1;
     }
 
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -4870,6 +4875,8 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 kept_pipeline: std::sync::atomic::AtomicUsize::new(0),
+                cbv_epoch: std::sync::atomic::AtomicU64::new(0),
+                twins_writing: std::sync::atomic::AtomicBool::new(false),
                 ahead_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6051,7 +6058,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         // Where the piece's last compare kept these bytes,
@@ -6398,7 +6408,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         let from = inflight_piece_from(&r.span, p);
@@ -6634,7 +6647,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -7824,6 +7840,8 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .readable = false;
         self.kept_pipeline.store(0, Ordering::Relaxed);
+        self.cbv_epoch.store(0, Ordering::Relaxed);
+        self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states
@@ -7954,7 +7972,11 @@ impl HostList {
         colour: bool,
         write: bool,
     ) -> bool {
-        // Asked for every texture a draw reads: most have no twin.
+        // Asked for every draw's depth target and every texture write: 99%+ of
+        // textures lack the depth+UAV flags and can never have a colour twin.
+        if !crate::resource::depth_and_unordered(resource) {
+            return false;
+        }
         let Some((depth, Some(twin))) = crate::resource::host_side(resource) else {
             return false;
         };
@@ -7996,7 +8018,10 @@ impl HostList {
             // Shaders write the twin when the draw or dispatch runs: what
             // the same one reads of the depth texture is prepared before
             // (`twins_written`).
-            (true, true) => u.writing = true,
+            (true, true) => {
+                u.writing = true;
+                self.twins_writing.store(true, Ordering::Release);
+            }
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
@@ -8141,6 +8166,9 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
+        if !self.twins_writing.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
@@ -8387,7 +8415,7 @@ impl HostList {
     /// Current constant-buffer snapshot epoch of this list (incremented on
     /// every deferred title write).
     pub(crate) fn cbv_epoch(&self) -> u64 {
-        self.deferred().cbv_epoch
+        self.cbv_epoch.load(Ordering::Relaxed)
     }
 
     /// Scratch-memory snapshot of `size` bytes of title constant data at
@@ -8445,6 +8473,7 @@ impl HostList {
         self.changes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.title_write();
+        self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -8874,11 +8903,46 @@ impl HostList {
         }
     }
 
-    /// Whether the list already holds host pipeline `pipeline`: the one it
-    /// was last asked about since its reset. A pipeline bound again after
-    /// the indirect clamp's own is kept once.
+    /// Keeps `pso` and `root` alive on this list and records `name` once per
+    /// list, avoiding repeat COM casts, locks and name lookups when a pipeline
+    /// is bound again after another pipeline or an internal pass.
+    pub(crate) fn bind_pipeline(
+        &self,
+        pso: &ID3D12PipelineState,
+        root: &ID3D12RootSignature,
+        name: &str,
+    ) {
+        let id = pso.as_raw() as usize;
+        if self.kept_pipeline.load(Ordering::Relaxed) == id {
+            return;
+        }
+        self.kept_pipeline.store(id, Ordering::Relaxed);
+        let first = {
+            let mut deferred = self.deferred();
+            if deferred.bound.insert(id) {
+                if let Ok(object) = pso.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(object);
+                }
+                if let Ok(object) = root.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(object);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if first {
+            self.used_pipeline(name);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn holds_pipeline(&self, pipeline: usize) -> bool {
-        self.kept_pipeline.swap(pipeline, Ordering::Relaxed) == pipeline
+        if self.kept_pipeline.load(Ordering::Relaxed) == pipeline {
+            return true;
+        }
+        self.kept_pipeline.store(pipeline, Ordering::Relaxed);
+        !self.deferred().bound.insert(pipeline)
     }
 
     /// The shader-visible descriptor heaps the list keeps (tests).
@@ -8913,6 +8977,7 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.title_write();
+        self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -9389,12 +9454,12 @@ impl Batch {
             && !crate::watch::ask_once_active();
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = copies
-                .iter()
-                .filter(|c| !c.shadow.unwatched())
-                .filter_map(|c| c.refresh_span)
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            crate::watch::ask_ahead(
+                copies
+                    .iter()
+                    .filter(|c| !c.shadow.unwatched())
+                    .filter_map(|c| c.refresh_span),
+            );
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && copies.len() >= 2 {
