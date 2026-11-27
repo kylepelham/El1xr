@@ -3201,6 +3201,37 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.loads, [load]);
     }
 
+    /// Same `v_cmpx_eq_u32` + `s_andn2_wrexec_b32` waterfall entered with a
+    /// narrowed EXEC (without an `s_cbranch_execz` skip, so both EXEC and the
+    /// saved-mask SGPR become loop phis): the two phis hold the same mask on
+    /// every iteration, so the waterfall proves and collapses.
+    #[test]
+    fn a_masked_wrexec_waterfall_over_a_first_lane_offset_is_one() {
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        // Narrow EXEC to lanes < 20 right before `s_mov_b32 s23, exec_lo`
+        // (index 14), without a skip branch, forcing EXEC and s21 to be loop
+        // phis rather than Bool::TRUE.
+        words.insert(14, 0x7DA8_0094); // v_cmpx_gt_u32 exec_lo, 20, v0
+        let old = crate::emit::TEST_COLLAPSE.replace(Some(false));
+        let off = waterfall(&words, false).unwrap();
+        crate::emit::TEST_COLLAPSE.set(Some(true));
+        let r = waterfall(&words, false);
+        crate::emit::TEST_COLLAPSE.set(old);
+        assert!(off.waterfall.compares.is_empty(), "VICTORY_WAVE_COLLAPSE off: no waterfall");
+        let r = r.unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
     /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,
     /// the others pick per lane with `v_cndmask_b32` (lanes below 24 the
