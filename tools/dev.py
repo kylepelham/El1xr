@@ -424,7 +424,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     overrides, mute = apply_mute_default(overrides, args.unmute)
     cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides, mute=mute)
-    with acquire_gpu_lock("bench"):
+    with acquire_gpu_lock("bench"), _quiet(args, "bench"):
         resets_before = dev_driver.resets_since_boot()
         run_timed_victory(cmd, log_path, args.seconds)
         resets_after = dev_driver.resets_since_boot()
@@ -454,6 +454,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 def _count(value: int | None) -> str:
     return "?" if value is None else str(value)
+
+
+def _quiet(args: argparse.Namespace, what: str):
+    """`--quiet`: hold every build slot for the run so no build competes with the game."""
+    if getattr(args, "quiet", False):
+        return dev_throttle.all_build_slots(LOCKS_DIR, f"{JOB or 'main'}:quiet-{what}")
+    return contextlib.nullcontext()
 
 
 def _print_driver_warning(before: int | None, after: int | None) -> None:
@@ -540,6 +547,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
+    p_bench.add_argument(
+        "--quiet", action="store_true",
+        help="Hold every build slot during the run (waits for running builds) for numbers not skewed by builds.",
+    )
     p_bench.set_defaults(func=cmd_bench)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")

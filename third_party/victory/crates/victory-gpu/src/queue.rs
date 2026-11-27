@@ -552,6 +552,7 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -732,6 +733,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -1041,6 +1043,7 @@ type Named = Option<(usize, Option<usize>)>;
 
 /// [`present`], when its turn has come.
 fn present_now(named: Named) {
+    let _hitch = crate::hitch::span(crate::hitch::Phase::Present);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -1128,6 +1131,7 @@ fn present_now(named: Named) {
     }
     #[cfg(not(windows))]
     let _ = named;
+    crate::hitch::presented(frame);
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
