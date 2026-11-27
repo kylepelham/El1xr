@@ -28,6 +28,9 @@ Plan (TOML or JSON; every key optional but `sets`):
     from = "on"                         # another set's values, then these
     VICTORY_FOO = 0
 
+    [greps]                             # log lines counted per run (see tools/dev_greps.py)
+    foo_skipped = 'foo copies skipped: ([0-9]+)'
+
 Values are strings, numbers or booleans (true is "1", false "0"). Results go to
 `<dev dir>/train_<plan file stem>/`: `NN_<set>.log`, `NN_<set>.json` and `NN_<set>_snaps/`.
 `--compare A B` writes `compare_<A>_vs_<B>/cmp-<A s>s-<B s>s.png`: each snap of run A (left)
@@ -40,8 +43,10 @@ import json
 import re
 import statistics
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import dev_greps
 
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -50,7 +55,9 @@ SNAP_RE = re.compile(r"^snap-(\d+)s-f(\d+)\.png$")
 DEFAULT_ORDER = ("on", "off", "off", "on")
 DEFAULT_SECONDS = 200
 DEFAULT_SNAP_EVERY = 15.0
-PLAN_KEYS = {"seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets"}
+PLAN_KEYS = {
+    "seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets", "greps",
+}
 
 # (stats key, column header, format): the report's columns, in order.
 COLUMNS = (
@@ -85,6 +92,7 @@ class Plan:
     save: str | None = None
     fast_boot: bool = True
     unmute: bool = False
+    greps: dict[str, re.Pattern[str]] = field(default_factory=dict)
 
 
 def _value(key: str, value: object) -> str:
@@ -150,6 +158,10 @@ def parse_plan(name: str, data: dict[str, object]) -> Plan:
     baseline = str(data.get("baseline", "off" if "off" in sets else order[0] if order else next(iter(sets))))
     if baseline not in sets:
         raise PlanError(f"baseline '{baseline}' is not a set")
+    try:
+        greps = dev_greps.parse_greps(data.get("greps", {}))
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
     return Plan(
         name=name,
         sets=sets,
@@ -161,6 +173,7 @@ def parse_plan(name: str, data: dict[str, object]) -> Plan:
         save=str(data["save"]) if data.get("save") else None,
         fast_boot=bool(data.get("fast_boot", True)),
         unmute=bool(data.get("unmute", False)),
+        greps=greps,
     )
 
 
@@ -288,10 +301,17 @@ def _resets(record: dict[str, object]) -> str:
     return str(after)
 
 
-def report(plan: Plan, done: dict[int, dict[str, object]]) -> tuple[str, dict[str, object]]:
+def report(
+    plan: Plan, done: dict[int, dict[str, object]], scans: dict[int, dev_greps.LogScan] | None = None
+) -> tuple[str, dict[str, object]]:
     """The markdown report and its figures: every run, pending steps, then each set's medians and
-    their differences from the baseline set."""
-    head = ["run", "set", *[c[1] for c in COLUMNS], "resets", "snaps", "ok"]
+    their differences from the baseline set, then the plan's greps per run. `scans` are the runs'
+    logs read with the plan's greps; a run's flags (fatal lines, a WARN rise against the baseline
+    arm) come from them."""
+    scans = scans or {}
+    base = dev_greps.baseline_warns([scans[s] for s in sorted(scans) if done[s]["set"] == plan.baseline])
+    run_flags = {s: dev_greps.flags(scan, base, done[s]["set"] == plan.baseline) for s, scan in scans.items()}
+    head = ["run", "set", *[c[1] for c in COLUMNS], "resets", "snaps", "ok", "flags"]
     lines = [f"# train {plan.name}", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     steps = sorted(set(range(1, len(plan.order) + 1)) | set(done))
     for step in steps:
@@ -304,7 +324,10 @@ def report(plan: Plan, done: dict[int, dict[str, object]]) -> tuple[str, dict[st
         cells = [_cell(stats, k, s) for k, _, s in COLUMNS]
         cells[COLUMNS.index(("worst_ms", "worst ms", ".0f"))] += f" @{int(stats.get('worst_frame', 0))}"
         ok = "yes" if rec.get("ok") else "**no**"
-        row = [run_id(step, str(rec["set"])), str(rec["set"]), *cells, _resets(rec), str(rec.get("snaps", 0)), ok]
+        flagged = "**" + "; ".join(f.split(":")[0] for f in run_flags[step]) + "**" if run_flags.get(step) else ""
+        row = [
+            run_id(step, str(rec["set"])), str(rec["set"]), *cells, _resets(rec), str(rec.get("snaps", 0)), ok, flagged,
+        ]
         lines.append("| " + " | ".join(row) + " |")
     medians = set_medians(done)
     figures: dict[str, object] = {"plan": plan.name, "baseline": plan.baseline, "medians": medians, "deltas": {}}
@@ -325,6 +348,25 @@ def report(plan: Plan, done: dict[int, dict[str, object]]) -> tuple[str, dict[st
             if delta:
                 figures["deltas"][name] = delta
             lines.append(f"| {name} | {int(m['runs'])} | " + " | ".join(cells) + " |")
+    ids = {s: run_id(s, str(done[s]["set"])) for s in sorted(scans)}
+    figures["runs"] = {
+        ids[s]: {
+            "flags": run_flags[s], "fatal": scans[s].fatal, "warns": scans[s].warns,
+            "greps": {n: dev_greps.grep_figures(*v) for n, v in scans[s].greps.items()},
+        }
+        for s in ids
+    }
+    if any(run_flags.values()):
+        lines += ["", "## Flags", ""]
+        lines += [f"- **{ids[s]}**: " + " / ".join(run_flags[s]) for s in ids if run_flags[s]]
+    if plan.greps and ids:
+        lines += ["", "## Greps (lines matched / median / last captured number)", ""]
+        lines.append("| grep | regex | " + " | ".join(ids.values()) + " |")
+        lines.append("|" + "---|" * (len(ids) + 2))
+        for name, pattern in plan.greps.items():
+            regex = pattern.pattern.replace("|", "\\|")
+            cells = [dev_greps.grep_cell(*scans[s].greps[name]) for s in ids]
+            lines.append(f"| {name} | `{regex}` | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n", figures
 
 

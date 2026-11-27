@@ -24,6 +24,7 @@ from typing import Iterator
 
 import dev_driver
 import dev_gate
+import dev_greps
 import dev_png
 import dev_stats
 import dev_throttle
@@ -716,6 +717,25 @@ def train_compare(plan: dev_train.Plan, done: dict[int, dict[str, object]], trai
     return 0 if ok else 1
 
 
+def train_greps_from(plan_path: Path, plan: dev_train.Plan, sources: list[str]) -> int:
+    """Adds the log-line phrases of writers' ready.md batch items to the plan's [greps]."""
+    found = []
+    for source in sources:
+        path = Path(source)
+        if not path.is_file():
+            print(f"error: no file {path}")
+            print("DEV train-greps FAIL reason=source")
+            return 1
+        found += dev_greps.extract(read_log_text(path), path.parent.name or path.stem)
+    added, skipped = dev_greps.merge_found({n: p.pattern for n, p in plan.greps.items()}, found)
+    dev_greps.add_to_plan(plan_path, added)
+    for f in added:
+        print(f"{f.name} = {f.regex}  # {f.note}")
+    dev_train.load_plan(plan_path)
+    print(f"DEV train-greps PASS added={len(added)} skipped={skipped} plan={plan_path}")
+    return 0
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     """One run of a batch plan (`--run`), or the report across its runs (`--report`, `--list`)."""
     try:
@@ -732,8 +752,15 @@ def cmd_train(args: argparse.Namespace) -> int:
         return 0
     if args.compare:
         return train_compare(plan, done, train_dir, *args.compare)
+    if args.greps_from:
+        return train_greps_from(Path(args.plan), plan, args.greps_from)
     if args.report:
-        text, figures = dev_train.report(plan, done)
+        scans = {
+            step: dev_greps.scan_log(read_log_text(log), plan.greps)
+            for step, rec in done.items()
+            if (log := train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log").exists()
+        }
+        text, figures = dev_train.report(plan, done, scans)
         train_dir.mkdir(parents=True, exist_ok=True)
         (train_dir / "report.md").write_text(text, encoding="utf-8")
         (train_dir / "report.json").write_text(json.dumps(figures, indent=2), encoding="utf-8")
@@ -875,11 +902,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--run", default="next", metavar="next|N|SET",
         help="Run one step: next (default) pending step, step N again, or SET (its next pending step, else an extra run).",
     )
-    mode.add_argument("--report", action="store_true", help="Table of every run, medians by set and deltas.")
+    mode.add_argument("--report", action="store_true", help="Table of every run, medians by set and deltas, flags and [greps] per run.")
     mode.add_argument("--list", action="store_true", help="The steps, done or pending, with their overrides.")
     mode.add_argument(
         "--compare", nargs=2, metavar=("A", "B"),
         help="Side-by-side PNGs: each snap of run A (left) with run B's nearest in time (A, B: step, run id or set).",
+    )
+    mode.add_argument(
+        "--greps-from", nargs="+", metavar="READY_MD",
+        help="Add the backticked log lines of these ready.md files' batch items to the plan's [greps].",
     )
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_train.set_defaults(func=cmd_train)
