@@ -4924,7 +4924,7 @@ pub(crate) fn cpu_ranges() -> [Vec<(usize, usize)>; 2] {
         .values()
         .cloned()
         .collect();
-    let kept: Vec<_> = buffers()
+    let kept: Vec<_> = build::walk(&BUFFERS, build::read_locks_on(), buffers)
         .values()
         .filter_map(|e| e.shadow.clone())
         .collect();
@@ -7171,11 +7171,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers()
+    let read = build::read_locks_on();
+    let mut spans: Vec<(u64, u64, bool)> = build::walk(&BUFFERS, read, buffers)
         .iter()
         .map(|(key, entry)| (key.0, entry.end - key.0, false))
         .collect();
-    let loose = loose_write();
+    let loose = build::walk(&LOOSE, read, loose_write);
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -7780,9 +7781,11 @@ fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
+/// (A read-write lock, and the askings counted apart: with
+/// `VICTORY_SHADOW_READ_LOCKS` one that is there is found to read.)
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> =
-    Mutex::new((0, BTreeMap::new()));
+static EXACT: std::sync::RwLock<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>)> =
+    std::sync::RwLock::new((0, BTreeMap::new()));
 
 /// Since the last frame line: askings for such copies, copies made with a
 /// new buffer, and copies given a spare one ([`exact_reuse`]).
@@ -7815,13 +7818,24 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let width = len.next_multiple_of(256);
     let reuse = exact_reuse();
+    if build::read_locks_on() {
+        // There already (nearly always): found beside the other readers, and
+        // noted asked at the latest asking counted (askings count on the
+        // way that takes the table to write).
+        let guard = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = guard.1.get(&(address, len)) {
+            used.fetch_max(guard.0, Ordering::Relaxed);
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+    }
     let gone = {
-        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = EXACT.write().unwrap_or_else(|e| e.into_inner());
         let (tick, map) = &mut *guard;
         *tick += 1;
         let now = *tick;
         if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-            *used = now;
+            *used.get_mut() = now;
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
@@ -7835,7 +7849,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         if map.len() >= MANY && due {
             map.retain(|_, (shadow, used)| {
                 let keep = Arc::strong_count(shadow) > 1
-                    || *used + LATELY > now
+                    || *used.get_mut() + LATELY > now
                     || crate::host::references(&shadow.buffer) > 1;
                 if !keep {
                     gone.push(shadow.clone());
@@ -7868,13 +7882,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = EXACT.write().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
         // Another thread made it meanwhile: that one, and this buffer to the
         // spares (nothing has seen it).
-        *used = now;
+        *used.get_mut() = now;
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         let shadow = shadow.clone();
         drop(guard);
@@ -7884,7 +7898,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return Some(shadow);
     }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
     Some(shadow)
 }
 
@@ -8058,7 +8072,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).1.len();
     let (spares, spare_mb) = {
         let s = SPARES.lock().unwrap_or_else(|e| e.into_inner());
         (s.items.len(), s.bytes >> 20)
@@ -8384,11 +8398,16 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let read = build::read_locks_on();
+    let mut all: Vec<(u64, u64, u64)> = build::walk(&BUFFERS, read, buffers)
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
-    all.extend(loose_write().values().map(|s| (s.gpu, s.start, s.len)));
+    all.extend(
+        build::walk(&LOOSE, read, loose_write)
+            .values()
+            .map(|s| (s.gpu, s.start, s.len)),
+    );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
