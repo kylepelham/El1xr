@@ -20,7 +20,6 @@
 //! for the queue. One the title has not streamed in yet (no memory) still cannot be uploaded:
 //! the per-frame line counts those.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The record stride and the byte offsets in a record of its texture indices.
@@ -39,9 +38,12 @@ const INDEX_BITS: u32 = (1 << 27) - 1;
 /// The user data word holding the records buffer's byte offset in the view heap.
 pub(crate) const USER_WORD: u32 = 9;
 
+/// Live: each bake draw picks its upload pass when it is bound.
+pub(crate) static ON: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_BAKE_INPUTS", |v| u64::from(v == Some("1")));
+
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_INPUTS").is_some_and(|v| v == "1"))
+    ON.get_bool()
 }
 
 /// Bytes from the records buffer's descriptor to the parameters' for the bake pixel shader
@@ -141,6 +143,20 @@ fn line(c: &[u64; N]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        // Unchanged, the switch reads what the environment said, as before.
+        assert_eq!(on(), std::env::var_os("VICTORY_BAKE_INPUTS").is_some_and(|v| v == "1"));
+        if std::env::var_os("VICTORY_BAKE_INPUTS").is_some() {
+            return;
+        }
+        victory_core::settings::set("VICTORY_BAKE_INPUTS", "1").unwrap();
+        let now = on();
+        victory_core::settings::set("VICTORY_BAKE_INPUTS", "").unwrap();
+        assert!(now, "a change takes effect while running");
+        assert!(!on(), "and clears back to the launch value");
+    }
 
     fn params(textures: [u32; 4], first: u32, end: u32, count: u32) -> [u32; PARAM_DWORDS] {
         let mut p = [0u32; PARAM_DWORDS];

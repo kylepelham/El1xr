@@ -371,14 +371,14 @@ impl Painter {
         if let Some(b) = l.banner {
             let pending = model.pending_restart();
             fill(&mut bm, b, px(4.0) as f32, 255, BANNER);
-            let labels: Vec<&str> = pending
+            let labels: Vec<String> = pending
                 .iter()
-                .map(|n| {
-                    model
-                        .infos()
-                        .iter()
-                        .find(|i| i.name == *n)
-                        .map_or(*n, |i| i.label)
+                .map(|&n| {
+                    let label = victory_core::settings::info(n).map_or(n, |i| i.label);
+                    match model.apply_of(n) {
+                        Apply::Retranslate => format!("{label} (rebuild)"),
+                        _ => label.to_string(),
+                    }
                 })
                 .collect();
             let head = "RESTART NEEDED";
@@ -445,20 +445,19 @@ impl Painter {
         let px = |v: f32| l.px(v);
         let x = r.x + px(16.0);
         let (lh, hh) = (t.measure(LABEL, "Ag").1, t.measure(HELP, "Ag").1);
-        let top = r.y + (r.h - lh - hh) / 2;
         let label_w = l.badge(r).x - px(16.0) - x;
         let (label, help) = match row {
             Row::Setting(i) => {
                 let info = model.infos()[i];
-                self.apply_class(bm, l.badge(r), info.apply);
-                let value = model
-                    .get(info.name)
-                    .unwrap_or_else(|| info.default.to_string());
-                self.value(bm, l, l.value(r), info.kind, &value, selected);
-                (
-                    info.label.to_string(),
-                    format!("{}   {}", info.help, info.name),
-                )
+                self.apply_class(bm, l.badge(r), model.apply_of(info.name));
+                let value = model.get(info.name).unwrap_or_default();
+                self.value(bm, l, l.value(r), info.name, info.kind, &value, selected);
+                let help = match (info.help, info.label == info.name) {
+                    (help, true) => help.to_string(),
+                    ("", false) => info.name.to_string(),
+                    (help, false) => format!("{help}   {}", info.name),
+                };
+                (info.label.to_string(), help)
             }
             Row::Preset(p) => {
                 let preset = model.presets()[p];
@@ -467,19 +466,23 @@ impl Painter {
             }
             Row::Save => {
                 self.action(bm, l.value(r), "SAVE", selected);
-                (
-                    "Save settings".into(),
-                    "Write the changed values to the settings file.".into(),
-                )
+                let help = match victory_core::settings::file_path() {
+                    Some(path) => format!("Write the changed values to {}", short_path(&path)),
+                    None => "No settings file in this run (VICTORY_SETTINGS_FILE=none)".into(),
+                };
+                ("Save settings".into(), help)
             }
-            Row::Reset => {
-                self.action(bm, l.value(r), "RESET", selected);
+            Row::Undo => {
+                self.action(bm, l.value(r), "UNDO", selected);
                 (
-                    "Reset to defaults".into(),
-                    "Every setting back to its default value.".into(),
+                    "Undo changes".into(),
+                    "Every setting changed while running back to its launch value.".into(),
                 )
             }
         };
+        // A row without help has its label centred.
+        let hh = if help.is_empty() { 0 } else { hh };
+        let top = r.y + (r.h - lh - hh) / 2;
         t.draw(
             bm,
             LABEL,
@@ -510,9 +513,19 @@ impl Painter {
 
     /// A value as plain text between small arrows (accent on the focused row), right-aligned in
     /// the value column; free text without arrows.
-    fn value(&self, bm: &mut Bitmap, l: &Layout, v: Rect, kind: Kind, value: &str, selected: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn value(
+        &self,
+        bm: &mut Bitmap,
+        l: &Layout,
+        v: Rect,
+        name: &str,
+        kind: Kind,
+        value: &str,
+        selected: bool,
+    ) {
         let t = &self.text;
-        let s = shown(kind, value);
+        let s = shown(name, kind, value);
         if kind == Kind::Text {
             let s = t.fit(SMALL, &s, v.w);
             let w = t.measure(SMALL, &s).0;
@@ -528,5 +541,16 @@ impl Painter {
         let inner = Rect { x: v.x + l.px(76.0), w: v.right() - rw - v.x - l.px(76.0), ..v };
         let s = t.fit(VALUE, &s, inner.w - l.px(32.0));
         t.centre(bm, VALUE, &s, inner, if off { DIM } else { TEXT });
+    }
+}
+
+/// `path` with the user's local data folder written as `%LOCALAPPDATA%`.
+fn short_path(path: &std::path::Path) -> String {
+    let full = path.display().to_string();
+    match std::env::var("LOCALAPPDATA") {
+        Ok(base) if !base.is_empty() && full.starts_with(&base) => {
+            format!("%LOCALAPPDATA%{}", &full[base.len()..])
+        }
+        _ => full,
     }
 }

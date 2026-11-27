@@ -61,9 +61,9 @@ const TURN_MS: u128 = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
-    Off,
-    On,
-    ByTurns,
+    Off = 0,
+    On = 1,
+    ByTurns = 2,
 }
 
 fn parse(value: Option<&str>) -> Mode {
@@ -79,8 +79,14 @@ fn mode() -> Mode {
     if tests::FORCED.load(Relaxed) {
         return Mode::On;
     }
-    static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| parse(std::env::var("VICTORY_CARD_AWAKE").ok().as_deref()))
+    // Live: the in-game menu turns it on, off or to turns while the title runs.
+    static MODE: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_CARD_AWAKE", |v| parse(v) as u64);
+    match MODE.get() {
+        1 => Mode::On,
+        2 => Mode::ByTurns,
+        _ => Mode::Off,
+    }
 }
 
 fn on() -> bool {
@@ -134,7 +140,6 @@ pub(crate) fn sent(device: &ID3D12Device) {
     if !on() {
         return;
     }
-    static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| start(device.clone()));
     state().idle_since = None;
     end_cover();
@@ -153,11 +158,14 @@ pub(crate) fn idle() {
     WAKE.notify_one();
 }
 
+/// Whether the thread was started (the switch was on at some point).
+static STARTED: std::sync::Once = std::sync::Once::new();
+
 /// Ends the thread, after what it sent has run: at the title's exit, before
 /// Windows ends the threads (a thread ended inside the runtime may hold its
-/// locks).
+/// locks). Also when the switch was turned off since.
 pub fn stop() {
-    if !on() {
+    if !on() && !STARTED.is_completed() {
         return;
     }
     state().stop = true;
@@ -203,7 +211,7 @@ fn run(device: &ID3D12Device) -> windows::core::Result<()> {
                 was_on = turn;
                 tracing::info!(on = turn, "the card is kept awake, by turns");
             }
-            if !(turn && s.idle_since.is_some_and(|t| t.elapsed() < QUIET)) {
+            if !(turn && on() && s.idle_since.is_some_and(|t| t.elapsed() < QUIET)) {
                 end_cover();
                 drop(WAKE.wait_timeout(s, Duration::from_millis(50)));
                 continue;

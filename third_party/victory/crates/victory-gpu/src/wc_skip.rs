@@ -35,8 +35,18 @@ static RESERVATIONS: Mutex<BTreeMap<usize, Reservation>> = Mutex::new(BTreeMap::
 /// Pieces left on the card by [`skip_back`]: count and bytes.
 static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Whether `VICTORY_SKIP_WC_BACK=1` is active (off by default).
+/// Whether `VICTORY_SKIP_WC_BACK=1` is active (off by default). Live: the
+/// in-game menu turns it on and off while the title runs (reservations are
+/// recorded either way; off copies everything back again, as before).
 pub(crate) fn skip_wc_back() -> bool {
+    static ON: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_SKIP_WC_BACK", |v| u64::from(v == Some("1")));
+    launched_on();
+    ON.get_bool()
+}
+
+/// Whether it was on at start (logged once).
+fn launched_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SKIP_WC_BACK").is_some_and(|v| v == "1");
@@ -66,9 +76,9 @@ pub(crate) fn keep_bytes() -> usize {
 
 /// Records that `XMemVirtualAlloc` reserved `[at, at + len)` with the title's
 /// original console `protect` flags (before `HOST_PROTECTION` masking).
-/// No-op when `VICTORY_SKIP_WC_BACK` is off.
+/// Recorded with `VICTORY_SKIP_WC_BACK` off too, for a live change.
 pub fn title_memory_reserved(at: usize, len: usize, protect: u32) {
-    if !skip_wc_back() || at == 0 || len == 0 {
+    if at == 0 || len == 0 {
         return;
     }
     let mut reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());

@@ -38,9 +38,14 @@ fn threads_from(value: Option<&str>) -> usize {
     }
 }
 
+/// Live: a submission's textures each go to the threads or to the join as
+/// the switch stands when they are met (the join runs both). The pool keeps
+/// the thread count it had at its first use.
+static N: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_TEX_EARLY", |v| threads_from(v) as u64);
+
 fn threads() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| threads_from(std::env::var("VICTORY_TEX_EARLY").ok().as_deref()))
+    N.get() as usize
 }
 
 pub(crate) fn on() -> bool {
@@ -287,6 +292,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
+
+    #[test]
+    fn the_switch_is_live() {
+        // Unchanged, the switch reads what the environment said, as before.
+        assert_eq!(threads(), threads_from(std::env::var("VICTORY_TEX_EARLY").ok().as_deref()));
+        if std::env::var_os("VICTORY_TEX_EARLY").is_some() {
+            return;
+        }
+        victory_core::settings::set("VICTORY_TEX_EARLY", "6").unwrap();
+        let now = threads();
+        victory_core::settings::set("VICTORY_TEX_EARLY", "").unwrap();
+        assert_eq!(now, 6, "a change takes effect while running");
+        assert_eq!(threads(), 0, "and clears back to the launch value");
+    }
 
     fn test_pool() -> &'static Pool {
         static POOL: OnceLock<&'static Pool> = OnceLock::new();

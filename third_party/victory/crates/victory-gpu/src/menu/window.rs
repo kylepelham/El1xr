@@ -16,8 +16,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::draw::Painter;
 use super::input::Key;
-use super::layout::{Layout, layout};
-use super::model::DemoModel;
+use super::layout::Layout;
+use super::model::Registry;
 use super::{BLOCKED, Driver, PAD_DOWN, PAD_PRESSED, WHEEL, hotkey};
 use crate::pixels::Bitmap;
 
@@ -148,9 +148,7 @@ impl Ctx {
             }
             return;
         };
-        let rows = self.driver.menu.rows(&*self.driver.model).len();
-        let pending = !self.driver.model.pending_restart().is_empty();
-        let l = layout(w, h, &mut self.driver.menu, rows, pending);
+        let l = self.driver.layout(w, h);
         let at = POINT {
             x: origin.x + (w - l.window.w) / 2,
             y: origin.y + (h - l.window.h) / 2,
@@ -355,7 +353,7 @@ fn run(game: HWND) {
             *c.borrow_mut() = Some(Ctx {
                 game,
                 window,
-                driver: Driver::new(Box::new(DemoModel::default())),
+                driver: Driver::new(Box::new(Registry::default())),
                 painter: None,
                 layout: None,
                 at: POINT { x: 0, y: 0 },
@@ -387,9 +385,7 @@ fn run(game: HWND) {
 /// it (offscreen previews for the tests).
 #[cfg(test)]
 pub(super) fn render(driver: &mut Driver, w: i32, h: i32) -> Option<Bitmap> {
-    let rows = driver.menu.rows(&*driver.model).len();
-    let pending = !driver.model.pending_restart().is_empty();
-    let l = layout(w, h, &mut driver.menu, rows, pending);
+    let l = driver.layout(w, h);
     Painter::for_layout(None, &l)?.paint(&l, &driver.menu, &*driver.model, None)
 }
 
@@ -433,38 +429,66 @@ mod tests {
 
     #[test]
     fn closed_menu_draws_nothing() {
-        let mut d = Driver::new(Box::new(DemoModel::default()));
+        let mut d = Driver::new(Box::new(Registry::default()));
         assert!(render(&mut d, 1920, 1080).is_none());
     }
 
-    /// Renders the demo menu offscreen; with `VICTORY_MENU_PNG_DIR` set, over a stand-in picture
-    /// to PNGs there.
+    /// The live hooks `apps/victory` registers when the title's upscale is ours and
+    /// `VICTORY_FFX_SCALE` was patched: here they do nothing but make the rows live.
+    fn hook_display() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            for name in [
+                "VICTORY_UPSCALE",
+                "VICTORY_DLSS_QUALITY",
+                "VICTORY_DLSS_SHARPNESS",
+                "VICTORY_FFX_SCALE",
+            ] {
+                victory_core::settings::on_change(name, |_| {});
+            }
+        });
+    }
+
+    /// Renders the menu on the registry offscreen; with `VICTORY_MENU_PNG_DIR` set, over a
+    /// stand-in picture to PNGs there.
     #[test]
     fn open_menu_renders_at_1080_and_4k() {
-        let mut d = Driver::new(Box::new(DemoModel::default()));
+        let _lock = super::super::model::registry_lock();
+        hook_display();
+        let mut d = Driver::new(Box::new(Registry::default()));
         d.tick(0, &[Key::Hotkey], 0, 0);
         let small = save("menu_display_1080.png", &mut d, 1920, 1080);
         let mid = (small.h / 2 * small.w + small.w / 2) * 4 + 3;
         assert!(small.px[mid] > 200, "the panel is nearly opaque");
         assert_eq!(small.px[3], 0, "the corner is clear");
-        // A restart-class change shows the banner; the 4K picture is the 1080 one at twice the size.
-        d.tick(30, &[], DOWN, 0);
+        // DLSS on (live), then frame generation (restart): the band shows; the 4K picture is the
+        // 1080 one at twice the size.
+        d.tick(30, &[Key::Right], 0, 0);
         d.tick(60, &[], 0, 0);
-        d.tick(90, &[], DOWN, 0);
+        d.tick(90, &[Key::Right], 0, 0);
         d.tick(120, &[], 0, 0);
-        d.tick(150, &[], DOWN, 0);
-        d.tick(180, &[Key::Enter], 0, 0);
-        assert!(!d.model.pending_restart().is_empty());
+        assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("dlss"));
+        for (at, pad) in [(150, DOWN), (180, 0), (210, DOWN), (240, 0), (270, DOWN), (300, 0), (330, DOWN)] {
+            d.tick(at, &[], pad, 0);
+        }
+        d.tick(360, &[Key::Enter], 0, 0);
+        assert_eq!(d.model.pending_restart(), ["VICTORY_FRAME_GEN"]);
         let big = save("menu_display_4k.png", &mut d, 3840, 2160);
         assert_eq!((big.w, big.h), (small.w * 2, small.h * 2));
-        d.tick(240, &[], PAD_RB, 0);
-        assert_eq!(d.menu.tab, Tab::Performance);
-        save("menu_performance_1080.png", &mut d, 1920, 1080);
-        d.menu.expert = true;
-        d.menu.tab = Tab::Experimental;
+        d.tick(400, &[], PAD_RB, 0);
+        assert_eq!(d.menu.tab, Tab::Group("Submission"));
+        save("menu_submission_1080.png", &mut d, 1920, 1080);
+        d.tick(430, &[Key::Expert], 0, 0);
+        d.tick(460, &[], 0, 0);
+        assert!(d.menu.expert);
+        d.menu.tab = Tab::Group(super::super::state::EXPERIMENTAL);
         save("menu_experimental_1080.png", &mut d, 1920, 1080);
         d.menu.tab = Tab::Presets;
         d.menu.selected = 1;
         save("menu_presets_1440.png", &mut d, 2560, 1440);
+        for name in ["VICTORY_UPSCALE", "VICTORY_FRAME_GEN"] {
+            d.model.set(name, "").unwrap();
+        }
+        assert!(d.model.pending_restart().is_empty());
     }
 }

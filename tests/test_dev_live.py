@@ -274,6 +274,20 @@ def test_apply_kinds_read_the_settings_table(tmp_path):
                      'Setting { name: "VICTORY_FOO", default: "0", apply: Apply::Retranslate, },\n', encoding="utf-8")
     assert dev_warm.apply_kinds(tmp_path) == {"VICTORY_AWAKE": "Live", "VICTORY_FOO": "Retranslate"}
     assert dev_warm.apply_kinds(tmp_path / "none") is None
+    (tmp_path / dev_warm.SETTINGS_EXPERT).write_text('    ("VICTORY_BAR", Apply::Restart),\n'
+                                                     '    ("VICTORY_AWAKE", Apply::Restart),\n', encoding="utf-8")
+    assert dev_warm.apply_kinds(tmp_path) == {"VICTORY_AWAKE": "Live", "VICTORY_FOO": "Retranslate",
+                                              "VICTORY_BAR": "Restart"}
+
+
+def test_the_registry_segment_line_parses():
+    """The line victory-core's `settings::schedule::segment_line` writes (its test holds the same text)."""
+    line = ("2026-11-27T10:00:00.000000Z  INFO victory_core::settings: "
+            "settings: segment 2 VICTORY_PRESENT_SMOOTH=0.5 at 190.0")
+    log = dev_live.parse_log(line + "\n")
+    assert [(n, name, value) for _, n, name, value in log.changes] == [(2, "VICTORY_PRESENT_SMOOTH", "0.5")]
+    m = dev_live.SEGMENT_RE.search(line)
+    assert m is not None and m.group(4) == "190.0"
 
 
 def fake_world_stats(dev, fps):
@@ -332,6 +346,8 @@ def test_a_live_run_gets_its_schedule_and_its_report_section(tmp_path, monkeypat
     plan = tmp_path / "b9.toml"
     plan.write_text(plan_text, encoding="utf-8")
     calls, _ = setup_train(dev, tmp_path, monkeypatch, log)
+    # The plan's made-up switch, Live, whatever the real registry says.
+    monkeypatch.setattr(dev.dev_warm, "apply_kinds", lambda root: {"VICTORY_AWAKE": "Live"})
     assert dev.main(["train", "--plan", str(plan), "--run", "next"]) == 0
     overrides, seconds, quiet = calls[0]
     schedule = Path(overrides["VICTORY_SETTINGS_SCHEDULE"])
@@ -414,3 +430,12 @@ def test_greps_from_all_reads_every_ready_md(tmp_path, monkeypatch, capsys):
     dev.main(["train", "--plan", str(plan), "--greps-from", "all"])
     text = plan.read_text(encoding="utf-8")
     assert "alpha joins per frame" in text and "beta skipped" in text
+
+
+def test_apply_kinds_reads_the_settings_registry():
+    kinds = dev_warm.apply_kinds(Path(__file__).resolve().parents[1])
+    assert kinds is not None and len(kinds) > 100
+    assert kinds["VICTORY_PRESENT_CAP"] == "Live" and kinds["VICTORY_CARD_AWAKE"] == "Live"
+    assert kinds["VICTORY_CARD_WINDOWS_MB"] == "Restart"
+    assert kinds["VICTORY_PORT_CBV"] == "Retranslate"
+    assert kinds["VICTORY_CARD_DECL_JOIN"] == "Live" and kinds["VICTORY_LATE_WAIT"] == "Restart"

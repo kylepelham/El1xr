@@ -132,7 +132,7 @@ El objetivo son 30 fps estables en 4K en la RTX 5090, y después eliminar los ti
 
 | Cifra | Qué |
 |---|---|
-| 1600+ pruebas automatizadas | herramientas de Python y crates de Rust, ejecutadas por `dev.py gate` |
+| 1800+ pruebas automatizadas | herramientas de Python y crates de Rust, ejecutadas por `dev.py gate` |
 | 26.148 programas de shaders | traducidos de RDNA 2 a DXIL, en caché en disco |
 | 0 pipelines rechazados | en la RTX 5090 |
 

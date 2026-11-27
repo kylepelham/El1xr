@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod live_hooks;
 mod run;
 mod shader;
 mod translate;
@@ -222,6 +224,9 @@ unsafe impl Sync for SdkPath {}
 pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());
 
 fn main() -> Result<()> {
+    // The user's settings file (`VICTORY_SETTINGS_FILE`), into the environment before any
+    // thread starts or reads it; nothing without a file.
+    let settings = victory_core::settings::init();
     // `VICTORY_HEAP_COUNT=1`: the Rust heap's live bytes for the resident line (off: it slowed loading).
     victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_some_and(|v| v == "1"));
     // (Neptune) Discord Rich Presence while a title runs (`discord.rs`).
@@ -229,10 +234,17 @@ fn main() -> Result<()> {
         discord::start();
     }
     victory_core::logging::init("info");
+    for line in settings.lines() {
+        tracing::info!("{line}");
+    }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
+    }
+    // `VICTORY_SETTINGS_SCHEDULE`: live settings changed on a timeline (`dev.py train` live arms).
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        victory_core::settings::schedule::start();
     }
     let cli = Cli::parse();
     match cli.command {

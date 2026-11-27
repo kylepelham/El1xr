@@ -3790,17 +3790,22 @@ pub(crate) fn copy_changed() -> bool {
 /// between them are the same on the CPU side and the card (nothing of the stretch is being written
 /// by shaders: `update` cut those ranges out), so sending them again changes nothing; what it saves
 /// is ranges (27,661 a frame for 51 MB in run main-neptune-2258).
+/// Live: the in-game menu may change it between refreshes (each refresh's runs are joined with
+/// one value; any value sends the same bytes).
 fn copy_coalesce_gap() -> usize {
-    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *GAP.get_or_init(|| {
-        std::env::var("VICTORY_COPY_COALESCE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
+    static GAP: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_COPY_COALESCE", |v| {
+            v.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0) as u64
+        });
+    GAP.get() as usize
 }
 
 /// `runs` (offset, bytes; in order) with those at most `gap` bytes apart joined.
+#[cfg(test)]
+pub(crate) fn coalesce_runs_for_bench(runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    coalesce_runs(runs, copy_coalesce_gap())
+}
+
 fn coalesce_runs(runs: &[(usize, usize)], gap: usize) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for &(r, m) in runs {
@@ -6514,6 +6519,7 @@ impl Shadow {
         let four_k = crate::watch::watch_4k();
         let dirty_4k_kept = crate::watch::dirty4k_kept();
         if !four_k && !dirty_4k_kept {
+            let planning = crate::refresh_prof::start();
             let runs = {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 if has_deferred {
@@ -6524,17 +6530,15 @@ impl Shadow {
                     copied.plan_stale(base, start, end, from, to, now, written)
                 }
             };
+            crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, planning);
             let total: usize = runs.iter().map(|(a, b)| b - a).sum();
             if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
                 return self.copy_runs_wide(runs.iter());
             }
-            let mut bytes = 0;
-            for (run_from, run_to) in runs.iter() {
-                bytes += self.copy(run_from, run_to);
-            }
-            return bytes;
+            return self.copy_runs_here(runs.iter());
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
+        let planning = crate::refresh_prof::start();
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
         // with CopiedPages bitset consistency, partial-page stamps, and lazy-deferred skipping.
         let bytes_runs = {
@@ -6566,15 +6570,12 @@ impl Shadow {
                 |idx| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
             )
         };
+        crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, planning);
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(bytes_runs.into_iter());
         }
-        let mut bytes = 0;
-        for (a, b) in bytes_runs {
-            bytes += self.copy(a, b);
-        }
-        bytes
+        self.copy_runs_here(bytes_runs.into_iter())
     }
 
     /// [`Shadow::copy_stale`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
@@ -6610,11 +6611,7 @@ impl Shadow {
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(runs.iter());
         }
-        let mut bytes = 0;
-        for (run_from, run_to) in runs.iter() {
-            bytes += self.copy(run_from, run_to);
-        }
-        bytes
+        self.copy_runs_here(runs.iter())
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -6701,17 +6698,77 @@ impl Shadow {
                 if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
                     let copied = differing;
                     COPY_CHANGED[1].fetch_add(copied as u64, Ordering::Relaxed);
-                    self.changed(from - start + first.0, from - start + last.0 + last.1);
-                    self.card_changed_runs(from - start, &runs, true);
+                    let noting = crate::refresh_prof::start();
+                    let (a, b) = (from - start + first.0, from - start + last.0 + last.1);
+                    if crate::stale_batch::active(self as *const Self as usize) {
+                        let merged = coalesce_runs(&runs, copy_coalesce_gap());
+                        crate::stale_batch::note(a, b, from - start, &merged);
+                    } else {
+                        self.changed(a, b);
+                        self.card_changed_runs(from - start, &runs, true);
+                    }
+                    crate::refresh_prof::finish(crate::refresh_prof::P::StaleNoteUs, noting);
                 }
             });
             return n;
         }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
-        self.changed(from - start, to - start);
-        self.card_changed(from - start, to - start);
+        if crate::stale_batch::active(self as *const Self as usize) {
+            if from < to {
+                let (a, b) = (from - start, to - start);
+                let card: &[(usize, usize)] = if self.card.is_some() { &[(0, b - a)] } else { &[] };
+                crate::stale_batch::note(a, b, a, card);
+            }
+        } else {
+            self.changed(from - start, to - start);
+            self.card_changed(from - start, to - start);
+        }
         to - from
+    }
+
+    /// (feedcard) `VICTORY_STALE_BATCH=1`: what the runs of a refresh noted
+    /// (`crate::stale_batch`), taken in one go as `changed` and
+    /// `card_changed_runs` took them run by run.
+    fn take_notes(&self, notes: crate::stale_batch::Notes) {
+        let noting = crate::refresh_prof::start();
+        if keeps() && !notes.changed.is_empty() {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if !kept.0.is_empty() {
+                for &(from, to) in &notes.changed {
+                    for piece in self.pieces(from, to) {
+                        kept.0[piece] = false;
+                    }
+                }
+            }
+        }
+        if let Some(card) = &self.card
+            && !notes.card.is_empty()
+        {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            crate::stale_batch::push_dirty(&mut dirty, &notes.card);
+            card.has_dirty.store(true, Ordering::Release);
+            drop(dirty);
+            self.card_flag(card);
+        }
+        crate::refresh_prof::finish(crate::refresh_prof::P::StaleNoteUs, noting);
+    }
+
+    /// The stale runs of a refresh copied one after another on this thread,
+    /// with `VICTORY_STALE_BATCH=1` their notes taken once at the end.
+    fn copy_runs_here(&self, runs: impl Iterator<Item = (usize, usize)>) -> usize {
+        let batch = crate::stale_batch::begin(self as *const Self as usize);
+        let mut bytes = 0;
+        let mut count = 0;
+        for (a, b) in runs {
+            bytes += self.copy(a, b);
+            count += 1;
+        }
+        crate::refresh_prof::add(crate::refresh_prof::P::StaleRuns, count);
+        if let Some(notes) = batch.end() {
+            self.take_notes(notes);
+        }
+        bytes
     }
 
     /// [`Shadow::copy`] of a transient window: title memory `[from, to)` into a chunk, noted

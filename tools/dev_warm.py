@@ -24,6 +24,8 @@ from pathlib import Path
 
 LIVE_RE = re.compile(r'name: "(VICTORY_[A-Z0-9_]+)".*?apply: Apply::(\w+)')
 SETTINGS_TABLE = Path("third_party/victory/crates/victory-core/src/settings/table.rs")
+EXPERT_RE = re.compile(r'\("(VICTORY_[A-Z0-9_]+)", Apply::(\w+)\)')
+SETTINGS_EXPERT = SETTINGS_TABLE.with_name("expert.rs")
 
 
 def victory_exe(repo_root: Path, diag: bool = False) -> Path:
@@ -103,11 +105,17 @@ def write_stamp(
 
 
 def apply_kinds(repo_root: Path) -> dict[str, str] | None:
-    """Each registry setting's apply kind (`Live`, `Restart`, `Retranslate`) as the settings table states it, or
-    None when the tree has no settings registry yet."""
-    path = repo_root / SETTINGS_TABLE
+    """Each registry setting's apply kind (`Live`, `Restart`, `Retranslate`) as the settings table (described
+    entries) and its expert list state it, or None when the tree has no settings registry yet."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = (repo_root / SETTINGS_TABLE).read_text(encoding="utf-8")
     except OSError:
         return None
-    return {m.group(1): m.group(2) for m in LIVE_RE.finditer(text)}
+    kinds = {m.group(1): m.group(2) for m in LIVE_RE.finditer(text)}
+    try:
+        expert = (repo_root / SETTINGS_EXPERT).read_text(encoding="utf-8")
+    except OSError:
+        expert = ""
+    for m in EXPERT_RE.finditer(expert):
+        kinds.setdefault(m.group(1), m.group(2))
+    return kinds
