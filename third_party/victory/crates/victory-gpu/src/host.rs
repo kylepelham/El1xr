@@ -10380,6 +10380,32 @@ fn logical_processors() -> u32 {
 /// The window's title, before the figures.
 const TITLE: &str = "El1xr by Bone/Nevaa (VIctory)";
 
+/// Title prefix, including `[<worktree>]` when run from `AnyXboxX-wt\<job>`
+/// or when `VICTORY_TITLE_TAG` is set.
+fn window_title() -> &'static str {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        let tag = std::env::var("VICTORY_TITLE_TAG")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let exe = std::env::current_exe().ok()?;
+                let mut comps = exe.components();
+                while let Some(c) = comps.next() {
+                    if c.as_os_str().to_string_lossy().eq_ignore_ascii_case("AnyXboxX-wt") {
+                        return comps.next().map(|j| j.as_os_str().to_string_lossy().into_owned());
+                    }
+                }
+                None
+            });
+        match tag {
+            Some(t) => format!("El1xr [{t}] by Bone/Nevaa (VIctory)"),
+            None => TITLE.to_owned(),
+        }
+    })
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -10908,7 +10934,7 @@ impl Meter {
                 }
             }
         }
-        let text = format!("{TITLE}  \u{b7}  {fps:.0} FPS  \u{b7}  {ms:.0} ms");
+        let text = format!("{}  \u{b7}  {fps:.0} FPS  \u{b7}  {ms:.0} ms", window_title());
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
         // presenting never waits; it takes the newest figures when free, and
@@ -11770,10 +11796,11 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let title_wide: Vec<u16> = window_title().encode_utf16().chain(Some(0)).collect();
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("El1xr by Bone/Nevaa (VIctory)"),
+            windows::core::PCWSTR(title_wide.as_ptr()),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
