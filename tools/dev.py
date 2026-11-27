@@ -68,12 +68,6 @@ POLICY_FILES_RE = re.compile(r"asset policy:\s*(\d+)\s+files ok")
 ALERT_LEVEL_RE = re.compile(r"\b(WARN|ERROR)\b")
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 
-REFUSED_PATTERNS = (
-    "does not translate",
-    "host pipeline refused",
-    "host mesh pipeline refused",
-    "host root signature refused",
-)
 WORLD_DRAWS_MIN = 100.0
 LOADING_P50_MS = 100.0
 BUILD_GRACE_SECS = 600.0
@@ -395,6 +389,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
     pacing_windows: list[dict[str, float]] = []
     dstorage_rates: list[float] = []
     refused = 0
+    refused_ahead = 0
     device_removed = False
     first_ts: datetime | None = None
     first_world_ts: datetime | None = None
@@ -410,12 +405,13 @@ def parse_victory_log(text: str) -> dict[str, object]:
             line_ts = datetime.fromisoformat(ts_match.group(1).replace("Z", "+00:00"))
             if first_ts is None:
                 first_ts = line_ts
-        if ALERT_LEVEL_RE.search(line):
-            lower = line.lower()
-            if "device removed" in lower:
-                device_removed = True
-            if any(pat in lower for pat in REFUSED_PATTERNS):
-                refused += 1
+        if ALERT_LEVEL_RE.search(line) and "device removed" in line.lower():
+            device_removed = True
+        kind = dev_stats.refusal(line)
+        if kind == "refused":
+            refused += 1
+        elif kind == "ahead":
+            refused_ahead += 1
         m_frame = FRAME_RE.search(line)
         if m_frame:
             fps = float(m_frame.group(1))
@@ -471,6 +467,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "dstorage_mbs": ds_med,
         "gpu_busy_ms": busy_med,
         "refused": refused,
+        "refused_ahead": refused_ahead,
         "device_removed": device_removed,
         **summarize_pacing(pacing_windows),
         **dev_stats.world_phase(timed_windows, hitches),
@@ -553,7 +550,8 @@ def cmd_policy(_args: argparse.Namespace) -> int:
 
 BENCH_FIELDS = (
     ("boot_s", ".1f"), ("settled_s", ".1f"), ("fps", ".1f"), ("gpu_ms", ".1f"), ("prep_ms", ".1f"),
-    ("gpu_busy_ms", ".1f"), ("dstorage_mbs", ".1f"), ("refused", "d"), ("p50_ms", ".1f"), ("p99_ms", ".1f"),
+    ("gpu_busy_ms", ".1f"), ("dstorage_mbs", ".1f"), ("refused", "d"), ("refused_ahead", "d"),
+    ("p50_ms", ".1f"), ("p99_ms", ".1f"),
     ("max_ms", ".1f"), ("sd_ms", ".1f"), ("jitter_ms", ".1f"), ("over50", "d"), ("hitches", "d"),
     ("steady_p99_ms", ".1f"), ("stream_s", ".1f"), ("world_over100", "d"), ("world_over250", "d"),
     ("worst_ms", ".1f"), ("worst_frame", "d"),
@@ -705,7 +703,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     status = "PASS" if ok else "FAIL"
     print(
         f"DEV capture {status} boot_s={float(stats['boot_s']):.1f} "
-        f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} "
+        f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} refused_ahead={int(stats['refused_ahead'])} "
         f"driver_resets={_count(resets_after)} dir={cap_dir}"
     )
     _print_driver_warning(resets_before, resets_after)
