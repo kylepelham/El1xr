@@ -1256,6 +1256,7 @@ fn present_now(named: Named) {
                     .map_or(SHADER_RESOURCE, |(_, before)| before);
                 (other, t, before)
             });
+        crate::present_audit::presenting(resource as usize);
         let shown = host.present(texture, state, frame, over.map(|(_, t, before)| (t, before)));
         if let Some((other, _, before)) = over {
             crate::resource::host_transition(other, before);
