@@ -1551,6 +1551,7 @@ impl State {
                     continue;
                 };
                 self.targets.push(record.resource as usize);
+                crate::present_audit::target_bound(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
                 let desc = record.desc();

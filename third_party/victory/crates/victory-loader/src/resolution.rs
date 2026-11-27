@@ -38,6 +38,8 @@
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
 
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Patched {
     Done,
@@ -247,17 +249,77 @@ pub fn own_scale_code(scale: f32) -> Vec<u8> {
     c
 }
 
+/// Where in [`FFX_SCALE`]'s padding the scale its loads read is written.
+const FFX_SLOT_AT: usize = 0x64;
+
 /// What goes at [`FFX_SCALE`] for `scale`: both loads read `scale`, written
 /// into the padding at +0x64.
 pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
     const LOADS: [usize; 2] = [0x28, 0x32];
-    const SLOT: usize = 0x64;
+    const SLOT: usize = FFX_SLOT_AT;
     let mut c = FFX_SCALE.bytes.to_vec();
     c[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
     for l in LOADS {
         c[l + 4..l + 8].copy_from_slice(&((SLOT - (l + 8)) as i32).to_le_bytes());
     }
     c
+}
+
+/// The address of the scale `VICTORY_FFX_SCALE` wrote (0: not patched), and
+/// that startup scale's bits.
+static FFX_SLOT: AtomicUsize = AtomicUsize::new(0);
+static FFX_START: AtomicU32 = AtomicU32::new(0);
+
+/// A live render scale for FidelityFX (the settings' live hook, or
+/// `VICTORY_UPSCALE_LIVE_TEST`): rewrites the scale `VICTORY_FFX_SCALE`
+/// placed at startup, clamped to 0.5 .. that startup scale (the title's
+/// targets are sized for it; a larger render size would not fit). Whether the
+/// title takes it before its next target rebuild is for a run to show (the
+/// render size in `VICTORY_UPSCALE_PROBE`'s lines). Returns the scale written.
+#[cfg(windows)]
+pub fn request_ffx_scale(scale: f32) -> Result<f32, &'static str> {
+    let slot = FFX_SLOT.load(Ordering::Relaxed);
+    if slot == 0 {
+        return Err("VICTORY_FFX_SCALE was not patched at startup");
+    }
+    let start = f32::from_bits(FFX_START.load(Ordering::Relaxed));
+    // SAFETY: the slot is the 4 aligned bytes of padding in the title's
+    // mapped image that the patch placed; only data loads read it.
+    let written = unsafe { write_live_scale(slot, start, scale) }?;
+    tracing::info!(
+        asked = scale,
+        written,
+        start,
+        "resolution: live FidelityFX render scale"
+    );
+    Ok(written)
+}
+
+/// Writes `asked`, clamped to 0.5 .. `start`, as the f32 at `slot`.
+///
+/// # Safety
+/// `slot` is 4 aligned bytes of mapped memory that only loads data from.
+#[cfg(windows)]
+unsafe fn write_live_scale(slot: usize, start: f32, asked: f32) -> Result<f32, &'static str> {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    if !asked.is_finite() {
+        return Err("not a number");
+    }
+    if slot % 4 != 0 {
+        return Err("slot not aligned");
+    }
+    let scale = asked.clamp(0.5, start.max(0.5));
+    let mut old = 0;
+    // SAFETY: the caller's promise; an aligned 4-byte store is atomic for the
+    // title's loads, and the page stays executable throughout.
+    unsafe {
+        if VirtualProtect(slot as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Err("Windows would not make it writable");
+        }
+        (*(slot as *const AtomicU32)).store(scale.to_bits(), Ordering::Relaxed);
+        VirtualProtect(slot as *const _, 4, old, &mut old);
+    }
+    Ok(scale)
 }
 
 /// `mov eax, kind ; ret`.
@@ -350,6 +412,13 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
         let offset = format!("{:#x}", site.at);
+        if done == Patched::Done
+            && std::ptr::eq(site, &FFX_SCALE)
+            && let Some(s) = asked_ffx_scale()
+        {
+            FFX_SLOT.store(base + FFX_SCALE.at + FFX_SLOT_AT, Ordering::Relaxed);
+            FFX_START.store(s.to_bits(), Ordering::Relaxed);
+        }
         match done {
             Patched::Done => {
                 tracing::info!(site = %offset, what = site.what, value, "resolution: patched")
@@ -466,6 +535,40 @@ mod tests {
             pool_check_code(),
             [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_scale_is_clamped_to_the_startup_one() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, VirtualAlloc, VirtualFree,
+        };
+        assert!(request_ffx_scale(0.6).is_err(), "nothing patched in tests");
+        // SAFETY: fresh memory of our own, executable and read-only as the image's is.
+        unsafe {
+            let place =
+                VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, 0x40) as *mut u8;
+            assert!(!place.is_null());
+            let slot = place as usize + FFX_SLOT_AT;
+            let mut old = 0;
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            );
+            let read = || f32::from_bits(std::ptr::read(slot as *const u32));
+            assert_eq!(write_live_scale(slot, 0.667, 0.58), Ok(0.58));
+            assert_eq!(read(), 0.58);
+            assert_eq!(write_live_scale(slot, 0.667, 1.0), Ok(0.667));
+            assert_eq!(read(), 0.667);
+            assert_eq!(write_live_scale(slot, 0.667, 0.1), Ok(0.5));
+            assert_eq!(read(), 0.5);
+            assert!(write_live_scale(slot, 0.667, f32::NAN).is_err());
+            assert!(write_live_scale(slot + 1, 0.667, 0.6).is_err());
+            assert_eq!(read(), 0.5);
+            VirtualFree(place.cast(), 0, MEM_RELEASE);
+        }
     }
 
     #[cfg(windows)]

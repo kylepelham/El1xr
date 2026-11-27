@@ -31,6 +31,16 @@ Plan (TOML or JSON; every key optional but `sets`):
     [greps]                             # log lines counted per run (see tools/dev_greps.py)
     foo_skipped = 'foo copies skipped: ([0-9]+)'
 
+    prewarm = "pipelines"               # before each arm, in the same call: "pipelines" (translate + the recipes'
+                                        # host pipelines, under the gpu lock), "shaders", or "none"; a no-op
+                                        # when a stamp says that variant is warm (tools/dev_warm.py)
+    prewarm_ahead = true                # while an arm runs (not a quiet one), translate the next arm's
+                                        # variant at idle priority
+    ahead_jobs = 8                      # its worker threads
+
+A set may say `quiet = true|false` (its runs only; not inherited through `from`). `[live.<name>]` tables are
+live arms (one launch, Live settings switched A/B/A/B; see tools/dev_live.py); `order` names them like sets.
+
 Values are strings, numbers or booleans (true is "1", false "0"). Results go to
 `<dev dir>/train_<plan file stem>/`: `NN_<set>.log`, `NN_<set>.json` and `NN_<set>_snaps/`.
 `--compare A B` writes `compare_<A>_vs_<B>/cmp-<A s>s-<B s>s.png`: each snap of run A (left)
@@ -47,6 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import dev_greps
+import dev_live
 
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -57,7 +68,13 @@ DEFAULT_SECONDS = 200
 DEFAULT_SNAP_EVERY = 15.0
 PLAN_KEYS = {
     "seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets", "greps",
+    "live", "prewarm", "prewarm_ahead", "ahead_jobs",
 }
+PREWARM_MODES = ("pipelines", "shaders", "none")
+DEFAULT_AHEAD_JOBS = 8
+# A run's Drift gpu lock: its seconds, plus boot grace, prewarm and margin, never under 20 minutes (AGENTS.md).
+TTL_EXTRA_S = 300
+TTL_MIN_MINUTES = 20
 
 # (stats key, column header, format): the report's columns, in order.
 COLUMNS = (
@@ -93,6 +110,11 @@ class Plan:
     fast_boot: bool = True
     unmute: bool = False
     greps: dict[str, re.Pattern[str]] = field(default_factory=dict)
+    live: dict[str, dev_live.LiveArm] = field(default_factory=dict)
+    set_quiet: dict[str, bool] = field(default_factory=dict)
+    prewarm: str = "pipelines"
+    prewarm_ahead: bool = True
+    ahead_jobs: int = DEFAULT_AHEAD_JOBS
 
 
 def _value(key: str, value: object) -> str:
@@ -108,7 +130,7 @@ def _overrides(where: str, table: object) -> dict[str, str]:
         raise PlanError(f"{where}: a table of VICTORY_* values")
     out: dict[str, str] = {}
     for key, value in table.items():
-        if key == "from":
+        if key in ("from", "quiet"):
             continue
         if not OVERRIDE_KEY_RE.match(key):
             raise PlanError(f"{where}: '{key}' is not a VICTORY_* name")
@@ -143,7 +165,8 @@ def resolve_sets(raw: dict[str, object], common: dict[str, str]) -> dict[str, di
     return resolved
 
 
-def parse_plan(name: str, data: dict[str, object]) -> Plan:
+def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None = None) -> Plan:
+    """`kinds`: the settings registry's apply kind per setting (live arms schedule Live ones only), if known."""
     unknown = set(data) - PLAN_KEYS
     if unknown:
         raise PlanError(f"unknown plan keys: {', '.join(sorted(unknown))}")
@@ -151,8 +174,15 @@ def parse_plan(name: str, data: dict[str, object]) -> Plan:
     if not isinstance(raw_sets, dict) or not raw_sets:
         raise PlanError("the plan names no sets ([sets.<name>])")
     sets = resolve_sets(raw_sets, _overrides("common", data.get("common", {})))
+    try:
+        live = dev_live.parse_live(data.get("live", {}), sets, kinds)
+    except dev_live.LiveError as exc:
+        raise PlanError(str(exc)) from exc
+    prewarm = str(data.get("prewarm", "pipelines"))
+    if prewarm not in PREWARM_MODES:
+        raise PlanError(f"prewarm: one of {', '.join(PREWARM_MODES)}, not '{prewarm}'")
     order = [str(s) for s in data.get("order", DEFAULT_ORDER)]
-    missing = [s for s in order if s not in sets]
+    missing = [s for s in order if s not in sets and s not in live]
     if missing:
         raise PlanError(f"order names sets the plan lacks: {', '.join(missing)}")
     baseline = str(data.get("baseline", "off" if "off" in sets else order[0] if order else next(iter(sets))))
@@ -174,16 +204,49 @@ def parse_plan(name: str, data: dict[str, object]) -> Plan:
         fast_boot=bool(data.get("fast_boot", True)),
         unmute=bool(data.get("unmute", False)),
         greps=greps,
+        live=live,
+        set_quiet={n: bool(t["quiet"]) for n, t in raw_sets.items() if isinstance(t, dict) and "quiet" in t},
+        prewarm=prewarm,
+        prewarm_ahead=bool(data.get("prewarm_ahead", True)),
+        ahead_jobs=int(data.get("ahead_jobs", DEFAULT_AHEAD_JOBS)),
     )
 
 
-def load_plan(path: Path) -> Plan:
+def load_plan(path: Path, kinds: dict[str, str] | None = None) -> Plan:
     text = path.read_text(encoding="utf-8")
     try:
         data = json.loads(text) if path.suffix.lower() == ".json" else tomllib.loads(text)
     except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         raise PlanError(f"{path}: {exc}") from exc
-    return parse_plan(re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem), data)
+    return parse_plan(re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem), data, kinds)
+
+
+def step_overrides(plan: Plan, name: str) -> dict[str, str]:
+    """The launch overrides of a set or live arm (a live arm launches with its set A's values)."""
+    return dict(plan.live[name].launch) if name in plan.live else dict(plan.sets[name])
+
+
+def step_seconds(plan: Plan, name: str) -> int:
+    return plan.live[name].seconds if name in plan.live else plan.seconds
+
+
+def step_quiet(plan: Plan, name: str) -> bool:
+    if name in plan.live and plan.live[name].quiet is not None:
+        return bool(plan.live[name].quiet)
+    return plan.set_quiet.get(name, plan.quiet)
+
+
+def ttl_minutes(plan: Plan, name: str) -> int:
+    """The Drift gpu lock's ttl_minutes for one `--run` of this set or arm."""
+    return max(TTL_MIN_MINUTES, -(-(step_seconds(plan, name) + TTL_EXTRA_S) // 60))
+
+
+def next_after(plan: Plan, done: dict[int, dict[str, object]], step: int) -> tuple[int, str] | None:
+    """The first pending step of the order other than `step` (what runs after it)."""
+    for s, name in enumerate(plan.order, 1):
+        if s != step and s not in done:
+            return s, name
+    return None
 
 
 def run_id(step: int, set_name: str) -> str:
@@ -226,8 +289,8 @@ def pick(plan: Plan, done: dict[int, dict[str, object]], run: str) -> tuple[int,
         if step in done:
             return step, str(done[step]["set"])
         raise PlanError(f"step {step} is not in the order (1-{len(plan.order)})")
-    if run not in plan.sets:
-        raise PlanError(f"no set '{run}' (sets: {', '.join(plan.sets)})")
+    if run not in plan.sets and run not in plan.live:
+        raise PlanError(f"no set '{run}' (sets: {', '.join([*plan.sets, *plan.live])})")
     for step, name in enumerate(plan.order, 1):
         if name == run and step not in done:
             return step, name
@@ -282,8 +345,18 @@ def listing(plan: Plan, done: dict[int, dict[str, object]]) -> str:
     for step in sorted(set(range(1, len(plan.order) + 1)) | set(done)):
         name = str(done[step]["set"]) if step in done else plan.order[step - 1]
         state = "done" if step in done else "pending"
-        values = " ".join(f"{k}={v}" for k, v in plan.sets[name].items()) if name in plan.sets else "(set no longer in the plan)"
-        lines.append(f"{run_id(step, name)} {state}: {values or '(defaults)'}")
+        if name in plan.live:
+            arm = plan.live[name]
+            values = (f"live {arm.a} vs {arm.b} {''.join(arm.labels())} x {arm.segment_s:g} s from {arm.start_s:g} s: "
+                      + " ".join(f"{k}={a}/{b}" for k, (a, b) in arm.keys.items()))
+        elif name in plan.sets:
+            values = " ".join(f"{k}={v}" for k, v in plan.sets[name].items())
+        else:
+            values = "(set no longer in the plan)"
+        extra = ""
+        if state == "pending" and (name in plan.sets or name in plan.live):
+            extra = f" [{step_seconds(plan, name)} s{', quiet' if step_quiet(plan, name) else ''}, gpu lock ttl>={ttl_minutes(plan, name)} min]"
+        lines.append(f"{run_id(step, name)} {state}{extra}: {values or '(defaults)'}")
     return "\n".join(lines) + "\n"
 
 
@@ -302,7 +375,8 @@ def _resets(record: dict[str, object]) -> str:
 
 
 def report(
-    plan: Plan, done: dict[int, dict[str, object]], scans: dict[int, dev_greps.LogScan] | None = None
+    plan: Plan, done: dict[int, dict[str, object]], scans: dict[int, dev_greps.LogScan] | None = None,
+    lives: dict[int, dict[str, object]] | None = None,
 ) -> tuple[str, dict[str, object]]:
     """The markdown report and its figures: every run, pending steps, then each set's medians and
     their differences from the baseline set, then the plan's greps per run. `scans` are the runs'
@@ -348,6 +422,11 @@ def report(
             if delta:
                 figures["deltas"][name] = delta
             lines.append(f"| {name} | {int(m['runs'])} | " + " | ".join(cells) + " |")
+    if lives:
+        lines += ["", "## Live arms (median over segments; first seconds after each change left out)"]
+        for s in sorted(lives):
+            lines += dev_live.report_lines(run_id(s, str(done[s]["set"])), lives[s])
+        figures["live"] = {run_id(s, str(done[s]["set"])): lives[s] for s in sorted(lives)}
     ids = {s: run_id(s, str(done[s]["set"])) for s in sorted(scans)}
     figures["runs"] = {
         ids[s]: {
@@ -376,11 +455,12 @@ def report(
 
 
 def set_medians(done: dict[int, dict[str, object]]) -> dict[str, dict[str, float]]:
-    """Each set's median of every column over its runs that passed, in first-run order."""
+    """Each set's median of every column over its runs that passed, in first-run order (live arms mix two sets in
+    one run: their figures are in their own section)."""
     by_set: dict[str, list[dict[str, object]]] = {}
     for step in sorted(done):
         rec = done[step]
-        if rec.get("ok"):
+        if rec.get("ok") and rec.get("kind", "set") == "set":
             by_set.setdefault(str(rec["set"]), []).append(rec["stats"])
     return {
         name: {"runs": float(len(runs)), **{k: statistics.median(float(r.get(k, 0)) for r in runs) for k, _, _ in COLUMNS}}

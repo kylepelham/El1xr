@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -202,6 +203,89 @@ def builds_idle(psutil_module=None) -> Iterator[int]:
                 ):
                     proc.nice(BELOW_NORMAL_PRIORITY_CLASS)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+
+def _worktree_tools(psutil) -> list:
+    """Windowless programs run from a worktree's cargo target (offline `victory translate`, test
+    executables started by hand), which `_build_tree` does not see."""
+    found = []
+    for proc in psutil.process_iter(["exe"]):
+        exe = (proc.info.get("exe") or "").lower().replace("/", "\\")
+        if "\\anyxboxx-wt\\" in exe and "\\target\\" in exe:
+            found.append(proc)
+    return found
+
+
+@contextlib.contextmanager
+def builds_suspended(psutil_module=None, rescan_s: float = 1.0, builds: bool = True) -> Iterator[int]:
+    """`--quiet` without the wait: suspends every build (`_build_tree`) and worktree tool or test
+    executable (`_worktree_tools`, which includes writers' GPU tests) for the duration and resumes
+    them after, so a quiet run starts at once and nothing competes with the game for the CPU or the
+    card. Rescans every `rescan_s` seconds so programs started during the run are caught too. This
+    dev.py, its parents and everything it starts (the game, its prewarm) are spared. `builds=False`
+    leaves builds running and suspends only the worktree tools (loud runs: builds go on at idle
+    priority, but no test may share the card with the game). Yields how many were suspended at the
+    start. A no-op without psutil."""
+    psutil = psutil_module
+    if psutil is None:
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+    if psutil is None:
+        yield 0
+        return
+    me = psutil.Process()
+    parents: set[int] = {me.pid}
+    try:
+        parents.update(p.pid for p in me.parents())
+    except Exception:
+        pass
+    paused: dict[int, object] = {}
+    lock = threading.Lock()
+
+    spared = set(parents)
+
+    def sweep() -> None:
+        # Once spared, always spared: the game stays spared if the launcher between it and dev.py exits.
+        try:
+            spared.update(c.pid for c in me.children(recursive=True))
+        except Exception:
+            pass
+        for proc in (_build_tree(psutil) if builds else []) + _worktree_tools(psutil):
+            if proc.pid in spared or proc.pid in paused:
+                continue
+            try:
+                proc.suspend()
+            except Exception:
+                continue
+            with lock:
+                paused[proc.pid] = proc
+
+    sweep()
+    first = len(paused)
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.wait(rescan_s):
+            sweep()
+
+    watcher = threading.Thread(target=loop, name="quiet-suspend", daemon=True)
+    if rescan_s > 0:
+        watcher.start()
+    try:
+        yield first
+    finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join(timeout=10)
+        with lock:
+            procs = list(paused.values())
+        for proc in procs:
+            try:
+                proc.resume()
+            except Exception:
                 pass
 
 

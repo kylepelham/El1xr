@@ -81,6 +81,7 @@ def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
     dev = load_dev()
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "2")
+    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda **_: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["bench", "--quiet"])
     with dev._quiet(args, "bench"):
         with pytest.raises(TimeoutError):
@@ -142,6 +143,7 @@ def test_loud_capture_holds_free_slots(tmp_path, monkeypatch):
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
     monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
+    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda **_: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["capture"])
     with dev._quiet(args, "capture"):
         with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3):
@@ -228,3 +230,79 @@ def test_builds_idle_is_a_no_op_without_psutil(monkeypatch):
     monkeypatch.setattr(dev_throttle.os, "name", "posix")
     with dev_throttle.builds_idle() as lowered:
         assert lowered == 0
+
+
+class _SuspendProc:
+    def __init__(self, pid, name, exe=""):
+        self.pid, self.info, self.state = pid, {"name": name, "exe": exe}, "running"
+
+    def children(self, recursive=False):
+        return []
+
+    def suspend(self):
+        self.state = "suspended"
+
+    def resume(self):
+        self.state = "running"
+
+
+class _SuspendPsutil:
+    NoSuchProcess = AccessDenied = Exception
+
+    def __init__(self, procs, children_of_me=()):
+        self.procs = procs
+        self.children_of_me = list(children_of_me)
+
+    def process_iter(self, _attrs):
+        return list(self.procs)
+
+    def Process(self):
+        ps = self
+
+        class _Me:
+            pid = 1
+
+            def parents(self):
+                return []
+
+            def children(self, recursive=False):
+                return list(ps.children_of_me)
+        return _Me()
+
+
+def test_quiet_suspends_builds_and_worktree_tools_then_resumes():
+    rustc = _SuspendProc(201, "rustc.exe")
+    translate = _SuspendProc(202, "victory.exe", r"E:\Gta6\AnyXboxX-wt\shaderperf\third_party\victory\target\release\victory.exe")
+    browser = _SuspendProc(203, "chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe")
+    ps = _SuspendPsutil([rustc, translate, browser])
+    with dev_throttle.builds_suspended(ps, rescan_s=0) as paused:
+        assert paused == 2
+        assert rustc.state == translate.state == "suspended"
+        assert browser.state == "running"
+    assert rustc.state == translate.state == "running"
+
+
+def test_quiet_suspends_tests_started_during_the_run_but_spares_the_game():
+    game = _SuspendProc(301, "victory.exe", r"E:\Gta6\AnyXboxX-wt\train\third_party\victory\target\release\victory.exe")
+    ps = _SuspendPsutil([], children_of_me=[game])
+    with dev_throttle.builds_suspended(ps, rescan_s=0.05) as paused:
+        assert paused == 0
+        late = _SuspendProc(302, "victory_gpu-1.exe", r"E:\Gta6\AnyXboxX-wt\racefix\third_party\victory\target\debug\deps\victory_gpu-1.exe")
+        ps.procs.extend([game, late])
+        deadline = time.time() + 5
+        while late.state != "suspended" and time.time() < deadline:
+            time.sleep(0.02)
+        assert late.state == "suspended"
+        assert game.state == "running"
+    assert late.state == "running"
+
+
+def test_loud_runs_suspend_worktree_tools_but_not_builds():
+    rustc = _SuspendProc(401, "rustc.exe")
+    test_exe = _SuspendProc(402, "victory_gpu-2.exe", r"E:\Gta6\AnyXboxX-wt\feedcard\third_party\victory\target\debug\deps\victory_gpu-2.exe")
+    ps = _SuspendPsutil([rustc, test_exe])
+    with dev_throttle.builds_suspended(ps, rescan_s=0, builds=False) as paused:
+        assert paused == 1
+        assert rustc.state == "running"
+        assert test_exe.state == "suspended"
+    assert test_exe.state == "running"

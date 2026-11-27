@@ -113,6 +113,8 @@ mod inplace;
 #[cfg(windows)]
 mod popwatch;
 #[cfg(windows)]
+mod present_audit;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -139,6 +141,7 @@ mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
+pub mod upscale_live;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -155,6 +158,8 @@ mod copy_profile;
 mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
+#[cfg(windows)]
+mod card_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

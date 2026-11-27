@@ -1,29 +1,29 @@
 //! (El1xr) Draws the menu into a premultiplied bitmap: GDI rasterises the glyphs (as the overlay
-//! does), everything else is plain pixel maths. Night-purple panel and sunset accents from the
-//! README charts (`docs/images/*.svg`).
+//! does), everything else is flat fills. Style per `planning/style.md`: a flat night-purple panel,
+//! plain text for status and values, a quiet row background for the selection, and the sunset
+//! accent only under the active tab and on the focused value's arrows.
 
 use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Graphics::Gdi::*;
 
 use super::layout::{Layout, Rect};
 use super::model::{Apply, Kind, MenuModel};
-use super::state::{Menu, Row, Tab, shown};
+use super::state::{Menu, Row, shown};
 use crate::pixels::Bitmap;
 
-const BG_TOP: [u8; 3] = [0x12, 0x0a, 0x24];
-const BG_BOTTOM: [u8; 3] = [0x1b, 0x0f, 0x33];
-const BORDER: [u8; 3] = [0x4a, 0x3a, 0x66];
-const ROW_SEL: [u8; 3] = [0x2b, 0x1a, 0x47];
-const CONTROL: [u8; 3] = [0x24, 0x16, 0x40];
-const TEXT: [u8; 3] = [0xf6, 0xee, 0xfe];
-const SOFT: [u8; 3] = [0xdd, 0xd3, 0xee];
-const DIM: [u8; 3] = [0xa9, 0x9b, 0xc6];
-const GOLD: [u8; 3] = [0xff, 0xd3, 0x6e];
-const ORANGE: [u8; 3] = [0xff, 0x8a, 0x3d];
-const PINK: [u8; 3] = [0xff, 0x3d, 0x8b];
-const VIOLET: [u8; 3] = [0x9b, 0x5c, 0xff];
-const MINT: [u8; 3] = [0x7c, 0xf0, 0xc0];
-const SUNSET: [[u8; 3]; 4] = [GOLD, ORANGE, PINK, VIOLET];
+const PANEL: [u8; 3] = [0x16, 0x0d, 0x2b];
+const RULE: [u8; 3] = [0x3a, 0x2d, 0x55];
+const ROW_SEL: [u8; 3] = [0x25, 0x18, 0x40];
+const BANNER: [u8; 3] = [0x1f, 0x14, 0x38];
+const TEXT: [u8; 3] = [0xf4, 0xf0, 0xfa];
+const SOFT: [u8; 3] = [0xd2, 0xca, 0xe2];
+const DIM: [u8; 3] = [0x9a, 0x8f, 0xb4];
+/// The one accent (sunset orange).
+const ACCENT: [u8; 3] = [0xff, 0x8a, 0x3d];
+/// Apply classes, as quiet text.
+const LIVE: [u8; 3] = [0x8c, 0xc4, 0xab];
+const RESTART: [u8; 3] = [0xd6, 0xa5, 0x7a];
+const REBUILD: [u8; 3] = [0xc9, 0x8f, 0xab];
 
 /// Font slots.
 const TITLE: usize = 0;
@@ -31,31 +31,18 @@ const TAB: usize = 1;
 const LABEL: usize = 2;
 const HELP: usize = 3;
 const VALUE: usize = 4;
-const BADGE: usize = 5;
+const CAPS: usize = 5;
 const SMALL: usize = 6;
 /// Face, size at 1080 lines, weight.
 const FONTS: [(&str, f32, i32); 7] = [
-    ("Bahnschrift", 30.0, 600),
-    ("Bahnschrift", 18.0, 600),
+    ("Segoe UI", 26.0, 600),
+    ("Segoe UI", 15.5, 600),
     ("Segoe UI", 16.5, 600),
     ("Segoe UI", 13.5, 400),
-    ("Segoe UI", 15.5, 600),
-    ("Bahnschrift", 12.5, 700),
-    ("Segoe UI", 13.5, 400),
+    ("Segoe UI", 15.5, 400),
+    ("Segoe UI", 11.5, 600),
+    ("Segoe UI", 13.0, 400),
 ];
-
-/// Sunset gradient at `t` (0..1).
-fn sunset(t: f32) -> [u8; 3] {
-    let t = t.clamp(0.0, 1.0) * (SUNSET.len() - 1) as f32;
-    let i = (t as usize).min(SUNSET.len() - 2);
-    mix(SUNSET[i], SUNSET[i + 1], t - i as f32)
-}
-
-fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    std::array::from_fn(|k| {
-        (f32::from(a[k]) + (f32::from(b[k]) - f32::from(a[k])) * t).round() as u8
-    })
-}
 
 /// Signed distance from (x, y) to a `w` x `h` rectangle with corner radius `r` at the origin.
 fn sdf(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
@@ -66,8 +53,8 @@ fn sdf(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
     (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
 }
 
-/// A rounded rectangle coloured per pixel by `colour(u, v)` (0..1 across and down), opacity `a`.
-fn round_rect(bm: &mut Bitmap, r: Rect, radius: f32, a: u32, colour: impl Fn(f32, f32) -> [u8; 3]) {
+/// A filled rectangle with corner radius `radius`, opacity `a`.
+fn fill(bm: &mut Bitmap, r: Rect, radius: f32, a: u32, rgb: [u8; 3]) {
     let radius = radius.min(r.w as f32 / 2.0).min(r.h as f32 / 2.0);
     for y in 0..r.h.max(0) {
         for x in 0..r.w.max(0) {
@@ -80,7 +67,6 @@ fn round_rect(bm: &mut Bitmap, r: Rect, radius: f32, a: u32, colour: impl Fn(f32
             );
             let c = (0.5 - d).clamp(0.0, 1.0);
             if c > 0.0 && r.x + x >= 0 && r.y + y >= 0 {
-                let rgb = colour(x as f32 / r.w as f32, y as f32 / r.h as f32);
                 bm.over(
                     (r.x + x) as usize,
                     (r.y + y) as usize,
@@ -92,63 +78,31 @@ fn round_rect(bm: &mut Bitmap, r: Rect, radius: f32, a: u32, colour: impl Fn(f32
     }
 }
 
-/// A one-pixel-wide rounded outline.
-fn outline(bm: &mut Bitmap, r: Rect, radius: f32, width: f32, rgb: [u8; 3], a: u32) {
-    for y in 0..r.h.max(0) {
-        for x in 0..r.w.max(0) {
-            let d = sdf(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                r.w as f32,
-                r.h as f32,
-                radius,
-            );
-            let c = (0.5 - (d + width / 2.0).abs() + width / 2.0).clamp(0.0, 1.0);
-            if c > 0.0 && r.x + x >= 0 && r.y + y >= 0 {
-                bm.over(
-                    (r.x + x) as usize,
-                    (r.y + y) as usize,
-                    rgb,
-                    (c * a as f32 + 0.5) as u32,
-                );
-            }
-        }
-    }
+/// A horizontal hairline.
+fn rule(bm: &mut Bitmap, l: &Layout, x: i32, y: i32, w: i32, rgb: [u8; 3]) {
+    let h = l.s.round().max(1.0) as i32;
+    fill(bm, Rect { x, y, w, h }, 0.0, 255, rgb);
 }
 
-/// The panel with its shadow and background glow; depends only on the layout's size, so it is
-/// drawn once per picture size.
+/// The panel with a soft drop shadow; depends only on the layout's size, so it is drawn once
+/// per picture size.
 fn base(l: &Layout) -> Bitmap {
     let mut bm = Bitmap::new(l.window.w as usize, l.window.h as usize);
     let p = l.panel;
-    let (radius, blur) = (l.px(18.0) as f32, (p.x as f32).max(1.0));
+    let (radius, blur) = (l.px(6.0) as f32, (p.x as f32).max(1.0));
     for y in 0..l.window.h {
         for x in 0..l.window.w {
-            let (fx, fy) = ((x - p.x) as f32 + 0.5, (y - p.y - l.px(6.0)) as f32 + 0.5);
+            let (fx, fy) = ((x - p.x) as f32 + 0.5, (y - p.y - l.px(4.0)) as f32 + 0.5);
             let d = sdf(fx, fy, p.w as f32, p.h as f32, radius);
             if d > 0.0 && d < blur {
                 let k = 1.0 - d / blur;
-                bm.over(x as usize, y as usize, [0, 0, 0], (110.0 * k * k) as u32);
+                bm.over(x as usize, y as usize, [0, 0, 0], (90.0 * k * k) as u32);
             }
         }
     }
-    round_rect(&mut bm, p, radius, 252, |u, v| {
-        let bg = mix(BG_TOP, BG_BOTTOM, v);
-        // The charts' glow: pink, fading to violet, from the bottom right.
-        let (dx, dy) = ((u - 0.88) * 1.6, v - 1.05);
-        let g = (1.0 - (dx * dx + dy * dy).sqrt() / 0.8).max(0.0);
-        let glow = mix(VIOLET, PINK, g);
-        mix(bg, glow, g * g * 0.28)
-    });
-    outline(&mut bm, p, radius, l.s.max(1.0), BORDER, 200);
-    // Sunset rule under the header.
-    let rule = Rect {
-        x: p.x + l.px(28.0),
-        y: l.header.bottom() - l.px(3.0),
-        w: p.w - 2 * l.px(28.0),
-        h: l.px(3.0).max(2),
-    };
-    round_rect(&mut bm, rule, rule.h as f32 / 2.0, 255, |u, _| sunset(u));
+    fill(&mut bm, p, radius, 255, PANEL);
+    let pad = l.px(28.0);
+    rule(&mut bm, l, p.x + pad, l.header.bottom() - l.px(1.0), p.w - 2 * pad, RULE);
     bm
 }
 
@@ -386,78 +340,37 @@ impl Painter {
         let t = &self.text;
         let px = |v: f32| l.px(v);
         let pad = px(28.0);
-        // Header: the name in the sunset gradient, then what this is.
+        // Header: the name, then what this is, on one baseline.
         let (nw, nh) = t.measure(TITLE, "El1xr");
-        let ty = l.header.y + (l.header.h - px(3.0) - nh) / 2;
-        t.draw_with(&mut bm, TITLE, "El1xr", l.panel.x + pad, ty, sunset);
+        let ty = l.header.y + (l.header.h - nh) / 2;
+        t.draw(&mut bm, TITLE, "El1xr", l.panel.x + pad, ty, TEXT);
         let sub_y = ty + t.ascent[TITLE] - t.ascent[TAB];
-        t.draw(
-            &mut bm,
-            TAB,
-            "SETTINGS",
-            l.panel.x + pad + nw + px(14.0),
-            sub_y,
-            SOFT,
-        );
-        // Expert toggle and close button.
+        t.draw(&mut bm, TAB, "Settings", l.panel.x + pad + nw + px(12.0), sub_y, DIM);
+        // Expert switch and close, as plain text at the right.
         let e = l.expert;
-        if menu.expert {
-            round_rect(&mut bm, e, e.h as f32 / 2.0, 255, |u, _| {
-                sunset(u * 0.7 + 0.15)
-            });
-            t.centre(&mut bm, BADGE, "EXPERT  ON", e, BG_TOP);
-        } else {
-            round_rect(&mut bm, e, e.h as f32 / 2.0, 255, |_, _| CONTROL);
-            outline(&mut bm, e, e.h as f32 / 2.0, l.s.max(1.0), BORDER, 255);
-            t.centre(&mut bm, BADGE, "EXPERT  OFF", e, DIM);
-        }
-        round_rect(&mut bm, l.close, l.close.h as f32 / 2.0, 255, |_, _| {
-            CONTROL
-        });
+        let state = if menu.expert { "ON" } else { "OFF" };
+        let sw = t.measure(CAPS, state).0;
+        t.mid(&mut bm, CAPS, state, e.right() - sw, e, if menu.expert { TEXT } else { DIM });
+        let label = "EXPERT";
+        let lw = t.measure(CAPS, label).0;
+        t.mid(&mut bm, CAPS, label, e.right() - sw - px(8.0) - lw, e, DIM);
         t.centre(&mut bm, TAB, "\u{2715}", l.close, SOFT);
-        // Tabs: the current one lit, with a sunset underline.
+        // Tabs: plain titles, the current one bright with the thin accent underline.
         for &(tab, r) in &l.tabs {
             let on = tab == menu.tab;
+            let title = tab.title();
+            let w = t.measure(TAB, title).0;
+            let x = r.x + (r.w - w) / 2;
+            t.mid(&mut bm, TAB, title, x, r, if on { TEXT } else { DIM });
             if on {
-                round_rect(&mut bm, r, px(10.0) as f32, 255, |_, _| ROW_SEL);
-                let bar = Rect {
-                    x: r.x + px(18.0),
-                    y: r.bottom() - px(3.0),
-                    w: r.w - 2 * px(18.0),
-                    h: px(3.0).max(2),
-                };
-                round_rect(&mut bm, bar, bar.h as f32 / 2.0, 255, |u, _| sunset(u));
+                let line = Rect { x, y: r.bottom() - px(2.0), w, h: px(2.0).max(2) };
+                fill(&mut bm, line, 0.0, 255, ACCENT);
             }
-            let title = tab.title().to_uppercase();
-            t.centre(
-                &mut bm,
-                TAB,
-                &title,
-                r,
-                if on {
-                    TEXT
-                } else if tab == Tab::Experimental {
-                    PINK
-                } else {
-                    DIM
-                },
-            );
         }
-        // Restart banner.
+        // Restart notice: a flat band, a quiet label and the settings that wait.
         if let Some(b) = l.banner {
             let pending = model.pending_restart();
-            round_rect(&mut bm, b, px(10.0) as f32, 255, |u, _| {
-                mix([0x3a, 0x1d, 0x30], [0x2a, 0x16, 0x3c], u)
-            });
-            let stripe = Rect {
-                x: b.x,
-                y: b.y,
-                w: px(5.0),
-                h: b.h,
-            };
-            round_rect(&mut bm, stripe, stripe.w as f32 / 2.0, 255, |_, v| {
-                sunset(0.2 + v * 0.4)
-            });
+            fill(&mut bm, b, px(4.0) as f32, 255, BANNER);
             let labels: Vec<&str> = pending
                 .iter()
                 .map(|n| {
@@ -469,67 +382,44 @@ impl Painter {
                 })
                 .collect();
             let head = "RESTART NEEDED";
-            t.mid(&mut bm, BADGE, head, b.x + px(20.0), b, ORANGE);
-            let x = b.x + px(20.0) + t.measure(BADGE, head).0 + px(14.0);
-            let list = t.fit(HELP, &labels.join("  \u{b7}  "), b.right() - px(16.0) - x);
+            t.mid(&mut bm, CAPS, head, b.x + px(16.0), b, RESTART);
+            let x = b.x + px(16.0) + t.measure(CAPS, head).0 + px(16.0);
+            let list = t.fit(HELP, &labels.join(", "), b.right() - px(16.0) - x);
             t.mid(&mut bm, HELP, &list, x, b, SOFT);
         }
-        // Rows.
+        // Rows: the selection (and the hovered row, fainter) on a quiet flat background.
         let rows = menu.rows(model);
         for &(i, r) in &l.rows {
             let selected = i == menu.selected;
             if selected || hover == Some(i) {
-                round_rect(
-                    &mut bm,
-                    r,
-                    px(12.0) as f32,
-                    if selected { 255 } else { 120 },
-                    |_, _| ROW_SEL,
-                );
-            }
-            if selected {
-                let bar = Rect {
-                    x: r.x,
-                    y: r.y + px(12.0),
-                    w: px(4.0),
-                    h: r.h - 2 * px(12.0),
-                };
-                round_rect(&mut bm, bar, bar.w as f32 / 2.0, 255, |_, v| {
-                    sunset(v * 0.66)
-                });
+                let a = if selected { 255 } else { 110 };
+                fill(&mut bm, r, px(4.0) as f32, a, ROW_SEL);
             }
             self.row(&mut bm, l, r, rows[i], model, selected);
         }
         if rows.is_empty() {
             t.centre(&mut bm, HELP, "Nothing here yet", l.list, DIM);
         }
-        // Scroll marks.
+        // Scroll position: a hairline track and a plain thumb.
         let n = rows.len();
         if n > l.visible {
             let track = Rect {
                 x: l.list.right() + px(10.0),
                 y: l.list.y,
-                w: px(4.0),
+                w: px(2.0).max(1),
                 h: l.visible as i32 * px(60.0),
             };
-            round_rect(&mut bm, track, track.w as f32 / 2.0, 255, |_, _| CONTROL);
-            let thumb_h = (track.h as usize * l.visible / n) as i32;
+            fill(&mut bm, track, 0.0, 255, RULE);
             let thumb = Rect {
                 y: track.y + (track.h as usize * menu.scroll / n) as i32,
-                h: thumb_h,
+                h: (track.h as usize * l.visible / n) as i32,
                 ..track
             };
-            round_rect(&mut bm, thumb, thumb.w as f32 / 2.0, 255, |_, v| sunset(v));
+            fill(&mut bm, thumb, 0.0, 255, DIM);
         }
         // Footer: hints, then the last change's outcome at the right.
         let f = l.footer;
-        let line = Rect {
-            x: f.x + pad,
-            y: f.y,
-            w: f.w - 2 * pad,
-            h: l.s.max(1.0) as i32,
-        };
-        round_rect(&mut bm, line, 0.0, 70, |_, _| BORDER);
+        rule(&mut bm, l, f.x + pad, f.y, f.w - 2 * pad, RULE);
         let hints = format!(
             "{} / Esc close   \u{2191}\u{2193} select   \u{2190}\u{2192} change   Q E tabs   X expert      Pad: A change  B close  LB RB tabs  Y expert",
             super::hotkey_name()
@@ -538,7 +428,7 @@ impl Painter {
         let sw = t.measure(SMALL, &status).0;
         let hints = t.fit(SMALL, &hints, f.w - 2 * pad - sw - px(24.0));
         t.mid(&mut bm, SMALL, &hints, f.x + pad, f, DIM);
-        t.mid(&mut bm, SMALL, &status, f.right() - pad - sw, f, GOLD);
+        t.mid(&mut bm, SMALL, &status, f.right() - pad - sw, f, SOFT);
         Some(bm)
     }
 
@@ -553,14 +443,14 @@ impl Painter {
     ) {
         let t = &self.text;
         let px = |v: f32| l.px(v);
-        let x = r.x + px(22.0);
+        let x = r.x + px(16.0);
         let (lh, hh) = (t.measure(LABEL, "Ag").1, t.measure(HELP, "Ag").1);
         let top = r.y + (r.h - lh - hh) / 2;
         let label_w = l.badge(r).x - px(16.0) - x;
         let (label, help) = match row {
             Row::Setting(i) => {
                 let info = model.infos()[i];
-                self.badge(bm, l.badge(r), info.apply);
+                self.apply_class(bm, l.badge(r), info.apply);
                 let value = model
                     .get(info.name)
                     .unwrap_or_else(|| info.default.to_string());
@@ -572,18 +462,18 @@ impl Painter {
             }
             Row::Preset(p) => {
                 let preset = model.presets()[p];
-                self.button(bm, l, l.value(r), "APPLY", selected);
+                self.action(bm, l.value(r), "APPLY", selected);
                 (format!("{} preset", preset.name), preset.help.to_string())
             }
             Row::Save => {
-                self.button(bm, l, l.value(r), "SAVE", selected);
+                self.action(bm, l.value(r), "SAVE", selected);
                 (
                     "Save settings".into(),
                     "Write the changed values to the settings file.".into(),
                 )
             }
             Row::Reset => {
-                self.button(bm, l, l.value(r), "RESET", selected);
+                self.action(bm, l.value(r), "RESET", selected);
                 (
                     "Reset to defaults".into(),
                     "Every setting back to its default value.".into(),
@@ -601,104 +491,42 @@ impl Painter {
         t.draw(bm, HELP, &t.fit(HELP, &help, label_w), x, top + lh, DIM);
     }
 
-    fn badge(&self, bm: &mut Bitmap, b: Rect, apply: Apply) {
+    /// The apply class as small capitals, left-aligned in its column.
+    fn apply_class(&self, bm: &mut Bitmap, b: Rect, apply: Apply) {
         let (text, rgb) = match apply {
-            Apply::Live => ("LIVE", MINT),
-            Apply::Restart => ("RESTART", ORANGE),
-            Apply::Retranslate => ("REBUILD", PINK),
+            Apply::Live => ("LIVE", LIVE),
+            Apply::Restart => ("RESTART", RESTART),
+            Apply::Retranslate => ("REBUILD", REBUILD),
         };
-        round_rect(bm, b, b.h as f32 / 2.0, 46, |_, _| rgb);
-        outline(bm, b, b.h as f32 / 2.0, 1.0, rgb, 150);
-        self.text.centre(bm, BADGE, text, b, rgb);
+        self.text.mid(bm, CAPS, text, b.x, b, rgb);
     }
 
-    fn button(&self, bm: &mut Bitmap, l: &Layout, v: Rect, text: &str, selected: bool) {
-        let w = l.px(120.0);
-        let b = Rect {
-            x: v.right() - w,
-            w,
-            ..v
-        };
-        if selected {
-            round_rect(bm, b, b.h as f32 / 2.0, 255, |u, _| sunset(u * 0.7 + 0.15));
-            self.text.centre(bm, BADGE, text, b, BG_TOP);
-        } else {
-            round_rect(bm, b, b.h as f32 / 2.0, 255, |_, _| CONTROL);
-            outline(bm, b, b.h as f32 / 2.0, 1.0, BORDER, 255);
-            self.text.centre(bm, BADGE, text, b, SOFT);
-        }
+    /// A row's action, as small capitals right-aligned in the value column.
+    fn action(&self, bm: &mut Bitmap, v: Rect, text: &str, selected: bool) {
+        let w = self.text.measure(CAPS, text).0;
+        let rgb = if selected { ACCENT } else { SOFT };
+        self.text.mid(bm, CAPS, text, v.right() - w, v, rgb);
     }
 
+    /// A value as plain text between small arrows (accent on the focused row), right-aligned in
+    /// the value column; free text without arrows.
     fn value(&self, bm: &mut Bitmap, l: &Layout, v: Rect, kind: Kind, value: &str, selected: bool) {
         let t = &self.text;
-        let px = |f: f32| l.px(f);
-        if kind == Kind::Bool {
-            let on = value == "1";
-            let track = Rect {
-                x: v.right() - px(56.0),
-                y: v.y + (v.h - px(28.0)) / 2,
-                w: px(56.0),
-                h: px(28.0),
-            };
-            if on {
-                round_rect(bm, track, track.h as f32 / 2.0, 255, |u, _| {
-                    sunset(u * 0.66)
-                });
-            } else {
-                round_rect(bm, track, track.h as f32 / 2.0, 255, |_, _| {
-                    [0x3a, 0x2a, 0x55]
-                });
-            }
-            let k = px(22.0);
-            let kx = if on {
-                track.right() - px(3.0) - k
-            } else {
-                track.x + px(3.0)
-            };
-            let knob = Rect {
-                x: kx,
-                y: track.y + (track.h - k) / 2,
-                w: k,
-                h: k,
-            };
-            round_rect(
-                bm,
-                knob,
-                k as f32 / 2.0,
-                255,
-                |_, _| if on { TEXT } else { DIM },
-            );
-            let s = shown(kind, value);
-            let w = t.measure(VALUE, &s).0;
-            t.mid(
-                bm,
-                VALUE,
-                &s,
-                track.x - px(12.0) - w,
-                v,
-                if on { TEXT } else { DIM },
-            );
-            return;
-        }
-        round_rect(bm, v, v.h as f32 / 2.0, 255, |_, _| CONTROL);
-        outline(
-            bm,
-            v,
-            v.h as f32 / 2.0,
-            1.0,
-            if selected { ORANGE } else { BORDER },
-            if selected { 200 } else { 255 },
-        );
         let s = shown(kind, value);
         if kind == Kind::Text {
-            let s = t.fit(SMALL, &s, v.w - px(28.0));
-            t.centre(bm, SMALL, &s, v, SOFT);
+            let s = t.fit(SMALL, &s, v.w);
+            let w = t.measure(SMALL, &s).0;
+            t.mid(bm, SMALL, &s, v.right() - w, v, SOFT);
             return;
         }
-        let arrow = if selected { ORANGE } else { DIM };
-        t.mid(bm, TAB, "\u{2039}", v.x + px(14.0), v, arrow);
-        let rw = t.measure(TAB, "\u{203a}").0;
-        t.mid(bm, TAB, "\u{203a}", v.right() - px(14.0) - rw, v, arrow);
-        t.centre(bm, VALUE, &t.fit(VALUE, &s, v.w - px(64.0)), v, TEXT);
+        let (left, right) = ("\u{2039}", "\u{203a}");
+        let arrow = if selected { ACCENT } else { DIM };
+        let rw = t.measure(VALUE, right).0;
+        t.mid(bm, VALUE, right, v.right() - rw, v, arrow);
+        t.mid(bm, VALUE, left, v.x + l.px(76.0), v, arrow);
+        let off = kind == Kind::Bool && value != "1";
+        let inner = Rect { x: v.x + l.px(76.0), w: v.right() - rw - v.x - l.px(76.0), ..v };
+        let s = t.fit(VALUE, &s, inner.w - l.px(32.0));
+        t.centre(bm, VALUE, &s, inner, if off { DIM } else { TEXT });
     }
 }
