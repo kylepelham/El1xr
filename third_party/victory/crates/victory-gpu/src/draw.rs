@@ -2015,6 +2015,7 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let _whole = BindLap::start(0);
+        let _hitch = crate::hitch::span(crate::hitch::Phase::Bind);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         {

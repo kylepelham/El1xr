@@ -8,6 +8,11 @@
 //! samples by their innermost frames, names them through `dbghelp`
 //! (VIctory's own functions from its PDB, system DLLs by export, title code
 //! as a bare address) and logs the most frequent ones.
+//!
+//! `VICTORY_HITCH_STACKS_TITLE=1` (with `VICTORY_HITCH_STACKS=1`) also
+//! samples the title's thread that calls the present at every look, late
+//! or not, and every [`TITLE_SAMPLES`] samples logs where it stood most
+//! ([`report_title`]): what a normal frame's title thread waits in.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -39,6 +44,32 @@ const KEY_FRAMES: usize = 22;
 const MOST_SAMPLES: usize = 8000;
 /// Threads whose open spans are known.
 const THREADS: usize = 128;
+/// Samples of the title's presenting thread per report.
+const TITLE_SAMPLES: usize = 2000;
+/// Innermost frames a title sample is grouped by.
+const TITLE_KEY_FRAMES: usize = 6;
+
+fn title_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var("VICTORY_HITCH_STACKS_TITLE").is_ok_and(|v| v == "1"))
+}
+
+/// The title's thread that calls the present, and its stack's bounds.
+static TITLE: AtomicU32 = AtomicU32::new(0);
+static TITLE_STACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The title calls a present on thread `me`.
+pub(crate) fn title_presents(me: u32) {
+    if !title_enabled() || TITLE.load(Ordering::Relaxed) == me {
+        return;
+    }
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: writes this thread's stack bounds.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    TITLE_STACK[0].store(low as u64, Ordering::Relaxed);
+    TITLE_STACK[1].store(high as u64, Ordering::Relaxed);
+    TITLE.store(me, Ordering::Relaxed);
+}
 
 /// Whether the sampler runs.
 fn enabled() -> bool {
@@ -217,11 +248,24 @@ fn sampler() {
     );
     let mut handles = Handles(std::collections::HashMap::new());
     let me = super::thread_id();
+    let mut title: Vec<[u64; DEPTH]> = Vec::with_capacity(TITLE_SAMPLES);
     loop {
         std::thread::sleep(Duration::from_millis(5));
         let ended = std::mem::take(&mut SHARED.lock().unwrap_or_else(|e| e.into_inner()).ended);
         for (frame, frame_us, samples) in ended {
             report(&symbols, frame, frame_us, &samples);
+        }
+        let id = TITLE.load(Ordering::Relaxed);
+        if id != 0
+            && let Some(h) = handles.get(id)
+        {
+            let low = TITLE_STACK[0].load(Ordering::Relaxed) as usize;
+            let high = TITLE_STACK[1].load(Ordering::Relaxed) as usize;
+            title.push(sample(h, low, high));
+            if title.len() == TITLE_SAMPLES {
+                report_title(&symbols, &title);
+                title.clear();
+            }
         }
         let now = now_ms();
         let late = now.saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed));
@@ -414,6 +458,36 @@ fn shorten(name: &str) -> String {
         .collect();
     let keep = parts.len().saturating_sub(3);
     parts[keep..].join("::")
+}
+
+/// Logs where the title's presenting thread stood most in `samples`, by
+/// their innermost [`TITLE_KEY_FRAMES`] frames.
+fn report_title(symbols: &Symbols, samples: &[[u64; DEPTH]]) {
+    use std::collections::HashMap;
+    let mut names: HashMap<u64, String> = HashMap::new();
+    let mut groups: HashMap<Vec<String>, usize> = HashMap::new();
+    for frames in samples {
+        let mut key: Vec<String> = Vec::with_capacity(TITLE_KEY_FRAMES);
+        for &pc in frames.iter().take_while(|&&pc| pc != 0) {
+            let n = names.entry(pc).or_insert_with(|| symbols.name(pc)).clone();
+            if key.last() != Some(&n) {
+                key.push(n);
+            }
+            if key.len() == TITLE_KEY_FRAMES {
+                break;
+            }
+        }
+        *groups.entry(key).or_default() += 1;
+    }
+    let mut groups: Vec<(Vec<String>, usize)> = groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    for (key, n) in groups.iter().take(8) {
+        tracing::info!(
+            "title stacks: {n} of {} samples of the title's presenting thread: {}",
+            samples.len(),
+            key.join(" <- ")
+        );
+    }
 }
 
 /// Logs the most frequent stacks of a late frame: the presenting
