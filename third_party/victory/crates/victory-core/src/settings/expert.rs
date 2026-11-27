@@ -281,6 +281,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_TEXTURE_COPY", Apply::Restart),
     ("VICTORY_TEXTURE_GATE_S", Apply::Restart),
     ("VICTORY_TEXTURE_GUARD", Apply::Restart),
+    ("VICTORY_TEXTURE_HASH_SAMPLED", Apply::Restart),
     ("VICTORY_TEXTURE_LOOK_MS", Apply::Restart),
     ("VICTORY_TEXTURE_PASS_MB", Apply::Restart),
     ("VICTORY_TEXTURE_RECHECK_MS", Apply::Restart),
