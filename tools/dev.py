@@ -642,7 +642,12 @@ def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
     quiet = getattr(args, "quiet", False)
     tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
     if quiet:
-        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+        # Take the free slots at once (none left to writers) and suspend running builds and worktree
+        # tools for the run: no wait for the machine's builds to finish, none competing with the game.
+        with dev_throttle.free_build_slots(LOCKS_DIR, tag, leave=0) as held, \
+                dev_throttle.builds_suspended() as paused:
+            print(f"DEV {what}: quiet: holding {len(held)} of {dev_throttle.build_slots()} build slots, "
+                  f"{paused} build/tool processes suspended for the run", flush=True)
             yield
         return
     with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:
