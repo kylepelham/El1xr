@@ -30,9 +30,18 @@ pub(crate) enum P {
     PreparePrivUs,
     StaleCopyUs,
     StaleBytes,
+    // (feedcard, #88) the stale copy and the guards, split.
+    StalePlanUs,
+    StaleRuns,
+    StaleNoteUs,
+    GuardWalks,
+    ProtectCalls,
+    ProtectUs,
+    OpenCalls,
+    OpenUs,
 }
 
-const COUNT: usize = P::StaleBytes as usize + 1;
+const COUNT: usize = P::OpenUs as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -86,5 +95,21 @@ pub(crate) fn log(frames: f64) {
         ms(P::GuardUs),
         ms(P::StaleCopyUs),
         mb(P::StaleBytes),
+    );
+    tracing::info!(
+        "stale copy and guards split per frame (VICTORY_FLUSH_PROF, VICTORY_STALE_BATCH={}): \
+         stale copy: plan under the copy's lock {:.2} ms, {:.0} runs copied one by one, \
+         noting their changes {:.2} ms (the rest of the stale copy is the bytes); \
+         guards: {:.0} walks under the guards' lock, VirtualProtect read-only {:.0} in {:.2} ms, \
+         opened {:.0} in {:.2} ms (all threads, faults' openings too)",
+        u8::from(crate::stale_batch::on()),
+        ms(P::StalePlanUs),
+        per(P::StaleRuns),
+        ms(P::StaleNoteUs),
+        per(P::GuardWalks),
+        per(P::ProtectCalls),
+        ms(P::ProtectUs),
+        per(P::OpenCalls),
+        ms(P::OpenUs),
     );
 }

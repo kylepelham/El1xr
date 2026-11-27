@@ -29,6 +29,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_BVH_QUARANTINE", Apply::Restart),
     ("VICTORY_CACHE_CORES", Apply::Restart),
     ("VICTORY_CAMERA_CAPTURE", Apply::Restart),
+    ("VICTORY_CAMERA_HUDLESS", Apply::Restart),
+    ("VICTORY_CAMERA_MV_CHECK", Apply::Restart),
     ("VICTORY_CAPTURE", Apply::Restart),
     ("VICTORY_CAPTURE_FRAMES", Apply::Restart),
     ("VICTORY_CAPTURE_HEAVY_FRAMES", Apply::Restart),

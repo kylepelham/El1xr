@@ -3481,6 +3481,7 @@ fn guard_with_epochs_flags(
         guards()
     };
     count(3, 1);
+    crate::refresh_prof::add(crate::refresh_prof::P::GuardWalks, 1);
     if first < last && !VIEWS.all(first, last) {
         VIEWS.set_range(first, last);
     }
@@ -3676,6 +3677,7 @@ fn guard_shared(
     const { assert!(BLOCK == PAGE) };
     port6_count(P6_GUARDS, 1);
     count(3, 1);
+    crate::refresh_prof::add(crate::refresh_prof::P::GuardWalks, 1);
     let g = guards_read();
     if first >= last || g.clean.covers(first, last) {
         return (Vec::new(), Vec::new());
@@ -4176,8 +4178,16 @@ fn os_virtual_protect(from: usize, to: usize, protect_flags: u32) -> bool {
     #[cfg(test)]
     OS_VIRTUAL_PROTECT_CALLS.with(|c| c.set(c.get() + 1));
     let mut old = 0;
+    let t = crate::refresh_prof::start();
     // SAFETY: title view memory; only its page protection changes.
-    unsafe { VirtualProtect(addr as *const _, len, protect_flags, &mut old) != 0 }
+    let done = unsafe { VirtualProtect(addr as *const _, len, protect_flags, &mut old) != 0 };
+    if t.is_some() {
+        use crate::refresh_prof::P;
+        let readonly = protect_flags == windows_sys::Win32::System::Memory::PAGE_READONLY;
+        crate::refresh_prof::add(if readonly { P::ProtectCalls } else { P::OpenCalls }, 1);
+        crate::refresh_prof::finish(if readonly { P::ProtectUs } else { P::OpenUs }, t);
+    }
+    done
 }
 
 /// Queries OS virtual memory metadata for `addr`.

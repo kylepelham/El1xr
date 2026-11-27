@@ -154,6 +154,10 @@ pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
 #[cfg(windows)]
+pub mod camera_copy;
+#[cfg(windows)]
+pub mod camera_mv;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -169,6 +173,8 @@ mod copy_profile;
 mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
+#[cfg(windows)]
+mod stale_batch;
 #[cfg(windows)]
 mod card_prof;
 #[cfg(windows)]
