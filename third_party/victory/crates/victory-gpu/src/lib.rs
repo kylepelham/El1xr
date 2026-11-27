@@ -51,6 +51,7 @@ mod flight_settle;
 pub mod frame;
 pub mod frametime;
 pub mod hitch;
+pub mod host_facts;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
