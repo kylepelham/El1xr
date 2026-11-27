@@ -308,9 +308,13 @@ struct Lower<'a> {
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
-    /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
-    /// IR block whether every lane runs it (exchanges need both halves there).
+    /// of two (or four when [`Self::exchange_quad`] is set) exchange dwords per console wave,
+    /// whether the group has no upper half (32 threads or fewer), and per IR block whether every
+    /// lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Whether each console wave has four exchange dwords (`[a_lo, a_hi, b_lo, b_hi]`) so a
+    /// two-word exchange (`exchange_halves_two`) uses two barriers instead of four.
+    exchange_quad: bool,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -900,6 +904,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut exchange_quad = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -1006,9 +1011,13 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through exchange dwords past the program's LDS
+                                let waves = group.div_ceil(64);
+                                let quad = insts().any(|i| i.name() == "v_readfirstlane_b32")
+                                    && s.lds_dwords + 4 * waves <= 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                exchange_quad = quad;
+                                s.lds_dwords += (if quad { 4 } else { 2 }) * waves;
                             }
                         }
                     }
@@ -1246,6 +1255,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            exchange_quad,
             clane: None,
             pair: None,
             halves,
@@ -3960,8 +3970,66 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// Like [`Self::exchange_halves`] for two words at once (`a` and `b`),
+    /// sharing one pair of barriers instead of two when four exchange dwords
+    /// were reserved per console wave (`exchange_quad`).
+    fn exchange_halves_two(&mut self, at: usize, a: V, b: V) -> ((V, V), (V, V)) {
+        if !self.exchange_quad {
+            let ra = self.exchange_halves(at, a);
+            let rb = self.exchange_halves(self.cur, b);
+            return (ra, rb);
+        }
+        self.meet.sync_block = at;
+        let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
+            let z = self.s.m.i32(0);
+            return ((a, z), (b, z));
+        };
+        if small {
+            let z = self.s.m.i32(0);
+            return ((a, z), (b, z));
+        }
+        if self.local {
+            let cl = self.console_lane();
+            let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+            let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
+            let lo_a = self.s.m.select(at, upper, z, a);
+            let hi_a = self.s.m.select(at, upper, a, z);
+            let lo_b = self.s.m.select(at, upper, z, b);
+            let hi_b = self.s.m.select(at, upper, b, z);
+            return ((lo_a, hi_a), (lo_b, hi_b));
+        }
+        let base = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let idx_a = self.s.m.bin(at, Bin::Add, base, half);
+        let two = self.s.m.i32(2);
+        let idx_b = self.s.m.bin(at, Bin::Add, idx_a, two);
+        let lds = self.s.lds();
+        let ptr_a = self.s.m.element(at, lds, idx_a);
+        let ptr_b = self.s.m.element(at, lds, idx_b);
+        self.s.m.store(at, ptr_a, a);
+        self.s.m.store(at, ptr_b, b);
+        let at = self.order_waves(at, self.reached_by_group());
+        let one = self.s.m.i32(1);
+        let three = self.s.m.i32(3);
+        let k1 = self.s.m.bin(at, Bin::Add, base, one);
+        let k2 = self.s.m.bin(at, Bin::Add, base, two);
+        let k3 = self.s.m.bin(at, Bin::Add, base, three);
+        let p0 = self.s.m.element(at, lds, base);
+        let p1 = self.s.m.element(at, lds, k1);
+        let p2 = self.s.m.element(at, lds, k2);
+        let p3 = self.s.m.element(at, lds, k3);
+        let lo_a = self.s.m.load(at, p0);
+        let hi_a = self.s.m.load(at, p1);
+        let lo_b = self.s.m.load(at, p2);
+        let hi_b = self.s.m.load(at, p3);
+        let _at = self.order_waves(at, self.reached_by_group());
+        ((lo_a, hi_a), (lo_b, hi_b))
+    }
+
+    /// The first of the exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves has 2 (or 4 with `exchange_quad`) for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -3970,10 +4038,10 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        let shift = self.s.m.i32(if self.exchange_quad { 2 } else { 1 });
+        let scaled = self.s.m.bin(e, Bin::Shl, wave, shift);
         let base = self.s.m.i32(slot);
-        let v = self.s.m.bin(e, Bin::Add, base, twice);
+        let v = self.s.m.bin(e, Bin::Add, base, scaled);
         self.pair = Some(v);
         v
     }
@@ -7719,8 +7787,8 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(self.cur, has);
-                        let (lo, hi) = self.exchange_halves(self.cur, mine);
+                        let ((lo_has, hi_has), (lo, hi)) =
+                            self.exchange_halves_two(self.cur, has, mine);
                         let c = self.cur;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
@@ -9288,7 +9356,10 @@ impl<'a> Lower<'a> {
                 return self.image_with_sampler(inst, b, i, Some(first));
             }
             let edge = |pred: usize| {
-                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                self.edges
+                    .get(&(pred, *block))
+                    .copied()
+                    .or(self.tail[pred])
                     .ok_or("a sampler choice with an unfinished predecessor")
             };
             let (left, right) = (edge(*left)?, edge(*right)?);
@@ -9297,7 +9368,9 @@ impl<'a> Lower<'a> {
             let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
             self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
             self.image_with_sampler(inst, b, i, Some(first))?;
-            let left = inst.writes.iter()
+            let left = inst
+                .writes
+                .iter()
                 .map(|&(_, v)| self.i32_of(v))
                 .collect::<Result<Vec<_>, _>>()?;
             self.image_with_sampler(inst, b, i, Some(second))?;
@@ -11763,15 +11836,23 @@ mod tests {
     fn a_uniform_branch_can_choose_between_immediate_samplers() {
         // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
         let words = [
-            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
-            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
-            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
-            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
-            0xBF85_0002,                    // branch to clamp
-            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
-            0xBE88_03FF, 0x0000_0092,       // clamp all axes
-            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
-            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            0xBE84_0300,
+            0xBE85_0380, // s[4:5] = texture table
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380,
+            0xBE8A_0380,
+            0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // branch to clamp
+            0xBE88_0380,
+            0xBF82_0002, // wrap, skip clamp
+            0xBE88_03FF,
+            0x0000_0092, // clamp all axes
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
             S_ENDPGM,
         ];
         let (mut layout, mut used) = texture_tables();

@@ -272,6 +272,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
     #[cfg(feature = "diagnostics")]
+    crate::gpucost::mark(&list.list, || "ours: alias copy");
+    #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.

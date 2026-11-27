@@ -907,7 +907,10 @@ pub(crate) fn ensure_held_state(
         let barrier =
             crate::host::transition(&copy.texture, State(before as i32), State(state as i32));
         #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: texture state transitions (and the setup after)");
+        crate::gpucost::mark(
+            &list.list,
+            || "ours: texture state transitions (and the setup after)",
+        );
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1004,10 +1007,13 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     target.refresh(list, to, len);
     target.gpu_writes(list, to, len);
     let wait = [crate::indirect::uav_barrier()];
+    let need_wait = list.take_uav_dirty();
     // SAFETY: an open list; the list holds both host copies (their
     // refreshes), and the ranges are inside them.
     unsafe {
-        list.list.ResourceBarrier(&wait);
+        if need_wait {
+            list.list.ResourceBarrier(&wait);
+        }
         list.list.CopyBufferRegion(
             &target.buffer,
             target.offset(to),
@@ -1019,18 +1025,16 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         // submission, and a shader of the list that then read it through a root view read
         // a resource in a state that is not a shader's (40 such errors in two minutes
         // under the debug layer, 2026-11-25): back to the common state, from which each
-        // later use takes the state it needs.
+        // later use takes the state it needs. Transitioning out of COPY_DEST already
+        // orders the copy with later shader reads; no global UAV barrier is needed here.
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
         };
-        let back = [
-            crate::indirect::uav_barrier(),
-            crate::host::transition(
-                &target.buffer,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_COMMON,
-            ),
-        ];
+        let back = [crate::host::transition(
+            &target.buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        )];
         list.list.ResourceBarrier(&back);
     }
     crate::host::CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2283,12 +2287,18 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        if !list.take_uav_dirty() {
+            return;
+        }
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "title barrier group (one wait for every shader write)");
+        crate::gpucost::mark(
+            &list.list,
+            || "title barrier group (one wait for every shader write)",
+        );
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }

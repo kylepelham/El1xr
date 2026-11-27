@@ -2941,8 +2941,6 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2976,6 +2974,7 @@ impl State {
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
+        list.mark_uav_dirty();
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3322,8 +3321,6 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -3336,6 +3333,7 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    list.mark_uav_dirty();
                     self.mesh_scissor(list, false);
                     #[cfg(feature = "diagnostics")]
                     self.dump_after(list);
@@ -3987,8 +3985,6 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4010,6 +4006,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4107,8 +4104,6 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: draw setup (bind, tables, textures, twins, planes)");
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
@@ -4120,6 +4115,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4145,8 +4141,6 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
@@ -4329,6 +4323,7 @@ impl State {
                     0,
                 )
             };
+            list.mark_uav_dirty();
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -4355,8 +4350,6 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::gpucost::mark(&list.list, || "ours: indirect sanitize after writer");
             let (safe, ran) = crate::indirect::sanitized(list, &args, arguments, kind);
-            #[cfg(feature = "diagnostics")]
-            crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
             if ran {
                 // The pass bound a compute pipeline and root signature of its own.
                 self.host_pipeline = 0;
@@ -4421,6 +4414,7 @@ impl State {
                     counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
                 )
             };
+            list.mark_uav_dirty();
             if kind == MESH {
                 self.mesh_scissor(list, false);
             }
@@ -4475,6 +4469,7 @@ impl State {
                     list.list
                         .ExecuteIndirect(signature, 1, &slots, at, None::<&ID3D12Resource>, 0)
                 };
+                list.mark_uav_dirty();
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
@@ -4597,8 +4592,6 @@ impl State {
                 (bounded, 0)
             }
         };
-        #[cfg(feature = "diagnostics")]
-        crate::gpucost::mark(&list.list, || "ours: indirect setup (clamps, sanitize, bind, tables)");
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -4653,6 +4646,7 @@ impl State {
                 )
             }
         };
+        list.mark_uav_dirty();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

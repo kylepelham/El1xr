@@ -846,7 +846,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -999,6 +1003,18 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        // Two loop phis at the same block with identical forward-edge masks
+        // and back-edge values produced as the identical (dst, EXEC) pair of
+        // the same `s_*_wrexec_*` instruction hold the same mask on every
+        // iteration (e.g. `s_andn2_wrexec_b64` in waterfall loops). Sharing
+        // one `Atom::Phi` lets downstream proofs see `saved == EXEC`.
+        if let Some((same_id, same_derived)) = self.matching_phi_join(block, &args) {
+            let born = self.index[block];
+            return Some((
+                self.b.atom(Atom::Phi(same_id), born),
+                derived | same_derived,
+            ));
+        }
         if self.phi_join_ids.insert(id) {
             self.phi_joins.push(PhiJoin {
                 block,
@@ -1009,6 +1025,58 @@ impl<'a> Lanes<'a> {
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
+    }
+
+    /// Finds an existing [`PhiJoin`] at `block` that is provably identical to
+    /// `args` on every iteration by induction: same forward-edge masks and
+    /// same back-edge value (either identical SSA keys or the identical
+    /// `(dst, EXEC)` outputs of the same `s_*_wrexec_*` instruction).
+    fn same_wrexec(&self, a: Key, b: Key) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Some(&da0), Some(&da1), Some(&db0), Some(&db1)) = (
+            self.defs.get(&a.0),
+            self.defs.get(&a.1),
+            self.defs.get(&b.0),
+            self.defs.get(&b.1),
+        ) else {
+            return false;
+        };
+        da0 == da1
+            && da0 == db0
+            && da0 == db1
+            && self.p.blocks[da0.0].insts[da0.1]
+                .name()
+                .contains("_wrexec_")
+    }
+
+    fn matching_phi_join(&mut self, block: usize, args: &[Key]) -> Option<(Value, bool)> {
+        let candidates: Vec<(Value, bool, Vec<Key>)> = self
+            .phi_joins
+            .iter()
+            .filter(|pj| pj.block == block && pj.args.len() == args.len())
+            .map(|pj| (pj.id, pj.derived, pj.args.clone()))
+            .collect();
+        for (cid, cderived, cargs) in candidates {
+            let mut equal = true;
+            for (n, (&a, &ca)) in args.iter().zip(cargs.iter()).enumerate() {
+                let (q, _) = self.incoming[block][n];
+                if self.index[q] < self.index[block] {
+                    if self.mask(a).0 != self.mask(ca).0 {
+                        equal = false;
+                        break;
+                    }
+                } else if !self.same_wrexec(a, ca) {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Some((cid, cderived));
+            }
+        }
+        None
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1247,7 +1315,11 @@ impl<'a> Lanes<'a> {
                     let e = exec.unwrap_or(Bool::TRUE);
                     let own = self.b.given(m, e);
                     if self.b.implies(m, e)
-                        && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                        && self
+                            .b
+                            .support(own)
+                            .iter()
+                            .all(|a| matches!(a, Atom::Uniform(_)))
                     {
                         self.scc_lane.insert(scc, own);
                     }

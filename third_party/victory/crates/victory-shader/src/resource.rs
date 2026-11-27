@@ -1998,7 +1998,15 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
+        let meet = |conditions: &[(Bool, bool)]| {
+            if !self.meet(lanes, conditions) {
+                return false;
+            }
+            let mut with_reach = Vec::with_capacity(conditions.len() + 1);
+            with_reach.push(reach);
+            with_reach.extend_from_slice(conditions);
+            self.meet(lanes, &with_reach)
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2057,7 +2065,7 @@ impl<'a> Tracer<'a> {
                 else {
                     continue;
                 };
-                if meet(&[reach, (selected, true), (matched, false)]) {
+                if meet(&[(selected, true), (matched, false)]) {
                     continue;
                 }
                 required.push((matched, true));
@@ -2070,20 +2078,20 @@ impl<'a> Tracer<'a> {
             }
         }
         if reads.iter().any(|v| !out.reads.contains(v))
-            || meet(&[reach, (selected, true), (remaining, false)])
+            || meet(&[(selected, true), (remaining, false)])
         {
             return Err(SELECT);
         }
         // The access must take every match.
-        required.extend([reach, (selected, false)]);
+        required.push((selected, false));
         if meet(&required) {
             return Err(SELECT);
         }
         // The retry must keep exactly the lanes that were eligible but did
         // not perform the access.
-        if meet(&[reach, (retry, true), (remaining, false)])
-            || meet(&[reach, (retry, true), (selected, true)])
-            || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
+        if meet(&[(retry, true), (remaining, false)])
+            || meet(&[(retry, true), (selected, true)])
+            || meet(&[(remaining, true), (selected, false), (retry, false)])
         {
             return Err(RETRY);
         }
@@ -3196,6 +3204,31 @@ pub(crate) mod tests {
         };
         let (_, address) = r.scalar.iter().find(|s| s.0 == load).unwrap();
         assert!(address.dynamic.is_some(), "{address:?}");
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// Same `v_cmpx_eq_u32` + `s_andn2_wrexec_b32` waterfall entered with a
+    /// narrowed EXEC (without an `s_cbranch_execz` skip, so both EXEC and the
+    /// saved-mask SGPR become loop phis): the two phis hold the same mask on
+    /// every iteration, so the waterfall proves and collapses.
+    #[test]
+    fn a_masked_wrexec_waterfall_over_a_first_lane_offset_is_one() {
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        // Narrow EXEC to lanes < 20 right before `s_mov_b32 s23, exec_lo`
+        // (index 14), without a skip branch, forcing EXEC and s21 to be loop
+        // phis rather than Bool::TRUE.
+        words.insert(14, 0x7DA8_0094); // v_cmpx_gt_u32 exec_lo, 20, v0
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
