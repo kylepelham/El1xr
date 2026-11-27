@@ -282,6 +282,9 @@ def build_launcher_command(
     parts = [
         # The user's settings file (the in-game menu's) stays out of runs: they stay reproducible.
         "$env:VICTORY_SETTINGS_FILE = 'none';",
+        # A controller switched on mid-batch hides the stand-in pad the Enter taps reach: tap A on it too
+        # (b4c arm 15 sat 75 s on the title screen). -Override can still set it to 0.
+        "$env:VICTORY_AUTO_A_PADS = '1';",
         "&",
         _ps_quote(str(LAUNCHER_PS1)),
         "-GameDir",
