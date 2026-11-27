@@ -32,6 +32,7 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod probe;
 mod section_mb;
 mod side_by_side;
 
@@ -1391,6 +1392,7 @@ static SCATTER: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     lift_thread();
+    let _making = probe::Making::begin(probe::Kind::Copy);
     let _call = Call::begin();
     let mut physical = physical();
     WORK[4].fetch_add((len / PAGE) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1535,6 +1537,7 @@ pub fn map_alias_constant(to: u64, from: u64, len: u64) -> bool {
     if pages == 0 {
         return true;
     }
+    let _making = probe::Making::begin(probe::Kind::Constant);
     let _call = Call::begin();
     let mut physical = physical();
     WORK[4].fetch_add(pages as u64, Relaxed);
@@ -1751,6 +1754,9 @@ fn work_line() {
         s[4] as f64 / secs,
         w[11] as f64 / 1e3 / secs,
     );
+    if let Some(line) = probe::line(secs) {
+        tracing::info!("{line}");
+    }
 }
 
 /// Counts a view made, when the making ends.
@@ -1991,6 +1997,7 @@ fn noted(
         }
     }
     victory_gpu::titlemem::title_range(base, len, victory_gpu::titlemem::VIEW);
+    probe::made(base);
     physical.views.insert(base, (len, slice));
     #[cfg(feature = "diagnostics")]
     remap_time(4, books);
@@ -2077,6 +2084,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        probe::gone(at, size);
         // Only the pages taken away stop being shown; what stays of the
         // view is mapped again where it was, showing the same.
         let (lo, hi) = (base.max(at) - at, end.min(at + size) - at);

@@ -205,6 +205,7 @@ pub(super) fn change_many(
             let Some((size, slice)) = physical.views.remove(&at) else {
                 continue;
             };
+            super::probe::gone(at, size);
             // As `unmap` does before its call.
             for k in 0..size / PAGE {
                 unshow(physical, &slice, k, at + k * PAGE);
