@@ -49,17 +49,10 @@ fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let sync = var("VICTORY_PRESENT_SYNC")
-            .and_then(|v| v.parse::<u32>().ok())
-            .map_or(0, |v| v.min(4));
+        let sync = parse_sync(var("VICTORY_PRESENT_SYNC").as_deref());
         let tearing = var("VICTORY_PRESENT_TEARING").is_some_and(|v| v == "1");
-        let cap = var("VICTORY_PRESENT_CAP")
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|fps| *fps > 0.0)
-            .map(|fps| Duration::from_secs_f64(1.0 / fps));
-        let smooth = var("VICTORY_PRESENT_SMOOTH")
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(Some(SMOOTH_DEFAULT), |f| (f > 0.0).then_some(f.min(1.0)));
+        let cap = parse_cap(var("VICTORY_PRESENT_CAP").as_deref());
+        let smooth = parse_smooth(var("VICTORY_PRESENT_SMOOTH").as_deref());
         tracing::info!(
             sync,
             tearing,
@@ -74,6 +67,58 @@ fn config() -> &'static Config {
             smooth,
         }
     })
+}
+
+fn parse_sync(v: Option<&str>) -> u32 {
+    v.filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u32>().ok())
+        .map_or(0, |v| v.min(4))
+}
+
+fn parse_cap(v: Option<&str>) -> Option<Duration> {
+    v.filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|fps| *fps > 0.0)
+        .map(|fps| Duration::from_secs_f64(1.0 / fps))
+}
+
+fn parse_smooth(v: Option<&str>) -> Option<f64> {
+    v.filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(Some(SMOOTH_DEFAULT), |f| (f > 0.0).then_some(f.min(1.0)))
+}
+
+/// The sync interval, cap and smoothing, live: the in-game menu changes
+/// them while the title runs (`victory_core::settings`). Parsed as at
+/// start; a cap of 0 ns and a smoothing of 0 stand for none.
+static SYNC: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PRESENT_SYNC", |v| u64::from(parse_sync(v)));
+static CAP: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PRESENT_CAP", |v| {
+        parse_cap(v).map_or(0, |d| d.as_nanos() as u64)
+    });
+static SMOOTH: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PRESENT_SMOOTH", |v| {
+        parse_smooth(v).unwrap_or(0.0).to_bits()
+    });
+
+/// What [`present`] paces by now: the start's values until the menu
+/// changes one (logged when it does).
+fn live() -> (u32, Option<Duration>, Option<f64>) {
+    let c = config();
+    let sync = SYNC.get() as u32;
+    let cap = Some(CAP.get())
+        .filter(|&ns| ns > 0)
+        .map(Duration::from_nanos);
+    let smooth = Some(SMOOTH.get_f64()).filter(|&f| f > 0.0);
+    static LOGGED: Mutex<Option<(u32, Option<Duration>, Option<f64>)>> = Mutex::new(None);
+    let now = (sync, cap, smooth);
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if *logged.get_or_insert((c.sync, c.cap, c.smooth)) != now {
+        *logged = Some(now);
+        tracing::info!(sync, cap = ?cap, smooth = ?smooth, "presenting changed (in-game settings)");
+    }
+    now
 }
 
 /// The swap chain flags chosen when it was made, for `ResizeBuffers` (which must keep them).
@@ -129,7 +174,7 @@ static WINDOW_STATE: Mutex<Option<Window>> = Mutex::new(None);
 
 /// Presents the swap chain's current buffer as configured and times it.
 pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
-    let c = config();
+    let (sync, cap, smooth) = live();
     let mut guard = WINDOW_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.get_or_insert_with(|| Window {
         since: Instant::now(),
@@ -139,7 +184,7 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         turn: None,
         mean_us: 0.0,
     });
-    if let Some(period) = c.cap {
+    if let Some(period) = cap {
         let now = Instant::now();
         let at = match w.turn {
             Some(turn) if turn > now => {
@@ -150,20 +195,21 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         };
         w.turn = Some(at + period);
     }
-    if let (Some(fraction), Some(last)) = (c.smooth, w.last) {
+    if let (Some(fraction), Some(last)) = (smooth, w.last) {
         let hold = last + Duration::from_micros((w.mean_us * fraction) as u64);
         let now = Instant::now();
         if hold > now {
             std::thread::sleep(hold - now);
         }
     }
-    let flags = if CHAIN_FLAGS.load(Ordering::Relaxed) != 0 {
+    // Tearing goes with a sync interval of 0 only (DXGI refuses the present otherwise).
+    let flags = if CHAIN_FLAGS.load(Ordering::Relaxed) != 0 && sync == 0 {
         DXGI_PRESENT_ALLOW_TEARING
     } else {
         DXGI_PRESENT(0)
     };
     // SAFETY: our swap chain; its buffer was written and moved to the present state.
-    let _ = unsafe { swap_chain.Present(c.sync, flags) };
+    let _ = unsafe { swap_chain.Present(sync, flags) };
     let now = Instant::now();
     if let Some(last) = w.last {
         let us = now
@@ -268,6 +314,39 @@ pub(crate) fn line(secs: f64, s: &Summary, draws: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_live_cells_hold_what_the_start_parsed() {
+        // Unset, empty, junk and real values: the live cells' bits read back as
+        // the start's `Config` fields, so nothing changes until the menu does.
+        for v in [
+            None,
+            Some(""),
+            Some("x"),
+            Some("0"),
+            Some("-3"),
+            Some("1"),
+            Some("2"),
+            Some("9"),
+            Some("30"),
+            Some("59.94"),
+            Some("0.5"),
+            Some("1.7"),
+        ] {
+            let cap = parse_cap(v).map_or(0, |d| d.as_nanos() as u64);
+            assert_eq!(
+                Some(cap).filter(|&ns| ns > 0).map(Duration::from_nanos),
+                parse_cap(v),
+                "{v:?}"
+            );
+            let smooth = f64::from_bits(parse_smooth(v).unwrap_or(0.0).to_bits());
+            assert_eq!(Some(smooth).filter(|&f| f > 0.0), parse_smooth(v), "{v:?}");
+            assert_eq!(u64::from(parse_sync(v)) as u32, parse_sync(v), "{v:?}");
+        }
+        assert_eq!(parse_smooth(None), Some(SMOOTH_DEFAULT));
+        assert_eq!(parse_smooth(Some("0")), None);
+        assert_eq!(parse_sync(Some("9")), 4);
+    }
 
     #[test]
     fn summary_takes_nearest_rank_percentiles_and_counts_slow_frames() {

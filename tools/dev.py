@@ -263,6 +263,8 @@ def build_launcher_command(
     extra: list[str] | None = None,
 ) -> list[str]:
     parts = [
+        # The user's settings file (the in-game menu's) stays out of runs: they stay reproducible.
+        "$env:VICTORY_SETTINGS_FILE = 'none';",
         "&",
         _ps_quote(str(LAUNCHER_PS1)),
         "-GameDir",
