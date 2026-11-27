@@ -29,6 +29,8 @@ import dev_gate
 import dev_greps
 import dev_live
 import dev_look
+import dev_mlrun
+import dev_multilive
 import dev_png
 import dev_prewarm
 import dev_runner
@@ -913,6 +915,7 @@ def write_verdict(
             flagged.setdefault(str(done[s]["set"]), []).append(f"{rid}: " + "; ".join(f.split(':')[0] for f in found))
     rows, floor, sources = dev_verdict.set_verdicts(plan.sets, plan.baseline, done, flagged)
     rows += [dev_verdict.live_verdict(r) for _, r in sorted(train_lives(plan, done, train_dir).items())]
+    rows += dev_mlrun.verdict_rows(dev_mlrun.analyses(plan, done, train_dir, read_log_text))
     text = "\n".join(dev_verdict.verdict_lines(rows, floor, sources, plan.name, plan.baseline)) + "\n"
     train_dir.mkdir(parents=True, exist_ok=True)
     (train_dir / "verdict.md").write_text(text, encoding="utf-8")
@@ -1037,6 +1040,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     done = dev_train.load_results(train_dir)
     if args.list:
         print(dev_train.listing(plan, done), end="")
+        print(dev_train.totals(plan, done))
         pending = dev_train.pending_steps(plan, done)
         print(f"--all: {len(pending)} arms pending; hold the Drift gpu lock with "
               f"ttl_minutes>={dev_train.all_ttl_minutes(plan, pending)} for the whole call")
@@ -1078,6 +1082,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         log = f" log={train_dir / f'prewarm_{name}.log'}" if why == "prewarm" else ""
         print(f"DEV train FAIL run={rid} reason={why}{log}")
         return 1
+    if record.get("skipped"):
+        print(f"DEV train PASS run={rid} skipped=\"{record['skipped']}\" next={dev_train.next_pending(plan, done)}")
+        return 0
     ok = bool(record["ok"])
     stats, after = record["stats"], record["resets_after"]
     nxt_id = dev_train.next_pending(plan, done)
@@ -1092,6 +1099,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     )
     if "live" in record:
         print(_live_line(rid, record["live"]))
+    if "multilive" in record:
+        print("\n".join(dev_mlrun.run_lines(rid, record["multilive"])))
     _print_driver_warning(record["resets_before"], after)
     _print_hang_lines(Path(str(record["log"])))
     return 0 if ok else 1
@@ -1099,7 +1108,13 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def write_report(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> str:
     """report.md and report.json (with the `--visual` hints when they ran); returns the text."""
-    text, figures = dev_train.report(plan, done, train_scans(plan, done, train_dir), train_lives(plan, done, train_dir))
+    text, figures = dev_train.report(
+        plan, done, train_scans(plan, done, train_dir), train_lives(plan, done, train_dir),
+        dev_mlrun.analyses(plan, done, train_dir, read_log_text),
+    )
+    multivis = dev_mlrun.cached_visual_lines(done, train_dir)
+    if multivis:
+        text += "\n## Multilive visuals (per arm)\n\n" + "\n".join(f"- {ln}" for ln in multivis) + "\n"
     visual = dev_visual.report_section(train_dir)
     if visual:
         text += "\n".join(visual) + "\n"
@@ -1132,8 +1147,15 @@ def train_arm(
         schedule = train_dir / f"{rid}.schedule.txt"
         schedule.write_text(dev_live.schedule_text(arm), encoding="utf-8")
         overrides["VICTORY_SETTINGS_SCHEDULE"] = str(schedule)
+    seconds = getattr(args, "seconds", None) or dev_train.step_seconds(plan, name, done, step)
+    ml_active, ml_info = dev_mlrun.prepare(plan, done, train_dir, step, name) if name in plan.multilive else ([], None)
+    if ml_info is not None:
+        if not ml_active:
+            done[step] = dev_mlrun.skipped_record(step, name, ml_info, parse_victory_log(""))
+            dev_train.save_result(train_dir, step, done[step])
+            return done[step], ""
+        overrides["VICTORY_SETTINGS_SCHEDULE"] = str(train_dir / f"{rid}.schedule.txt")
     quiet = args.quiet if args.quiet is not None else dev_train.step_quiet(plan, name)
-    seconds = getattr(args, "seconds", None) or dev_train.step_seconds(plan, name)
     monitor = dev_early.Monitor(
         early=dev_train.step_early_stop(plan, name, quiet), min_s=plan.min_seconds, steady_s=plan.steady_seconds,
     )
@@ -1169,7 +1191,8 @@ def train_arm(
         print(f"DEV train: {rid}: {line}", flush=True)
     text = read_log_text(log_path)
     done[step] = {
-        "step": step, "set": name, "kind": "live" if arm is not None else "set", "overrides": overrides,
+        "step": step, "set": name, "kind": "live" if arm is not None else "multilive" if ml_info else "set",
+        "overrides": overrides,
         "ok": bench_ok(stats), "stats": stats, "resets_before": before, "resets_after": after, "snaps": snaps,
         "log": str(log_path), "quiet": quiet, "prewarm": warm, "ahead": ahead_info, "seconds": seconds,
         "ended": ended, "fatal": dev_greps.scan_log(text, {}).fatal, "wall_s": round(time.monotonic() - t0, 1),
@@ -1177,6 +1200,9 @@ def train_arm(
     }
     if arm is not None:
         done[step]["live"] = dev_live.analyse(arm, text)
+    if ml_info is not None:
+        halt = dev_mlrun.stopped(done[step], dev_runner.stop_reason(done[step]))
+        done[step]["multilive"] = {**dev_multilive.analyse(plan.multilive[name], ml_active, text, halt), **ml_info}
     dev_train.save_result(train_dir, step, done[step])
     return done[step], ""
 
@@ -1189,6 +1215,8 @@ def train_autovis(plan: dev_train.Plan, done: dict[int, dict[str, object]], trai
         return 1
     summary = dev_autovis.update(plan, done, train_dir)
     for line in dev_autovis.summary_lines(summary):
+        print(line)
+    for line in dev_mlrun.visuals(done, train_dir, dev_mlrun.analyses(plan, done, train_dir, read_log_text)):
         print(line)
     print(f"DEV train-autovis PASS pairs={len(summary['pairs'])} flagged={summary['flagged']} "
           f"black={len(summary['black'])} visual={train_dir / 'autovis' / 'visual.json'}")
@@ -1221,6 +1249,10 @@ def train_all(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_di
             return f"visual=error({exc})"
         rid = dev_train.run_id(step, str(done[step]["set"]))
         flagged, black = dev_autovis.arm_entries(summary, rid)
+        if done[step].get("kind") == "multilive":
+            for line in dev_mlrun.visuals({step: done[step]}, train_dir, {
+                    s: v for s, v in dev_mlrun.analyses(plan, done, train_dir, read_log_text).items() if s == step}):
+                print(f"DEV train-multivis {line}", flush=True)
         return f"visual_flagged={len(flagged)} black={len(black)}"
 
     return dev_runner.run_all(

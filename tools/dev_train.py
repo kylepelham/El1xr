@@ -43,7 +43,9 @@ Plan (TOML or JSON; every key optional but `sets`):
     steady_seconds = 60                 # steady windows needed after the world settled
 
 A set may say `quiet = true|false` and `early_stop = true|false` (its runs only; not inherited through `from`). `[live.<name>]` tables are
-live arms (one launch, Live settings switched A/B/A/B; see tools/dev_live.py); `order` names them like sets.
+live arms (one launch, Live settings switched A/B/A/B; see tools/dev_live.py) and `[multilive.<name>]` tables
+multi-switch live launches (one launch, several Live switches A/B'd one after another; see tools/dev_multilive.py);
+`order` names both like sets.
 
 Values are strings, numbers or booleans (true is "1", false "0"). Results go to
 `<dev dir>/train_<plan file stem>/`: `NN_<set>.log`, `NN_<set>.json` and `NN_<set>_snaps/`.
@@ -62,6 +64,7 @@ from pathlib import Path
 
 import dev_greps
 import dev_live
+import dev_multilive
 
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -72,7 +75,7 @@ DEFAULT_SECONDS = 200
 DEFAULT_SNAP_EVERY = 15.0
 PLAN_KEYS = {
     "seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets", "greps",
-    "live", "prewarm", "prewarm_ahead", "ahead_jobs", "early_stop", "min_seconds", "steady_seconds",
+    "live", "multilive", "prewarm", "prewarm_ahead", "ahead_jobs", "early_stop", "min_seconds", "steady_seconds",
 }
 SET_FLAGS = ("from", "quiet", "early_stop")
 DEFAULT_MIN_SECONDS = 90
@@ -121,6 +124,7 @@ class Plan:
     unmute: bool = False
     greps: dict[str, re.Pattern[str]] = field(default_factory=dict)
     live: dict[str, dev_live.LiveArm] = field(default_factory=dict)
+    multilive: dict[str, dev_multilive.MultiLive] = field(default_factory=dict)
     set_quiet: dict[str, bool] = field(default_factory=dict)
     prewarm: str = "pipelines"
     prewarm_ahead: bool = True
@@ -192,14 +196,21 @@ def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None 
         live = dev_live.parse_live(data.get("live", {}), sets, kinds)
     except dev_live.LiveError as exc:
         raise PlanError(str(exc)) from exc
+    order = [str(s) for s in data.get("order", DEFAULT_ORDER)]
+    baseline = str(data.get("baseline", "off" if "off" in sets else order[0] if order else next(iter(sets))))
+    try:
+        multilive = dev_multilive.parse_multilive(data.get("multilive", {}), sets, baseline, kinds)
+    except dev_multilive.MultiLiveError as exc:
+        raise PlanError(str(exc)) from exc
+    clash = set(multilive) & set(live)
+    if clash:
+        raise PlanError(f"multilive and live entries share names: {', '.join(sorted(clash))}")
     prewarm = str(data.get("prewarm", "pipelines"))
     if prewarm not in PREWARM_MODES:
         raise PlanError(f"prewarm: one of {', '.join(PREWARM_MODES)}, not '{prewarm}'")
-    order = [str(s) for s in data.get("order", DEFAULT_ORDER)]
-    missing = [s for s in order if s not in sets and s not in live]
+    missing = [s for s in order if s not in sets and s not in live and s not in multilive]
     if missing:
         raise PlanError(f"order names sets the plan lacks: {', '.join(missing)}")
-    baseline = str(data.get("baseline", "off" if "off" in sets else order[0] if order else next(iter(sets))))
     if baseline not in sets:
         raise PlanError(f"baseline '{baseline}' is not a set")
     try:
@@ -219,6 +230,7 @@ def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None 
         unmute=bool(data.get("unmute", False)),
         greps=greps,
         live=live,
+        multilive=multilive,
         set_quiet={n: bool(t["quiet"]) for n, t in raw_sets.items() if isinstance(t, dict) and "quiet" in t},
         prewarm=prewarm,
         prewarm_ahead=bool(data.get("prewarm_ahead", True)),
@@ -240,24 +252,33 @@ def load_plan(path: Path, kinds: dict[str, str] | None = None) -> Plan:
 
 
 def step_overrides(plan: Plan, name: str) -> dict[str, str]:
-    """The launch overrides of a set or live arm (a live arm launches with its set A's values)."""
+    """The launch overrides of a set or live arm (a live arm launches with its set A's values, a multilive launch
+    with its base set's)."""
+    if name in plan.multilive:
+        return dict(plan.multilive[name].launch)
     return dict(plan.live[name].launch) if name in plan.live else dict(plan.sets[name])
 
 
-def step_seconds(plan: Plan, name: str) -> int:
+def step_seconds(plan: Plan, name: str, done: dict[int, dict[str, object]] | None = None, step: int = 0) -> int:
+    """A step's run seconds; a multilive launch's from the arms it still owes (all of them without `done`)."""
+    if name in plan.multilive:
+        ml = plan.multilive[name]
+        active = dev_multilive.owed(ml, done, step)[0] if done is not None else [a.name for a in ml.arms]
+        return dev_multilive.seconds(ml, active) if active else 0
     return plan.live[name].seconds if name in plan.live else plan.seconds
 
 
 def step_quiet(plan: Plan, name: str) -> bool:
-    if name in plan.live and plan.live[name].quiet is not None:
-        return bool(plan.live[name].quiet)
+    entry = plan.live.get(name) or plan.multilive.get(name)
+    if entry is not None and entry.quiet is not None:
+        return bool(entry.quiet)
     return plan.set_quiet.get(name, plan.quiet)
 
 
 def step_early_stop(plan: Plan, name: str, quiet: bool) -> bool:
     """Whether a run of this set ends early once steady: the set's `early_stop`, else the plan's, else on for a
     loud run and off for a quiet one. Never for a live arm (its segments are scheduled)."""
-    if name in plan.live:
+    if name in plan.live or name in plan.multilive:
         return False
     if name in plan.set_early:
         return plan.set_early[name]
@@ -334,8 +355,8 @@ def pick(plan: Plan, done: dict[int, dict[str, object]], run: str) -> tuple[int,
         if step in done:
             return step, str(done[step]["set"])
         raise PlanError(f"step {step} is not in the order (1-{len(plan.order)})")
-    if run not in plan.sets and run not in plan.live:
-        raise PlanError(f"no set '{run}' (sets: {', '.join([*plan.sets, *plan.live])})")
+    if run not in plan.sets and run not in plan.live and run not in plan.multilive:
+        raise PlanError(f"no set '{run}' (sets: {', '.join([*plan.sets, *plan.live, *plan.multilive])})")
     for step, name in enumerate(plan.order, 1):
         if name == run and step not in done:
             return step, name
@@ -394,15 +415,30 @@ def listing(plan: Plan, done: dict[int, dict[str, object]]) -> str:
             arm = plan.live[name]
             values = (f"live {arm.a} vs {arm.b} {''.join(arm.labels())} x {arm.segment_s:g} s from {arm.start_s:g} s: "
                       + " ".join(f"{k}={a}/{b}" for k, (a, b) in arm.keys.items()))
+        elif name in plan.multilive and state == "done":
+            info = done[step].get("multilive") or {}
+            values = f"multilive: {done[step].get('skipped') or ' | '.join(info.get('arms', []))}"
+        elif name in plan.multilive:
+            values = dev_multilive.list_line(plan.multilive[name], *dev_multilive.owed(plan.multilive[name], done, step))
         elif name in plan.sets:
             values = " ".join(f"{k}={v}" for k, v in plan.sets[name].items())
         else:
             values = "(set no longer in the plan)"
         extra = ""
-        if state == "pending" and (name in plan.sets or name in plan.live):
-            extra = f" [{step_seconds(plan, name)} s{', quiet' if step_quiet(plan, name) else ''}, gpu lock ttl>={ttl_minutes(plan, name)} min]"
+        if state == "pending" and (name in plan.sets or name in plan.live or name in plan.multilive):
+            extra = f" [{step_seconds(plan, name, done, step)} s{', quiet' if step_quiet(plan, name) else ''}, gpu lock ttl>={ttl_minutes(plan, name)} min]"
         lines.append(f"{run_id(step, name)} {state}{extra}: {values or '(defaults)'}")
     return "\n".join(lines) + "\n"
+
+
+def totals(plan: Plan, done: dict[int, dict[str, object]]) -> str:
+    """The pending launches and their minutes: game time, and wall time with each arm's boot, prewarm and report."""
+    pending = [(s, n) for s, n in pending_steps(plan, done) if step_seconds(plan, n, done, s) > 0]
+    game = sum(step_seconds(plan, n, done, s) for s, n in pending)
+    wall = game + ALL_ARM_EXTRA_S * len(pending)
+    ran = sum(1 for r in done.values() if not r.get("skipped"))
+    return (f"launches: {len(pending)} pending ({ran} run), ~{game / 60:.0f} min of game time, "
+            f"~{wall / 60:.0f} min with boot, prewarm and report")
 
 
 def _cell(stats: dict[str, object], key: str, spec: str) -> str:
@@ -421,7 +457,7 @@ def _resets(record: dict[str, object]) -> str:
 
 def report(
     plan: Plan, done: dict[int, dict[str, object]], scans: dict[int, dev_greps.LogScan] | None = None,
-    lives: dict[int, dict[str, object]] | None = None,
+    lives: dict[int, dict[str, object]] | None = None, multis: dict[int, dict[str, object]] | None = None,
 ) -> tuple[str, dict[str, object]]:
     """The markdown report and its figures: every run, pending steps, then each set's medians and
     their differences from the baseline set, then the plan's greps per run. `scans` are the runs'
@@ -472,6 +508,12 @@ def report(
         for s in sorted(lives):
             lines += dev_live.report_lines(run_id(s, str(done[s]["set"])), lives[s])
         figures["live"] = {run_id(s, str(done[s]["set"])): lives[s] for s in sorted(lives)}
+    if multis:
+        lines += ["", "## Multilive launches (per arm: median over segments, A = base, B = the arm's values)"]
+        for s in sorted(multis):
+            ml = plan.multilive.get(str(done[s]["set"]))
+            lines += dev_multilive.report_lines(run_id(s, str(done[s]["set"])), ml, multis[s])
+        figures["multilive"] = {run_id(s, str(done[s]["set"])): multis[s] for s in sorted(multis)}
     ids = {s: run_id(s, str(done[s]["set"])) for s in sorted(scans)}
     figures["runs"] = {
         ids[s]: {

@@ -43,7 +43,7 @@ ARM_FIELDS = (
 
 def stop_reason(record: dict[str, object]) -> str | None:
     """Why this arm stops the whole call, or None."""
-    if record.get("prewarm_failed"):
+    if record.get("prewarm_failed") or record.get("skipped"):
         return None
     stats = record["stats"]
     before, after = record.get("resets_before"), record.get("resets_after")
