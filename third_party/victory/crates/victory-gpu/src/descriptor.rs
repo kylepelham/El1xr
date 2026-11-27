@@ -605,7 +605,7 @@ const _: () = assert!(size_of::<RtvRecord>() <= 112);
 /// of descriptor storage the title may rewrite. The caller still owns the
 /// resource's lifetime, as with the command first recorded.
 #[cfg(windows)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RtvSnapshot {
     tag: u32,
     described: u32,
