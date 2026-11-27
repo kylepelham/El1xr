@@ -39,6 +39,10 @@ mod heap_rounds;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod land_aside;
+#[cfg(windows)]
+mod output_views;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod pacing;
@@ -68,6 +72,11 @@ pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod stretch;
+#[cfg(all(windows, feature = "dlss"))]
+mod dlss;
+pub mod upscale;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

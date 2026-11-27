@@ -580,8 +580,19 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                    host.log_messages();
+                    // Include the first error from the shared debug queue.
+                    // Another worker may have produced it; correlation is
+                    // best-effort, not proof it belongs to this PSO.
+                    let debug_layer_first_error = host.log_messages();
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        ?debug_layer_first_error,
+                        dxil_bytes = desc.CS.BytecodeLength,
+                        root_parameters = params.len(),
+                        static_samplers = samplers.len(),
+                        "host pipeline refused"
+                    );
                     return None;
                 }
             };
@@ -1383,8 +1394,6 @@ mod tests {
             // Replay onto a second host list, exercising `State::replay`.
             let list = host.new_list().unwrap();
             state.replay(&list);
-            let rtv = host.rtv(Some(&color), None);
-            let dsv = host.dsv(&depth, None);
             let vp = D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -1401,11 +1410,15 @@ mod tests {
             };
             // SAFETY: open command list, live resources and views.
             unsafe {
-                list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
-                list.list
-                    .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
-                list.list
-                    .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                host.output_views(|views| {
+                    let rtv = views.rtv(Some(&color), None);
+                    let dsv = views.dsv(&depth, None);
+                    list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                    list.list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                    list.list
+                        .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                });
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
                 list.list.SetGraphicsRootSignature(&root);
@@ -1674,7 +1687,6 @@ mod tests {
         // Execute a real GPU draw with pso1 and verify output texel == 42.
         let rt_uint = make_rt_tex(host, DXGI_FORMAT_R8_UINT);
         let list = host.new_list().expect("list");
-        let rtv = host.rtv(Some(&rt_uint), None);
         let vp = D3D12_VIEWPORT {
             Width: 4.0,
             Height: 4.0,
@@ -1689,8 +1701,11 @@ mod tests {
         };
         // SAFETY: open list, live resources.
         unsafe {
-            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
-            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            host.output_views(|views| {
+                let rtv = views.rtv(Some(&rt_uint), None);
+                list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            });
             list.list.RSSetViewports(&[vp]);
             list.list.RSSetScissorRects(&[rect]);
             list.list.SetGraphicsRootSignature(&root);
@@ -1715,17 +1730,19 @@ mod tests {
 
         let rt_color = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
         let list2 = host.new_list().expect("list2");
-        let rtvs = [
-            host.rtv(Some(&rt_color), None),
-            host.rtv(Some(&rt_uint), None),
-        ];
         // SAFETY: open list, live resources.
         unsafe {
-            list2.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
-            list2.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
-            list2
-                .list
-                .OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            host.output_views(|views| {
+                let rtvs = [
+                    views.rtv(Some(&rt_color), None),
+                    views.rtv(Some(&rt_uint), None),
+                ];
+                list2.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
+                list2.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
+                list2
+                    .list
+                    .OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            });
             list2.list.RSSetViewports(&[vp]);
             list2.list.RSSetScissorRects(&[rect]);
             list2.list.SetGraphicsRootSignature(&root);
@@ -1785,7 +1802,6 @@ mod tests {
         assert_eq!(g.targets.RTFormats[2], DXGI_FORMAT_UNKNOWN);
         let rt = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
         let list = host.new_list().expect("list");
-        let rtv = host.rtv(Some(&rt), None);
         let vp = D3D12_VIEWPORT {
             Width: 4.0,
             Height: 4.0,
@@ -1800,8 +1816,11 @@ mod tests {
         };
         // SAFETY: open list, live resources.
         unsafe {
-            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
-            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            host.output_views(|views| {
+                let rtv = views.rtv(Some(&rt), None);
+                list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            });
             list.list.RSSetViewports(&[vp]);
             list.list.RSSetScissorRects(&[rect]);
             list.list.SetGraphicsRootSignature(&root);
@@ -1850,10 +1869,6 @@ mod tests {
         let rt_color = make_rt_tex(host, DXGI_FORMAT_R8G8B8A8_UNORM);
         let rt_uint = make_rt_tex(host, DXGI_FORMAT_R8_UINT);
         let list = host.new_list().expect("list");
-        let rtvs = [
-            host.rtv(Some(&rt_color), None),
-            host.rtv(Some(&rt_uint), None),
-        ];
         let vp = D3D12_VIEWPORT {
             Width: 4.0,
             Height: 4.0,
@@ -1868,10 +1883,16 @@ mod tests {
         };
         // SAFETY: open list, live resources.
         unsafe {
-            list.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
-            list.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
-            list.list
-                .OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            host.output_views(|views| {
+                let rtvs = [
+                    views.rtv(Some(&rt_color), None),
+                    views.rtv(Some(&rt_uint), None),
+                ];
+                list.list.ClearRenderTargetView(rtvs[0], &[0.0; 4], None);
+                list.list.ClearRenderTargetView(rtvs[1], &[0.0; 4], None);
+                list.list
+                    .OMSetRenderTargets(2, Some(rtvs.as_ptr()), false, None);
+            });
             list.list.RSSetViewports(&[vp]);
             list.list.RSSetScissorRects(&[rect]);
             list.list.SetGraphicsRootSignature(&root);

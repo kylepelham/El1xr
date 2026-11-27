@@ -566,8 +566,13 @@ pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        {
+            let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+            heaps.retain(|&(_, _, h)| h != at);
+        }
+        if let Some(Some(host)) = self.host.get() {
+            crate::draw::forget_heap_ranges(host.id());
+        }
     }
 }
 
