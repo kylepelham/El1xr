@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import dev_driver
 import dev_gate
 import dev_throttle
 
@@ -424,7 +425,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     overrides, mute = apply_mute_default(overrides, args.unmute)
     cmd = build_launcher_command(game_dir=game_dir, diag=False, overrides=overrides, mute=mute)
     with acquire_gpu_lock("bench"):
+        resets_before = dev_driver.resets_since_boot()
         run_timed_victory(cmd, log_path, args.seconds)
+        resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     ok = int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
@@ -442,9 +445,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"sd_ms={float(stats['sd_ms']):.1f} "
         f"jitter_ms={float(stats['jitter_ms']):.1f} "
         f"over50={int(stats['over50'])} "
-        f"hitches={int(stats['hitches'])}"
+        f"hitches={int(stats['hitches'])} "
+        f"driver_resets={_count(resets_after)}"
     )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
+
+
+def _count(value: int | None) -> str:
+    return "?" if value is None else str(value)
+
+
+def _print_driver_warning(before: int | None, after: int | None) -> None:
+    line = dev_driver.warning(before, after)
+    if line:
+        print(line)
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -469,13 +484,19 @@ def cmd_capture(args: argparse.Namespace) -> int:
     overrides, mute = apply_mute_default(overrides, args.unmute)
     cmd = build_launcher_command(game_dir=game_dir, diag=True, overrides=overrides, mute=mute)
     with acquire_gpu_lock(f"capture:{safe_tag}"):
+        resets_before = dev_driver.resets_since_boot()
         run_timed_victory(cmd, log_path, args.seconds)
+        resets_after = dev_driver.resets_since_boot()
 
     stats = parse_victory_log(read_log_text(log_path))
     frames = len(list(cap_dir.glob("*.png")))
     ok = frames > 0 and not bool(stats["device_removed"])
     status = "PASS" if ok else "FAIL"
-    print(f"DEV capture {status} frames={frames} refused={int(stats['refused'])} dir={cap_dir}")
+    print(
+        f"DEV capture {status} frames={frames} refused={int(stats['refused'])} "
+        f"driver_resets={_count(resets_after)} dir={cap_dir}"
+    )
+    _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
 
 

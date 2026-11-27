@@ -1524,17 +1524,31 @@ fn found_set(address: usize, now: u64) {
 /// copied (`at == 0`), written without a 4 KiB answer, or nothing found.
 pub(crate) fn stale_mask(page: usize, at: u64) -> Option<u16> {
     use std::sync::atomic::Ordering::Acquire;
-    if !watch_4k() || at == 0 {
+    if !watch_4k() {
+        if at != 0 {
+            crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::NoWatch4k);
+        }
+        return None;
+    }
+    if at == 0 {
         return None;
     }
     if part_of(&WHOLE, page, false).is_some_and(|p| p.0[page % PART].load(Acquire) > at) {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::WholeStamp);
         return None;
     }
     let sub = page * (PAGE / KERNEL_PAGE);
-    let part = part_of(&SUBS, sub, false)?;
+    let Some(part) = part_of(&SUBS, sub, false) else {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::NoSubsPart);
+        return None;
+    };
     let stamps: [u64; PAGE / KERNEL_PAGE] =
         std::array::from_fn(|k| part.0[(sub + k) % PART].load(Acquire));
-    mask_of(&stamps, at)
+    let m = mask_of(&stamps, at);
+    if m.is_none() {
+        crate::copy_profile::whole_why(crate::copy_profile::WholeWhy::ZeroMask);
+    }
+    m
 }
 
 /// The sub-pages stamped after `at`; `None` if there are none (the page's stamp then rests on
@@ -1627,6 +1641,80 @@ pub(crate) fn ask_once_active() -> bool {
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
+fn prepare_flush_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREPARE_FLUSH").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_PREPARE_FLUSH=1`, off by default: not yet measured in settled play) Before a wide `Batch::flush`, on the
+/// submitting thread: re-guards the flush's view memory once, merged across its
+/// copies, and asks the kernel for private ranges the submission's asking left
+/// out. The workers then find them published or asked (no `VirtualProtect` or
+/// `GetWriteWatch` from 16 threads at once, which contend in the kernel).
+pub(crate) fn prepare_flush(ranges: &[(usize, usize)]) {
+    if !prepare_flush_enabled() || !light() || ranges.is_empty() {
+        return;
+    }
+    let mut pages: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(a, b)| a < b)
+        .map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE)))
+        .collect();
+    pages.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for (a, b) in pages {
+        match merged.last_mut() {
+            Some((_, last)) if a <= *last => *last = (*last).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    const { assert!(BLOCK == PAGE) };
+    let skip_v = skip_views();
+    let mut private: Vec<(usize, usize)> = Vec::new();
+    let t = crate::refresh_prof::start();
+    let mut guarded = 0u64;
+    for (first, last) in merged {
+        if published_all(first, last) {
+            continue;
+        }
+        let view = (skip_v && (PROTECTED.any(first, last) || VIEWS.any(first, last)))
+            || known_view(first * PAGE);
+        if !view {
+            private.push((first, last));
+            continue;
+        }
+        if let Some((pages, epochs)) = guard_with_epochs(first * PAGE, last * PAGE) {
+            guarded += 1;
+            let now = next_asking();
+            for &page in &pages {
+                written_set(page, now);
+            }
+            publish(&epochs);
+        }
+    }
+    crate::refresh_prof::add(crate::refresh_prof::P::PrepareViewsCalls, guarded);
+    crate::refresh_prof::finish(crate::refresh_prof::P::PrepareViewsUs, t);
+    if private.is_empty() || !reservation::enabled() || !ask_once_active() {
+        return;
+    }
+    let uncovered: Vec<(usize, usize)> = {
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        if !j.kept {
+            return;
+        }
+        private
+            .into_iter()
+            .filter(|&(a, b)| !reservation::covered(&j, a, b))
+            .collect()
+    };
+    if !uncovered.is_empty() {
+        let t = crate::refresh_prof::start();
+        crate::refresh_prof::add(crate::refresh_prof::P::PreparePrivCalls, uncovered.len() as u64);
+        reservation::ask_more(&uncovered);
+        crate::refresh_prof::finish(crate::refresh_prof::P::PreparePrivUs, t);
+    }
+}
+
 pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`. Check before consuming/filtering/sorting
@@ -2646,8 +2734,10 @@ fn writes_with(
     }
     let (first_b, last_b) = (start / BLOCK, end.div_ceil(BLOCK));
     if guarded && light() && start < end && published_all(first_b, last_b) {
+        crate::refresh_prof::add(crate::refresh_prof::P::PublishedCalls, 1);
         return Some((next_asking(), read_pages(marks.as_deref_mut())));
     }
+    let t_path = crate::refresh_prof::start();
     // View memory the kernel would refuse, and the caller does not ask the
     // guards (textures, which then fall back to guarded/hash tracking): no
     // failing kernel call.
@@ -2746,6 +2836,11 @@ fn writes_with(
         }
         if failed {
             publish(&epochs);
+            crate::refresh_prof::add(crate::refresh_prof::P::GuardCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::GuardUs, t_path);
+        } else {
+            crate::refresh_prof::add(crate::refresh_prof::P::KernelCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::KernelUs, t_path);
         }
         Some((now, read_pages(marks.as_deref_mut())))
     })
@@ -2783,6 +2878,11 @@ impl Tracked {
         }
         ranges
     }
+}
+
+/// Whether the block holding `start` is view memory the guards hold ([`known_view`]).
+pub(crate) fn is_known_view(start: usize) -> bool {
+    known_view(start)
 }
 
 /// Guarded blocks of view memory.

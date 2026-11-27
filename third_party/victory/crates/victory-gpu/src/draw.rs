@@ -3649,9 +3649,13 @@ impl State {
                 })
             };
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
+            let dsv_flags = self
+                .depth_view
+                .and_then(|s| s.restore().depth_desc())
+                .map_or(0, |d| d.Flags.0);
             let _ = write!(
                 text,
-                " targets {targets:?} depth {:?} state [{}]",
+                " targets {targets:?} depth {:?} dsv_flags {dsv_flags:#x} state [{}]",
                 described(self.depth),
                 p.state
             );

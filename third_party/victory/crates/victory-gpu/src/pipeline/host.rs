@@ -680,7 +680,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 is_bake,
-                state: String::new(),
+                state: state_summary(g, depth_bounds),
             });
         }
 
@@ -805,39 +805,38 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             is_bake,
-            state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
-                    format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0,
-                        f.StencilDepthFailOp.0,
-                        f.StencilPassOp.0,
-                        f.StencilFunc.0
-                    )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
-            },
+            state: state_summary(g, depth_bounds),
         })
     }
+}
+
+fn state_summary(g: &GraphicsState, depth_bounds: bool) -> String {
+    let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+    let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+        format!(
+            "fail {} depth-fail {} pass {} func {}",
+            f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+        )
+    };
+    let bounds = if depth_bounds { " bounds true" } else { "" };
+    format!(
+        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+        d.DepthEnable.as_bool(),
+        d.DepthWriteMask.0,
+        d.DepthFunc.0,
+        d.StencilEnable.as_bool(),
+        d.StencilReadMask,
+        d.StencilWriteMask,
+        face(&d.FrontFace),
+        face(&d.BackFace),
+        r.CullMode.0,
+        r.FrontCounterClockwise.as_bool(),
+        b.BlendEnable.as_bool(),
+        b.SrcBlend.0,
+        b.DestBlend.0,
+        b.BlendOp.0,
+        b.RenderTargetWriteMask
+    )
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.
