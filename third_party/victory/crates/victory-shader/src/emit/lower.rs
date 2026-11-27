@@ -100,6 +100,14 @@ mod valu16;
 #[path = "sop.rs"]
 mod sop;
 
+/// LDS atomics in loops without a meeting of the host waves (`VICTORY_LDS_LOOP_ATOMICS=1`).
+#[path = "lds_loop.rs"]
+mod lds_loop;
+
+/// The group's LDS set-up by its first thread whether its lane runs (`VICTORY_LDS_FIRST_INIT=1`).
+#[path = "lds_first.rs"]
+mod lds_first;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -338,6 +346,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// With `split_lds`, LDS atomics in loops that get a fence, no meeting
+    /// ([`lds_loop::looped_atomics`], `VICTORY_LDS_LOOP_ATOMICS=1`).
+    lds_looped: HashSet<(usize, usize)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two (or four when [`Self::exchange_quad`] is set) exchange dwords per console wave,
     /// whether the group has no upper half (32 threads or fewer), and per IR block whether every
@@ -1296,6 +1307,11 @@ impl<'a> Lower<'a> {
             whole: whole_masks(x.p, x.st, x.native.wave64),
             split_lds,
             lds_meet,
+            lds_looped: if split_lds && lds_loop::loop_atomics_on() {
+                lds_loop::looped_atomics(p, x.st)
+            } else {
+                HashSet::new()
+            },
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -5078,6 +5094,20 @@ impl<'a> Lower<'a> {
             } else {
                 return Err("an LDS write of bytes or halves");
             };
+            if let Some((first, constants)) =
+                self.first_thread_init(b, i, addr.as_ref(), data, &elements)
+            {
+                // The group's first thread sets shared memory up, whether its lane runs or not.
+                let at = self.begin_guarded(Some(first));
+                for (bytes, x) in constants {
+                    let (index, x) = (self.s.m.i32(bytes / 4), self.s.m.i32(x));
+                    let lds = self.s.lds();
+                    let ptr = self.s.m.element(self.cur, lds, index);
+                    self.s.m.store(self.cur, ptr, x);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut stores = Vec::new();
             for (e, (off, w)) in elements.into_iter().enumerate() {
                 let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
@@ -5305,10 +5335,19 @@ impl<'a> Lower<'a> {
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten. A group of two
-            // console waves meets only the halves of the wave that reached this block.
-            self.lds_access_meet(name);
+            if self.lds_looped.contains(&(b, i)) {
+                // (in a loop the host waves take each on its own: a fence, no wait; the next
+                // access meets again)
+                let (fence, void) = (self.s.m.i32(8), self.s.t.void);
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+                self.meet.lds_run = None;
+            } else {
+                // the two host waves of a console wave meet before each LDS access: what the
+                // other half wrote is visible, and what it still reads is not overwritten. A
+                // group of two console waves meets only the halves of the wave that reached
+                // this block.
+                self.lds_access_meet(name);
+            }
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),

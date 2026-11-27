@@ -17,6 +17,21 @@
   (XboxBvhBuilder.dll, amd_fidelityfx_upscaler_xbox.dll), with the same environment variables as the game.
   Combine with -Warm to cover every archive as well.
 
+.PARAMETER NoGame
+  Optional. Stops after -Warm / -Precompile without starting the title (an offline prewarm: `dev.py prewarm`).
+
+.PARAMETER WarmJobs
+  Optional. Worker threads for -Warm / -Precompile (default: every logical core).
+
+.PARAMETER WarmNoPipelines
+  Optional. -Warm / -Precompile only translate shaders: no compute pipelines, no device on the card when
+  VICTORY_HOST_WAVE and VICTORY_VIEW_LIMIT give the host's facts (as `dev.py prewarm` does).
+
+.PARAMETER WarmRecipes
+  Optional. After -Warm / -Precompile, makes the host pipeline of every recipe earlier runs wrote down
+  (VICTORY_PIPELINE_RECIPES=1) into the pipeline library (`victory warm --recipes`). Makes a device on the card:
+  only under the gpu lock (`dev.py prewarm --pipelines`).
+
 .PARAMETER AutoA
   Optional. Taps A through the start screens for 150 s (VICTORY_AUTO_A=150), as Neptune's play.ps1 does by default.
 
@@ -96,6 +111,10 @@ param(
     [Parameter(Mandatory = $true)][string]$GameDir,
     [switch]$Warm,
     [switch]$Precompile,
+    [switch]$NoGame,
+    [int]$WarmJobs = 0,
+    [switch]$WarmNoPipelines,
+    [switch]$WarmRecipes,
     [switch]$AutoA,
     [switch]$FrametimeDump,
     [switch]$Diag,
@@ -230,6 +249,26 @@ if (-not $NoTunedSettings) {
         VICTORY_PORT_CBV                 = '1'         # bind 16-byte-aligned table CBVs in-place as raw SRVs (skips ~22k scratch copies/frame)
         VICTORY_DIRTY_4K                 = '1'         # narrow write-watched copy spans to dirty 4 KiB subpages (-45% copy bytes)
         VICTORY_PORT_GUARD               = '1'         # concurrent guard lock (GUARDS.read + per-block claims)
+        VICTORY_STAGING_UNLOCKED         = '1'         # batch 1: staging buffers built outside the global lock
+        VICTORY_PREPARE_TAKE_BY_TABLE    = '1'         # batch 1: a table's take frees the prepare entry at once
+        VICTORY_SHADOW_ALLOC_OUTSIDE     = '1'         # batch 1: buffer copies made outside the table lock (Vice-Tay #199)
+        VICTORY_LOOSE_ALLOC_OUTSIDE      = '1'         # batch 1: loose copies made outside the table lock (Vice-Tay #238)
+        VICTORY_SHADOW_READ_LOCKS        = '1'         # batch 1: read-only table walks take read locks (Vice-Tay #238)
+        VICTORY_TABLED_ALL               = '1'         # batch 1: every slot of a bound table marked (fxceless #1414)
+        VICTORY_LIST_VIEWS               = '1'         # batch 1: a fresh table's views made once per list (cool_fox)
+        VICTORY_BAKE_PARALLEL            = '8'         # batch 1: bake textures created on 8 threads
+        VICTORY_BAKE_STAGE_AHEAD         = '1'         # batch 1: bake textures fully prepared ahead
+        VICTORY_TRANSLATE_AHEAD          = '4'         # batch 1: shaders translated when the title creates the pipeline
+        VICTORY_LIBRARY_NAME_LOCK        = '1'         # batch 1: pipeline library loads lock per name (fxceless #1442)
+        VICTORY_LIBRARY_PREFETCH         = '1'         # batch 1: pipeline library read ahead (avatarmanz #443)
+        VICTORY_MAP_LEAN                 = '1'         # batch 1: map straight into freed space
+        VICTORY_STREAM_PRIORITY          = '1'         # batch 1: title streaming thread above normal (cool_fox)
+        VICTORY_REMAP_KEEP               = '1'         # batch 1: a failed remap keeps the old pages (fxceless #1460)
+        VICTORY_BUFFER_AHEAD             = '1'         # batch 1: heap-buffers pass makes its host copies ahead
+        VICTORY_PRELUDE_RECHECK          = '1'         # batch 1: no stale prelude upload over a baked texture (trustno1 #33)
+        VICTORY_SAMPLER_ORDER            = '1'         # batch 1: static samplers in a fixed order (fxceless #1461)
+        VICTORY_ALIAS_AFTER_UPLOAD       = '1'         # batch 1: GPU-written texture copy kept after a CPU upload (Vice-Tay #141)
+        VICTORY_PREFILL_RETRY            = '1'         # batch 1: cached mips kept when upload room runs out (Vice-Tay)
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]
@@ -282,6 +321,11 @@ if ($PSBoundParameters.ContainsKey('XgDll') -and $XgDll) {
     $env:VICTORY_XG_MODE = $XgMode
 }
 
+$warmArgs = @()
+if ($WarmJobs -gt 0) { $warmArgs += @('--jobs', [string]$WarmJobs) }
+if ($WarmNoPipelines) { $warmArgs += '--no-pipelines' }
+if ($WarmRecipes) { $warmArgs += '--recipes' }
+
 if ($Warm) {
     # Same environment as the game below: the cache key depends on it. Only the game folder's own .rpf files.
     $archives = @(Get-ChildItem -LiteralPath $GameDir -Filter '*.rpf' -File | Sort-Object Name | ForEach-Object { $_.FullName })
@@ -292,7 +336,7 @@ if ($Warm) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm @archives
+        & $exe warm @warmArgs @archives
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }
@@ -311,11 +355,15 @@ if ($Precompile) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm $shaders $gameExe @dlls
+        & $exe warm @warmArgs $shaders $gameExe @dlls
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }
     if ($LASTEXITCODE -ne 0) { throw "victory warm failed (exit code $LASTEXITCODE)." }
+}
+
+if ($NoGame) {
+    exit 0
 }
 
 $prevErrorAction = $ErrorActionPreference

@@ -246,6 +246,13 @@ impl Bools {
     /// `Bools` found out and adds what it finds. The answer is the one
     /// `meet` gives.
     pub fn meet_seen(&self, all: &[(Bool, bool)], seen: &mut Meets) -> bool {
+        if crate::emit::meet::enabled() {
+            return crate::emit::meet::pruned(all, |all| {
+                let mut budget = MAX_MEET;
+                let mut work = all.iter().map(|&(b, holds)| b.0 << 1 | u32::from(holds)).collect();
+                (self.meet_in(0, &mut work, &mut budget, seen), budget)
+            });
+        }
         self.meet_within(all, MAX_MEET, seen)
     }
 
@@ -1573,6 +1580,39 @@ mod tests {
                 .collect();
             meet_anew(b, next, budget)
         })
+    }
+
+    #[test]
+    fn a_search_that_gives_up_finds_no_lane_without_the_large_condition() {
+        // `big`, x0 y0 + x1 y1 + .. over the x's before the y's, has 2^17
+        // ways to be decided; `inner` is `outer` and one more mask. Meeting
+        // `big`, `inner` and not `outer` runs out of case splits and says
+        // yes; `VICTORY_MEET_PRUNE` asks again without `big`: no lane. A
+        // mask asked to hold and not to hold meets no lane unsearched.
+        let mut b = Bools::new();
+        let xs: Vec<Bool> = (0..17).map(|i| b.atom(Atom::Constant(i + 2), 0)).collect();
+        let ys: Vec<Bool> = (0..17).map(|i| b.atom(Atom::Constant(i + 19), 0)).collect();
+        let mut big = Bool::FALSE;
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let both = b.and(x, y);
+            big = b.or(big, both);
+        }
+        let outer = b.atom(Atom::Constant(40), 0);
+        let more = b.atom(Atom::Constant(41), 0);
+        let inner = b.and(outer, more);
+        let all = [(big, true), (inner, true), (outer, false)];
+        let held = [(big, true), (inner, true), (inner, false)];
+        let old = crate::emit::meet::TEST_PRUNE.get();
+        crate::emit::meet::TEST_PRUNE.set(Some(false));
+        assert!(b.meet(&all), "the plain search gives up");
+        assert!(b.meet(&held));
+        assert!(b.meet(&[(big, true), (inner, true)]));
+        crate::emit::meet::TEST_PRUNE.set(Some(true));
+        assert!(!b.meet(&all));
+        assert!(!b.meet(&held));
+        assert!(b.meet(&[(big, true), (inner, true)]));
+        assert!(b.meet(&[(big, true), (inner, false), (outer, true)]));
+        crate::emit::meet::TEST_PRUNE.set(old);
     }
 
     #[test]

@@ -17,6 +17,11 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+#[path = "host_launch.rs"]
+mod launch;
+pub(crate) use launch::Launch;
+mod state_bytes;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -337,6 +342,9 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// A mesh pipeline's second host pipeline, with the launch stage
+    /// (`VICTORY_MESH_LAUNCH=1`, `crate::launch`).
+    pub(crate) launch: Option<Launch>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -571,8 +579,20 @@ impl HostPipeline {
             && bound
                 .iter()
                 .any(|s| crate::draw::BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        // (fxceless/victory-fork b1d777a) The launch stage's parameters after the
+        // translated stages' (five root words); without them if over the limit.
+        let mut launch_roots = (mesh.is_some() && crate::launch::on()).then(|| launch::add_params(&mut params));
+        let made = match (root_signature(&host.device, &params, &samplers, compute.is_some()), launch_roots) {
+            (Err(e), Some([first, ..])) => {
+                tracing::warn!(error = %e, ?shaders, "host root signature refused with the launch stage's parameters: made without");
+                params.truncate(first as usize);
+                launch_roots = None;
+                root_signature(&host.device, &params, &samplers, compute.is_some())
+            }
+            (made, _) => made,
+        };
         let (root, root_blob) =
-            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+            match made {
                 Ok(root) => root,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -643,6 +663,7 @@ impl HostPipeline {
                 rects: false,
                 is_bake: false,
                 state: String::new(),
+                launch: None,
             });
         }
         let Some(g) = g else {
@@ -696,7 +717,10 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            let launch = launch_roots.and_then(|roots| {
+                launch::make(&host.device, &root, &root_blob, code(0), code(1), g, depth_bounds, roots, &shaders)
+            });
+            tracing::info!(?shaders, launched = launch.is_some(), "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -712,6 +736,7 @@ impl HostPipeline {
                 rects: false,
                 is_bake,
                 state: state_summary(g, depth_bounds),
+                launch,
             });
         }
 
@@ -837,6 +862,7 @@ impl HostPipeline {
             rects: rect_gs.is_some(),
             is_bake,
             state: state_summary(g, depth_bounds),
+            launch: None,
         })
     }
 }
@@ -1150,6 +1176,9 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        // The host first sees different static samplers in the same order
+        // in every launch (`super::samplers`, VICTORY_SAMPLER_ORDER).
+        super::samplers::before(device, samplers, super::library::dir());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }

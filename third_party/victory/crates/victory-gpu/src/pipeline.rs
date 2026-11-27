@@ -258,7 +258,7 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        let done = self.translated
             .get_or_init(|| {
                 let _hitch = crate::hitch::span(crate::hitch::Phase::ShaderTranslate);
                 let done = translate(&self.container);
@@ -299,17 +299,34 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        name = program_name(&self.container).unwrap_or("?"),
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
+                    #[cfg(windows)]
+                    Err(e) if translate_ahead::on_ahead_thread() => translate_ahead::refused_ahead(
+                        self,
+                        program_name(&self.container).unwrap_or("?"),
+                        e,
                     ),
+                    Err(e) => self.log_refused(e),
                 }
                 done.ok()
-            })
-            .as_ref()
+            });
+        let done = done.as_ref();
+        // (bootfast) Refused ahead (`VICTORY_TRANSLATE_AHEAD`) and now
+        // needed: reported as a refusal, as it would have been here.
+        #[cfg(windows)]
+        if done.is_none() && !translate_ahead::on_ahead_thread() && translate_ahead::needed(self) {
+            self.log_refused("does not translate (refused ahead)");
+        }
+        done
+    }
+
+    fn log_refused(&self, error: &str) {
+        tracing::warn!(
+            stage = self.stage,
+            hash = %self.hash,
+            name = program_name(&self.container).unwrap_or("?"),
+            error = %error,
+            "shader does not translate; its pipelines' draws are dropped"
+        );
     }
 }
 
@@ -783,8 +800,8 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
 }
 
 /// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// pixel 4567..]` (diagnostics, `crate::drop_why`); "no pipeline" for none.
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".to_owned();
@@ -1049,6 +1066,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    translate_ahead::ahead(&shaders);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -1273,7 +1292,15 @@ mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+pub(crate) mod samplers;
+#[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod recipe;
+#[cfg(windows)]
+pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
+#[cfg(windows)]
+mod translate_ahead;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

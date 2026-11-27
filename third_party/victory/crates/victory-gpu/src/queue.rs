@@ -279,6 +279,24 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::trace_va::submit(
+        this as usize,
+        queue(this).kind as u32,
+        &lists
+            .iter()
+            .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+            .collect::<Vec<_>>(),
+    );
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -366,6 +384,24 @@ fn submit_split(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::trace_va::submit(
+        this as usize,
+        queue(this).kind as u32,
+        &lists
+            .iter()
+            .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+            .collect::<Vec<_>>(),
+    );
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -578,6 +614,7 @@ pub(crate) fn release_held(all: bool) {
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
+                            let (lists, order) = take_along(&mut held, lists, order);
                             // Not waited for: the host keeps the lists
                             // until they are settled.
                             if async_submit() {
@@ -638,6 +675,52 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// (feedcard) `VICTORY_MERGE_SUBMISSIONS=1`: the submissions right behind this one in its
+/// queue's line that may go to the card with it, taken out of `held` and put behind it
+/// ([`crate::merge_runs`]).
+#[cfg(windows)]
+fn take_along(
+    held: &mut Vec<Held>,
+    mut lists: Vec<crate::list::Detached>,
+    mut order: Vec<usize>,
+) -> (Vec<crate::list::Detached>, Vec<usize>) {
+    use crate::merge_runs::Next;
+    if !crate::merge_runs::on() || held.is_empty() {
+        return (lists, order);
+    }
+    let mut refused = false;
+    let taken = {
+        let mut runs: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        crate::merge_runs::take(
+            order.len(),
+            held.iter().map(|h| match h {
+                Held::Wait(fence, value) if crate::fence::completed(fence.as_this()) >= *value => Next::Met,
+                Held::Value(wait) if wait.met() => Next::Met,
+                Held::Wait(..) | Held::Value(_) | Held::Signal(..) => Next::Stop,
+                Held::Run(more, more_order) => {
+                    let after: Vec<&crate::host::HostList> = more_order.iter().map(|&i| more[i].host()).collect();
+                    if crate::host::joinable(&runs, &after) {
+                        runs.extend(after);
+                        Next::Run(more_order.len())
+                    } else {
+                        refused = true;
+                        Next::Refused
+                    }
+                }
+            }),
+        )
+    };
+    let mut along = 0;
+    for h in held.drain(..taken) {
+        if let Held::Run(more, more_order) = h {
+            crate::merge_runs::join(&mut lists, &mut order, more, more_order);
+            along += 1;
+        }
+    }
+    crate::merge_runs::gathered(along, refused);
+    (lists, order)
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -734,6 +817,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    #[cfg(windows)]
+    crate::timeline::title_submit();
     let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
@@ -767,6 +852,26 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let (taken, order) = crate::list::detach(lists);
             Held::Run(taken, order)
         });
+        #[cfg(windows)]
+        if crate::bake_watch::on() {
+            crate::bake_watch::submit(
+                &lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            crate::trace_va::submit(
+                this as usize,
+                queue(this).kind as u32,
+                &lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                    .collect::<Vec<_>>(),
+            );
+        }
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
         #[cfg(feature = "diagnostics")]
@@ -1208,6 +1313,7 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    let map_const = crate::resource::constant_page_mapper();
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1223,18 +1329,63 @@ extern "system" fn copy_page_mappings(
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
+        let mut i = 0;
+        while i < ranges.len() {
+            let r = &ranges[i];
+            let inside =
+                |start: u32, pages: u32| start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let mut pages = r.count;
+            let mut next = i + 1;
+            match r.kind {
+                0 => {
+                    let len = u64::from(pages) * PAGE;
+                    let source = pool + u64::from(r.start) * PAGE;
+                    ok &= inside(r.start, pages) && map(at, source, len);
+                    at += len;
+                }
+                1 => {
+                    while next < ranges.len()
+                        && ranges[next].kind == 1
+                        && ranges[next].start == r.start
+                        && pages.checked_add(ranges[next].count).is_some()
+                    {
+                        pages += ranges[next].count;
+                        next += 1;
+                    }
+                    let len = u64::from(pages) * PAGE;
+                    let source = pool + u64::from(r.start) * PAGE;
+                    ok &= if inside(r.start, 1) {
+                        if let Some(fill) = map_const {
+                            fill(at, source, len)
+                        } else {
+                            (0..u64::from(pages)).all(|k| map(at + k * PAGE, source, PAGE))
+                        }
+                    } else {
+                        false
+                    };
+                    at += len;
+                }
+                2 => {
+                    while next < ranges.len()
+                        && ranges[next].kind == 2
+                        && pages.checked_add(ranges[next].count).is_some()
+                    {
+                        pages += ranges[next].count;
+                        next += 1;
+                    }
+                    let len = u64::from(pages) * PAGE;
+                    ok &= map(at, 0, len);
+                    at += len;
+                }
+                3 => {
+                    at += u64::from(pages) * PAGE;
+                }
+                _ => {
+                    ok = false;
+                    at += u64::from(pages) * PAGE;
+                }
+            }
+            i = next;
         }
     }
     if !ok {

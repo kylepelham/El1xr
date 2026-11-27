@@ -382,6 +382,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     // Magenta (green far below red and blue) is what the probes' memory held, not light.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+#ifdef VIOLET
+    // And the bluer kind of it (blue over 2.5x green and over red), which the line above
+    // leaves as a faint violet (readmet3xt-lab/foxhound 9f8838b109: a purple-blue glow on a
+    // lit sheet of paper in the prison cell, RTX 5080). The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
+#endif
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -413,10 +420,18 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
+/// Whether bluish-violet probe leftovers are dropped from the title's light too
+/// (`VICTORY_AMBIENT_VIOLET=1`; off by default: only the magenta kind is).
+fn violet() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_VIOLET").is_ok_and(|v| v.trim() == "1"))
+}
+
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let violet = if violet() { "#define VIOLET\n" } else { "" };
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n{violet}{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -607,6 +622,16 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// `VICTORY_AMBIENT_VIOLET=1`'s form of the light-raising pass compiles, and differs.
+    #[test]
+    fn the_violet_drop_compiles() {
+        let raise = |violet: &str| {
+            crate::host::compile(&format!("#define RAISE\n{violet}{SOURCE}"), s!("raise"), s!("cs_5_1"))
+                .expect("the raising pass")
+        };
+        assert_ne!(raise(""), raise("#define VIOLET\n"));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
