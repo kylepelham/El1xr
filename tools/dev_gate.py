@@ -5,6 +5,12 @@ builds in parallel and holds its directory lock). Then the test binaries run dir
 cargo, side by side with `cargo xtask policy` and pytest. Binaries in `SERIAL_BINARIES` share
 process-wide state between their tests (the write-watch tables, guarded pages, the lazy
 copy-back switch) and run with one test thread; the other binaries use the default.
+
+Binaries in `SHARDED_BINARIES` run as several processes of one test thread each, every test in
+exactly one of them. `victory_shader`'s GPU tests take one process-wide lock and create a D3D12
+device each; with libtest's default 32 threads in one process the binary took 497-850 s here
+(and timed out at 900 s in one gate), against 60 s on one thread and 24-28 s as 6-8 processes of
+one thread (measured 2026-11-27 with other jobs building).
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SERIAL_BINARIES = frozenset({"victory_gpu"})
+SHARDED_BINARIES = {"victory_shader": 6}
+MAX_SHARD_ARGS_CHARS = 24_000  # Windows command lines end at 32,767 characters
 STEP_TIMEOUT_S = 900.0
 CARGO_RESULT_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+) passed;\s*(\d+) failed;")
 PYTEST_COUNT_RE = re.compile(r"\b(\d+) (passed|failed|error|errors)\b")
@@ -136,11 +144,45 @@ def build(manifest: Path, crate: str | None) -> Build:
     return Build(ok, time.monotonic() - t0, binaries, warnings, log)
 
 
+def list_tests(exe: str, cwd: Path) -> list[str] | None:
+    """The test names of a libtest binary (`--list`, ignored ones included), or None if it cannot
+    list them."""
+    try:
+        proc = subprocess.run(
+            [exe, "--list"], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return sorted(line[: -len(": test")] for line in proc.stdout.splitlines() if line.endswith(": test"))
+
+
+def shards(names: list[str], count: int) -> list[list[str]]:
+    """`names` dealt round robin into `count` non-empty groups (more when a group's command line
+    would grow too long), so the neighbouring tests of one slow module spread out."""
+    total = sum(len(n) + 3 for n in names)
+    count = max(count, -(-total // MAX_SHARD_ARGS_CHARS))
+    count = max(1, min(count, len(names)))
+    return [names[i::count] for i in range(count)]
+
+
+def cargo_steps(label: str, exe: str, victory_dir: Path) -> list[Step]:
+    if label in SERIAL_BINARIES:
+        return [Step(label, [exe, "--test-threads=1"], victory_dir, "cargo")]
+    if label in SHARDED_BINARIES:
+        names = list_tests(exe, victory_dir)
+        if names:
+            return [
+                Step(f"{label}#{i + 1}", [exe, "--test-threads=1", "--exact", *group], victory_dir, "cargo")
+                for i, group in enumerate(shards(names, SHARDED_BINARIES[label]))
+            ]
+    return [Step(label, [exe], victory_dir, "cargo")]
+
+
 def plan(b: Build, victory_dir: Path, repo_root: Path, python: str) -> list[Step]:
-    steps = [
-        Step(label, [exe, *(["--test-threads=1"] if label in SERIAL_BINARIES else [])], victory_dir, "cargo")
-        for label, exe in b.binaries
-    ]
+    steps = [step for label, exe in b.binaries for step in cargo_steps(label, exe, victory_dir)]
     steps.append(Step("policy", ["cargo", "xtask", "policy"], victory_dir, "policy"))
     steps.append(Step("pytest", [python, "-m", "pytest", "-q"], repo_root, "pytest"))
     return steps
@@ -175,11 +217,19 @@ def run_all(steps: list[Step]) -> list[Step]:
         return list(pool.map(run_step, steps))
 
 
+def _shown(cmd: list[str]) -> str:
+    """A command for the log, a shard's test names counted rather than listed."""
+    if "--exact" in cmd:
+        at = cmd.index("--exact") + 1
+        return " ".join(cmd[:at]) + f" <{len(cmd) - at} tests>"
+    return " ".join(cmd)
+
+
 def write_log(path: Path, b: Build, steps: list[Step]) -> None:
     with path.open("w", encoding="utf-8", errors="replace") as logf:
         logf.write(b.log)
         for s in steps:
-            logf.write(f"=== {s.label}: {' '.join(s.cmd)} (cwd={s.cwd}) ===\n{s.output}")
+            logf.write(f"=== {s.label}: {_shown(s.cmd)} (cwd={s.cwd}) ===\n{s.output}")
             if s.output and not s.output.endswith("\n"):
                 logf.write("\n")
             logf.write(f"--- {s.label} {'ok' if s.ok else 'FAIL'} secs={s.secs:.1f} ---\n")

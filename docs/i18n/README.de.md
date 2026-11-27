@@ -128,7 +128,7 @@ Ziel sind stabile 30 fps in 4K auf der RTX 5090, danach keine Ruckler und keine 
 
 | Zahl | Was |
 |---|---|
-| 1600+ automatisierte Tests | Python-Werkzeuge und Rust-Crates, ausgeführt von `dev.py gate` |
+| 1700+ automatisierte Tests | Python-Werkzeuge und Rust-Crates, ausgeführt von `dev.py gate` |
 | 26.148 Shader-Programme | von RDNA 2 nach DXIL übersetzt, auf der Festplatte zwischengespeichert |
 | 0 abgelehnte Pipelines | auf der RTX 5090 |
 
