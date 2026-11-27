@@ -547,6 +547,10 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each page is shown, by section and index in it.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Placeholders left by [`unmap`], address and length, each exactly
+    /// what a view took ([`lean`]). The title may have joined or freed one
+    /// since: mapping over it then fails and the placeholder is split first.
+    holes: BTreeMap<usize, usize>,
 }
 
 impl Physical {
@@ -1167,6 +1171,12 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
             _ => {}
         }
     }
+    if let Some(pages) = pages.filter(|_| remap_keep()) {
+        if let Some(unknown) = pages[..n].iter().find(|page| !physical.pages.contains_key(page)) {
+            tracing::warn!(page = unknown, "XMemMapPhysicalPages: unknown page, nothing changed");
+            return false;
+        }
+    }
     let _changing = changing(physical, base, n * PAGE);
     unmap(physical, base, n * PAGE);
     let Some(pages) = pages else {
@@ -1224,6 +1234,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let want = |i: usize| pages.map(|p| p[i]).filter(|&p| p != 0);
+    lift_thread();
     let _call = Call::begin();
     let mut physical = physical();
     let mut i = 0;
@@ -1370,9 +1381,10 @@ fn scatter_runs() -> bool {
 }
 
 /// Since the last line ([`work_line`]): pages of scatters handled as runs,
-/// those runs, views mapped without splitting a placeholder, and views
-/// mapped without committing (their pages committed already).
-static SCATTER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// those runs, views mapped without splitting a placeholder, views
+/// mapped without committing (their pages committed already), and maps
+/// over a placeholder that failed (it was split, and mapped again).
+static SCATTER: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
@@ -1381,6 +1393,7 @@ static SCATTER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    lift_thread();
     let _call = Call::begin();
     let mut physical = physical();
     WORK[4].fetch_add((len / PAGE) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1564,6 +1577,62 @@ fn remap_same() -> u8 {
     })
 }
 
+/// Whether a view is mapped straight over a placeholder only where
+/// [`unmap`] left one of exactly its size, else after splitting one
+/// (`VICTORY_MAP_LEAN=1`; off: a map is tried first everywhere, and where it
+/// fails, the placeholder is split and the map tried again). Committed pages
+/// are not committed again either way.
+fn lean() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::FORCE.with(|f| f.get()[0]) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_LEAN").is_some_and(|v| v == "1"))
+}
+
+/// Whether [`XMemMapPhysicalPages`] looks at every page number before it
+/// takes away what is mapped (`VICTORY_REMAP_KEEP=1`, after fxceless #1460):
+/// one it does not know fails the call with the old pages still mapped, as
+/// the title expects of a remap that failed. Off: what was mapped is gone,
+/// and the pages before the unknown one are mapped.
+fn remap_keep() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::FORCE.with(|f| f.get()[1]) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// Lifts the calling thread above normal priority if it is below normal,
+/// once per thread (`VICTORY_STREAM_PRIORITY=1`, after cool_fox 49d71266b2).
+/// Called where the title's streaming thread scatters pages and copies page
+/// mappings: that thread runs below normal, and every mapping call it makes
+/// waits for the process's address-space lock behind our guards' and the
+/// driver's protection changes, so loading waits on it.
+fn lift_thread() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    thread_local!(static LOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if LOOKED.with(|l| l.replace(true)) {
+        return;
+    }
+    // SAFETY: plain calls on this thread's pseudo handle.
+    unsafe {
+        let thread = GetCurrentThread();
+        let was = GetThreadPriority(thread);
+        if matches!(was, -2..0) && SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) != 0 {
+            tracing::info!(was, "a title thread that maps pages lifted above normal priority (VICTORY_STREAM_PRIORITY=1)");
+        }
+    }
+}
+
 /// Whether `[base, base + pages)` shows `pages` already, page for page.
 fn shows(physical: &Physical, base: usize, pages: &[usize]) -> bool {
     pages.iter().enumerate().all(|(i, page)| {
@@ -1626,10 +1695,10 @@ fn work_line() {
     }
     *last = Some(now);
     let w = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| WORK[i].swap(0, Relaxed));
-    let s = [0, 1, 2, 3].map(|i| SCATTER[i].swap(0, Relaxed));
+    let s = [0, 1, 2, 3, 4].map(|i| SCATTER[i].swap(0, Relaxed));
     let split = SPLITS.swap(0, Relaxed);
     tracing::info!(
-        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already); scatters: {:.0} pages in {:.0} runs; {:.0} views mapped without placeholder split, {:.0} without commit, {split} views split",
+        "title memory remapped, a second over {secs:.0} s: {:.0} views taken away in {:.1} ms, {:.0} made in {:.1} ms; {:.0} calls of the title, {:.1} ms in them; pages asked for: {:.0} mapped or unmapped ({:.0} of them there already, {:.0} of nothing unmapped: nothing done), {:.0} of copied mappings ({:.0} there already); scatters: {:.0} pages in {:.0} runs; {:.0} views mapped without placeholder split, {:.0} without commit, {:.0} failed first maps, {split} views split",
         w[0] as f64 / secs,
         w[1] as f64 / 1e3 / secs,
         w[2] as f64 / secs,
@@ -1645,6 +1714,7 @@ fn work_line() {
         s[1] as f64 / secs,
         s[2] as f64 / secs,
         s[3] as f64 / secs,
+        s[4] as f64 / secs,
     );
 }
 
@@ -1795,10 +1865,25 @@ fn map_view(
             0,
         )
     };
-    let mut view = map_once();
+    // `lean`: a map over a placeholder that is not exactly the range is
+    // a kernel call that fails, so it is tried only over one [`unmap`] left.
+    let own = physical.holes.remove(&base) == Some(len);
+    // Those inside are mapped over now.
+    let inside: Vec<usize> = physical.holes.range(base + 1..base + len).map(|(&at, _)| at).collect();
+    for at in inside {
+        physical.holes.remove(&at);
+    }
+    let mut view = if own || !lean() {
+        map_once()
+    } else {
+        MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() }
+    };
     if view.Value as usize == base {
         SCATTER[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
+        if own || !lean() {
+            SCATTER[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // SAFETY: acts only on placeholders; fails harmlessly when the
         // range is a whole placeholder or spans several.
         unsafe {
@@ -1951,7 +2036,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         }
         let taken = std::time::Instant::now();
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let gone = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1971,6 +2056,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map_again(physical, end, at + size - end, Slice { index, ..slice });
+        }
+        // What is taken away is a placeholder of its own now: cut off the
+        // view's placeholder by mapping what stays of it again.
+        if gone != 0 && lean() {
+            let (lo, hi) = (base.max(at), end.min(at + size));
+            physical.holes.insert(lo, hi - lo);
         }
     }
 }
@@ -2118,6 +2209,102 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// This thread's [`lean`] and [`remap_keep`], when set.
+        pub(super) static FORCE: std::cell::Cell<[Option<bool>; 2]> =
+            const { std::cell::Cell::new([None; 2]) };
+    }
+
+    /// Pages keep what they hold however often they are mapped, moved and
+    /// unmapped with `VICTORY_MAP_LEAN=1`, also after the title joins the
+    /// placeholders that unmapping left (the next map over one fails and is
+    /// tried again after a split), and in runs of several pages.
+    #[test]
+    fn lean_maps_keep_what_pages_hold() {
+        FORCE.with(|f| f.set([Some(true), None]));
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 8 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        for round in 0..6_usize {
+            for (k, page) in pages.iter().enumerate() {
+                let to = at((round + 2 * k) % 8);
+                assert_eq!(XMemMapPhysicalPages(to, 1, page), to);
+                assert!(!physical().holes.contains_key(&(to as usize)));
+                let first = to.cast::<u64>();
+                // SAFETY: mapped read-write; the far end of the page too.
+                unsafe {
+                    if round > 0 {
+                        assert_eq!(first.read(), (round * 16 + k - 16) as u64);
+                        assert_eq!(first.add(PAGE / 8 - 1).read(), k as u64);
+                    }
+                    first.write((round * 16 + k) as u64);
+                    first.add(PAGE / 8 - 1).write(k as u64);
+                }
+            }
+            for k in 0..pages.len() {
+                let to = at((round + 2 * k) % 8);
+                assert_eq!(XMemMapPhysicalPages(to, 1, std::ptr::null()), to);
+                assert_eq!(query(to).host.State, MEM_RESERVE);
+                assert_eq!(physical().holes.get(&(to as usize)), Some(&PAGE));
+            }
+            if round == 3 {
+                // SAFETY: placeholders of ours, nothing mapped in them.
+                unsafe { VirtualFree(a, 8 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */) };
+            }
+        }
+        // A run of three as one view, over placeholders the title joined;
+        // its middle page taken away leaves a hole of one page, and both
+        // ends stay.
+        // SAFETY: placeholders of ours, nothing mapped in them.
+        unsafe { VirtualFree(a, 8 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */) };
+        assert_eq!(XMemMapPhysicalPages(at(0), 3, pages.as_ptr()), at(0));
+        // SAFETY: mapped read-write.
+        unsafe { at(2).cast::<u64>().write(99) };
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
+        assert_eq!(physical().holes.get(&(at(1) as usize)), Some(&PAGE));
+        assert_eq!(query(at(0)).host.State, MEM_COMMIT);
+        // SAFETY: still mapped read-write.
+        assert_eq!(unsafe { at(2).cast::<u64>().read() }, 99);
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, &pages[1]), at(1));
+        assert_eq!(XMemMapPhysicalPages(at(0), 3, std::ptr::null()), at(0));
+        // Each page a view of its own then, and a placeholder of its own now.
+        assert!((0..3).all(|k| physical().holes.get(&(at(k) as usize)) == Some(&PAGE)));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        FORCE.with(|f| f.set([None; 2]));
+    }
+
+    /// With `VICTORY_REMAP_KEEP=1` a remap that cannot serve every page
+    /// number leaves the title's memory as it was: the pages it showed stay
+    /// mapped, with their bytes (fxceless #1460).
+    #[test]
+    fn a_remap_with_an_unknown_page_leaves_the_pages_it_showed() {
+        FORCE.with(|f| f.set([None, Some(true)]));
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: both pages are mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(0x5a);
+            a.wrapping_byte_add(PAGE).cast::<u8>().write(0xa5);
+        }
+        // Another page in the list that is no physical page.
+        let other = allocate(1);
+        assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
+        assert!(XMemMapPhysicalPages(a, 2, [pages[1], other[0]].as_ptr()).is_null());
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(query(a.wrapping_byte_add(PAGE)).host.State, MEM_COMMIT);
+        // SAFETY: both pages are still the ones mapped above.
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 0x5a);
+            assert_eq!(a.wrapping_byte_add(PAGE).cast::<u8>().read(), 0xa5);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        FORCE.with(|f| f.set([None; 2]));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
