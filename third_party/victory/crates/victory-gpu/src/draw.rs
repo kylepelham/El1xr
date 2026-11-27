@@ -3754,7 +3754,6 @@ impl State {
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
-        list.mark_uav_dirty();
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -4121,7 +4120,6 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
-                    list.mark_uav_dirty();
                     #[cfg(feature = "diagnostics")]
                     self.check_rtv_formats(
                         crate::pipeline::host_pipeline(self.pipeline as This),
@@ -4781,7 +4779,6 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             self.check_rtv_formats(
                 crate::pipeline::host_pipeline(self.pipeline as This),
@@ -4895,7 +4892,6 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             self.check_rtv_formats(
                 crate::pipeline::host_pipeline(self.pipeline as This),
@@ -5136,7 +5132,6 @@ impl State {
                     0,
                 )
             };
-            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             self.check_rtv_formats(Some(p), "ExecuteIndirect");
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -5237,7 +5232,6 @@ impl State {
                     counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
                 )
             };
-            list.mark_uav_dirty();
             if kind == MESH {
                 self.mesh_scissor(list, false);
             }
@@ -5302,7 +5296,6 @@ impl State {
                     list.list
                         .ExecuteIndirect(signature, 1, &slots, at, None::<&ID3D12Resource>, 0)
                 };
-                list.mark_uav_dirty();
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
@@ -5489,7 +5482,6 @@ impl State {
                 )
             }
         };
-        list.mark_uav_dirty();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

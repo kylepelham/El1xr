@@ -880,11 +880,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 {
-                self.masks
-            } else {
-                Map::default()
-            },
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -1042,7 +1038,9 @@ impl<'a> Lanes<'a> {
         // the same `s_*_wrexec_*` instruction hold the same mask on every
         // iteration (e.g. `s_andn2_wrexec_b64` in waterfall loops). Sharing
         // one `Atom::Phi` lets downstream proofs see `saved == EXEC`.
-        if let Some((same_id, same_derived)) = self.matching_phi_join(block, &args) {
+        if crate::emit::wave_collapse()
+            && let Some((same_id, same_derived)) = self.matching_phi_join(block, &args)
+        {
             let born = self.index[block];
             return Some((
                 self.b.atom(Atom::Phi(same_id), born),

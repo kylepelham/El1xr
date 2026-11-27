@@ -2491,8 +2491,10 @@ fn guarded_readfirstlane_in_halves_mode_runs_correctly_and_halves_barriers() {
     let native = native_with(&w, true, 64, 0);
     let old_wave = lower::TEST_HOST_WAVE.replace(Some(32));
     let old_pairs = super::TEST_PAIRS.replace(Some(false));
+    let old_collapse = super::TEST_COLLAPSE.replace(Some(true));
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
     let res = lowered(&native, &p, &HashSet::new());
+    super::TEST_COLLAPSE.set(old_collapse);
     super::TEST_PAIRS.set(old_pairs);
     lower::TEST_HOST_WAVE.set(old_wave);
     let shader = res.expect("guarded readfirstlane halves shader should lower");

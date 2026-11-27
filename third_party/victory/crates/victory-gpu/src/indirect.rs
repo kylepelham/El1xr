@@ -289,20 +289,9 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, (dst, from)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let pre_uav = list.take_uav_dirty();
     recorded(
         list,
-        record_clamp_as(
-            c,
-            &list.list,
-            (&dst, from),
-            budget,
-            src,
-            count,
-            spec,
-            0,
-            pre_uav,
-        ),
+        record_clamp_as(c, &list.list, (&dst, from), budget, src, count, spec, 0),
         dst,
     )
 }
@@ -312,7 +301,6 @@ pub(crate) fn bound(
 fn recorded(list: &HostList, recorded: bool, dst: ID3D12Resource) -> Option<ID3D12Resource> {
     recorded.then(|| {
         list.indirect_readable();
-        list.mark_uav_dirty();
         dst
     })
 }
@@ -334,20 +322,9 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, (dst, from)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let pre_uav = list.take_uav_dirty();
     recorded(
         list,
-        record_clamp_as(
-            c,
-            &list.list,
-            (&dst, from),
-            budget,
-            src,
-            None,
-            spec,
-            AHEAD,
-            pre_uav,
-        ),
+        record_clamp_as(c, &list.list, (&dst, from), budget, src, None, spec, AHEAD),
         dst,
     )
 }
@@ -575,9 +552,7 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Re
     unsafe {
         std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), ptr, table.len() * 8);
         let l = &list.list;
-        if list.take_uav_dirty() {
-            l.ResourceBarrier(&[uav_barrier()]);
-        }
+        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 1, (&raw const n).cast(), 0);
@@ -586,7 +561,6 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Re
         l.SetComputeRootUnorderedAccessView(3, budget);
         l.Dispatch(n.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[uav_barrier()]);
-        list.clear_uav_dirty();
     }
     list.with_san(|s| {
         s.passed.insert(args.id(), seq);
@@ -618,7 +592,6 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let (dst, from) = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    let pre_uav = list.take_uav_dirty();
     recorded(
         list,
         record_clamp_as(
@@ -630,7 +603,6 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
             None,
             spec,
             IN_PARTS,
-            pre_uav,
         ),
         dst,
     )
@@ -660,7 +632,6 @@ fn record_clamp(
         count,
         spec,
         0,
-        true,
     )
 }
 
@@ -680,7 +651,6 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     how: u32,
-    pre_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -751,19 +721,18 @@ fn record_clamp_as(
         uav_barrier(),
         transition(dst, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    // `dst` transitions from UNORDERED_ACCESS to INDIRECT_ARGUMENT, which
-    // already synchronises our clamp writes to `dst` for ExecuteIndirect;
-    // `budget` is only read by our own next clamp/sanitizer pass (which waits
-    // before reading it), so no global UAV barrier is needed after the clamp.
-    let second = [transition(
-        dst,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    )];
-    let skip_first = usize::from(!(waits && pre_uav));
+    let second = [
+        uav_barrier(),
+        transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
+    let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip_first..]);
+        l.ResourceBarrier(&first[skip..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -774,7 +743,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second);
+        l.ResourceBarrier(&second[skip..]);
     }
     true
 }
@@ -830,7 +799,7 @@ pub(crate) fn record_ahead(
         return;
     }
     let mut first = vec![uav_barrier()];
-    let mut second = Vec::with_capacity(used);
+    let mut second = vec![uav_barrier()];
     for (buffer, argument) in &chunks[..used] {
         let from = if *argument {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
@@ -899,15 +868,6 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
-}
-
-/// `VICTORY_UAV_ELIDE` (on unless `0`): a wait for every earlier shader
-/// write (ours before a clamp, sanitize or card copy, and the title's barrier
-/// groups) is left out when the list recorded no draw or dispatch since the
-/// last such wait. `0` waits every time, as before.
-pub(crate) fn uav_elide() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_ELIDE").is_none_or(|v| v != "0"))
 }
 
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1815,7 +1775,6 @@ void main() {
                 None,
                 (2, 12, 1),
                 IN_PARTS,
-                true,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list and live buffers.
@@ -1872,7 +1831,6 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 if ahead { AHEAD } else { 0 },
-                true,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

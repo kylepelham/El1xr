@@ -1998,15 +1998,7 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| {
-            if !self.meet(lanes, conditions) {
-                return false;
-            }
-            let mut with_reach = Vec::with_capacity(conditions.len() + 1);
-            with_reach.push(reach);
-            with_reach.extend_from_slice(conditions);
-            self.meet(lanes, &with_reach)
-        };
+        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2065,7 +2057,7 @@ impl<'a> Tracer<'a> {
                 else {
                     continue;
                 };
-                if meet(&[(selected, true), (matched, false)]) {
+                if meet(&[reach, (selected, true), (matched, false)]) {
                     continue;
                 }
                 required.push((matched, true));
@@ -2078,20 +2070,20 @@ impl<'a> Tracer<'a> {
             }
         }
         if reads.iter().any(|v| !out.reads.contains(v))
-            || meet(&[(selected, true), (remaining, false)])
+            || meet(&[reach, (selected, true), (remaining, false)])
         {
             return Err(SELECT);
         }
         // The access must take every match.
-        required.push((selected, false));
+        required.extend([reach, (selected, false)]);
         if meet(&required) {
             return Err(SELECT);
         }
         // The retry must keep exactly the lanes that were eligible but did
         // not perform the access.
-        if meet(&[(retry, true), (remaining, false)])
-            || meet(&[(retry, true), (selected, true)])
-            || meet(&[(remaining, true), (selected, false), (retry, false)])
+        if meet(&[reach, (retry, true), (remaining, false)])
+            || meet(&[reach, (retry, true), (selected, true)])
+            || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
         {
             return Err(RETRY);
         }
@@ -3220,7 +3212,13 @@ pub(crate) mod tests {
         // (index 14), without a skip branch, forcing EXEC and s21 to be loop
         // phis rather than Bool::TRUE.
         words.insert(14, 0x7DA8_0094); // v_cmpx_gt_u32 exec_lo, 20, v0
-        let r = waterfall(&words, false).unwrap();
+        let old = crate::emit::TEST_COLLAPSE.replace(Some(false));
+        let off = waterfall(&words, false).unwrap();
+        crate::emit::TEST_COLLAPSE.set(Some(true));
+        let r = waterfall(&words, false);
+        crate::emit::TEST_COLLAPSE.set(old);
+        assert!(off.waterfall.compares.is_empty(), "VICTORY_WAVE_COLLAPSE off: no waterfall");
+        let r = r.unwrap();
         let image = r
             .descriptors
             .iter()

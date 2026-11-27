@@ -1000,11 +1000,6 @@ pub(crate) struct HostList {
     /// a draw/dispatch) since its last reset, so submitting it needs
     /// `descriptor::sync_heaps` and `make_waiting`.
     uses_heaps: std::sync::atomic::AtomicBool,
-    /// Whether a shader write may be pending on this list without a global
-    /// UAV barrier after it. Starts `true` after reset (earlier lists in the
-    /// same `ExecuteCommandLists` batch may have pending UAV writes), becomes
-    /// `false` after a global UAV barrier, and `true` after any draw/dispatch.
-    uav_dirty: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1145,9 +1140,7 @@ unsafe impl Sync for PlanePass {}
 fn plane_pass() -> Option<&'static PlanePass> {
     static PASS: OnceLock<PlanePass> = OnceLock::new();
     host()?;
-    Some(PASS.get_or_init(|| PlanePass {
-        made: Mutex::default(),
-    }))
+    Some(PASS.get_or_init(|| PlanePass { made: Mutex::default() }))
 }
 
 /// Views of present planes drawn over the first one ([`Host::present`]): a
@@ -1428,7 +1421,11 @@ impl PlanePass {
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
-fn record_plane_pass(owner: &HostList, depth: &ID3D12Resource, plane: &ID3D12Resource) {
+fn record_plane_pass(
+    owner: &HostList,
+    depth: &ID3D12Resource,
+    plane: &ID3D12Resource,
+) {
     let list = &owner.list;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
@@ -1455,13 +1452,12 @@ fn record_plane_pass(owner: &HostList, depth: &ID3D12Resource, plane: &ID3D12Res
     // SAFETY: plain heap creation. One view per subresource, and the list
     // keeps the heap until its reset, through every submission of it.
     let views: ID3D12DescriptorHeap = match unsafe {
-        host.device
-            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: kind,
-                NumDescriptors: count,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                NodeMask: 0,
-            })
+        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
     } {
         Ok(heap) => heap,
         Err(e) => {
@@ -1809,8 +1805,7 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     if scratch_pool() {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let kept =
-            crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
+        let kept = crate::scratch_spare::take_kept(|s| spare.take(s), size, SCRATCH_FIRST, SCRATCH_CHUNK);
         if let Some((chunk, size)) = kept {
             ALIVE[3].fetch_sub(1, Ordering::Relaxed);
             ALIVE[4].fetch_sub(size, Ordering::Relaxed);
@@ -1824,14 +1819,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some((
-        Chunk {
-            buffer,
-            data: data as usize,
-            gpu,
-        },
-        size,
-    ))
+    Some((Chunk { buffer, data: data as usize, gpu }, size))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -1998,28 +1986,31 @@ RWByteAddressBuffer differs : register(u1);
 RWByteAddressBuffer snaps : register(u2);
 #endif
 // Each thread's hash of its part of the group's piece.
-groupshared uint4 part[256];
+groupshared uint4 part[64];
 static const uint4 SEED = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
 static const uint4 STEP = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
 [RootSignature(RS)]
-[numthreads(256, 1, 1)]
+[numthreads(64, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
-    uint tid = thread.x;
     uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = SEED + tid;
-    uint at = lo + tid * 16u;
-    // Four loads at once across 256 threads (16 KiB in flight per group).
+    uint4 h = SEED + thread.x;
+    uint at = lo + thread.x * 16u;
+    // Eight loads at once: one after the other, each waits for memory.
     [loop]
-    for (; at + 12288u < hi; at += 16384u) {
+    for (; at + 7168u < hi; at += 8192u) {
         uint4 v0 = now.Load4(at + 0u);
-        uint4 v1 = now.Load4(at + 4096u);
-        uint4 v2 = now.Load4(at + 8192u);
-        uint4 v3 = now.Load4(at + 12288u);
+        uint4 v1 = now.Load4(at + 1024u);
+        uint4 v2 = now.Load4(at + 2048u);
+        uint4 v3 = now.Load4(at + 3072u);
+        uint4 v4 = now.Load4(at + 4096u);
+        uint4 v5 = now.Load4(at + 5120u);
+        uint4 v6 = now.Load4(at + 6144u);
+        uint4 v7 = now.Load4(at + 7168u);
         h = (h ^ v0) * STEP;
         h = h.yzwx ^ (h >> 15);
         h = (h ^ v1) * STEP;
@@ -2028,27 +2019,31 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
         h = h.yzwx ^ (h >> 15);
         h = (h ^ v3) * STEP;
         h = h.yzwx ^ (h >> 15);
+        h = (h ^ v4) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v5) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v6) * STEP;
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v7) * STEP;
+        h = h.yzwx ^ (h >> 15);
     }
     [loop]
-    for (; at < hi; at += 4096u) {
+    for (; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * STEP;
         h = h.yzwx ^ (h >> 15);
     }
-    part[tid] = h;
+    part[thread.x] = h;
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            uint4 r = (part[tid] * STEP) ^ part[tid + s];
-            part[tid] = r.yzwx ^ (r >> 15);
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
 #ifdef SNAP
     uint slot = 0xFFFFFFFFu;
 #endif
-    if (tid == 0u && group.x < pieces) {
-        uint4 all = part[0];
+    if (thread.x == 0u && group.x < pieces) {
+        uint4 all = SEED;
+        for (uint k = 0u; k < 64u; k++) {
+            all = (all ^ part[k]) * STEP;
+            all = all.yzwx ^ (all >> 15);
+        }
         if (compare != 0u) {
             uint flag = any(all != hashes.Load4(piece * 16u)) ? 1u : 0u;
 #ifdef SNAP
@@ -2072,13 +2067,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
 #ifdef SNAP
     // The first thread tells the others the slot; each copies the bytes it
     // hashed.
-    if (tid == 0u) part[0] = uint4(slot, 0u, 0u, 0u);
+    if (thread.x == 0u) part[thread.x] = uint4(slot, 0u, 0u, 0u);
     GroupMemoryBarrierWithGroupSync();
     slot = part[0].x;
     if (slot != 0xFFFFFFFFu) {
         uint base = 65536u + slot * 65568u;
         [loop]
-        for (uint a = lo + tid * 16u; a < hi; a += 4096u) {
+        for (uint a = lo + thread.x * 16u; a < hi; a += 1024u) {
             snaps.Store4(base + (a - lo), now.Load4(a));
         }
     }
@@ -3746,9 +3741,7 @@ fn fence_reached(completed: u64, target: u64) -> bool {
 unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
     // SAFETY: caller owns the event and fence for the entire wait.
     if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
-        fail(format_args!(
-            "{context}: SetEventOnCompletion({target}) failed: {e}"
-        ));
+        fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
     }
     let status = unsafe { WaitForSingleObject(event, INFINITE) };
     if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
@@ -3756,9 +3749,7 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     }
     let completed = unsafe { fence.GetCompletedValue() };
     if !fence_reached(completed, target) {
-        fail(format_args!(
-            "{context}: fence {completed} did not reach {target}"
-        ));
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
     }
 }
 
@@ -4882,7 +4873,6 @@ impl Host {
                 twins: Mutex::default(),
                 plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 uses_heaps: std::sync::atomic::AtomicBool::new(false),
-                uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -5426,8 +5416,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    #[cfg(windows)]
-                    crate::gpucost::begin(list, "ours: card sync copies (into the card's copies)");
+                    crate::gpucost::begin(list, crate::gpucost::CARD_SYNC);
                     // Resolve each dirty copy's card sides once and execute in
                     // 3 batched phases (Copy -> CARD_PATCH -> Rehash) to
                     // collapse per-buffer barriers and compute PSO binds.
@@ -5474,8 +5463,7 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(total_ranges, Ordering::Relaxed);
                     }
                     // Phase 2: masked CARD_PATCH dispatches (batched barriers + single PSO bind).
-                    #[cfg(windows)]
-                    crate::gpucost::mark(list, || "ours: card CARD_PATCH");
+                    crate::gpucost::at(list, crate::gpucost::CARD_PATCH);
                     if let (Some((root, pso)), Some((mask_buffer, _, _))) =
                         (work.patch.as_ref(), masks.as_ref())
                     {
@@ -5534,11 +5522,7 @@ impl Host {
                     // `ExecuteCommandLists` as the title's lists; `COPY_DEST`/`UAV` ->
                     // `NON_PIXEL_SHADER_RESOURCE` for copies with `before`) followed by a
                     // single rehash PSO bind and a final `NON_PIXEL_SHADER_RESOURCE` -> `COMMON`.
-                    #[cfg(windows)]
-                    crate::gpucost::mark(
-                        list,
-                        || "ours: card rehash (CARD_COMPARE hashing of the before copies)",
-                    );
+                    crate::gpucost::at(list, crate::gpucost::CARD_REHASH);
                     let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                     let mut any_rehash = false;
                     for (shadow, _, _, before, _, _, state) in &items {
@@ -5632,7 +5616,6 @@ impl Host {
                         CARD_PASSES[0].fetch_add(pass_count, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(piece_count, Ordering::Relaxed);
                     }
-                    #[cfg(windows)]
                     crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
@@ -5723,11 +5706,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    #[cfg(windows)]
-                    crate::gpucost::begin(
-                        list,
-                        "ours: card check (CARD_COMPARE of shader-written ranges)",
-                    );
+                    crate::gpucost::begin(list, crate::gpucost::CARD_CHECK);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -5835,7 +5814,6 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
-                    #[cfg(windows)]
                     crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
@@ -6230,7 +6208,7 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    crate::gpucost::begin(&list, "ours: copy-back fetch (relay)");
+                    crate::gpucost::begin(&list, crate::gpucost::FETCH_RELAY);
                     for (shadow, lo, hi, at) in
                         crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
                     {
@@ -6716,7 +6694,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    crate::gpucost::begin(list, "ours: copy-back fetch (waited)");
+                    crate::gpucost::begin(list, crate::gpucost::FETCH_WAITED);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(
                             fetched,
@@ -7749,10 +7727,7 @@ impl Host {
 
     /// Prepare and record the CPU descriptors for one output-merger call or clear.
     /// Each thread owns its scratch heaps through the call (`crate::output_views`).
-    pub(crate) fn output_views(
-        &self,
-        record: impl FnOnce(&mut crate::output_views::OutputViews<'_>),
-    ) {
+    pub(crate) fn output_views(&self, record: impl FnOnce(&mut crate::output_views::OutputViews<'_>)) {
         crate::output_views::with_output_views(&self.device, record);
     }
 }
@@ -7851,15 +7826,10 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
-        #[cfg(windows)]
-        crate::gpucost::mark(
-            &self.list,
-            || "ours: list end (twins to depth, textures back, indirect args back)",
-        );
+        crate::gpucost::at(&self.list, crate::gpucost::LIST_END);
         self.twins_to_depth();
         self.textures_back();
         self.indirect_args_back();
-        #[cfg(windows)]
         crate::gpucost::end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -7902,7 +7872,6 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
-        self.uav_dirty.store(true, Ordering::Relaxed);
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -7927,7 +7896,6 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        #[cfg(windows)]
         crate::gpucost::begin(&self.list, crate::gpucost::TITLE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -8001,11 +7969,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
-            #[cfg(windows)]
-            crate::gpucost::mark(
-                &self.list,
-                || "ours: texture state transitions (and the setup after)",
-            );
+            crate::gpucost::at(&self.list, crate::gpucost::TRANSITIONS);
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
@@ -8122,19 +8086,6 @@ impl HostList {
         self.uses_heaps.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn mark_uav_dirty(&self) {
-        self.uav_dirty.store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn clear_uav_dirty(&self) {
-        self.uav_dirty.store(false, Ordering::Relaxed);
-    }
-
-    /// Returns `true` and clears the flag if a global UAV barrier is needed.
-    pub(crate) fn take_uav_dirty(&self) -> bool {
-        self.uav_dirty.swap(false, Ordering::Relaxed) || !crate::indirect::uav_elide()
-    }
-
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
@@ -8174,11 +8125,7 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
-        #[cfg(windows)]
-        crate::gpucost::mark(
-            &self.list,
-            || "ours: twin copy inline (and the setup after)",
-        );
+        crate::gpucost::at(&self.list, crate::gpucost::TWIN_INLINE);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
@@ -8371,16 +8318,14 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                #[cfg(windows)]
-                crate::gpucost::begin(list, "ours: prelude twin copies (and their transitions)");
+                crate::gpucost::begin(list, crate::gpucost::PRELUDE_TWINS);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                #[cfg(windows)]
-                crate::gpucost::mark(list, || "ours: prelude texture uploads");
+                crate::gpucost::at(list, crate::gpucost::PRELUDE_UPLOADS);
                 for (upload, _) in uploads {
                     upload.record(self, list);
                 }
@@ -8388,12 +8333,10 @@ impl HostList {
                     list.ResourceBarrier(&barriers);
                 }
                 if let Some(budget) = budget {
-                    #[cfg(windows)]
-                    crate::gpucost::mark(list, || "ours: prelude indirect clamps ahead");
+                    crate::gpucost::at(list, crate::gpucost::PRELUDE_AHEAD);
                     let mut chunks = self.ahead_chunks.lock().unwrap_or_else(|e| e.into_inner());
                     crate::indirect::record_ahead(list, budget, &mut chunks, &ahead);
                 }
-                #[cfg(windows)]
                 crate::gpucost::end(list);
                 list.Close()
             })
@@ -9035,9 +8978,7 @@ impl HostList {
     /// The shader-visible descriptor heaps the list keeps (tests).
     #[cfg(test)]
     pub(crate) fn kept_shader_heaps(&self) -> Vec<ID3D12DescriptorHeap> {
-        self.deferred()
-            .kept
-            .iter()
+        self.deferred().kept.iter()
             .filter_map(|object| object.cast::<ID3D12DescriptorHeap>().ok())
             .filter(|heap| {
                 // SAFETY: a live descriptor heap.
@@ -11077,13 +11018,8 @@ impl Host {
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
-                p.swap_chain.ResizeBuffers(
-                    BUFFERS,
-                    width,
-                    height,
-                    format,
-                    crate::pacing::chain_flags(),
-                )
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, crate::pacing::chain_flags())
             };
             match resized {
                 Ok(()) => {

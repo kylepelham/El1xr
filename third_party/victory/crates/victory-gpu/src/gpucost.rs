@@ -62,6 +62,25 @@ pub(crate) fn fine() -> bool {
 /// The title's work in coarse mode, and the first label of a host list.
 pub(crate) const TITLE: &str = "title passes";
 
+/// Labels of our own work, for the hooks in `host.rs`.
+pub(crate) const CARD_SYNC: &str = "ours: card sync copies (into the card's copies)";
+pub(crate) const CARD_PATCH: &str = "ours: card CARD_PATCH";
+pub(crate) const CARD_REHASH: &str = "ours: card rehash (CARD_COMPARE hashing of the before copies)";
+pub(crate) const CARD_CHECK: &str = "ours: card check (CARD_COMPARE of shader-written ranges)";
+pub(crate) const FETCH_RELAY: &str = "ours: copy-back fetch (relay)";
+pub(crate) const FETCH_WAITED: &str = "ours: copy-back fetch (waited)";
+pub(crate) const LIST_END: &str = "ours: list end (twins to depth, textures back, indirect args back)";
+pub(crate) const TRANSITIONS: &str = "ours: texture state transitions (and the setup after)";
+pub(crate) const TWIN_INLINE: &str = "ours: twin copy inline (and the setup after)";
+pub(crate) const PRELUDE_TWINS: &str = "ours: prelude twin copies (and their transitions)";
+pub(crate) const PRELUDE_UPLOADS: &str = "ours: prelude texture uploads";
+pub(crate) const PRELUDE_AHEAD: &str = "ours: prelude indirect clamps ahead";
+
+/// [`mark`] under a fixed label.
+pub(crate) fn at(list: &ID3D12GraphicsCommandList, label: &'static str) {
+    mark(list, || label);
+}
+
 /// A list's timestamp heap, where it is resolved, and the labels of the
 /// stamps written since the list's last reset.
 struct Stamps {
