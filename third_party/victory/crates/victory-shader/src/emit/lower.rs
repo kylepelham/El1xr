@@ -74,6 +74,12 @@ pub(super) use halves::{branches_around, lane_uniform};
 
 #[path = "resinfo.rs"]
 mod resinfo;
+
+/// Vice-Tay #208's exact rules for the paired form (`VICTORY_WAVE_PAIRS_VT`), a child module so
+/// it shares the emitter's state.
+#[path = "paired_vt.rs"]
+mod paired_vt;
+pub(super) use paired_vt::{accesses_lds, supports_paired_lds};
 use resinfo::{packed_resinfo, primitive_index_mask, resinfo_sizes, window_properties};
 
 /// Image sampling, loads and stores (`image_*`), a child module so it shares the emitter's state.
@@ -111,6 +117,9 @@ mod lds_first;
 /// Where the program's code table starts (`VICTORY_CONST_TABLE_TRIM=1`).
 #[path = "code_table.rs"]
 mod code_table;
+/// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
+#[path = "isa_fixes.rs"]
+pub(super) mod isa_fixes;
 
 type Why = &'static str;
 
@@ -441,6 +450,11 @@ struct Lower<'a> {
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
+    /// The paired form with Vice-Tay #208's rules ([`with_paired_lanes_vt`]).
+    vt: bool,
+    /// [`Self::vt`]: an ordered FP32 reduction being replayed (`paired_vt`): `v_add_f32`,
+    /// `v_min_f32` and `v_max_f32` as the console rounds them.
+    paired_fp32: bool,
     /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
@@ -573,6 +587,8 @@ thread_local! {
     static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_paired_lanes_vt`].
+    static PAIRED_VT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Restore the previous mode even when a worker catches a panic and
@@ -621,6 +637,14 @@ pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
 // compiler from moving one thread's accesses past each other.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
     with_lowering_mode(&PAIRED, f)
+}
+
+/// [`with_paired_lanes`] with Vice-Tay #208's rules (`paired_vt`): LDS accesses bounds-checked
+/// with group barriers between them, LDS atomics only where order-free, `ds_bpermute_b32` within
+/// each half as GFX10 wave64 has it, GDS, scalar memory writes and lane-varying lane reads
+/// refused, and float reductions replayed in the console's order (or refused).
+pub(super) fn with_paired_lanes_vt<R>(f: impl FnOnce() -> R) -> R {
+    with_lowering_mode(&PAIRED_VT, || with_paired_lanes(f))
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1393,6 +1417,8 @@ impl<'a> Lower<'a> {
             } else {
                 HashSet::new()
             },
+            vt: paired && PAIRED_VT.get(),
+            paired_fp32: false,
             drop_in,
             drop_out,
         }
@@ -1677,8 +1703,30 @@ impl<'a> Lower<'a> {
                 true => self.sections[&b][&start].shapes.get(&w).copied(),
                 false => None,
             };
+            // (Vice-Tay #208) A value that leaves the section with no shape but that nothing
+            // after it sees (a reduction's scratch partial sums, which the next tree overwrites
+            // in every lane before reading: `paired_vt::unseen_after`): any value will do.
+            if self.vt
+                && shape.is_none()
+                && self.section_out.contains(&w)
+                && let Some(&(reg, _)) = inst.writes.iter().find(|x| x.1 == w)
+                && paired_vt::unseen_after(
+                    self.x.p,
+                    &self.sections,
+                    (b, start, self.sections[&b][&start].end),
+                    reg,
+                    w,
+                )
+            {
+                let z = self.s.m.i32(0);
+                self.put_lanes(w, Val::I32(z), Val::I32(z));
+                continue;
+            }
             let made = match shape {
                 None => Err(UNKNOWN),
+                Some(Shape::Sum64 { high, lo, hi, mask }) if self.vt => {
+                    self.paired_f64_constant_sum(b, start, lo, hi, mask, high)
+                }
                 Some(sh @ (Shape::Active(..) | Shape::Prefix(..) | Shape::Sum64 { .. })) => {
                     self.paired_shape(sh)
                 }
@@ -1926,6 +1974,18 @@ impl<'a> Lower<'a> {
     /// lanes' total.
     fn paired_shape(&mut self, shape: super::wave::Shape) -> Result<[V; 2], Why> {
         use super::wave::{Op, Shape};
+        if self.vt {
+            match shape {
+                Shape::Sum64 { .. } => return Err("a paired FP64 reduction"),
+                Shape::Prefix(Op::AddF | Op::AddH | Op::MinF | Op::MaxF, ..) => {
+                    return Err("a paired floating-point prefix");
+                }
+                Shape::Active(Op::AddF | Op::MinF | Op::MaxF, ..) => {
+                    return Err("a floating-point reduction without an exact paired tree");
+                }
+                _ => {}
+            }
+        }
         if let Shape::Sum64 { high, lo, hi, mask } = shape {
             return self.paired_sum64(high, lo, hi, mask);
         }
@@ -2238,6 +2298,10 @@ impl<'a> Lower<'a> {
                     self.inst(b, i)?;
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    if self.vt && self.replay_paired_fp32(b, i, end)? {
+                        i = end;
+                        continue;
+                    }
                     for j in i + 1..end {
                         if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
@@ -4999,6 +5063,17 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if self.vt {
+            let dwords = match self.x.native.io {
+                StageIo::Cs(cs) => cs.lds_bytes() / 4,
+                _ => 0,
+            };
+            if dwords == 0 {
+                return Err("LDS the program does not allocate");
+            }
+            let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+            return self.paired_lds(inst, a, guard, dwords);
+        }
         if self.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -5397,6 +5472,8 @@ impl<'a> Lower<'a> {
                     divergent,
                     self.writes_uavs,
                 );
+                // (Vice-Tay #208: the paired form's barriers wait for the group)
+                let mode = if self.vt { mode | 1 } else { mode };
                 let waits = mode & 1 != 0;
                 if waits && self.meet.enabled && !self.reached_by_group() {
                     if self.writes_uavs {
@@ -5458,6 +5535,14 @@ impl<'a> Lower<'a> {
     fn paired_inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let name = inst.name();
+        if self.vt {
+            if matches!(inst.fields, Fields::Ds { gds: true, .. }) {
+                return Err(unsupported(inst.machine.offset, "GDS"));
+            }
+            if matches!(inst.fields, Fields::Smem { .. }) && (name.contains("store") || name.contains("atomic")) {
+                return Err(unsupported(inst.machine.offset, "a scalar memory write in paired Wave64"));
+            }
+        }
         let once = matches!(inst.fields, Fields::Sopp { .. })
             || matches!(inst.fields, Fields::Smem { .. })
                 && (name.contains("store") || name.contains("atomic"));
@@ -5488,7 +5573,9 @@ impl<'a> Lower<'a> {
             && !name.contains("permute")
         {
             let write = !name.starts_with("ds_read");
-            if write || self.lds_last != Some(false) {
+            if (write || self.lds_last != Some(false)) && self.vt {
+                self.group_sync(self.cur);
+            } else if write || self.lds_last != Some(false) {
                 let (mode, void) = (self.s.m.i32(8), self.s.t.void);
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5534,6 +5621,9 @@ impl<'a> Lower<'a> {
         match inst.name() {
             "v_readlane_b32" => {
                 // the lane: a scalar or a constant
+                if self.vt && inst.reads.iter().any(|r| self.lane_scalars.contains(&r.1)) {
+                    return Err("a paired lane read with a lane-varying scalar index");
+                }
                 let lane = self.src(inst, 1)?;
                 let [lo, hi] = self.both(|l| l.src(inst, 0))?;
                 let r = pick(self, lo, hi, lane);
@@ -5579,10 +5669,17 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let read = [
-                    pick(self, x_lo, x_hi, from_lo),
-                    pick(self, x_lo, x_hi, from_hi),
-                ];
+                let read = if self.vt {
+                    // (GFX10 wave64: each half reads only its own lanes)
+                    let from_lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                    let from_hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                    [self.read_lane(x_lo, from_lo), self.read_lane(x_hi, from_hi)]
+                } else {
+                    [
+                        pick(self, x_lo, x_hi, from_lo),
+                        pick(self, x_lo, x_hi, from_hi),
+                    ]
+                };
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {
@@ -6231,6 +6328,25 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
+                let cmp = props.0 & 0x8000 != 0;
+                if isa_fixes::Fix::CmpSamplerSplit.on() {
+                    // one slot per (constant, comparison or not)
+                    let slot = self.samplers.iter().enumerate().position(|(n, w)| {
+                        *w == words && (self.s.cmp_samplers >> n & 1 != 0) == cmp
+                    });
+                    let n = match slot {
+                        Some(n) => n,
+                        None if self.samplers.len() >= u64::BITS as usize => {
+                            return Err("more than 64 immediate sampler slots");
+                        }
+                        None => {
+                            self.samplers.push(words);
+                            self.s.cmp_samplers |= u64::from(cmp) << (self.samplers.len() - 1);
+                            self.samplers.len() - 1
+                        }
+                    };
+                    return Ok(self.s.sampler_handle(self.cur, n as u32));
+                }
                 let n = match self.samplers.iter().position(|w| *w == words) {
                     Some(n) => n,
                     None => {
@@ -6238,7 +6354,7 @@ impl<'a> Lower<'a> {
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
+                if cmp {
                     // shortcut: one sampler used with and without comparison
                     // would need two static samplers; it becomes a comparison one.
                     self.s.cmp_samplers |= 1 << n;
@@ -7986,7 +8102,7 @@ impl<'a> Lower<'a> {
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = self.vt || *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {
@@ -8599,6 +8715,37 @@ mod tests {
         assert_eq!(shader.samplers.len(), 2);
         assert!(shader.samplers.contains(&[0, 0, 0, 0]));
         assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
+    }
+
+    #[test]
+    fn a_sampler_constant_used_with_and_without_comparison_takes_a_slot_for_each() {
+        // One constant (all zeros) used by image_sample_lz and image_sample_c_lz.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE88_0380, 0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 0-3
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0xF0BC_0108, 0x0043_1002,       // image_sample_c_lz v16, v[2:4], s[12:19], s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            0xD834_0000, 0x0000_1000,       // ds_write_b32 v0, v16
+            S_ENDPGM,
+        ];
+        let lowered = |split| {
+            super::isa_fixes::set_for_test(super::isa_fixes::Fix::CmpSamplerSplit, Some(split));
+            let (layout, mut used) = texture_tables();
+            used.truncate(1);
+            let l = lower_with(&words, layout, used);
+            super::isa_fixes::set_for_test(super::isa_fixes::Fix::CmpSamplerSplit, None);
+            l.unwrap()
+        };
+        // Off: one comparison sampler for both uses.
+        let off = lowered(false);
+        assert_eq!(off.samplers, [[0u32; 4]]);
+        assert_eq!(off.cmp_samplers, 0b1);
+        // On: the plain sample keeps an ordinary sampler.
+        let on = lowered(true);
+        assert_eq!(on.samplers, [[0u32; 4]; 2]);
+        assert_eq!(on.cmp_samplers, 0b10);
     }
 
     #[test]
