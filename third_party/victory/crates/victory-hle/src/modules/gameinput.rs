@@ -472,6 +472,14 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// Whether `VICTORY_AUTO_A`'s tap is down `run` after the start: during the first `secs`
+/// seconds, for the first third (100-250 ms) of every `period_ms`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn auto_a_tap(run: std::time::Duration, secs: u64, period_ms: u128) -> bool {
+    let hold = (period_ms / 3).clamp(100, 250);
+    run.as_secs() < secs && run.as_millis() % period_ms < hold
+}
+
 /// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
@@ -1314,6 +1322,34 @@ mod host {
         }
     }
 
+    /// (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter (the
+    /// stand-in pad's A) is down for a quarter of a second in every four, whether or not the
+    /// window has focus: a launch gets through the title's "press A" screens without the focus
+    /// being taken from what the user does.
+    fn auto_a_down() -> bool {
+        static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+            std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        });
+        static AUTO_A_PERIOD_MS: LazyLock<u128> = LazyLock::new(|| {
+            std::env::var("VICTORY_AUTO_A_PERIOD_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u128>().ok())
+                .map(|ms| ms.max(250))
+                .unwrap_or(4000)
+        });
+        super::auto_a_tap(super::START.elapsed(), *AUTO_A, *AUTO_A_PERIOD_MS)
+    }
+
+    /// `VICTORY_AUTO_A_PADS=1` (off by default): `VICTORY_AUTO_A`'s tap presses A on the host's
+    /// pads too. With a pad connected the stand-in pad is not there, so Enter reached only
+    /// the keyboard and the title's "press A" screen (ACCOUNT PICKER / PLAYER) waited until
+    /// the pad went away (batch 4 arm 15: 114 s on that screen).
+    fn auto_a_pads() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("VICTORY_AUTO_A_PADS").is_ok_and(|v| v.trim() == "1"));
+        *ON
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if slot == 0 {
@@ -1325,8 +1361,10 @@ mod host {
                     super::dualsense::pads,
                 );
             }
-            #[allow(unused_mut)]
             let mut pad = self.pads[slot]?;
+            if auto_a_pads() && auto_a_down() {
+                pad.buttons |= A;
+            }
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1357,24 +1395,7 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            // (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
-            // (the stand-in pad's A) is down for a quarter of a second in every four,
-            // whether or not the window has focus: a launch gets through the title's
-            // "press A" screens without the focus being taken from what the user does.
-            static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
-                std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-            });
-            static AUTO_A_PERIOD_MS: LazyLock<u128> = LazyLock::new(|| {
-                std::env::var("VICTORY_AUTO_A_PERIOD_MS")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u128>().ok())
-                    .map(|ms| ms.max(250))
-                    .unwrap_or(4000)
-            });
-            let run = super::START.elapsed();
-            let period = *AUTO_A_PERIOD_MS;
-            let hold = (period / 3).clamp(100, 250);
-            if run.as_secs() < *AUTO_A && run.as_millis() % period < hold && !down.contains(&0x0D) {
+            if auto_a_down() && !down.contains(&0x0D) {
                 down.push(0x0D);
             }
             down.into_iter()
@@ -2091,6 +2112,18 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    /// The auto-A tap: down for the first third (at most 250 ms) of every period, and only
+    /// during its seconds.
+    #[test]
+    fn the_auto_a_tap_is_down_a_quarter_second_in_four_for_its_seconds() {
+        let at = std::time::Duration::from_millis;
+        assert!(super::auto_a_tap(at(0), 150, 4000));
+        assert!(super::auto_a_tap(at(4249), 150, 4000));
+        assert!(!super::auto_a_tap(at(4250), 150, 4000));
+        assert!(!super::auto_a_tap(at(150_000), 150, 4000));
+        assert!(!super::auto_a_tap(at(0), 0, 4000));
     }
 
     #[test]

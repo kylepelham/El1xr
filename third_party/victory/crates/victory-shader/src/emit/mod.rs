@@ -135,6 +135,7 @@ pub use link::{link_mesh, mesh_fits};
 pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, native_glass};
 pub use miss_sky::miss_sky_key;

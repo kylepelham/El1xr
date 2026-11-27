@@ -43,11 +43,15 @@ mod ambient;
 mod ambient_miss;
 #[cfg(windows)]
 mod ambient_reflect;
+#[cfg(windows)]
+mod ambient_sky;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 mod boot_prof;
 #[cfg(windows)]
 mod bake_inputs;
+#[cfg(windows)]
+mod bake_publish;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
@@ -198,6 +202,12 @@ mod stale_batch;
 mod sweep_every;
 #[cfg(windows)]
 mod card_prof;
+#[cfg(windows)]
+mod compare_apart;
+#[cfg(windows)]
+mod fresh_open;
+#[cfg(windows)]
+mod scratch_landing;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

@@ -47,7 +47,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
+fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -105,6 +105,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     }
     if wave_pairs_vt {
         h.update(b"VICTORY_WAVE_PAIRS_VT=1");
+    }
+    if strict {
+        h.update(b"VICTORY_UNIFORM_STRICT=1");
     }
     if victory_shader::emit::native_glass() {
         h.update(b"VICTORY_NATIVE_GLASS=1");
@@ -176,6 +179,25 @@ const WAVE_PAIRS_VT: [&str; 29] = [
     "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
     "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
 ];
+
+/// `VICTORY_UNIFORM_STRICT=<hash,hash,..>` (none by default): the containers, by the 16-digit
+/// hash the log names shaders with, whose first-lane reads take the stricter proof of
+/// `VICTORY_UNIFORM_STRICT_ALL=1` (`victory_shader::emit::with_uniform_strict`), so that switch's
+/// shaders can be tried apart. Only these containers' cache keys change.
+static UNIFORM_STRICT: OnceLock<Vec<String>> = OnceLock::new();
+
+fn allow_uniform_strict(container: &[u8]) -> bool {
+    hash_in_list(
+        container,
+        UNIFORM_STRICT.get_or_init(|| parse_hash_list(std::env::var("VICTORY_UNIFORM_STRICT").ok().as_deref(), &[])),
+    )
+}
+
+/// Whether `VICTORY_UNIFORM_STRICT` names this container: for the offline translation
+/// (`victory translate`), which calls the translator without this cache.
+pub fn uniform_strict_listed(container: &[u8]) -> bool {
+    allow_uniform_strict(container)
+}
 
 fn wave_pairs_vt_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -354,12 +376,13 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
     let vt = allow_wave_pairs_vt(container);
+    let strict = allow_uniform_strict(container);
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        translate_vt(c, wide, pairs, vt)
+        victory_shader::emit::with_uniform_strict(strict, || translate_vt(c, wide, pairs, vt))
     };
-    cached(cache, &build(wide, pairs, vt), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(wide, pairs, vt, strict), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
@@ -368,9 +391,10 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
     let vt = allow_wave_pairs_vt(container);
-    let translate = |c: &[u8]| translate_vt(c, wide, pairs, vt);
+    let strict = allow_uniform_strict(container);
+    let translate = |c: &[u8]| victory_shader::emit::with_uniform_strict(strict, || translate_vt(c, wide, pairs, vt));
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(wide, pairs, vt), container, translate),
+        Some(cache) => cached(cache, &build(wide, pairs, vt, strict), container, translate),
         None => translate(container),
     }
 }
@@ -746,5 +770,16 @@ mod tests {
             parse_wave_pairs_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
             vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
         );
+    }
+
+    /// `VICTORY_UNIFORM_STRICT` names no container unless set, and a named one is filed
+    /// under a key of its own.
+    #[test]
+    fn uniform_strict_names_none_by_default_and_keys_its_own() {
+        assert!(parse_hash_list(None, &[]).is_empty());
+        assert!(!hash_in_list(b"container", &parse_hash_list(None, &[])));
+        let h = blake3::hash(b"container").to_hex()[..16].to_owned();
+        assert!(hash_in_list(b"container", &parse_hash_list(Some(&h.to_uppercase()), &[])));
+        assert_ne!(build(false, false, false, true), build(false, false, false, false));
     }
 }

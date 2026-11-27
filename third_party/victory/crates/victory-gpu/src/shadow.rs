@@ -33,6 +33,8 @@ mod placement;
 pub(crate) mod plan_split;
 #[path = "shadow_refresh_stamp.rs"]
 pub(crate) mod refresh_stamp;
+#[path = "shadow_wide_wake.rs"]
+pub(crate) mod wide_wake;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -3261,6 +3263,7 @@ fn wide(jobs: Vec<Job>) {
     });
     #[cfg(test)]
     let scope = lazy::lazy_test_scope_now();
+    let queued = jobs.len();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -3280,7 +3283,7 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    wide_wake::wake(&workers.more, queued, workers.threads);
     loop {
         let job = workers
             .jobs
@@ -3292,6 +3295,7 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    wide_wake::spin_for_last(&wait.left);
     if wait.left.load(Ordering::Acquire) > 0 {
         let mut done = wait.done.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {

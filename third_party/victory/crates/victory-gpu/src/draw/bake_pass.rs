@@ -197,7 +197,7 @@ impl State {
 
     /// The title slots bake draw `p` reads textures from (`crate::bake_inputs`): from its
     /// parameter constants and records, found through user data word 9.
-    fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
+    pub(super) fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
         let stage = p
             .stages
             .iter()

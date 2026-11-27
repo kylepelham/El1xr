@@ -10,6 +10,74 @@ fn read_buffer_into_copies_small_buffers_without_floor() {
     }
 }
 
+/// (foxhound a7b8667) A list left open for the title's reset skips the D3D12
+/// reset there and records and runs as one reset; one something else reaches
+/// first is closed then; a reset that is not the title's closes it first.
+#[test]
+fn fresh_open_lists_record_and_run_after_each_way_out() {
+    use crate::fresh_open::{NO, OPEN, leave_open, title_reset, touched};
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else { return };
+    if crate::gpucost::on() {
+        return;
+    }
+    crate::fresh_open::FORCED.with(|f| f.set(Some(true)));
+    let run = |list: &HostList| {
+        assert!(list.scratch(256).is_some());
+        list.close();
+        host.execute(&[list]);
+    };
+    for way in 0..3 {
+        let list = host.new_list().unwrap();
+        leave_open(&list);
+        assert_eq!(list.left_open.load(Relaxed), OPEN);
+        match way {
+            0 => title_reset(&list),
+            1 => {
+                touched(&list);
+                assert_eq!(list.left_open.load(Relaxed), NO, "closed when reached");
+            }
+            _ => {}
+        }
+        list.reset();
+        assert_eq!(list.left_open.load(Relaxed), NO);
+        run(&list);
+        list.reset();
+        run(&list);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "way {way}");
+    }
+    crate::fresh_open::FORCED.with(|f| f.set(Some(false)));
+    let list = host.new_list().unwrap();
+    leave_open(&list);
+    assert_eq!(list.left_open.load(Relaxed), NO, "off: closed at once");
+    list.reset();
+    run(&list);
+    crate::fresh_open::FORCED.with(|f| f.set(None));
+}
+
+/// (PR #112) A landed list's scratch goes to the pool with
+/// `VICTORY_SCRATCH_AT_LANDING=1` and stays with it to its reset without.
+#[test]
+fn landed_list_gives_its_scratch_back_only_with_the_switch() {
+    let Some(host) = host() else { return };
+    for on in [false, true] {
+        crate::scratch_landing::FORCED.with(|f| f.set(Some(on)));
+        let list = host.new_list().unwrap();
+        assert!(list.scratch(64 << 10).is_some());
+        let held = list.scratch_kept();
+        assert!(held >= 64 << 10);
+        list.close();
+        host.execute(&[&list]);
+        list.release_scratch();
+        assert_eq!(list.scratch_kept(), if on && scratch_pool() { 0 } else { held }, "on={on}");
+        // Scratch after a release starts again from nothing, like after a reset.
+        list.reset();
+        assert!(list.scratch(16).is_some());
+    }
+    crate::scratch_landing::FORCED.with(|f| f.set(None));
+}
+
 #[test]
 fn root_cbv_fill_reuses_until_copy_or_deferred_write_and_resets() {
     let Some(host) = host() else { return };

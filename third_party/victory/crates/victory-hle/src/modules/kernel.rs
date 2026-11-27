@@ -82,6 +82,23 @@ fn title_path(module: *mut c_void) -> Option<String> {
 /// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
 /// the buffer size.
 fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
+    copy_truncated_as(text, out, name_clears_error())
+}
+
+/// `VICTORY_MODULE_NAME_CLEARS_ERROR=1`: a title image's name that fits clears the last
+/// error, as the host's `GetModuleFileName` does (titles tell a truncated name from a whole
+/// one by it, after a buffer they grew until the call fit). Off: a whole name leaves the
+/// last error as it was, as before.
+///
+/// Source: trustno1-coder/VIctory-NVIDIA PR #252 (`b998af5`, Maraco91; from DexNom/VIctory
+/// `3c7d845b`), GPL-3.0.
+fn name_clears_error() -> bool {
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_MODULE_NAME_CLEARS_ERROR");
+    ON.get_bool()
+}
+
+/// [`copy_truncated`]; with `clear`, a name that fits sets the last error to 0.
+fn copy_truncated_as<T: Copy + Default>(text: &[T], out: &mut [T], clear: bool) -> u32 {
     let Some(room) = out.len().checked_sub(1) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return 0;
@@ -93,8 +110,13 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return out.len() as u32;
     }
+    if clear {
+        host::set_last_error(ERROR_SUCCESS);
+    }
     n as u32
 }
+
+const ERROR_SUCCESS: u32 = 0;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -752,6 +774,40 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// With `VICTORY_MODULE_NAME_CLEARS_ERROR`, a name that fits (an exact fit too) clears
+    /// the last error; without it the last error stays. A truncated name sets it either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_module_name_that_fits_clears_the_last_error_with_the_switch() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: this thread's last error.
+        let last_error = || unsafe { GetLastError() };
+        // SAFETY: sets this thread's last error.
+        let stale = || unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        let name = b"C:\\title\\game.exe";
+        for clear in [false, true] {
+            let want = if clear { ERROR_SUCCESS } else { ERROR_INSUFFICIENT_BUFFER };
+            let mut out = [0u8; 64];
+            stale();
+            assert_eq!(copy_truncated_as(name, &mut out, clear), 17);
+            assert_eq!(last_error(), want, "fits, clear={clear}");
+            let mut exact = [0u8; 18];
+            stale();
+            assert_eq!(copy_truncated_as(name, &mut exact, clear), 17);
+            assert_eq!(last_error(), want, "exact fit, clear={clear}");
+            // SAFETY: this thread's last error.
+            unsafe { SetLastError(0) };
+            let mut short = [0u8; 17];
+            assert_eq!(copy_truncated_as(name, &mut short, clear), 17);
+            assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER, "truncated, clear={clear}");
+        }
+    }
+
+    #[test]
+    fn module_name_clears_error_is_live() {
+        victory_core::settings::check_live("VICTORY_MODULE_NAME_CLEARS_ERROR", "1", name_clears_error, false, true);
     }
 
     fn w(text: &str) -> Vec<u16> {
