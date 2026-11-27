@@ -6,11 +6,13 @@
 //! `CuteBooty/victory-8gb`).
 //!
 //! When opted in (on Series S, or on Series X with `VICTORY_UPSCALER=7`),
-//! `ffxDispatch` alone is taken here: an upscale dispatch becomes native
+//! `ffxDispatch` is taken here: an upscale dispatch becomes native
 //! NVIDIA DLSS SR (`VICTORY_UPSCALE=dlss`, through the driver's NGX core and
 //! an `nvngx_dlss.dll`) or a plain bilinear stretch (`VICTORY_UPSCALE=stretch`,
 //! also the fallback if DLSS cannot run). Any other dispatch, and any upscale
 //! we could not record, is forwarded to the title's own DLL.
+//! `ffxQuery` is taken with it: the title's queries its own DLL fails (its
+//! FSR 4 context refuses 4K) are answered here, see [`query`].
 //!
 //! The structures match the public FidelityFX API (`ffx_api.h`,
 //! `ffx_upscale.h`): a header of a type and a next pointer, and resources of
@@ -329,6 +331,169 @@ pub fn dispatch_address() -> usize {
     dispatch as *const () as usize
 }
 
+// --- `ffxQuery`, taken with `ffxDispatch` ---
+//
+// The title's upscaler DLL is a shipping FSR 4 build with only the
+// fixed-size Quality tables (maxUpscaleSize 1920x1080, render 2/3 of it).
+// At 4K output, or at another render scale, its `ffxCreateContext` refuses
+// ("Shipping FSR4 configuration mismatch") and the title goes on with no
+// context: its jitter phase count query (made right after creating the
+// context, into a field left 0) fails, and after the first upscale it
+// divides its frame index by that 0 (title+0x28f03e8, batch 4 part B; run
+// res-6 on Series S at 0.5). With the upscale ours, the title's queries that
+// fail are answered here with the public FSR formulas (`ffx_upscale.h`,
+// FSR 2/3 `ffxFsr*GetJitterPhaseCount` / `GetJitterOffset`); answers its DLL
+// gives are kept.
+
+/// `FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT`.
+const GET_JITTER_PHASE_COUNT: u64 = 0x0001_0004;
+/// `FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET`.
+const GET_JITTER_OFFSET: u64 = 0x0001_0005;
+/// `FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE`.
+const GPU_MEMORY_USAGE: u64 = 0x0001_0008;
+
+/// `ffxQueryDescUpscaleGetJitterPhaseCount`.
+#[repr(C)]
+struct PhaseCount {
+    header: Header,
+    render_width: u32,
+    display_width: u32,
+    out: *mut i32,
+}
+
+/// `ffxQueryDescUpscaleGetJitterOffset`.
+#[repr(C)]
+struct JitterOffset {
+    header: Header,
+    index: i32,
+    phase_count: i32,
+    out_x: *mut f32,
+    out_y: *mut f32,
+}
+
+/// `ffxQueryDescUpscaleGetGPUMemoryUsage`: a pointer to two `u64`s.
+#[repr(C)]
+struct MemoryUsage {
+    header: Header,
+    out: *mut [u64; 2],
+}
+
+/// FSR's jitter phase count: 8 times the square of the upscale ratio, at
+/// least 1 (the title divides by it).
+pub fn jitter_phase_count(render_width: u32, display_width: u32) -> i32 {
+    const BASE: f32 = 8.0;
+    if render_width == 0 {
+        return BASE as i32;
+    }
+    let ratio = display_width as f32 / render_width as f32;
+    ((BASE * ratio * ratio) as i32).max(1)
+}
+
+/// The Halton sequence's `index`th value in `base`.
+fn halton(mut index: i32, base: i32) -> f32 {
+    let (mut f, mut result) = (1.0f32, 0.0f32);
+    while index > 0 {
+        f /= base as f32;
+        result += f * (index % base) as f32;
+        index /= base;
+    }
+    result
+}
+
+/// FSR's sub-pixel jitter for `index` of a sequence of `phase_count`
+/// (Halton 2, 3, centred): pixels in -0.5..0.5.
+pub fn jitter_offset(index: i32, phase_count: i32) -> (f32, f32) {
+    let n = phase_count.max(1);
+    let i = index.rem_euclid(n) + 1;
+    (halton(i, 2) - 0.5, halton(i, 3) - 0.5)
+}
+
+static REAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+
+/// The title's own `ffxQuery`, asked first.
+pub fn set_real_query(address: usize) {
+    REAL_QUERY.store(address, Ordering::Relaxed);
+}
+
+type Query = extern "system" fn(*mut *mut c_void, *mut Header) -> u32;
+
+extern "system" fn query(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    let real = match REAL_QUERY.load(Ordering::Relaxed) {
+        0 => ERROR,
+        // SAFETY: the title's own `ffxQuery`, with its own arguments.
+        q => unsafe { std::mem::transmute::<usize, Query>(q)(context, desc) },
+    };
+    // SAFETY: the title passes a query description, whose header says what
+    // follows it.
+    unsafe { answer(desc, real) }
+}
+
+/// The title's query `desc` after its DLL answered `real`: kept if that
+/// answer is usable, else answered here (`FFX_API_RETURN_OK`).
+///
+/// # Safety
+/// `desc` is null or a query description laid out as its type says, whose
+/// out pointers are null or writable.
+unsafe fn answer(desc: *mut Header, real: u32) -> u32 {
+    // SAFETY: the caller's promise.
+    let Some(header) = (unsafe { desc.as_ref() }) else {
+        return real;
+    };
+    match header.kind {
+        GET_JITTER_PHASE_COUNT => {
+            // SAFETY: a phase count query, by its type.
+            let q = unsafe { &*desc.cast::<PhaseCount>() };
+            // SAFETY: null or the title's `int32_t`.
+            let Some(out) = (unsafe { q.out.as_mut() }) else {
+                return real;
+            };
+            if real == 0 && *out > 0 {
+                return real;
+            }
+            *out = jitter_phase_count(q.render_width, q.display_width);
+            static TOLD: std::sync::Once = std::sync::Once::new();
+            TOLD.call_once(|| {
+                tracing::warn!(
+                    real,
+                    render_width = q.render_width,
+                    display_width = q.display_width,
+                    phases = *out,
+                    "FidelityFX: the title's jitter phase count query failed (its FSR 4 context refused this size); answered here"
+                );
+            });
+            0
+        }
+        GET_JITTER_OFFSET if real != 0 => {
+            // SAFETY: a jitter offset query, by its type.
+            let q = unsafe { &*desc.cast::<JitterOffset>() };
+            let (x, y) = jitter_offset(q.index, q.phase_count);
+            // SAFETY: null or the title's floats.
+            unsafe {
+                if let Some(o) = q.out_x.as_mut() {
+                    *o = x;
+                }
+                if let Some(o) = q.out_y.as_mut() {
+                    *o = y;
+                }
+            }
+            0
+        }
+        GPU_MEMORY_USAGE if real != 0 => {
+            // SAFETY: a memory usage query, by its type; null or the title's two u64s.
+            if let Some(o) = unsafe { (*desc.cast::<MemoryUsage>()).out.as_mut() } {
+                *o = [0, 0];
+            }
+            0
+        }
+        _ => real,
+    }
+}
+
+/// What the title's import of `ffxQuery` is bound to, with `ffxDispatch`.
+pub fn query_address() -> usize {
+    query as *const () as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +591,127 @@ mod tests {
         set_real_dispatch(fake_real as *const () as usize);
         assert_eq!(dispatch(std::ptr::null_mut(), &other), 42);
         REAL.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn query_layouts_are_the_public_apis() {
+        assert_eq!(offset_of!(PhaseCount, render_width), 0x10);
+        assert_eq!(offset_of!(PhaseCount, display_width), 0x14);
+        assert_eq!(offset_of!(PhaseCount, out), 0x18);
+        assert_eq!(offset_of!(JitterOffset, index), 0x10);
+        assert_eq!(offset_of!(JitterOffset, phase_count), 0x14);
+        assert_eq!(offset_of!(JitterOffset, out_x), 0x18);
+        assert_eq!(offset_of!(JitterOffset, out_y), 0x20);
+        assert_eq!(offset_of!(MemoryUsage, out), 0x10);
+    }
+
+    #[test]
+    fn the_formulas_are_fsrs() {
+        // 4K from 2/3 (what batch 4 ran): 8 * 1.4994^2.
+        assert_eq!(jitter_phase_count(2561, 3840), 17);
+        assert_eq!(jitter_phase_count(1280, 1920), 18);
+        assert_eq!(jitter_phase_count(1920, 1920), 8);
+        assert_eq!(jitter_phase_count(3840, 3840), 8);
+        assert!(jitter_phase_count(0, 3840) > 0);
+        assert!(jitter_phase_count(3840, 0) > 0);
+        // Halton(1, 2) = 1/2, Halton(1, 3) = 1/3; index wraps at the count.
+        assert_eq!(jitter_offset(0, 8), (0.0, 1.0 / 3.0 - 0.5));
+        assert_eq!(jitter_offset(8, 8), jitter_offset(0, 8));
+        assert_eq!(jitter_offset(1, 8), (0.25 - 0.5, 2.0 / 3.0 - 0.5));
+        assert_eq!(jitter_offset(5, 0), jitter_offset(0, 1));
+        for i in 0..64 {
+            let (x, y) = jitter_offset(i, 17);
+            assert!((-0.5..0.5).contains(&x) && (-0.5..0.5).contains(&y));
+        }
+    }
+
+    /// Batch 4 part B: the title's DLL refused the 4K context, its phase
+    /// count query failed and left the title's field 0, which it then divided
+    /// by. Through our `ffxQuery` the field is the FSR count, never 0.
+    #[test]
+    fn a_failed_phase_count_query_is_answered_and_never_zero() {
+        extern "system" fn refusing(_: *mut *mut c_void, _: *mut Header) -> u32 {
+            ERROR
+        }
+        extern "system" fn zero_ok(_: *mut *mut c_void, desc: *mut Header) -> u32 {
+            // SAFETY: the test's phase count query.
+            unsafe { *(*desc.cast::<PhaseCount>()).out = 0 };
+            0
+        }
+        extern "system" fn answers(_: *mut *mut c_void, desc: *mut Header) -> u32 {
+            // SAFETY: the test's query.
+            unsafe {
+                match (*desc).kind {
+                    GET_JITTER_PHASE_COUNT => *(*desc.cast::<PhaseCount>()).out = 99,
+                    _ => *(*desc.cast::<JitterOffset>()).out_x = 0.125,
+                }
+            }
+            0
+        }
+        let before = REAL_QUERY.swap(0, Ordering::Relaxed);
+        let mut field = 0i32;
+        let mut q = PhaseCount {
+            header: Header {
+                kind: GET_JITTER_PHASE_COUNT,
+                next: std::ptr::null(),
+            },
+            render_width: 2561,
+            display_width: 3840,
+            out: &mut field,
+        };
+        let ask = |q: &mut PhaseCount| query(std::ptr::null_mut(), (q as *mut PhaseCount).cast());
+        for real in [
+            0,
+            refusing as *const () as usize,
+            zero_ok as *const () as usize,
+        ] {
+            field = 0;
+            REAL_QUERY.store(real, Ordering::Relaxed);
+            assert_eq!(ask(&mut q), 0);
+            assert_eq!(field, 17, "the title's 0 is replaced");
+            // The title's next step: its frame index modulo the count.
+            assert_eq!(5u32 % field as u32, 5);
+        }
+        REAL_QUERY.store(answers as *const () as usize, Ordering::Relaxed);
+        assert_eq!(ask(&mut q), 0);
+        assert_eq!(field, 99, "a usable answer of the title's DLL is kept");
+
+        let (mut x, mut y) = (f32::NAN, f32::NAN);
+        let mut j = JitterOffset {
+            header: Header {
+                kind: GET_JITTER_OFFSET,
+                next: std::ptr::null(),
+            },
+            index: 1,
+            phase_count: 17,
+            out_x: &mut x,
+            out_y: &mut y,
+        };
+        REAL_QUERY.store(refusing as *const () as usize, Ordering::Relaxed);
+        assert_eq!(query(std::ptr::null_mut(), (&raw mut j).cast()), 0);
+        assert_eq!((x, y), jitter_offset(1, 17));
+        REAL_QUERY.store(answers as *const () as usize, Ordering::Relaxed);
+        assert_eq!(query(std::ptr::null_mut(), (&raw mut j).cast()), 0);
+        assert_eq!(x, 0.125);
+
+        let mut usage = [7u64, 7];
+        let mut m = MemoryUsage {
+            header: Header {
+                kind: GPU_MEMORY_USAGE,
+                next: std::ptr::null(),
+            },
+            out: &mut usage,
+        };
+        REAL_QUERY.store(refusing as *const () as usize, Ordering::Relaxed);
+        assert_eq!(query(std::ptr::null_mut(), (&raw mut m).cast()), 0);
+        assert_eq!(usage, [0, 0], "not left as stack garbage");
+
+        // Another query is the DLL's answer, as it gave it.
+        let mut other = Header {
+            kind: 0x0001_0002,
+            next: std::ptr::null(),
+        };
+        assert_eq!(query(std::ptr::null_mut(), &mut other), ERROR);
+        REAL_QUERY.store(before, Ordering::Relaxed);
     }
 }

@@ -166,6 +166,13 @@ pub(crate) fn note_held(depth: Option<Arc<HostTexture>>, motion: Option<Arc<Host
     }
 }
 
+/// The frame being built's depth and motion vectors so far (the velocity
+/// pass's), for DLSS-G without an upscale (`dlssg::tag_from_camera`).
+pub(crate) fn noted_velocity() -> (Option<Arc<HostTexture>>, Option<Arc<HostTexture>>) {
+    let n = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+    (n[0].clone(), n[1].clone())
+}
+
 /// Records the copy of render target `target` (a title texture) into ours,
 /// once a frame, before the UI blit draws over it. Every state is as it was
 /// after it.

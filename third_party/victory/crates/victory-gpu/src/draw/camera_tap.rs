@@ -183,6 +183,8 @@ impl State {
                 crate::camera_copy::note_held(None, None, Some(held));
             }
         }
+        // DLSS-G without an upscale hook: the velocity pass is behind us.
+        crate::dlssg::tag_from_camera(list);
         let current = self.targets.first().map_or(0, |&t| t as u64);
         if crate::camera_copy::hudless_on() && current != 0 && !compute {
             crate::camera_copy::copy_hudless(list, current);

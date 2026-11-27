@@ -106,6 +106,27 @@ fn constants_from_the_camera() {
     assert!((c.camera_fov - d.fov_y).abs() < 1e-6);
 }
 
+/// Without `VICTORY_UPSCALER=7` (no upscale dispatch), the camera's velocity
+/// pass gives the constants: its mv scale (UV per pixel) and jitter, and its
+/// reversed depth read as inverted.
+#[test]
+fn constants_without_an_upscale_come_from_the_camera() {
+    let mut cam = still_camera();
+    cam.mv_scale = [1.0 / RENDER[0] as f32, 1.0 / RENDER[1] as f32];
+    cam.jitter_px = [0.125, -0.25];
+    assert!(constants(Some(&cam), None).is_err(), "nothing tagged: paused");
+    let up = from_camera(&cam, RENDER).expect("upscale values from the camera");
+    assert_eq!(up.render, RENDER);
+    assert!(up.near > up.far, "reversed depth");
+    let c = constants(Some(&cam), Some(&up)).expect("constants");
+    assert_eq!(c.mvec_scale, cam.mv_scale);
+    assert_eq!(c.jitter_offset, [0.125, -0.25]);
+    assert_eq!(c.depth_inverted, sl::TRUE);
+    assert!(c.camera_near > 0.0 && c.camera_near < c.camera_far);
+    // A camera without matrices gives nothing.
+    assert!(from_camera(&FrameCamera::default(), RENDER).is_none());
+}
+
 #[test]
 fn no_hudless_without_a_copy_of_this_frame() {
     assert!(hudless_for(None).is_none());
