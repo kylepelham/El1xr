@@ -820,6 +820,7 @@ pub(crate) fn take_dropped() -> u64 {
         );
     }
     crate::drop_why::line(crate::queue::frame_count());
+    crate::indirect_fit::line(crate::queue::frame_count());
     DROPPED.swap(0, Ordering::Relaxed)
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
@@ -4939,9 +4940,6 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
-        if ran {
-            crate::drop_why::pipeline(0);
-        }
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
         // geometry missing; an empty one is no loss).
@@ -5087,11 +5085,15 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
+        let Some((args, max)) = crate::shadow::find_any(arguments, len)
+            .map(|args| (args, max))
+            .or_else(|| crate::indirect_fit::fitted(arguments, stride, max))
+        else {
             crate::drop_why::set("arguments outside title buffers");
             why("arguments outside title buffers");
             return false;
         };
+        let len = u64::from(stride) * u64::from(max.max(1));
         if crate::indirect::after_writer()
             && matches!(kind, DRAW | INDEXED | MESH)
             && max == 1

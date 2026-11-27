@@ -66,6 +66,8 @@ mod scratch_spare;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod indirect_fit;
+#[cfg(windows)]
 mod cores;
 #[cfg(windows)]
 mod inplace;
