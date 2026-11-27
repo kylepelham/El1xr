@@ -5,19 +5,34 @@ ROOT = Path(__file__).resolve().parents[1] / "PrototypeScarlett"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT))
 
+import atexit  # noqa: E402
 import os  # noqa: E402
+import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
 import pytest  # noqa: E402
+
+
+def _dossier_de_test(variable, prefixe):
+    """Un dossier temporaire propre à ce processus de tests sous `variable`, effacé à la sortie. Celui que
+    l'utilisateur a donné est gardé ; celui hérité du processus qui a lancé ce worker de pytest-xdist est remplacé
+    (les workers ne partagent pas de dossier)."""
+    marque, pid = f"{variable}_PYTEST_PID", str(os.getpid())
+    if variable in os.environ and os.environ.get(marque, pid) == pid:
+        return
+    dossier = tempfile.mkdtemp(prefix=prefixe)
+    atexit.register(shutil.rmtree, dossier, True)
+    os.environ[variable], os.environ[marque] = dossier, pid
+
 
 # Tests déterministes : El1xr gère seul le runtime GDK, même si Gaming Services est
 # installé. Les tests de délégation lancent un sous-processus avec la valeur "1".
 os.environ.setdefault("ANYXBOXX_SYSTEM_RUNTIME", "0")
 # Cache de shaders propre à la session de tests : jamais celui de l'utilisateur.
-os.environ.setdefault("ANYXBOXX_SHADER_CACHE", tempfile.mkdtemp(prefix="anyxboxx-shader-cache-"))
+_dossier_de_test("ANYXBOXX_SHADER_CACHE", "anyxboxx-shader-cache-")
 # Sans DLL de TomBox dans les tests du runtime : ils vérifient nos DLL. Le dossier par défaut
 # (runtime/build/tombox) est testé à part, et tests/test_tombox_native.py le désigne explicitement.
-os.environ.setdefault("ANYXBOXX_TOMBOX_DIR", tempfile.mkdtemp(prefix="anyxboxx-sans-tombox-"))
+_dossier_de_test("ANYXBOXX_TOMBOX_DIR", "anyxboxx-sans-tombox-")
 
 RUNTIME_DIR = Path(os.environ.get("ANYXBOXX_RUNTIME")
                    or Path(__file__).resolve().parents[1] / "runtime" / "build" / "bin")
