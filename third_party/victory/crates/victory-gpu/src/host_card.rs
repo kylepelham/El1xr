@@ -308,11 +308,42 @@ impl Host {
         if !crate::shadow::cards() {
             return (None, None);
         }
+        use crate::card_prof::P;
+        let mut lap = crate::card_prof::Lap::new();
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         let mut decl_index: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
-        if step_index() {
+        // Each copy's ranges sorted and joined here, once (`decl_join`).
+        let joined_decl = crate::card_prof::decl_join();
+        if joined_decl {
+            let mut join = crate::card_prof::DeclJoin::new();
+            let mut gathered = 0u64;
+            for list in runs {
+                if step_index() {
+                    for (shadow, ranges) in &list.deferred().gpu_writes {
+                        if !shadow.carded() || shadow.transient() {
+                            continue;
+                        }
+                        gathered += ranges.len() as u64;
+                        join.add(Arc::as_ptr(shadow) as usize, || shadow.clone(), ranges);
+                    }
+                } else {
+                    for step in &list.deferred().copies {
+                        if let Step::GpuWrite(shadow, address, len) = step
+                            && shadow.carded()
+                            && !shadow.transient()
+                        {
+                            gathered += 1;
+                            let range = (*address, *address + *len);
+                            join.add(Arc::as_ptr(shadow) as usize, || shadow.clone(), &[range]);
+                        }
+                    }
+                }
+            }
+            declared = join.finish();
+            crate::card_prof::add(P::DeclIn, gathered);
+        } else if step_index() {
             for list in runs {
                 for (shadow, ranges) in &list.deferred().gpu_writes {
                     if !shadow.carded() || shadow.transient() {
@@ -352,9 +383,15 @@ impl Host {
                 }
             }
         }
+        if !joined_decl && crate::card_prof::on() {
+            let gathered: usize = declared.iter().map(|(_, r)| r.len()).sum();
+            crate::card_prof::add(P::DeclIn, gathered as u64);
+        }
+        lap.mark(P::Declared);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        lap.mark(P::Order);
         let sent_as = match order.as_mut() {
             Some(order) => {
                 **order += 1;
@@ -363,13 +400,21 @@ impl Host {
             None => 0,
         };
         let (mut dirty, uploads) = crate::shadow::card_dirty(sent_as);
+        lap.mark(P::Dirty);
         if declared.is_empty() && dirty.is_empty() && uploads.is_empty() {
             return (None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        lap.mark(P::Work);
         let Some(work) = work.as_mut() else {
             return (None, None);
         };
+        if crate::card_prof::on() {
+            crate::card_prof::add(P::Plans, 1);
+            crate::card_prof::add(P::DirtyCopies, dirty.len() as u64);
+            let ranges: usize = dirty.iter().map(|(_, r)| r.len()).sum();
+            crate::card_prof::add(P::DirtyRanges, ranges as u64);
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -387,6 +432,7 @@ impl Host {
                 }
             }
         }
+        lap.mark(P::Before);
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut sync_list: Option<ID3D12CommandList> = None;
         // (Neptune) The masks this plan's send reads (`under_writes_masks`).
@@ -451,6 +497,7 @@ impl Host {
                                 at += pass.len() * 8;
                             }
                             CARD_MASKED[0].fetch_add(masked.len() as u64, Ordering::Relaxed);
+                            crate::card_prof::add(P::MaskBlocks, masked.len() as u64);
                             CARD_MASKED_PASSES.fetch_add(runs.len() as u64, Ordering::Relaxed);
                             sends.push((Some(copies), runs));
                         }
@@ -462,6 +509,7 @@ impl Host {
             if sends.is_empty() {
                 sends.resize_with(dirty.len(), || (None, Vec::new()));
             }
+            lap.mark(P::Masks);
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -682,6 +730,7 @@ impl Host {
             }
             used.push((false, sync));
         }
+        lap.mark(P::Sync);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             sync: sync_list,
@@ -706,20 +755,28 @@ impl Host {
         // results go behind those of plans still in the air.
         let mut at = work.taken;
         for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
+            let joined_here;
+            let spans: &[(usize, usize)] = if joined_decl {
+                ranges
+            } else {
+                let mut sorted = ranges.clone();
+                sorted.sort_unstable();
+                let mut spans: Vec<(usize, usize)> = Vec::new();
+                for (from, to) in sorted {
+                    match spans.last_mut() {
+                        Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                        _ => spans.push((from, to)),
+                    }
                 }
-            }
+                joined_here = spans;
+                &joined_here
+            };
+            crate::card_prof::add(P::DeclOut, spans.len() as u64);
             let twin = shadow
                 .card_sides()
                 .is_some_and(|(_, before, _)| before.is_some());
             let mut run = crate::card_share::Run::new(crate::card_share::on() && !inflight_fetch());
-            for (from, to) in spans {
+            for &(from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
@@ -736,6 +793,7 @@ impl Host {
             }
         }
         work.taken = at;
+        lap.mark(P::Spans);
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
@@ -889,6 +947,7 @@ impl Host {
             plan.snap = keep.map(|(_, base)| base);
             plan.lists.push((true, check));
         }
+        lap.mark(P::Check);
         work.out += 1;
         (Some(plan), order)
     }

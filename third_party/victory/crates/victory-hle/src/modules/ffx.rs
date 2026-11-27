@@ -7,8 +7,8 @@
 //!
 //! When opted in (on Series S, or on Series X with `VICTORY_UPSCALER=7`),
 //! `ffxDispatch` alone is taken here: an upscale dispatch becomes native
-//! NVIDIA DLSS SR (`VICTORY_UPSCALE=dlss` with `--features dlss` and
-//! `nvngx_dlss.dll`) or a plain bilinear stretch (`VICTORY_UPSCALE=stretch`,
+//! NVIDIA DLSS SR (`VICTORY_UPSCALE=dlss`, through the driver's NGX core and
+//! an `nvngx_dlss.dll`) or a plain bilinear stretch (`VICTORY_UPSCALE=stretch`,
 //! also the fallback if DLSS cannot run). Any other dispatch, and any upscale
 //! we could not record, is forwarded to the title's own DLL.
 //!
@@ -199,7 +199,14 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 }
             }
             #[cfg(windows)]
-            {
+            if victory_gpu::camera::on() {
+                note_camera(d);
+            }
+            #[cfg(windows)]
+            let live = live_mode();
+            // (None: the hook is only observing for `VICTORY_CAMERA_CAPTURE`.)
+            #[cfg(windows)]
+            if live.is_some() && live != Some(victory_gpu::upscale_live::Live::Native) {
                 let up = victory_gpu::upscale::Upscale {
                     colour: d.colour.resource as u64,
                     depth: d.depth.resource as u64,
@@ -209,12 +216,14 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     render: d.render,
                     jitter: d.jitter,
                     motion_scale: d.motion_scale,
-                    reset: d.reset != 0,
+                    reset: d.reset != 0 || mode_changed(),
                     pre_exposure: d.pre_exposure,
                     near: d.camera_near,
                     far: d.camera_far,
                     frame_ms: d.frame_time_delta,
-                    dlss: asked_mode() == Some(Mode::Dlss),
+                    dlss: live == Some(victory_gpu::upscale_live::Live::Dlss),
+                    fov_y: d.camera_fov,
+                    metres_per_unit: d.view_to_meters,
                 };
                 if victory_gpu::upscale::upscale(d.list, &up) {
                     return 0;
@@ -245,6 +254,72 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
         // SAFETY: the title's own `ffxDispatch`, with its own arguments.
         real => unsafe { std::mem::transmute::<usize, Dispatch>(real)(context, desc) },
     }
+}
+
+/// `VICTORY_CAMERA_CAPTURE=1`: the dispatch's inputs for the frame's camera
+/// record (`victory_gpu::camera`); the output is the HUD-less scene.
+#[cfg(windows)]
+fn note_camera(d: &Upscale) {
+    use victory_gpu::camera::format_of;
+    victory_gpu::camera::note_dispatch(victory_gpu::camera::Dispatch {
+        colour: d.colour.resource as u64,
+        depth: d.depth.resource as u64,
+        motion: d.motion.resource as u64,
+        output: d.output.resource as u64,
+        formats: [
+            format_of(d.colour.resource as u64),
+            format_of(d.depth.resource as u64),
+            format_of(d.motion.resource as u64),
+            format_of(d.output.resource as u64),
+        ],
+        jitter: d.jitter,
+        motion_scale: d.motion_scale,
+        render: d.render,
+        upscale: d.upscale,
+        near: d.camera_near,
+        far: d.camera_far,
+        fov: d.camera_fov,
+        frame_ms: d.frame_time_delta,
+        reset: d.reset != 0,
+    });
+}
+
+/// `VICTORY_CAMERA_CAPTURE=1` installs the hook to observe the dispatch
+/// (passed on to the title's DLL) where an upscale switch could take it.
+pub fn should_observe_dispatch(
+    console_is_series_s: bool,
+    asked_upscaler: Option<u32>,
+    fsr_dll_enabled: bool,
+    camera_capture: bool,
+) -> bool {
+    camera_capture && !fsr_dll_enabled && (console_is_series_s || asked_upscaler == Some(7))
+}
+
+/// `VICTORY_CAMERA_CAPTURE=1`.
+pub fn camera_capture() -> bool {
+    std::env::var_os("VICTORY_CAMERA_CAPTURE").is_some_and(|v| v == "1")
+}
+
+/// The upscale to record: a live request (`victory_gpu::upscale_live`) over
+/// `VICTORY_UPSCALE`. `Native` passes the dispatch to the title's own DLL.
+#[cfg(windows)]
+fn live_mode() -> Option<victory_gpu::upscale_live::Live> {
+    use victory_gpu::upscale_live::Live;
+    victory_gpu::upscale_live::mode().or_else(|| {
+        asked_mode().map(|m| match m {
+            Mode::Stretch => Live::Stretch,
+            Mode::Dlss => Live::Dlss,
+        })
+    })
+}
+
+/// Whether the upscale mode changed since the last upscale recorded here:
+/// the new upscaler starts without the old one's history.
+#[cfg(windows)]
+fn mode_changed() -> bool {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let now = victory_gpu::upscale_live::generation();
+    SEEN.swap(now, Ordering::Relaxed) != now
 }
 
 /// What the title's import of `ffxDispatch` is bound to. The DLL is not an
@@ -321,6 +396,15 @@ mod tests {
             true,
             Some(Mode::Stretch)
         ));
+    }
+
+    #[test]
+    fn camera_capture_observes_only_where_the_dispatch_can_be_hooked() {
+        assert!(!should_observe_dispatch(false, None, false, true));
+        assert!(!should_observe_dispatch(true, None, false, false));
+        assert!(should_observe_dispatch(true, None, false, true));
+        assert!(should_observe_dispatch(false, Some(7), false, true));
+        assert!(!should_observe_dispatch(false, Some(7), true, true));
     }
 
     /// A dispatch that is not an upscale, with no DLL of the title's to

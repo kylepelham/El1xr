@@ -411,6 +411,77 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// Lowers `body` with `fix` set as `on` for this thread.
+fn build_cs_with(fix: lower::isa_fixes::Fix, on: bool, body: &[u32], threads: u32) -> HostShader {
+    lower::isa_fixes::set_for_test(fix, Some(on));
+    let shader = build_cs(body, threads, 0);
+    lower::isa_fixes::set_for_test(fix, None);
+    shader
+}
+
+#[test]
+fn s_min_and_s_max_set_scc_when_the_first_operand_is_chosen() {
+    use lower::isa_fixes::Fix;
+    let cases: [[u32; 4]; 7] = [
+        [5, 3, 0, 0],
+        [3, 5, 0, 0],
+        [4, 4, 0, 0],
+        [0, 7, 0, 0],
+        [7, 0, 0, 0],
+        [u32::MAX, 1, 0, 0],
+        [1, u32::MAX, 0, 0],
+    ];
+    // (SOP2 opcode, name, first operand chosen, the result)
+    type Rule = fn(u32, u32) -> bool;
+    let ops: [(u8, &str, Rule); 4] = [
+        (6, "s_min_i32", |a, b| (a as i32) < (b as i32)),
+        (7, "s_min_u32", |a, b| a < b),
+        (8, "s_max_i32", |a, b| (a as i32) > (b as i32)),
+        (9, "s_max_u32", |a, b| a > b),
+    ];
+    for (op, name, first) in ops {
+        for fixed in [true, false] {
+            let body = [
+                sop2(op, 12, 0, 1),
+                sop2(10, 13, 129, 128),       // s_cselect_b32 s13, 1, 0
+                vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+            ];
+            let shader = build_cs_with(Fix::SccMinMax, fixed, &body, 1);
+            run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+                let chosen = if first(a, b) { a } else { b };
+                // Off: SCC = (D != 0), as before the fix.
+                let want = if fixed { first(a, b) } else { chosen != 0 };
+                assert_eq!(got, u32::from(want), "{backend}: {name} {a:#x}, {b:#x} (fixed: {fixed})");
+            });
+        }
+    }
+}
+
+#[test]
+fn v_writelane_takes_its_lane_from_s1_masked_to_the_wave() {
+    use lower::isa_fixes::Fix;
+    // 32 lanes, each with its lane number in v0; v_writelane_b32 v0, s0, s1; then lane s2
+    // of v0 into s12, and into v0 for the store.
+    let body = [
+        vop3(0x361, 0, sgpr(0), sgpr(1), 0)[0],
+        vop3(0x361, 0, sgpr(0), sgpr(1), 0)[1],
+        vop3(0x360, 12, vgpr(0), sgpr(2), 0)[0],
+        vop3(0x360, 12, vgpr(0), sgpr(2), 0)[1],
+        vop1(0x001, 0, sgpr(12)),
+    ];
+    // (value, lane select, lane read)
+    let cases: [[u32; 4]; 5] = [[7, 1, 1, 0], [7, 33, 1, 0], [7, 33, 2, 0], [7, 63, 31, 0], [7, 0x8000_0005, 5, 0]];
+    for fixed in [true, false] {
+        let shader = build_cs_with(Fix::WritelaneMask, fixed, &body, 32);
+        // Cross-lane code declares WaveSize(32), which WARP refuses: hardware only.
+        run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, [value, select, read, _], got| {
+            let lane = if fixed { select & 31 } else { select };
+            let want = if lane == read { value } else { read };
+            assert_eq!(got, want, "{backend}: write lane {select:#x}, read lane {read} (fixed: {fixed})");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)

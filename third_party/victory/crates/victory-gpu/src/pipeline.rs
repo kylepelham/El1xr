@@ -68,6 +68,13 @@ pub(crate) struct Shader {
     translated: OnceLock<Option<Translated>>,
 }
 
+impl Shader {
+    /// The program name in its container (`PS_VelocityFill_...`), if any.
+    pub(crate) fn program(&self) -> Option<&str> {
+        program_name(&self.container)
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)?;

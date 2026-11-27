@@ -267,6 +267,11 @@ impl Lower<'_> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, bb);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),
@@ -749,9 +754,11 @@ impl Lower<'_> {
                         need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
+                    let (c1, turn) = self.exchange_turn(self.cur);
                     let cl = self.console_lane();
-                    let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
+                    let is = self.s.m.cmp(c1, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    let k = self.exchange_set(c1, k, turn);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -760,7 +767,7 @@ impl Lower<'_> {
                     let c2 = self.order_waves(self.cur, self.reached_by_group());
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    let _c2 = self.order_waves(c2, self.reached_by_group());
+                    let _c2 = self.exchange_done(c2, turn);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -781,11 +788,16 @@ impl Lower<'_> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
+                // (the paired form: a wave64 lane select takes the low six bits;
+                // `VICTORY_WRITELANE_MASK=1`: every form takes S1 masked to the wave)
                 let lane = match self.twin {
                     Some(_) => {
                         let k63 = self.s.m.i32(63);
                         self.s.m.bin(c, Bin::And, lane, k63)
+                    }
+                    None if super::isa_fixes::Fix::WritelaneMask.on() => {
+                        let k = self.s.m.i32(self.wave() - 1);
+                        self.s.m.bin(c, Bin::And, lane, k)
                     }
                     None => lane,
                 };

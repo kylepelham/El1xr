@@ -43,6 +43,8 @@ mod ambient_miss;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
+mod bake_inputs;
+#[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
 mod draw;
@@ -82,6 +84,7 @@ mod land_aside;
 mod list_reap;
 #[cfg(windows)]
 mod output_views;
+pub mod menu;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -110,6 +113,8 @@ mod inplace;
 #[cfg(windows)]
 mod popwatch;
 #[cfg(windows)]
+mod present_audit;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -133,9 +138,15 @@ mod stretch;
 mod table_defer;
 #[cfg(windows)]
 mod readable_once;
-#[cfg(all(windows, feature = "dlss"))]
+#[cfg(windows)]
 mod dlss;
+#[cfg(windows)]
+pub mod framegen;
+#[cfg(windows)]
+mod ngx;
 pub mod upscale;
+pub mod upscale_live;
+pub mod camera;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -152,6 +163,8 @@ mod copy_profile;
 mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
+#[cfg(windows)]
+mod card_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

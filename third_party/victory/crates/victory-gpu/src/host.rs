@@ -8406,6 +8406,7 @@ impl Host {
                 crate::capture::probe(&self.device, list, texture)
             };
             let watched = crate::popwatch::take(&self.device, list, texture);
+            let audited = crate::present_audit::take(&self.device, list, texture, index, frame);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
@@ -8445,6 +8446,9 @@ impl Host {
             };
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
+            }
+            if let Some(audited) = audited {
+                crate::present_audit::sent(audited, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
@@ -8597,13 +8601,17 @@ impl Host {
                 Flags: crate::pacing::swap_chain_flags(&factory).0 as u32,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let swap_chain = match crate::framegen::create_swap_chain(&factory, &self.queue, hwnd, &desc) {
+                Some(proxy) => proxy,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             crate::overlay::start(hwnd, self.adapter.clone());
+            crate::menu::start(hwnd);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,

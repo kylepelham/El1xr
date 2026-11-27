@@ -186,7 +186,7 @@ fn metadata() -> &'static str {
 
 /// A `REG_SZ` value under `HKLM`, or `None`.
 #[cfg(windows)]
-fn registry_string(subkey: &str, value: &str) -> Option<String> {
+pub(crate) fn registry_string(subkey: &str, value: &str) -> Option<String> {
     use windows_sys::Win32::System::Registry::{
         HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
     };

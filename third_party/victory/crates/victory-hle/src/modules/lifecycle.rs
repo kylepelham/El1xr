@@ -162,6 +162,35 @@ fn hook(hwnd: HWND) {
     }
 }
 
+/// (El1xr) While the in-game menu has the input: the arrow cursor over the picture, the wheel
+/// to the menu, and key presses and mouse movement kept from the title (releases still reach it).
+fn menu_has_input(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    match message {
+        wm::WM_SETCURSOR if (lparam & 0xFFFF) as u32 == wm::HTCLIENT => {
+            // SAFETY: a system cursor.
+            unsafe { wm::SetCursor(wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW)) };
+            Some(1)
+        }
+        wm::WM_MOUSEWHEEL => {
+            victory_gpu::menu::wheel(i32::from((wparam >> 16) as u16 as i16));
+            Some(0)
+        }
+        wm::WM_KEYDOWN
+        | wm::WM_CHAR
+        | wm::WM_MOUSEMOVE
+        | wm::WM_LBUTTONDOWN
+        | wm::WM_RBUTTONDOWN
+        | wm::WM_MBUTTONDOWN
+        | wm::WM_XBUTTONDOWN
+        | wm::WM_LBUTTONDBLCLK
+        | wm::WM_RBUTTONDBLCLK
+        | wm::WM_MOUSEHWHEEL => Some(0),
+        // SAFETY: raw input must still be handed to the default procedure.
+        wm::WM_INPUT => Some(unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }),
+        _ => None,
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -182,6 +211,11 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    if victory_gpu::menu::blocked()
+        && let Some(result) = menu_has_input(hwnd, message, wparam, lparam)
+    {
+        return result;
     }
     if message == wm::WM_SETCURSOR
         && (lparam & 0xFFFF) as u32 == wm::HTCLIENT

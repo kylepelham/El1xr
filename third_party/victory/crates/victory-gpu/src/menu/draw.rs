@@ -1,0 +1,532 @@
+//! (El1xr) Draws the menu into a premultiplied bitmap: GDI rasterises the glyphs (as the overlay
+//! does), everything else is flat fills. Style per `planning/style.md`: a flat night-purple panel,
+//! plain text for status and values, a quiet row background for the selection, and the sunset
+//! accent only under the active tab and on the focused value's arrows.
+
+use windows_sys::Win32::Foundation::SIZE;
+use windows_sys::Win32::Graphics::Gdi::*;
+
+use super::layout::{Layout, Rect};
+use super::model::{Apply, Kind, MenuModel};
+use super::state::{Menu, Row, shown};
+use crate::pixels::Bitmap;
+
+const PANEL: [u8; 3] = [0x16, 0x0d, 0x2b];
+const RULE: [u8; 3] = [0x3a, 0x2d, 0x55];
+const ROW_SEL: [u8; 3] = [0x25, 0x18, 0x40];
+const BANNER: [u8; 3] = [0x1f, 0x14, 0x38];
+const TEXT: [u8; 3] = [0xf4, 0xf0, 0xfa];
+const SOFT: [u8; 3] = [0xd2, 0xca, 0xe2];
+const DIM: [u8; 3] = [0x9a, 0x8f, 0xb4];
+/// The one accent (sunset orange).
+const ACCENT: [u8; 3] = [0xff, 0x8a, 0x3d];
+/// Apply classes, as quiet text.
+const LIVE: [u8; 3] = [0x8c, 0xc4, 0xab];
+const RESTART: [u8; 3] = [0xd6, 0xa5, 0x7a];
+const REBUILD: [u8; 3] = [0xc9, 0x8f, 0xab];
+
+/// Font slots.
+const TITLE: usize = 0;
+const TAB: usize = 1;
+const LABEL: usize = 2;
+const HELP: usize = 3;
+const VALUE: usize = 4;
+const CAPS: usize = 5;
+const SMALL: usize = 6;
+/// Face, size at 1080 lines, weight.
+const FONTS: [(&str, f32, i32); 7] = [
+    ("Segoe UI", 26.0, 600),
+    ("Segoe UI", 15.5, 600),
+    ("Segoe UI", 16.5, 600),
+    ("Segoe UI", 13.5, 400),
+    ("Segoe UI", 15.5, 400),
+    ("Segoe UI", 11.5, 600),
+    ("Segoe UI", 13.0, 400),
+];
+
+/// Signed distance from (x, y) to a `w` x `h` rectangle with corner radius `r` at the origin.
+fn sdf(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    let (qx, qy) = (
+        (x - w / 2.0).abs() - (w / 2.0 - r),
+        (y - h / 2.0).abs() - (h / 2.0 - r),
+    );
+    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+/// A filled rectangle with corner radius `radius`, opacity `a`.
+fn fill(bm: &mut Bitmap, r: Rect, radius: f32, a: u32, rgb: [u8; 3]) {
+    let radius = radius.min(r.w as f32 / 2.0).min(r.h as f32 / 2.0);
+    for y in 0..r.h.max(0) {
+        for x in 0..r.w.max(0) {
+            let d = sdf(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                r.w as f32,
+                r.h as f32,
+                radius,
+            );
+            let c = (0.5 - d).clamp(0.0, 1.0);
+            if c > 0.0 && r.x + x >= 0 && r.y + y >= 0 {
+                bm.over(
+                    (r.x + x) as usize,
+                    (r.y + y) as usize,
+                    rgb,
+                    (c * a as f32 + 0.5) as u32,
+                );
+            }
+        }
+    }
+}
+
+/// A horizontal hairline.
+fn rule(bm: &mut Bitmap, l: &Layout, x: i32, y: i32, w: i32, rgb: [u8; 3]) {
+    let h = l.s.round().max(1.0) as i32;
+    fill(bm, Rect { x, y, w, h }, 0.0, 255, rgb);
+}
+
+/// The panel with a soft drop shadow; depends only on the layout's size, so it is drawn once
+/// per picture size.
+fn base(l: &Layout) -> Bitmap {
+    let mut bm = Bitmap::new(l.window.w as usize, l.window.h as usize);
+    let p = l.panel;
+    let (radius, blur) = (l.px(6.0) as f32, (p.x as f32).max(1.0));
+    for y in 0..l.window.h {
+        for x in 0..l.window.w {
+            let (fx, fy) = ((x - p.x) as f32 + 0.5, (y - p.y - l.px(4.0)) as f32 + 0.5);
+            let d = sdf(fx, fy, p.w as f32, p.h as f32, radius);
+            if d > 0.0 && d < blur {
+                let k = 1.0 - d / blur;
+                bm.over(x as usize, y as usize, [0, 0, 0], (90.0 * k * k) as u32);
+            }
+        }
+    }
+    fill(&mut bm, p, radius, 255, PANEL);
+    let pad = l.px(28.0);
+    rule(&mut bm, l, p.x + pad, l.header.bottom() - l.px(1.0), p.w - 2 * pad, RULE);
+    bm
+}
+
+/// GDI as a glyph rasteriser: each run drawn white on black into a scratch DIB, its grey level
+/// the coverage blended in the run's colour.
+pub(super) struct Text {
+    dc: HDC,
+    fonts: Vec<HFONT>,
+    ascent: Vec<i32>,
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+impl Text {
+    pub(super) fn new(s: f32) -> Option<Text> {
+        // SAFETY: a memory DC compatible with the screen and plain font creations.
+        let dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+        let fonts: Vec<HFONT> = FONTS
+            .iter()
+            .map(|&(face, px, weight)| {
+                let face = wide(face);
+                unsafe {
+                    CreateFontW(
+                        -(px * s).round() as i32,
+                        0,
+                        0,
+                        0,
+                        weight,
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        ANTIALIASED_QUALITY as u32,
+                        0,
+                        face.as_ptr(),
+                    )
+                }
+            })
+            .collect();
+        let mut t = Text {
+            dc,
+            fonts,
+            ascent: vec![0; FONTS.len()],
+        };
+        if dc.is_null() || t.fonts.iter().any(|f| f.is_null()) {
+            return None;
+        }
+        for i in 0..FONTS.len() {
+            // SAFETY: live DC and font; a plain struct filled by the call.
+            unsafe {
+                SelectObject(dc, t.fonts[i]);
+                let mut tm = std::mem::zeroed::<TEXTMETRICW>();
+                GetTextMetricsW(dc, &mut tm);
+                t.ascent[i] = tm.tmAscent;
+            }
+        }
+        Some(t)
+    }
+
+    fn measure(&self, font: usize, text: &str) -> (i32, i32) {
+        let t: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE { cx: 0, cy: 0 };
+        // SAFETY: live DC and font, a slice and its length.
+        unsafe {
+            SelectObject(self.dc, self.fonts[font]);
+            GetTextExtentPoint32W(self.dc, t.as_ptr(), t.len() as i32, &mut size);
+        }
+        (size.cx, size.cy)
+    }
+
+    /// `text` cut with an ellipsis to fit `width`.
+    fn fit(&self, font: usize, text: &str, width: i32) -> String {
+        if self.measure(font, text).0 <= width {
+            return text.to_string();
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        while !chars.is_empty() {
+            chars.pop();
+            let t: String = chars.iter().collect::<String>() + "\u{2026}";
+            if self.measure(font, &t).0 <= width {
+                return t;
+            }
+        }
+        String::new()
+    }
+
+    /// Draws `text` with its top-left at (x, y).
+    fn draw(&self, bm: &mut Bitmap, font: usize, text: &str, x: i32, y: i32, rgb: [u8; 3]) {
+        self.draw_with(bm, font, text, x, y, |_| rgb);
+    }
+
+    /// Draws `text` coloured by `colour(u)` (0..1 across the run).
+    fn draw_with(
+        &self,
+        bm: &mut Bitmap,
+        font: usize,
+        text: &str,
+        x: i32,
+        y: i32,
+        colour: impl Fn(f32) -> [u8; 3],
+    ) {
+        let t: Vec<u16> = text.encode_utf16().collect();
+        let (w, h) = self.measure(font, text);
+        let w = w + 2;
+        if w <= 2 || h <= 0 {
+            return;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD {
+                rgbBlue: 0,
+                rgbGreen: 0,
+                rgbRed: 0,
+                rgbReserved: 0,
+            }],
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: a zeroed DIB section of w x h x 4 bytes selected for the text, read after
+        // GdiFlush, and freed here.
+        unsafe {
+            let dib = CreateDIBSection(
+                self.dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            if dib.is_null() || bits.is_null() {
+                return;
+            }
+            let old = SelectObject(self.dc, dib);
+            SelectObject(self.dc, self.fonts[font]);
+            SetBkMode(self.dc, TRANSPARENT as i32);
+            SetTextColor(self.dc, 0x00ff_ffff);
+            TextOutW(self.dc, 0, 0, t.as_ptr(), t.len() as i32);
+            GdiFlush();
+            let grey = std::slice::from_raw_parts(bits.cast::<u8>(), (w * h) as usize * 4);
+            for col in 0..w {
+                let rgb = colour(col as f32 / w as f32);
+                for row in 0..h {
+                    let (px, py) = (x + col, y + row);
+                    let a = u32::from(grey[((row * w + col) * 4 + 1) as usize]);
+                    if px >= 0 && py >= 0 && a > 0 {
+                        bm.over(px as usize, py as usize, rgb, a);
+                    }
+                }
+            }
+            SelectObject(self.dc, old);
+            DeleteObject(dib);
+        }
+    }
+
+    /// Draws `text` centred vertically in `r`, at `x`.
+    fn mid(&self, bm: &mut Bitmap, font: usize, text: &str, x: i32, r: Rect, rgb: [u8; 3]) {
+        let h = self.measure(font, text).1;
+        self.draw(bm, font, text, x, r.y + (r.h - h) / 2, rgb);
+    }
+
+    /// Draws `text` centred in `r`.
+    fn centre(&self, bm: &mut Bitmap, font: usize, text: &str, r: Rect, rgb: [u8; 3]) {
+        let w = self.measure(font, text).0;
+        self.mid(bm, font, text, r.x + (r.w - w) / 2, r, rgb);
+    }
+}
+
+impl Drop for Text {
+    fn drop(&mut self) {
+        // SAFETY: objects this value made.
+        unsafe {
+            for &f in &self.fonts {
+                if !f.is_null() {
+                    DeleteObject(f);
+                }
+            }
+            if !self.dc.is_null() {
+                DeleteDC(self.dc);
+            }
+        }
+    }
+}
+
+/// Fonts and the panel background for one picture size, kept between redraws.
+pub(super) struct Painter {
+    key: (i32, f32),
+    text: Text,
+    base: Bitmap,
+}
+
+impl Painter {
+    pub(super) fn for_layout(cached: Option<Painter>, l: &Layout) -> Option<Painter> {
+        let key = (l.window.w, l.s);
+        match cached {
+            Some(p) if p.key == key && p.base.h == l.window.h as usize => Some(p),
+            _ => Some(Painter {
+                key,
+                text: Text::new(l.s)?,
+                base: base(l),
+            }),
+        }
+    }
+
+    /// The menu as `menu`, `model` and `l` say, or nothing when it is closed.
+    pub(super) fn paint(
+        &self,
+        l: &Layout,
+        menu: &Menu,
+        model: &dyn MenuModel,
+        hover: Option<usize>,
+    ) -> Option<Bitmap> {
+        if !menu.open {
+            return None;
+        }
+        let mut bm = Bitmap {
+            w: self.base.w,
+            h: self.base.h,
+            px: self.base.px.clone(),
+        };
+        let t = &self.text;
+        let px = |v: f32| l.px(v);
+        let pad = px(28.0);
+        // Header: the name, then what this is, on one baseline.
+        let (nw, nh) = t.measure(TITLE, "El1xr");
+        let ty = l.header.y + (l.header.h - nh) / 2;
+        t.draw(&mut bm, TITLE, "El1xr", l.panel.x + pad, ty, TEXT);
+        let sub_y = ty + t.ascent[TITLE] - t.ascent[TAB];
+        t.draw(&mut bm, TAB, "Settings", l.panel.x + pad + nw + px(12.0), sub_y, DIM);
+        // Expert switch and close, as plain text at the right.
+        let e = l.expert;
+        let state = if menu.expert { "ON" } else { "OFF" };
+        let sw = t.measure(CAPS, state).0;
+        t.mid(&mut bm, CAPS, state, e.right() - sw, e, if menu.expert { TEXT } else { DIM });
+        let label = "EXPERT";
+        let lw = t.measure(CAPS, label).0;
+        t.mid(&mut bm, CAPS, label, e.right() - sw - px(8.0) - lw, e, DIM);
+        t.centre(&mut bm, TAB, "\u{2715}", l.close, SOFT);
+        // Tabs: plain titles, the current one bright with the thin accent underline.
+        for &(tab, r) in &l.tabs {
+            let on = tab == menu.tab;
+            let title = tab.title();
+            let w = t.measure(TAB, title).0;
+            let x = r.x + (r.w - w) / 2;
+            t.mid(&mut bm, TAB, title, x, r, if on { TEXT } else { DIM });
+            if on {
+                let line = Rect { x, y: r.bottom() - px(2.0), w, h: px(2.0).max(2) };
+                fill(&mut bm, line, 0.0, 255, ACCENT);
+            }
+        }
+        // Restart notice: a flat band, a quiet label and the settings that wait.
+        if let Some(b) = l.banner {
+            let pending = model.pending_restart();
+            fill(&mut bm, b, px(4.0) as f32, 255, BANNER);
+            let labels: Vec<&str> = pending
+                .iter()
+                .map(|n| {
+                    model
+                        .infos()
+                        .iter()
+                        .find(|i| i.name == *n)
+                        .map_or(*n, |i| i.label)
+                })
+                .collect();
+            let head = "RESTART NEEDED";
+            t.mid(&mut bm, CAPS, head, b.x + px(16.0), b, RESTART);
+            let x = b.x + px(16.0) + t.measure(CAPS, head).0 + px(16.0);
+            let list = t.fit(HELP, &labels.join(", "), b.right() - px(16.0) - x);
+            t.mid(&mut bm, HELP, &list, x, b, SOFT);
+        }
+        // Rows: the selection (and the hovered row, fainter) on a quiet flat background.
+        let rows = menu.rows(model);
+        for &(i, r) in &l.rows {
+            let selected = i == menu.selected;
+            if selected || hover == Some(i) {
+                let a = if selected { 255 } else { 110 };
+                fill(&mut bm, r, px(4.0) as f32, a, ROW_SEL);
+            }
+            self.row(&mut bm, l, r, rows[i], model, selected);
+        }
+        if rows.is_empty() {
+            t.centre(&mut bm, HELP, "Nothing here yet", l.list, DIM);
+        }
+        // Scroll position: a hairline track and a plain thumb.
+        let n = rows.len();
+        if n > l.visible {
+            let track = Rect {
+                x: l.list.right() + px(10.0),
+                y: l.list.y,
+                w: px(2.0).max(1),
+                h: l.visible as i32 * px(60.0),
+            };
+            fill(&mut bm, track, 0.0, 255, RULE);
+            let thumb = Rect {
+                y: track.y + (track.h as usize * menu.scroll / n) as i32,
+                h: (track.h as usize * l.visible / n) as i32,
+                ..track
+            };
+            fill(&mut bm, thumb, 0.0, 255, DIM);
+        }
+        // Footer: hints, then the last change's outcome at the right.
+        let f = l.footer;
+        rule(&mut bm, l, f.x + pad, f.y, f.w - 2 * pad, RULE);
+        let hints = format!(
+            "{} / Esc close   \u{2191}\u{2193} select   \u{2190}\u{2192} change   Q E tabs   X expert      Pad: A change  B close  LB RB tabs  Y expert",
+            super::hotkey_name()
+        );
+        let status = menu.status.clone().unwrap_or_default();
+        let sw = t.measure(SMALL, &status).0;
+        let hints = t.fit(SMALL, &hints, f.w - 2 * pad - sw - px(24.0));
+        t.mid(&mut bm, SMALL, &hints, f.x + pad, f, DIM);
+        t.mid(&mut bm, SMALL, &status, f.right() - pad - sw, f, SOFT);
+        Some(bm)
+    }
+
+    fn row(
+        &self,
+        bm: &mut Bitmap,
+        l: &Layout,
+        r: Rect,
+        row: Row,
+        model: &dyn MenuModel,
+        selected: bool,
+    ) {
+        let t = &self.text;
+        let px = |v: f32| l.px(v);
+        let x = r.x + px(16.0);
+        let (lh, hh) = (t.measure(LABEL, "Ag").1, t.measure(HELP, "Ag").1);
+        let top = r.y + (r.h - lh - hh) / 2;
+        let label_w = l.badge(r).x - px(16.0) - x;
+        let (label, help) = match row {
+            Row::Setting(i) => {
+                let info = model.infos()[i];
+                self.apply_class(bm, l.badge(r), info.apply);
+                let value = model
+                    .get(info.name)
+                    .unwrap_or_else(|| info.default.to_string());
+                self.value(bm, l, l.value(r), info.kind, &value, selected);
+                (
+                    info.label.to_string(),
+                    format!("{}   {}", info.help, info.name),
+                )
+            }
+            Row::Preset(p) => {
+                let preset = model.presets()[p];
+                self.action(bm, l.value(r), "APPLY", selected);
+                (format!("{} preset", preset.name), preset.help.to_string())
+            }
+            Row::Save => {
+                self.action(bm, l.value(r), "SAVE", selected);
+                (
+                    "Save settings".into(),
+                    "Write the changed values to the settings file.".into(),
+                )
+            }
+            Row::Reset => {
+                self.action(bm, l.value(r), "RESET", selected);
+                (
+                    "Reset to defaults".into(),
+                    "Every setting back to its default value.".into(),
+                )
+            }
+        };
+        t.draw(
+            bm,
+            LABEL,
+            &t.fit(LABEL, &label, label_w),
+            x,
+            top,
+            if selected { TEXT } else { SOFT },
+        );
+        t.draw(bm, HELP, &t.fit(HELP, &help, label_w), x, top + lh, DIM);
+    }
+
+    /// The apply class as small capitals, left-aligned in its column.
+    fn apply_class(&self, bm: &mut Bitmap, b: Rect, apply: Apply) {
+        let (text, rgb) = match apply {
+            Apply::Live => ("LIVE", LIVE),
+            Apply::Restart => ("RESTART", RESTART),
+            Apply::Retranslate => ("REBUILD", REBUILD),
+        };
+        self.text.mid(bm, CAPS, text, b.x, b, rgb);
+    }
+
+    /// A row's action, as small capitals right-aligned in the value column.
+    fn action(&self, bm: &mut Bitmap, v: Rect, text: &str, selected: bool) {
+        let w = self.text.measure(CAPS, text).0;
+        let rgb = if selected { ACCENT } else { SOFT };
+        self.text.mid(bm, CAPS, text, v.right() - w, v, rgb);
+    }
+
+    /// A value as plain text between small arrows (accent on the focused row), right-aligned in
+    /// the value column; free text without arrows.
+    fn value(&self, bm: &mut Bitmap, l: &Layout, v: Rect, kind: Kind, value: &str, selected: bool) {
+        let t = &self.text;
+        let s = shown(kind, value);
+        if kind == Kind::Text {
+            let s = t.fit(SMALL, &s, v.w);
+            let w = t.measure(SMALL, &s).0;
+            t.mid(bm, SMALL, &s, v.right() - w, v, SOFT);
+            return;
+        }
+        let (left, right) = ("\u{2039}", "\u{203a}");
+        let arrow = if selected { ACCENT } else { DIM };
+        let rw = t.measure(VALUE, right).0;
+        t.mid(bm, VALUE, right, v.right() - rw, v, arrow);
+        t.mid(bm, VALUE, left, v.x + l.px(76.0), v, arrow);
+        let off = kind == Kind::Bool && value != "1";
+        let inner = Rect { x: v.x + l.px(76.0), w: v.right() - rw - v.x - l.px(76.0), ..v };
+        let s = t.fit(VALUE, &s, inner.w - l.px(32.0));
+        t.centre(bm, VALUE, &s, inner, if off { DIM } else { TEXT });
+    }
+}
