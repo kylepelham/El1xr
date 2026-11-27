@@ -13,6 +13,9 @@ arm (more than WARN_RISE_FACTOR times its median plus WARN_RISE_MIN), with the W
 that rose most. The lines of the device-removed report (`dred:`, `VICTORY_DRED=1`) and of the
 hang watch (`hang watch:`, `VICTORY_HANG_WATCH`) are kept per run (`hang_lines`): bench,
 capture and train print them under the run's summary line, and the train report lists them.
+A crash that is the title's own hang watchdog (an access violation writing address 0 at one of
+the title image's watchdog stores, `victory-image-*.dll+0x23cf683` and its siblings) is named
+first among those lines (`title watchdog:`), so it is not bisected as a GPU hang.
 
 `--greps-from <ready.md ...>` reads the `## Batch items` tables of writers' ready.md files and
 adds every backticked log-line phrase it finds there (best effort: placeholders such as `N` or
@@ -52,6 +55,13 @@ TABLE_HEADER_RE = re.compile(r"^\s*\[greps\]\s*(?:#.*)?$")
 HANG_RE = re.compile(r"\b(?:dred|hang watch): ")
 HANG_SKIP_RE = re.compile(r"device-removed data on\b|hang watch: on\b")
 HANG_LINES_MOST = 80
+# The title's own hang watchdog (build 1.0.2.1, image hash b99f876b74d4a77f): a store to address
+# 0 when frames take about 30 s, at 0x23cf683 (seen in crashes) and the eight sibling stores
+# cool_fox#80 lists. A long frame or stall on our side, not a GPU fault.
+WATCHDOG_RVAS = frozenset({
+    0x23CF683, 0x2215035, 0x22151A9, 0x23CEA83, 0x258A400, 0x29DFC80, 0x390D4C0, 0x402A070, 0x3DCE53C,
+})
+WATCHDOG_RE = re.compile(r"exception 0xc0000005 at victory-image-[0-9a-f]+\.dll\+(0x[0-9a-f]+) \(write 0x0\b")
 
 
 class GrepError(ValueError):
@@ -101,11 +111,28 @@ class LogScan:
     hang: list[str] = field(default_factory=list)
 
 
+def title_watchdog(text: str) -> str | None:
+    """The `title watchdog:` line for a log whose crash is the title's own hang watchdog, else None."""
+    for raw in text.splitlines():
+        m = WATCHDOG_RE.search(ANSI_RE.sub("", raw))
+        if m and int(m.group(1), 16) in WATCHDOG_RVAS:
+            return (
+                f"title watchdog: the write to 0x0 at victory-image+{m.group(1)} is the title's own hang "
+                "watchdog (about 30 s without a finished frame), not a GPU hang or DEVICE_HUNG: look for "
+                "the long frame or stall before it (pipeline waits, locks, loading); do not bisect shaders for it"
+            )
+    return None
+
+
 def hang_lines(text: str, most: int = HANG_LINES_MOST) -> list[str]:
     """The `dred:` and `hang watch:` lines of a run's log, from those words on, each once (the
-    crash report repeats the failure's text), at most `most`; not the lines saying they are on."""
+    crash report repeats the failure's text), at most `most`; not the lines saying they are on.
+    A title watchdog crash (`title_watchdog`) comes first."""
     out: list[str] = []
     seen: set[str] = set()
+    watchdog = title_watchdog(text)
+    if watchdog and most > 0:
+        out.append(watchdog)
     for raw in text.splitlines():
         line = ANSI_RE.sub("", raw).rstrip()
         m = HANG_RE.search(line)
