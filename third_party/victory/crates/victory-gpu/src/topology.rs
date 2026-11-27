@@ -1,5 +1,5 @@
 //! Soft thread placement across a processor's two last-level caches
-//! (`VICTORY_VCACHE_PIN=1`, opt-in).
+//! (`VICTORY_VCACHE_PIN`: on by default where they differ, `0` off).
 //!
 //! On a dual-CCD 3D V-Cache part such as the Ryzen 9 9950X3D (CCD0: 16 sets
 //! on 96 MiB of L3, CCD1: 16 sets on 32 MiB) every core reports the same
@@ -84,14 +84,25 @@ pub fn classify(sets: &[(u32, u8, u8)], l3: &[(u32, u32)]) -> Placement {
     }
 }
 
-/// `VICTORY_VCACHE_PIN`: `1` turns placement on; anything else leaves it off.
-pub fn parse_switch(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+/// `VICTORY_VCACHE_PIN`: `0` off, `1` on wherever the sets split, anything
+/// else (unset) on only where the last-level caches differ (the measured case).
+pub fn active(value: Option<&str>, split: Split) -> bool {
+    match value.map(str::trim) {
+        Some("0") => false,
+        Some("1") => split != Split::Uniform,
+        _ => matches!(split, Split::Cache { .. }),
+    }
 }
 
+/// Whether placement applies on this machine (see [`active`]).
 pub fn vcache_pin_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| parse_switch(std::env::var("VICTORY_VCACHE_PIN").ok().as_deref()))
+    *ON.get_or_init(|| {
+        active(
+            std::env::var("VICTORY_VCACHE_PIN").ok().as_deref(),
+            discover().split,
+        )
+    })
 }
 
 /// The sets a thread of this kind prefers (empty: leave it alone).
@@ -231,12 +242,18 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_is_opt_in() {
-        assert!(!parse_switch(None));
-        assert!(!parse_switch(Some("0")));
-        assert!(!parse_switch(Some("true")));
-        assert!(parse_switch(Some("1")));
-        assert!(parse_switch(Some(" 1 ")));
+    fn unset_places_only_where_the_caches_differ() {
+        let cache = Split::Cache {
+            hot: 96 * MB,
+            other: 32 * MB,
+        };
+        assert!(active(None, cache));
+        assert!(!active(None, Split::Class));
+        assert!(!active(None, Split::Uniform));
+        assert!(!active(Some("0"), cache));
+        assert!(active(Some(" 1 "), Split::Class));
+        assert!(active(Some("1"), cache));
+        assert!(!active(Some("1"), Split::Uniform));
     }
 
     #[test]

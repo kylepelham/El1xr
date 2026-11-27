@@ -319,7 +319,7 @@ pub(crate) fn keep_on_fast_cores() {
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
 /// a landing shares its work with.
 pub(crate) fn keep_helper_on_fast_cores() {
-    // Under `VICTORY_VCACHE_PIN=1`, wide copy/merge worker pools stay unpinned
+    // With V-Cache placement on (`crate::topology`), wide copy/merge worker pools stay unpinned
     // so 24+ bulk workers never oversubscribe CCD0's 8 cores or evict the
     // 96 MiB 3D V-Cache.
     if crate::topology::vcache_pin_enabled() {
