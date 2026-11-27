@@ -422,7 +422,8 @@ fn reap_one(object: Retired) {
 /// Drops `object` on the reaper thread when [`reaper_on`] (caller guarantees
 /// the card is done with it, so D3D12 `Release()` does not stall a hot thread).
 pub(crate) fn reap_now<T: 'static>(object: T) {
-    if !reaper_on() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_REAP_RESETS").is_none_or(|v| v != "0")) || !reaper_on() {
         drop(object);
         return;
     }
