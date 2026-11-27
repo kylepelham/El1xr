@@ -191,7 +191,7 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    make_from(device, SOURCE, s!("clamp"))
+    make_from(device, &budget::clamp_source(SOURCE, budget::log2()), s!("clamp"))
 }
 
 fn make_from(
@@ -379,6 +379,8 @@ pub(crate) fn learn(at: usize, kind: u32) {
 
 #[cfg(test)]
 mod san_tests;
+
+pub(crate) mod budget;
 
 /// What a list knows of its records: the writes it declared (range, with the order number of
 /// its latest declaration), the order number of each copy's last pass (by [`Shadow::id`]), and
@@ -974,6 +976,9 @@ void main() {
     hits.InterlockedAdd(0, 1, prev);
 }
 "#;
+
+    #[path = "../budget_tests.rs"]
+    mod budget_tests;
 
     struct WarpHarness {
         device: ID3D12Device,
