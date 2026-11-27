@@ -5344,6 +5344,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::gpucost::begin(list, crate::gpucost::CARD_SYNC);
                     // Resolve each dirty copy's card sides once and execute in
                     // 3 batched phases (Copy -> CARD_PATCH -> Rehash) to
                     // collapse per-buffer barriers and compute PSO binds.
@@ -5390,6 +5391,7 @@ impl Host {
                         crate::shadow::CARD_STATS[1].fetch_add(total_ranges, Ordering::Relaxed);
                     }
                     // Phase 2: masked CARD_PATCH dispatches (batched barriers + single PSO bind).
+                    crate::gpucost::at(list, crate::gpucost::CARD_PATCH);
                     if let (Some((root, pso)), Some((mask_buffer, _, _))) =
                         (work.patch.as_ref(), masks.as_ref())
                     {
@@ -5448,6 +5450,7 @@ impl Host {
                     // `ExecuteCommandLists` as the title's lists; `COPY_DEST`/`UAV` ->
                     // `NON_PIXEL_SHADER_RESOURCE` for copies with `before`) followed by a
                     // single rehash PSO bind and a final `NON_PIXEL_SHADER_RESOURCE` -> `COMMON`.
+                    crate::gpucost::at(list, crate::gpucost::CARD_REHASH);
                     let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                     let mut any_rehash = false;
                     for (shadow, _, _, before, _, _, state) in &items {
@@ -5541,6 +5544,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(pass_count, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(piece_count, Ordering::Relaxed);
                     }
+                    crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -5630,6 +5634,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::gpucost::begin(list, crate::gpucost::CARD_CHECK);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -5737,6 +5742,7 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
+                    crate::gpucost::end(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -6130,6 +6136,7 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
+                    crate::gpucost::begin(&list, crate::gpucost::FETCH_RELAY);
                     for (shadow, lo, hi, at) in
                         crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
                     {
@@ -6141,6 +6148,7 @@ impl Host {
                             (hi - lo) as u64,
                         );
                     }
+                    crate::gpucost::end(&list);
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     // In the order of the queue: the sends of title bytes so
@@ -6614,6 +6622,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::gpucost::begin(list, crate::gpucost::FETCH_WAITED);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(
                             fetched,
@@ -6623,6 +6632,7 @@ impl Host {
                             (hi - lo) as u64,
                         );
                     }
+                    crate::gpucost::end(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -7765,9 +7775,11 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::gpucost::at(&self.list, crate::gpucost::LIST_END);
         self.twins_to_depth();
         self.textures_back();
         self.indirect_args_back();
+        crate::gpucost::end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -7833,6 +7845,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        crate::gpucost::begin(&self.list, crate::gpucost::TITLE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
@@ -7905,6 +7918,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
+            crate::gpucost::at(&self.list, crate::gpucost::TRANSITIONS);
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
@@ -8060,6 +8074,7 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
+        crate::gpucost::at(&self.list, crate::gpucost::TWIN_INLINE);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
@@ -8252,12 +8267,14 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                crate::gpucost::begin(list, crate::gpucost::PRELUDE_TWINS);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
+                crate::gpucost::at(list, crate::gpucost::PRELUDE_UPLOADS);
                 for (upload, _) in uploads {
                     upload.record(self, list);
                 }
@@ -8265,9 +8282,11 @@ impl HostList {
                     list.ResourceBarrier(&barriers);
                 }
                 if let Some(budget) = budget {
+                    crate::gpucost::at(list, crate::gpucost::PRELUDE_AHEAD);
                     let mut chunks = self.ahead_chunks.lock().unwrap_or_else(|e| e.into_inner());
                     crate::indirect::record_ahead(list, budget, &mut chunks, &ahead);
                 }
+                crate::gpucost::end(list);
                 list.Close()
             })
         };
@@ -10576,6 +10595,7 @@ impl Meter {
         }
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::gpucost::log(frames, ms);
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);

@@ -50,6 +50,7 @@ FRAME_RE = re.compile(
     r"([0-9.]+) draws/frame, dropped ([0-9.]+) without a host pipeline "
     r"\((\d+) being made\) and ([0-9.]+) indirect"
 )
+CARD_CLOCK_RE = re.compile(r"the card's clock per frame: nothing of ours queued [0-9.]+ ms \(the card about ([0-9.]+)% busy")
 PACING_RE = re.compile(
     r"frame pacing: (\d+) frames in [0-9.]+ s \([0-9.]+ fps\), frame time p50 ([0-9.]+) ms "
     r"p95 ([0-9.]+) ms p99 ([0-9.]+) ms max ([0-9.]+) ms, (\d+) over 50 ms, (\d+) over 100 ms, "
@@ -379,6 +380,8 @@ def summarize_pacing(windows: list[dict[str, float]]) -> dict[str, float]:
 
 def parse_victory_log(text: str) -> dict[str, object]:
     world_rows: list[tuple[float, float, float]] = []
+    busy_rows: list[float] = []
+    frame_ms: float | None = None
     pacing_windows: list[dict[str, float]] = []
     dstorage_rates: list[float] = []
     refused = 0
@@ -409,8 +412,15 @@ def parse_victory_log(text: str) -> dict[str, object]:
             draws = float(m_frame.group(11))
             if draws >= WORLD_DRAWS_MIN:
                 world_rows.append((fps, gpu_ms, prep_ms))
+                frame_ms = float(m_frame.group(2))
                 if first_world_ts is None and line_ts is not None:
                     first_world_ts = line_ts
+            else:
+                frame_ms = None
+        m_card = CARD_CLOCK_RE.search(line)
+        if m_card and frame_ms is not None:
+            # GPU busy: the share of the frame the card had work of ours queued.
+            busy_rows.append(frame_ms * float(m_card.group(1)) / 100.0)
         pacing = parse_pacing_line(line)
         if pacing:
             pacing_windows.append(pacing)
@@ -427,6 +437,8 @@ def parse_victory_log(text: str) -> dict[str, object]:
     gpu_med = statistics.median(r[1] for r in settled) if settled else 0.0
     prep_med = statistics.median(r[2] for r in settled) if settled else 0.0
     ds_med = statistics.median(dstorage_rates) if dstorage_rates else 0.0
+    busy_settled = busy_rows[len(busy_rows) // 2 :]
+    busy_med = statistics.median(busy_settled) if busy_settled else 0.0
     boot_s = (first_world_ts - first_ts).total_seconds() if (first_ts and first_world_ts) else 0.0
     settled_ts = settled_world_ts(world_window_ts)
     settled_s = (settled_ts - first_ts).total_seconds() if (first_ts and settled_ts) else 0.0
@@ -438,6 +450,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "gpu_ms": gpu_med,
         "prep_ms": prep_med,
         "dstorage_mbs": ds_med,
+        "gpu_busy_ms": busy_med,
         "refused": refused,
         "device_removed": device_removed,
         **summarize_pacing(pacing_windows),
@@ -539,7 +552,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     with isolated_save_data_dir(args.save, "bench") as data_dir:
         cmd = build_launcher_command(
             game_dir=game_dir,
-            diag=False,
+            diag=args.diag,
             overrides=overrides,
             mute=mute,
             skip_intro=args.skip_intro,
@@ -561,6 +574,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"fps={float(stats['fps']):.1f} "
         f"gpu_ms={float(stats['gpu_ms']):.1f} "
         f"prep_ms={float(stats['prep_ms']):.1f} "
+        f"gpu_busy_ms={float(stats['gpu_busy_ms']):.1f} "
         f"dstorage_mbs={float(stats['dstorage_mbs']):.1f} "
         f"refused={int(stats['refused'])} "
         f"p50_ms={float(stats['p50_ms']):.1f} "
@@ -683,6 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--seconds", type=int, default=75, help="Run duration in seconds (default: 75).")
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_bench.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
     p_bench.add_argument("--save", help="Named checkpoint under AnyXboxX-coord/saves/<name> (isolated copy per run).")
     p_bench.add_argument(
         "--title-args",
