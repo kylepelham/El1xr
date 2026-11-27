@@ -16,6 +16,23 @@ thread_local! {
     pub(super) static ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether a pass over the due slots stops before its `i`th: never for the first `pinned` (a
+/// bake draw's own textures, `VICTORY_BAKE_INPUTS`: outside the budgets, whatever
+/// `VICTORY_BAKE_ONE_BUDGET` left of the pass's time), else once the frame's bytes are spent
+/// (`bytes_spent`) or, after an upload (or at every 8th slot looked at), past `budget`.
+pub(super) fn stops_at(
+    i: usize,
+    pinned: usize,
+    bytes_spent: bool,
+    uploaded: u64,
+    checked: u64,
+    budget: std::time::Duration,
+    elapsed: impl FnOnce() -> std::time::Duration,
+) -> bool {
+    let looked_enough = uploaded > 0 || (checked > 0 && checked.is_multiple_of(8));
+    i >= pinned && (bytes_spent || (looked_enough && elapsed() >= budget))
+}
+
 /// Reads `n` dwords at title address `at`, if its memory is there.
 pub(super) fn words(at: u64, n: usize) -> Option<Vec<u32>> {
     if at == 0 || n == 0 || !crate::texture::committed(at as *const u8, n * 4) {
@@ -244,4 +261,33 @@ fn bake_hash(p: &HostPipeline) -> &'static str {
         .find_map(|s| BAKE_PIXEL_SHADERS.iter().find(|&&h| h == s.shader.hash.as_str()))
         .copied()
         .unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stops_at;
+    use std::time::Duration;
+
+    /// Batch 4 part C: `bake inputs frame ... short=1` in the world with
+    /// `VICTORY_BAKE_ONE_BUDGET=1`. The switch only shortens the pass's
+    /// `budget`; a bake draw's own slots (the first `pinned`) are uploaded
+    /// whatever the budget or bytes say, so a short bake is a slot the pass
+    /// could not upload (no memory yet, part of it, or no room), not one it
+    /// ran out of time for.
+    #[test]
+    fn a_bake_draws_own_slots_are_outside_every_budget() {
+        let none = Duration::ZERO;
+        let late = || Duration::from_secs(10);
+        for i in 0..3 {
+            assert!(!stops_at(i, 3, true, 5, 8, none, late), "pinned slot {i}");
+        }
+        assert!(stops_at(3, 3, true, 0, 1, none, late), "past the bytes");
+        assert!(stops_at(3, 3, false, 1, 4, none, late), "past the time after an upload");
+        assert!(!stops_at(3, 3, false, 0, 3, none, late), "nothing uploaded, not the 8th look");
+        assert!(stops_at(3, 3, false, 0, 8, none, late), "the 8th look");
+        assert!(
+            !stops_at(3, 3, false, 1, 4, Duration::from_secs(11), late),
+            "within the budget"
+        );
+    }
 }

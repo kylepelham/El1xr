@@ -17,6 +17,12 @@
 //!   recent mean interval has passed since the one before (a quick frame after a slow one waits).
 //!   Default 0.9, `0` turns it off. Measured on GTA VI at 19-21 fps (200 s benches): present
 //!   interval jitter 12.7-15.3 ms to 6.2 ms and its spread 11.3 ms to 7.2 ms, at the same fps.
+//! - (bootfast) `VICTORY_PRESENT_SMOOTH_READY=1`: the running mean takes each frame's interval
+//!   up to when its present was ready, not the interval after the hold. With the held interval
+//!   the mean can fall by at most 1% a frame (a held frame is 0.9 of the mean, weighted 0.1), so
+//!   after the boot frames (capped at 100 ms) the loading screen was held at 14-24 fps for about
+//!   6 s with the title waiting on its present turn (batch 4: 0.991-0.993 a frame, frames 25-200).
+//!   `=2`: also no hold before the world's first frame (`crate::load_rate::in_world`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -102,6 +108,43 @@ static SMOOTH: victory_core::settings::Live =
         parse_smooth(v).unwrap_or(0.0).to_bits()
     });
 
+/// `VICTORY_PRESENT_SMOOTH_READY` (0, 1 or 2), live.
+static SMOOTH_READY: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PRESENT_SMOOTH_READY", |v| {
+        u64::from(parse_smooth_ready(v))
+    });
+
+fn parse_smooth_ready(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// Microseconds presents were held by `VICTORY_PRESENT_SMOOTH` since the last take
+/// (`crate::boot_prof`).
+static HELD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn take_held_us() -> u64 {
+    HELD_US.swap(0, Ordering::Relaxed)
+}
+
+/// The interval the running mean takes: the held one, or with `ready` (the switch on) the one
+/// up to when the present was ready.
+fn mean_sample_us(held_us: u32, ready_us: u32, ready: bool) -> f64 {
+    f64::from(if ready { ready_us } else { held_us }).min(SMOOTH_MAX_US)
+}
+
+/// The running mean after a sample.
+fn next_mean(mean_us: f64, sample_us: f64) -> f64 {
+    if mean_us == 0.0 {
+        sample_us
+    } else {
+        mean_us + SMOOTH_WEIGHT * (sample_us - mean_us)
+    }
+}
+
 /// What [`present`] paces by now: the start's values until a setting
 /// changes one (logged when it does).
 fn live() -> (u32, Option<Duration>, Option<f64>) {
@@ -168,6 +211,9 @@ struct Window {
     turn: Option<Instant>,
     /// The running mean interval for `VICTORY_PRESENT_SMOOTH`, microseconds.
     mean_us: f64,
+    /// Microseconds held by `VICTORY_PRESENT_SMOOTH` in this window, and the presents held.
+    held_us: u64,
+    held: u32,
 }
 
 static WINDOW_STATE: Mutex<Option<Window>> = Mutex::new(None);
@@ -186,7 +232,11 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         intervals: Vec::with_capacity(512),
         turn: None,
         mean_us: 0.0,
+        held_us: 0,
+        held: 0,
     });
+    let ready_mode = SMOOTH_READY.get() as u8;
+    let ready = Instant::now();
     // Frame generation's proxy swap chain paces its own presents.
     let paced_by_proxy = crate::framegen::active();
     if let Some(period) = cap.filter(|_| !paced_by_proxy) {
@@ -200,11 +250,19 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
         };
         w.turn = Some(at + period);
     }
-    if let (Some(fraction), Some(last), false) = (smooth, w.last, paced_by_proxy) {
+    let loading_free = ready_mode >= 2 && !crate::load_rate::in_world();
+    if let (Some(fraction), Some(last), false, false) = (smooth, w.last, paced_by_proxy, loading_free)
+    {
         let hold = last + Duration::from_micros((w.mean_us * fraction) as u64);
         let now = Instant::now();
         if hold > now {
             std::thread::sleep(hold - now);
+            let us = (hold - now).as_micros() as u64;
+            w.held_us += us;
+            w.held += 1;
+            if crate::boot_prof::on() {
+                HELD_US.fetch_add(us, Ordering::Relaxed);
+            }
         }
     }
     // Tearing goes with a sync interval of 0 only (DXGI refuses the present otherwise).
@@ -229,12 +287,11 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
             .as_micros()
             .min(u128::from(u32::MAX)) as u32;
         w.intervals.push(us);
-        let sample = f64::from(us).min(SMOOTH_MAX_US);
-        w.mean_us = if w.mean_us == 0.0 {
-            sample
-        } else {
-            w.mean_us + SMOOTH_WEIGHT * (sample - w.mean_us)
-        };
+        let ready_us = ready
+            .saturating_duration_since(last)
+            .as_micros()
+            .min(u128::from(u32::MAX)) as u32;
+        w.mean_us = next_mean(w.mean_us, mean_sample_us(us, ready_us, ready_mode > 0));
     }
     w.last = Some(now);
     let elapsed = w.since.elapsed();
@@ -251,6 +308,18 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
     if let Some(s) = summarize(&mut w.intervals) {
         tracing::info!("{}", line(elapsed.as_secs_f64(), &s, draws));
     }
+    if ready_mode > 0 || crate::boot_prof::on() {
+        tracing::info!(
+            held_ms = w.held_us / 1000,
+            held = w.held,
+            frames,
+            mean_ms = format_args!("{:.1}", w.mean_us / 1000.0),
+            ready_mode,
+            world = crate::load_rate::in_world(),
+            "present smoothing in the window: presents held to the recent mean (VICTORY_PRESENT_SMOOTH_READY)"
+        );
+    }
+    (w.held_us, w.held) = (0, 0);
     (w.since, w.drawn) = (Instant::now(), drawn);
     w.intervals.clear();
 }
@@ -392,6 +461,31 @@ mod tests {
         assert_eq!(alternating.sd, ramp.sd);
         assert_eq!(alternating.jitter, 20.0);
         assert!((ramp.jitter - 20.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// Frames ready every 20 ms after boot frames that left the mean at 100 ms: held to the
+    /// mean, the mean falls 1% a frame (still over 60 ms after 50 frames); from the ready
+    /// intervals it is near 20 ms within 30 frames.
+    #[test]
+    fn the_mean_follows_ready_frames_down_with_the_switch() {
+        let run = |ready: bool, frames: usize| {
+            let mut mean: f64 = 100_000.0;
+            for _ in 0..frames {
+                let natural = 20_000u32;
+                let held = (mean * 0.9).max(f64::from(natural)) as u32;
+                mean = next_mean(mean, mean_sample_us(held, natural, ready));
+            }
+            mean
+        };
+        assert!(run(false, 50) > 60_000.0, "{}", run(false, 50));
+        assert!(run(true, 30) < 25_000.0, "{}", run(true, 30));
+        // Off: the held interval, capped, as before.
+        assert_eq!(mean_sample_us(150_000, 20_000, false), SMOOTH_MAX_US);
+        assert_eq!(mean_sample_us(40_000, 20_000, true), 20_000.0);
+        assert_eq!(next_mean(0.0, 33_000.0), 33_000.0);
+        assert_eq!(parse_smooth_ready(Some("2")), 2);
+        assert_eq!(parse_smooth_ready(Some("x")), 0);
+        assert_eq!(parse_smooth_ready(None), 0);
     }
 
     /// `tools/dev.py` and `tests/test_dev_pacing.py` read this exact shape.
