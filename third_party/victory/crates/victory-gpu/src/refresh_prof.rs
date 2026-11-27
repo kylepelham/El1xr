@@ -39,9 +39,13 @@ pub(crate) enum P {
     ProtectUs,
     OpenCalls,
     OpenUs,
+    // (feedcard, #88) the 4 KiB guards' closing calls, the plan's wait for the copy's lock.
+    Protect4kCalls,
+    Protect4kUs,
+    StalePlanWaitUs,
 }
 
-const COUNT: usize = P::OpenUs as usize + 1;
+const COUNT: usize = P::StalePlanWaitUs as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -98,12 +102,16 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "stale copy and guards split per frame (VICTORY_FLUSH_PROF, VICTORY_STALE_BATCH={}): \
-         stale copy: plan under the copy's lock {:.2} ms, {:.0} runs copied one by one, \
+         stale copy: plan under the copy's lock {:.2} ms (of it waiting for the lock {:.2} ms, \
+         VICTORY_PLAN_SPLIT={}), {:.0} runs copied one by one, \
          noting their changes {:.2} ms (the rest of the stale copy is the bytes); \
          guards: {:.0} walks under the guards' lock, VirtualProtect read-only {:.0} in {:.2} ms, \
-         opened {:.0} in {:.2} ms (all threads, faults' openings too)",
+         opened {:.0} in {:.2} ms (all threads, faults' openings too); \
+         4 KiB guards closed read-only in {:.0} calls, {:.2} ms (VICTORY_GUARD_4K_JOIN={})",
         u8::from(crate::stale_batch::on()),
         ms(P::StalePlanUs),
+        ms(P::StalePlanWaitUs),
+        u8::from(crate::shadow::plan_split::on()),
         per(P::StaleRuns),
         ms(P::StaleNoteUs),
         per(P::GuardWalks),
@@ -111,5 +119,8 @@ pub(crate) fn log(frames: f64) {
         ms(P::ProtectUs),
         per(P::OpenCalls),
         ms(P::OpenUs),
+        per(P::Protect4kCalls),
+        ms(P::Protect4kUs),
+        u8::from(crate::watch::guard_4k_join()),
     );
 }

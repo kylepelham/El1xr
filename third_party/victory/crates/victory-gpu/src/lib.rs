@@ -41,6 +41,8 @@ mod buffer_ahead;
 mod ambient;
 #[cfg(windows)]
 mod ambient_miss;
+#[cfg(windows)]
+mod ambient_reflect;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 mod boot_prof;
@@ -167,6 +169,8 @@ pub mod camera_mv;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(windows)]
+mod material_demand;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]

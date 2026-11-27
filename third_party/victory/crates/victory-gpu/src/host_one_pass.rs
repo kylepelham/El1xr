@@ -141,11 +141,17 @@ impl<C: Clone> Run<C> {
         run
     }
 
-    fn plan(&self, copy: ShadowBatch<C>, out: &mut Vec<Work<C>>) {
+    /// Plans `copy` onto `out`; returns how many pieces it added. (#88) Only
+    /// what this call pushed is counted: counting all of `out`, which
+    /// `Run::new` fills for every copy of the flush, made the setup quadratic
+    /// in the flush's copies (batch 4: 4.29 M "pieces" a frame for 6.4 k).
+    fn plan(&self, copy: ShadowBatch<C>, out: &mut Vec<Work<C>>) -> usize {
         let (chunk, page) = (self.chunk, self.page);
+        let before = out.len();
         plan(copy, self.min, |a, b| pieces(a, b, chunk, page), out);
-        let pieces = out.iter().filter(|w| matches!(w, Work::Piece(..))).count();
+        let pieces = out[before..].iter().filter(|w| matches!(w, Work::Piece(..))).count();
         STATS[PIECES].fetch_add(pieces as u64, Ordering::Relaxed);
+        pieces
     }
 
     /// Takes and does work until there is none queued or running.
@@ -413,6 +419,19 @@ mod tests {
     }
 
     #[test]
+    fn plan_counts_only_the_pieces_it_adds() {
+        use ShadowStep::{Refresh, Write};
+        let r: Run<usize> = Run::new(Vec::new(), 16, 4, 2);
+        let mut out = Vec::new();
+        for i in 0..50 {
+            // [0, 40) in pieces of 4: ten pieces a copy, whatever `out` already holds.
+            assert_eq!(r.plan(batch(i, vec![Refresh(0, 40), Write(0, 1)]), &mut out), 10);
+            assert_eq!(r.plan(batch(i, vec![Refresh(0, 8)]), &mut out), 0);
+        }
+        assert_eq!(out.iter().filter(|w| matches!(w, Work::Piece(..))).count(), 500);
+    }
+
+    #[test]
     fn an_empty_run_returns_at_once() {
         let r: Run<usize> = Run::new(Vec::new(), 16, 4, 2);
         r.work(|_| panic!("no work"), |_, _, _| panic!("no work"));
@@ -429,6 +448,25 @@ mod tests {
                 pieces(from, to, super::super::flush::SPLIT_CHUNK, 65536),
                 super::super::flush::pieces(from, to, 65536)
             );
+        }
+    }
+
+    /// (#88) Sizes `Run::new` for one big wide flush: `copies` copies, each a
+    /// long refresh of two pieces then a write. Ignored; run with
+    /// `--ignored --nocapture` (release for real numbers).
+    #[test]
+    #[ignore]
+    fn bench_run_new() {
+        use ShadowStep::{Refresh, Write};
+        for copies in [250usize, 1000, 2000, 4000] {
+            let list: Vec<_> = (0..copies)
+                .map(|i| batch(i, vec![Refresh(0, 2 << 20), Write(0, 4)]))
+                .collect();
+            let t = std::time::Instant::now();
+            let r = Run::new(list, 1 << 20, super::super::flush::SPLIT_CHUNK, 65536);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            drop(r);
+            println!("Run::new with {copies} copies: {ms:.3} ms");
         }
     }
 
