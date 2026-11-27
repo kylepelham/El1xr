@@ -22,11 +22,14 @@
 //!    the upscale's jitter, motion-vector scale, near/far and reset kept for
 //!    the constants. Without an upscale hook (the default Series X path, no
 //!    `VICTORY_UPSCALER=7`), [`tag_from_camera`] at the title's UI composite
-//!    tags the velocity pass's depth and motion the camera job noted, and the
-//!    constants take the camera's jitter and motion-vector scale.
+//!    (on Series X 1.0.2.1 the first Scaleform draw onto the target
+//!    `PS_TAA2_SpatialUpscaleWithDithering` wrote) tags the depth and motion
+//!    of `PS_VelocityFill` the camera job noted, and the constants take the
+//!    camera's jitter and motion-vector scale ([`frame_upscale`]).
 //! 3. [`before_present`] / [`after_present`] (`pacing.rs`): the frame's
 //!    constants from `camera::latest()` (`VICTORY_CAMERA_CAPTURE=1`), DLSS-G
-//!    switched off for frames without a valid camera (menus, loading) and on
+//!    switched off for frames without a valid camera (menus, loading) or
+//!    without this frame's depth and motion vectors, and on
 //!    again with a reset, the backbuffer tag, the PC-latency markers around
 //!    `Present`, then the next frame's token and `slReflexSleep`
 //!    (`VICTORY_DLSSG_SLEEP=0` skips the sleep).
@@ -93,6 +96,12 @@ struct Session {
     real: u64,
     /// Presents with DLSS-G on in this window.
     generating: u64,
+    /// Frames of this window whose depth and motion came from an upscale,
+    /// from the camera.
+    upscale_tags: u64,
+    camera_tags: u64,
+    /// Why DLSS-G was last off (for the window line).
+    off_why: String,
     since: Instant,
     told_constants: bool,
     told_tags: bool,
@@ -328,6 +337,9 @@ fn start_after_init(
             switches: 0,
             real: 0,
             generating: 0,
+            upscale_tags: 0,
+            camera_tags: 0,
+            off_why: String::new(),
             since: Instant::now(),
             told_constants: false,
             told_tags: false,
@@ -418,10 +430,23 @@ pub(crate) fn tag_from_camera(list: &crate::host::HostList) {
     s.camera_render = Some(render);
     if !s.told_camera {
         s.told_camera = true;
+        // SAFETY: a live host texture.
+        let d = unsafe { depth.texture.GetDesc() };
+        let depth_size = [d.Width as u32, d.Height];
         tracing::info!(
             render = ?render,
+            motion_format = desc.Format.0,
+            depth_format = d.Format.0,
+            depth_size = ?depth_size,
             "DLSS-G: depth and motion vectors from the camera's velocity pass (no upscale hook)"
         );
+        if depth_size != render {
+            tracing::warn!(
+                ?depth_size,
+                motion_size = ?render,
+                "DLSS-G: the camera's depth and motion vectors differ in size; tagged at the motion size"
+            );
+        }
     }
 }
 
@@ -441,6 +466,26 @@ pub(crate) fn from_camera(cam: &FrameCamera, render: [u32; 2]) -> Option<Upscale
         far: d.near.min(d.far),
         reset: false,
     })
+}
+
+/// Why DLSS-G is off when nothing gave this frame depth and motion vectors.
+const NOTHING_TAGGED: &str = "no upscale and no camera depth/motion tagged this frame (velocity pass, or the first UI draw after PS_TAA2_SpatialUpscale, not seen)";
+
+/// The constants' upscale values for this frame: the upscale's when it
+/// tagged this frame's depth and motion, else the camera's when
+/// [`tag_from_camera`] did (`render`: the size it tagged), else none: an
+/// earlier frame's values without this frame's tags would make DLSS-G
+/// generate from inputs Streamline does not have.
+pub(crate) fn frame_upscale(
+    upscaled_now: bool,
+    camera_render: Option<[u32; 2]>,
+    last: Option<&Upscaled>,
+    cam: Option<&FrameCamera>,
+) -> Option<Upscaled> {
+    if upscaled_now {
+        return last.copied();
+    }
+    from_camera(cam?, camera_render?)
 }
 
 /// Tags `depth` and `motion` (in [`SHADER_READ`] on `list`) for this frame.
@@ -514,7 +559,7 @@ pub(crate) fn constants(
         return Err(format!("camera not valid: {}", cam.why));
     }
     let d = cam.camera.as_ref().ok_or("no camera matrices")?;
-    let up = up.ok_or("no upscale yet")?;
+    let up = up.ok_or(NOTHING_TAGGED)?;
     if up.render[0] == 0 || up.render[1] == 0 {
         return Err("no render size".into());
     }
@@ -593,11 +638,11 @@ fn before_present_with(cam: Option<&FrameCamera>) {
         return;
     };
     let token = TOKEN.load(Ordering::Relaxed);
-    let from_cam = match (s.upscaled_now, s.camera_render, cam) {
-        (false, Some(render), Some(c)) => from_camera(c, render),
-        _ => None,
-    };
-    let consts = constants(cam, from_cam.as_ref().or(s.last.as_ref()));
+    let up = frame_upscale(s.upscaled_now, s.camera_render, s.last.as_ref(), cam);
+    let consts = constants(cam, up.as_ref());
+    if let Err(why) = &consts {
+        s.off_why.clone_from(why);
+    }
     let want = consts.is_ok();
     if want != s.on {
         s.options.mode = if want {
@@ -712,6 +757,8 @@ pub(crate) fn after_present() {
         }
         s.real += 1;
         s.generating += u64::from(s.on);
+        s.upscale_tags += u64::from(s.upscaled_now);
+        s.camera_tags += u64::from(!s.upscaled_now && s.camera_render.is_some());
         s.upscaled_now = false;
         s.camera_render = None;
         if s.since.elapsed() >= WINDOW {
@@ -724,14 +771,19 @@ pub(crate) fn after_present() {
                 real = s.real,
                 real_fps = format_args!("{:.1}", s.real as f64 / secs),
                 generating_presents = s.generating,
+                upscale_tags = s.upscale_tags,
+                camera_tags = s.camera_tags,
                 frames_per_present = state.num_frames_actually_presented,
                 generating = s.on,
+                off_why = %s.off_why,
                 status = %sl::dlssg_status(state.status),
                 max_generated = state.num_frames_to_generate_max,
                 vram_mb = state.estimated_vram_usage_in_bytes >> 20,
                 "DLSS-G: window"
             );
             (s.real, s.generating, s.since) = (0, 0, Instant::now());
+            (s.upscale_tags, s.camera_tags) = (0, 0);
+            s.off_why.clear();
         }
         let frame = FRAME.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let mut next: sl::FrameToken = std::ptr::null();
