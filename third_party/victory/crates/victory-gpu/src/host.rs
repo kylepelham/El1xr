@@ -4522,7 +4522,7 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + crate::sweep_every::every_ms() {
             if sweep_aside::on() {
                 sweep_aside::ask();
             } else {

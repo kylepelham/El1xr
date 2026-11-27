@@ -91,6 +91,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_DLSS_MV_SIGN", Apply::Restart),
     ("VICTORY_DLSS_SDK", Apply::Restart),
     ("VICTORY_DRAW_CENSUS", Apply::Restart),
+    ("VICTORY_DSP_CONVOLVE", Apply::Restart),
+    ("VICTORY_DSP_GAIN", Apply::Restart),
     ("VICTORY_DSTORAGE_ONE_LOOK", Apply::Restart),
     ("VICTORY_DSTORAGE_OWN_HANDLES", Apply::Restart),
     ("VICTORY_DSTORAGE_RETRIES", Apply::Restart),
@@ -299,6 +301,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STRICT_JOINS", Apply::Retranslate),
     ("VICTORY_SUBMIT_CHUNKS", Apply::Restart),
     ("VICTORY_SWEEP", Apply::Restart),
+    ("VICTORY_SWEEP_EVERY_MS", Apply::Restart),
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
     // a flip would compare against stale state and miss changed records (wrong descriptors).
     ("VICTORY_SYNC_IN_PLACE", Apply::Restart),
