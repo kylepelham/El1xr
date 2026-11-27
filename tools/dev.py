@@ -30,6 +30,7 @@ import dev_prewarm
 import dev_stats
 import dev_throttle
 import dev_train
+import dev_visual
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -754,6 +755,44 @@ def train_greps_from(plan_path: Path, plan: dev_train.Plan, sources: list[str]) 
     return 0
 
 
+def train_visual(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, which: list[str]) -> int:
+    """Visual hints: ON snaps against OFF snaps, above the OFF-vs-OFF noise floor."""
+    if len(which) not in (0, 2):
+        print("error: --visual takes no runs (every ON run against the baseline) or two (A B)")
+        print("DEV train-visual FAIL reason=args")
+        return 1
+    try:
+        lines, summary = dev_visual.visual(plan, done, train_dir, which)
+    except dev_train.PlanError as exc:
+        print(f"error: {exc}")
+        print("DEV train-visual FAIL reason=run")
+        return 1
+    print("\n".join(lines))
+    ok = summary["pairs"] > 0
+    print(
+        f"DEV train-visual {'PASS' if ok else 'FAIL'} pairs={summary['pairs']} flagged={summary['flagged']} "
+        f"off_off_pairs={summary['floor']['off_off_pairs']} dir={train_dir / 'visual'} (hint, not a verdict)"
+    )
+    return 0 if ok else 1
+
+
+def train_region(done: dict[int, dict[str, object]], train_dir: Path, spec: list[str], times: list[float] | None) -> int:
+    """Mean colour of a reference PNG's rectangle in every run's snap nearest each time."""
+    try:
+        if not times:
+            raise ValueError("--region needs --at T [T ...] (seconds since the run's first present)")
+        box = tuple(int(v) for v in spec[1:])
+        lines, measured = dev_visual.region(done, train_dir, Path(spec[0]), box, times)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}")
+        print("DEV train-region FAIL reason=args")
+        return 1
+    print("\n".join(lines))
+    ok = measured > 0
+    print(f"DEV train-region {'PASS' if ok else 'FAIL'} measured={measured} dir={train_dir / 'visual'} (hint, not a verdict)")
+    return 0 if ok else 1
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     """One run of a batch plan (`--run`), or the report across its runs (`--report`, `--list`)."""
     try:
@@ -772,6 +811,10 @@ def cmd_train(args: argparse.Namespace) -> int:
         return train_compare(plan, done, train_dir, *args.compare)
     if args.greps_from:
         return train_greps_from(Path(args.plan), plan, args.greps_from)
+    if args.visual is not None:
+        return train_visual(plan, done, train_dir, args.visual)
+    if args.region:
+        return train_region(done, train_dir, args.region, args.at)
     if args.report:
         scans = {
             step: dev_greps.scan_log(read_log_text(log), plan.greps)
@@ -779,6 +822,9 @@ def cmd_train(args: argparse.Namespace) -> int:
             if (log := train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log").exists()
         }
         text, figures = dev_train.report(plan, done, scans)
+        visual = dev_visual.report_section(train_dir)
+        if visual:
+            text += "\n".join(visual) + "\n"
         train_dir.mkdir(parents=True, exist_ok=True)
         (train_dir / "report.md").write_text(text, encoding="utf-8")
         (train_dir / "report.json").write_text(json.dumps(figures, indent=2), encoding="utf-8")
@@ -985,6 +1031,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--greps-from", nargs="+", metavar="READY_MD",
         help="Add the backticked log lines of these ready.md files' batch items to the plan's [greps].",
     )
+    mode.add_argument(
+        "--visual", nargs="*", metavar="RUN",
+        help="Visual hints: ON snaps vs OFF snaps above the OFF-vs-OFF noise floor (no runs: every ON run; or A B).",
+    )
+    mode.add_argument(
+        "--region", nargs=5, metavar=("REF", "X0", "Y0", "X1", "Y1"),
+        help="Mean colour of this rectangle of REF.png in every run's snap nearest each --at time.",
+    )
+    p_train.add_argument("--at", nargs="+", type=float, metavar="T", help="Seconds for --region.")
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_train.set_defaults(func=cmd_train)
 
