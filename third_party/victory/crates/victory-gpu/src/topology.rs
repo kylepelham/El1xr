@@ -138,6 +138,7 @@ pub fn discover() -> &'static Placement {
 /// Prefers the largest-L3 (or fastest-class) sets for the calling thread,
 /// which a frame waits for. Once per thread; nothing without the switch.
 pub fn pin_hot(what: &str) {
+    crate::priority::helper();
     pin(what, true);
 }
 

@@ -57,6 +57,8 @@ pub mod host_facts;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
+mod joined_apart;
+#[cfg(windows)]
 mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
@@ -86,6 +88,7 @@ mod scratch_spare;
 mod indirect;
 #[cfg(windows)]
 mod launch;
+mod load_rate;
 #[cfg(windows)]
 mod indirect_fit;
 #[cfg(windows)]
@@ -160,6 +163,8 @@ mod texture;
 pub mod titlemem;
 #[cfg(windows)]
 pub mod topology;
+#[cfg(windows)]
+pub mod priority;
 #[cfg(windows)]
 #[cfg(windows)]
 mod defrag;

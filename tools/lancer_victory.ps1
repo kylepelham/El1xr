@@ -27,6 +27,11 @@
   Optional. -Warm / -Precompile only translate shaders: no compute pipelines, no device on the card when
   VICTORY_HOST_WAVE and VICTORY_VIEW_LIMIT give the host's facts (as `dev.py prewarm` does).
 
+.PARAMETER WarmRecipes
+  Optional. After -Warm / -Precompile, makes the host pipeline of every recipe earlier runs wrote down
+  (VICTORY_PIPELINE_RECIPES=1) into the pipeline library (`victory warm --recipes`). Makes a device on the card:
+  only under the gpu lock (`dev.py prewarm --pipelines`).
+
 .PARAMETER AutoA
   Optional. Taps A through the start screens for 150 s (VICTORY_AUTO_A=150), as Neptune's play.ps1 does by default.
 
@@ -109,6 +114,7 @@ param(
     [switch]$NoGame,
     [int]$WarmJobs = 0,
     [switch]$WarmNoPipelines,
+    [switch]$WarmRecipes,
     [switch]$AutoA,
     [switch]$FrametimeDump,
     [switch]$Diag,
@@ -298,6 +304,7 @@ if ($PSBoundParameters.ContainsKey('XgDll') -and $XgDll) {
 $warmArgs = @()
 if ($WarmJobs -gt 0) { $warmArgs += @('--jobs', [string]$WarmJobs) }
 if ($WarmNoPipelines) { $warmArgs += '--no-pipelines' }
+if ($WarmRecipes) { $warmArgs += '--recipes' }
 
 if ($Warm) {
     # Same environment as the game below: the cache key depends on it. Only the game folder's own .rpf files.

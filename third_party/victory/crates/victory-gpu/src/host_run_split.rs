@@ -146,6 +146,13 @@ pub(super) fn line(frames: f64) {
         "run_other split per frame (VICTORY_RUN_SPLIT=1): {total:.2} ms over {lists:.1} lists: {}",
         text.join(", ")
     );
+    // Outside run_other (card_before's `card_dirty`, and merges under writes).
+    let [joins, ranges, kept, ms] = crate::joined_apart::taken(frames);
+    tracing::info!(
+        "changed ranges joined per frame (VICTORY_RUN_SPLIT=1): {joins:.0} joins of {ranges:.0} ranges in {ms:.3} ms, \
+         {kept:.0} returned as they were (VICTORY_JOINED_APART={})",
+        u8::from(crate::joined_apart::on())
+    );
 }
 
 #[cfg(test)]

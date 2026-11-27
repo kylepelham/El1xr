@@ -57,14 +57,14 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The folder the library is kept in, if one was given.
+pub(crate) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(super::samplers::cache_dir(dir));
-}
-
-/// The folder of the library and the lists beside it, if one was given.
-pub(super) fn dir() -> Option<&'static std::path::Path> {
-    DIR.get().map(PathBuf::as_path)
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -793,6 +793,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    super::recipe::save(dir);
     store_unstored(library);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was

@@ -49,17 +49,104 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// A pass the picture depends on once per run (character bakes, the
+    /// face network): made at creation and waited for, not dropped
+    /// ([`scene_input`]).
+    scene_input: bool,
+    /// Whether a draw has waited for it past the frame budget already: it
+    /// is waited for so once ([`wait_scene_input`]).
+    scene_waited: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
+    if named_out(shaders) {
+        Some("named in VICTORY_LEAVE_OUT, left out")
+    } else if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
     } else {
         None
     }
+}
+
+/// Shader hashes left out in every build (`VICTORY_LEAVE_OUT=<16 hex>[,..]`;
+/// `VICTORY_SKIP_PIPELINES` does it in diagnostics builds only). After
+/// readmet3xt-lab/foxhound 9f8838b109 `pipeline/make.rs` (its launcher sets
+/// `02384a60fda6f2d0` the decal heap's CS_DefragHeap_ComputeRelocations,
+/// 11.85 ms of the card a frame on a 32-lane host, and `731a39171b568298`
+/// the heat-haze / in-scattering pass).
+fn named_out(shaders: &[Arc<Shader>]) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    !hashes.is_empty() && shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
+/// Passes whose output lasts the whole run or feeds every face: the
+/// character skin/decoration bakes (`crate::draw::BAKE_PIXEL_SHADERS`) and
+/// the face network's producers (after foxhound's `scene_input`). A dropped
+/// one leaves a wrong outfit or a blotched face for the run, so with
+/// `VICTORY_SCENE_INPUT=1` they are started when the title creates them and
+/// a draw waits for them past the frame budget ([`wait_scene_input`]: once
+/// per pipeline, at most `VICTORY_SCENE_INPUT_WAIT_MS` (3000, no more than
+/// [`SCENE_WAIT_MOST`]) a wait and `VICTORY_SCENE_INPUT_TOTAL_MS` (15000) a
+/// run, so a cold cache cannot hold the world for long).
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    shaders.iter().any(|s| {
+        matches!(
+            s.hash.as_str(),
+            "970c4fbb3b017c0e"
+                | "068c90badc86f1fd"
+                | "e4a7e088c7780ce8"
+                | "ebe4e53f031f5249"
+                | "2cc4c197ee29e291"
+                | "369cbe906ea72764"
+        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+    })
+}
+
+/// The longest one scene-input wait may be, whatever is asked.
+const SCENE_WAIT_MOST: u64 = 10_000;
+
+fn ms_from_env(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// What one scene-input wait may last: `VICTORY_SCENE_INPUT_WAIT_MS`
+/// (3000), at most [`SCENE_WAIT_MOST`].
+fn scene_input_wait() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_WAIT_MS", 3000).min(SCENE_WAIT_MOST))
+}
+
+/// What all scene-input waits of a run may last together:
+/// `VICTORY_SCENE_INPUT_TOTAL_MS` (15000).
+fn scene_input_total() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_TOTAL_MS", 15_000))
+}
+
+/// Takes what a scene-input wait may last, in milliseconds, from the run's
+/// allowance `taken` of `total` (at most `each`); 0 when it is spent.
+fn take_scene_wait(taken: &AtomicU64, each: u64, total: u64) -> u64 {
+    let mut got = 0;
+    let _ = taken.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+        got = each.min(total.saturating_sub(t));
+        Some(t + got)
+    });
+    got
 }
 
 /// Whether some compute shader of `shaders` holds `name`.
@@ -122,7 +209,10 @@ impl Pending {
                 .as_bytes(),
         );
         let left_out = left_out(&shaders);
+        let scene_input = left_out.is_none() && scene_input(&shaders);
         Pending {
+            scene_input,
+            scene_waited: AtomicBool::new(false),
             shaders,
             graphics,
             left_out,
@@ -151,6 +241,11 @@ impl Pending {
 
     fn make(&self) {
         self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // (bootfast) `VICTORY_PIPELINE_RECIPES=1`: written down for the
+        // offline warm-up.
+        if super::recipe::on() && matches!(self.made.get(), Some(Some(_))) {
+            super::recipe::made(&self.key, &self.shaders, self.graphics.as_deref());
+        }
     }
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
@@ -316,7 +411,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
-        wait(p, crate::frame::current());
+        if p.scene_input {
+            wait_scene_input(p, crate::frame::current());
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -338,13 +437,35 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
     if p.left_out.is_some() {
         return None;
     }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
+    let made = HostPipeline::new(&p.shaders, None).is_some();
+    if made {
+        // (bootfast) With `VICTORY_PIPELINE_RECIPES=1` a compute warm-up
+        // writes them down too.
+        super::recipe::made(&p.key, &p.shaders, None);
+    }
+    Some(made)
+}
+
+/// (bootfast) Makes the host pipeline of a recipe (`super::recipe`) for the
+/// library on disk: the key it comes out with, and whether it has one
+/// (`None`: left out).
+pub(crate) fn warm_recipe(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> (String, Option<bool>) {
+    let p = Pending::new(shaders, graphics);
+    if p.left_out.is_some() {
+        return (p.key, None);
+    }
+    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
+    (p.key, Some(made))
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_some() || p.shaders.is_empty() {
+        return;
+    }
+    if p.scene_input {
+        start(p, REQUESTED, 0);
         return;
     }
     if let Some(rank) = super::library::wanted_early(&p.key) {
@@ -479,6 +600,57 @@ impl FrameWait {
             Sharing::Reserve => self.spent = self.spent.saturating_sub(left - waited),
             Sharing::PerThread => self.spent += waited,
         }
+    }
+}
+
+/// Waits for a [`scene_input`] pipeline outside the frame budgets: the
+/// first time a draw finds it not made, for as long as the run's allowance
+/// gives ([`take_scene_wait`]); after that, or with the allowance spent,
+/// within the frame's budget as any pipeline. Every such wait is logged.
+fn wait_scene_input(p: &Pending, frame: u64) {
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    if p.scene_waited.swap(true, Ordering::Relaxed) {
+        return wait(p, frame);
+    }
+    let allowed = take_scene_wait(&TAKEN, scene_input_wait(), scene_input_total());
+    if allowed == 0 {
+        tracing::warn!(shaders = ?p.shaders, "scene-input wait: the run's allowance (VICTORY_SCENE_INPUT_TOTAL_MS) is spent; waited as any pipeline");
+        return wait(p, frame);
+    }
+    let _hitch = crate::hitch::span(crate::hitch::Phase::PipelineWait);
+    let started = Instant::now();
+    let left = Duration::from_millis(allowed);
+    let (lock, done) = &p.completion;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let waited = started.elapsed();
+    // What was not waited goes back to the run's allowance.
+    let unused = allowed.saturating_sub(waited.as_millis() as u64);
+    TAKEN.fetch_sub(unused, Ordering::Relaxed);
+    let made = p.made.get().is_some();
+    if made {
+        tracing::info!(
+            shaders = ?p.shaders,
+            frame,
+            waited_ms = waited.as_millis() as u64,
+            run_ms = TAKEN.load(Ordering::Relaxed),
+            "scene-input wait: a bake or face pipeline was made while the draw waited (VICTORY_SCENE_INPUT)"
+        );
+    } else {
+        tracing::warn!(
+            shaders = ?p.shaders,
+            frame,
+            waited_ms = waited.as_millis() as u64,
+            run_ms = TAKEN.load(Ordering::Relaxed),
+            "scene-input wait: a bake or face pipeline was not made in time (VICTORY_SCENE_INPUT_WAIT_MS): its draw is dropped"
+        );
     }
 }
 
@@ -972,6 +1144,41 @@ mod tests {
         assert!(matches!(good.made.get(), Some(None)));
 
         bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
+    /// Scene-input waits take from the run's allowance, each at most its
+    /// own bound, and nothing once it is spent.
+    #[test]
+    fn scene_input_waits_are_bounded_each_and_per_run() {
+        let taken = AtomicU64::new(0);
+        assert_eq!(take_scene_wait(&taken, 3000, 7000), 3000);
+        assert_eq!(take_scene_wait(&taken, 3000, 7000), 3000);
+        assert_eq!(take_scene_wait(&taken, 3000, 7000), 1000);
+        assert_eq!(take_scene_wait(&taken, 3000, 7000), 0);
+        // What a wait gave back can be taken again.
+        taken.fetch_sub(2500, Ordering::Relaxed);
+        assert_eq!(take_scene_wait(&taken, 3000, 7000), 2500);
+        assert_eq!(take_scene_wait(&AtomicU64::new(0), 3000, 0), 0);
+    }
+
+    /// A scene-input pipeline waits past the frame budget only the first
+    /// time; it is made by then here.
+    #[test]
+    fn a_scene_input_pipeline_is_waited_for_once() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.scene_input = true;
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        assert!(p.scene_waited.load(Ordering::Relaxed));
+        assert!(matches!(p.made.get(), Some(None)), "the first use waits until the worker has answered");
+    }
+
+    /// `VICTORY_LEAVE_OUT` is read once; with it unset nothing is named.
+    #[test]
+    fn nothing_is_named_out_without_the_switch() {
+        if std::env::var_os("VICTORY_LEAVE_OUT").is_none() {
+            assert!(!named_out(&[]));
+        }
     }
 
     #[test]

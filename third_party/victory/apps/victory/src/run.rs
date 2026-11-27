@@ -150,6 +150,35 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // VICTORY_LOAD_FPS=<rate> (off without it): the title runs at that rate
+    // while it loads and at its own 30 after. At 25 or more frames a second
+    // it baked its characters' skin before the textures were there, and
+    // every head was without it for the run; at 5 they were there. The end
+    // of loading is victory-gpu's (no bake for ten seconds).
+    // (avatarmanz/VIctory-7900XTX PR #449)
+    #[cfg(windows)]
+    if execute && let Some(load) = victory_loader::frame_rate::asked_load_rate() {
+        use victory_loader::frame_rate::{PLAYING_RATE, Patched, SITES, apply, change};
+        let size = image.info().size_of_image as usize;
+        let base = image.base();
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { apply(base, size, load, &SITES) };
+        let patched = done.iter().filter(|d| **d == Patched::Done).count();
+        println!(
+            "frame rate: the title's rate {load} while it loads, {PLAYING_RATE} after ({patched} of {} reads of its setting patched)",
+            SITES.len()
+        );
+        if patched > 0 {
+            std::thread::spawn(move || {
+                while !victory_core::LOADING_OVER.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                // SAFETY: the title's image, mapped for the run.
+                let changed = unsafe { change(base, size, load, PLAYING_RATE, &SITES) };
+                println!("frame rate: loading over, the title's rate {PLAYING_RATE} from now ({changed} sites)");
+            });
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
