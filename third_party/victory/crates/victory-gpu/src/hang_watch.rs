@@ -155,6 +155,10 @@ fn flights(completed: u64) -> Vec<String> {
                 ),
                 None => format!("  victory list #{}: being recorded again", ops.id()),
             });
+            // (`VICTORY_RAW_ARGS_WATCH`) What the card read for its raw records.
+            if f.fence == completed + 1 {
+                lines.extend(crate::raw_watch::lines(ops.id(), 16));
+            }
         }
     }
     lines

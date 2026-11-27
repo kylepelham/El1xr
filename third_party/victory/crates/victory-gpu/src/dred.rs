@@ -105,6 +105,7 @@ impl Ops {
 
     /// The list is reset.
     pub(crate) fn reset(&self) {
+        crate::raw_watch::reset(self.id);
         if !tracking() {
             return;
         }
