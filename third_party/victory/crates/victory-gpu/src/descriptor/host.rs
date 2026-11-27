@@ -1105,10 +1105,18 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// Replacing a retry also clears a card-space hold for the same write.
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     /// Returns whether the slot was marked live.
     fn done(&mut self, index: u32, write: u64) -> bool {
-        if self.same(index, write).is_some() {
+        if self.reschedule(index, write).is_some() {
             self.slots.remove(&index);
             self.live.remove(&index)
         } else {
@@ -1119,7 +1127,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
@@ -1159,7 +1167,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -5739,6 +5747,43 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             memory[at] ^= 1;
         }
         assert_ne!(print(&memory[..100]), print(&memory[..200]));
+    }
+
+    #[test]
+    fn card_room_preserves_texture_retries_after_a_hold() {
+        let mut q = TextureQueue::default();
+        for index in 1..=4 {
+            q.written(index, 0, 0, false);
+        }
+        let due = q.due(0, 4);
+        for &(index, write) in &due {
+            q.hold(index, write, 4);
+        }
+        assert!(q.due(3, 4).is_empty());
+        assert_eq!(q.due(4, 4), due);
+
+        for (index, write) in due {
+            match index {
+                1 => q.later(index, write, 4, 8),
+                2 => q.partly(index, write, 8, 4),
+                3 => {
+                    q.done(index, write);
+                    q.recheck(index, 4, (16, 8), 1, false);
+                }
+                _ => q.hold(index, write, 12),
+            }
+        }
+
+        assert_eq!(q.room(4), 1);
+        let due_slots = |frame| {
+            q.due(frame, 4)
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(due_slots(4), [4].into());
+        assert_eq!(due_slots(5), [1, 4].into());
+        assert_eq!(due_slots(8), [1, 2, 4].into());
     }
 
     #[test]

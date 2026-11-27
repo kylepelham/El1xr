@@ -60,6 +60,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtv_trace;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -501,6 +504,11 @@ fn opt_f32_array_eq<const N: usize>(a: Option<[f32; N]>, b: Option<[f32; N]>) ->
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// Set at the leaf that refused preparation, including table and root views.
+    #[cfg(feature = "diagnostics")]
+    prepare_failure: crate::pipeline::PrepareFailure,
+    #[cfg(feature = "diagnostics")]
+    bound_rtv_formats: [(i32, bool); 8],
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -1056,6 +1064,17 @@ macro_rules! once {
     }};
 }
 
+// Ordinary builds keep the plain boolean failure, with no trace state.
+macro_rules! prepare_failed {
+    ($state:expr, $why:ident) => {{
+        #[cfg(feature = "diagnostics")]
+        {
+            $state.prepare_failure = crate::pipeline::PrepareFailure::$why;
+        }
+        false
+    }};
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1074,6 +1093,10 @@ impl State {
         // heap capacities of per-list containers across frames.
         let Self {
             pipeline,
+            #[cfg(feature = "diagnostics")]
+            prepare_failure,
+            #[cfg(feature = "diagnostics")]
+            bound_rtv_formats,
             heaps,
             graphics,
             compute,
@@ -1127,6 +1150,11 @@ impl State {
             tables_gone,
         } = self;
         *pipeline = new_pipeline as usize;
+        #[cfg(feature = "diagnostics")]
+        {
+            *prepare_failure = crate::pipeline::PrepareFailure::default();
+            *bound_rtv_formats = [(0, false); 8];
+        }
         *heaps = [0; 2];
         graphics.clear();
         compute.clear();
@@ -1349,6 +1377,12 @@ impl State {
         self.targets.clear();
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
+        #[cfg(feature = "diagnostics")]
+        let trace_rtvs = rtv_trace::enabled();
+        #[cfg(feature = "diagnostics")]
+        if trace_rtvs {
+            self.bound_rtv_formats = [(0, false); 8];
+        }
         host.output_views(|output| {
             let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
             let mut rtv_len = 0usize;
@@ -1365,6 +1399,11 @@ impl State {
                         .desc()
                         .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                     if let Some(desc) = null {
+                        #[cfg(feature = "diagnostics")]
+                        if trace_rtvs && rtv_len < self.bound_rtv_formats.len() {
+                            self.bound_rtv_formats[rtv_len] =
+                                rtv_trace::slot_format(None, Some(&desc));
+                        }
                         rtvs[rtv_len] = output.rtv(None, Some(&desc));
                         rtv_len += 1;
                     }
@@ -1373,7 +1412,13 @@ impl State {
                 self.targets.push(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
-                rtvs[rtv_len] = output.rtv(Some(texture), record.desc().as_ref());
+                let desc = record.desc();
+                #[cfg(feature = "diagnostics")]
+                if trace_rtvs && rtv_len < self.bound_rtv_formats.len() {
+                    self.bound_rtv_formats[rtv_len] =
+                        rtv_trace::slot_format(Some(texture), desc.as_ref());
+                }
+                rtvs[rtv_len] = output.rtv(Some(texture), desc.as_ref());
                 rtv_len += 1;
             }
             let dsv = resolved_depth.map(|(record, texture)| {
@@ -1710,17 +1755,17 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return prepare_failed!(self, SkippedPipeline);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return prepare_failed!(self, MissingHostPipeline);
         };
         if p.compute || p.mesh != mesh {
             once!(
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
-            return false;
+            return prepare_failed!(self, PipelineKind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1793,7 +1838,7 @@ impl State {
                 let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                     self.host_index = None;
                     self.host_index_dirty = true;
-                    return false;
+                    return prepare_failed!(self, IndexBuffer);
                 };
                 shadow.refresh(list, v.address, u64::from(v.size));
                 let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1929,7 +1974,7 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 self.scratch_made = made;
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return prepare_failed!(self, DynamicDescriptorTable);
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
@@ -1954,7 +1999,7 @@ impl State {
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
                     );
-                    return false;
+                    return prepare_failed!(self, ShaderMemoryViews);
                 };
                 Some(ready)
             } else {
@@ -2171,7 +2216,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return prepare_failed!(self, RootUavBuffer);
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -2194,7 +2239,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootUavHeap);
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
@@ -2202,7 +2247,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return prepare_failed!(self, RootUavSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
@@ -2265,7 +2310,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootSrvHeap);
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -2278,7 +2323,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return prepare_failed!(self, RootSrvSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
@@ -3915,6 +3960,11 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    self.check_rtv_formats(
+                        crate::pipeline::host_pipeline(self.pipeline as This),
+                        "DispatchMesh",
+                    );
                     self.mesh_scissor(list, false);
                     #[cfg(feature = "diagnostics")]
                     self.dump_after(list);
@@ -4568,6 +4618,11 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(
+                crate::pipeline::host_pipeline(self.pipeline as This),
+                "DrawInstanced",
+            );
+            #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4674,6 +4729,11 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(
+                crate::pipeline::host_pipeline(self.pipeline as This),
+                "DrawIndexedInstanced",
+            );
+            #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4707,6 +4767,23 @@ impl State {
             self.dropped_records(list, (kind, stride, max), arguments, count);
         }
         ran
+    }
+
+    /// Checks bound RTV formats against the graphics PSO's declared formats
+    /// when `VICTORY_RTV_FORMAT_LOG=1` is active.
+    #[cfg(feature = "diagnostics")]
+    fn check_rtv_formats(&self, p: Option<&HostPipeline>, draw_call: &'static str) {
+        if let Some(pipeline) = p
+            && let Some((key, declared)) = &pipeline.traced_targets
+        {
+            rtv_trace::check(
+                key,
+                declared,
+                &self.bound_rtv_formats,
+                draw_call,
+                &pipeline.name,
+            );
+        }
     }
 
     /// Straight after a draw: its render targets and depth, and what it
@@ -4856,6 +4933,14 @@ impl State {
             self.window = None;
             args.refresh(list, arguments, len);
             if !self.prepare_for(list, false, true) {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_indirect_prepare(
+                    self.pipeline as This,
+                    std::mem::take(&mut self.prepare_failure),
+                    (kind, stride, max),
+                    (&args, arguments),
+                    counter.as_ref(),
+                );
                 why("prepare failed");
                 return false;
             }
@@ -4878,6 +4963,8 @@ impl State {
                     0,
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(Some(p), "ExecuteIndirect");
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -4939,6 +5026,14 @@ impl State {
                 _ => self.bind(list, p, true),
             };
             if !ran {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_indirect_prepare(
+                    self.pipeline as This,
+                    std::mem::take(&mut self.prepare_failure),
+                    (kind, stride, max),
+                    (&args, arguments),
+                    counter.as_ref(),
+                );
                 why("prepare failed");
                 return false;
             }
@@ -4971,6 +5066,8 @@ impl State {
             if kind == DISPATCH {
                 DISPATCHED.fetch_add(1, Ordering::Relaxed);
             } else {
+                #[cfg(feature = "diagnostics")]
+                self.check_rtv_formats(Some(p), "ExecuteIndirect");
                 DRAWN.fetch_add(1, Ordering::Relaxed);
             }
             return true;
@@ -4994,9 +5091,17 @@ impl State {
                 let ran = match kind {
                     DRAW | INDEXED => self.prepare(list, kind == INDEXED),
                     MESH => self.prepare_for(list, false, true),
-                    _ => false,
+                    _ => prepare_failed!(self, PipelineKind),
                 };
                 if !ran {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_indirect_prepare(
+                        self.pipeline as This,
+                        std::mem::take(&mut self.prepare_failure),
+                        (kind, stride, max),
+                        (&args, arguments),
+                        counter.as_ref(),
+                    );
                     why("prepare failed");
                     return false;
                 }
@@ -5019,6 +5124,8 @@ impl State {
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
+                #[cfg(feature = "diagnostics")]
+                self.check_rtv_formats(Some(p), "ExecuteIndirect");
                 CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -5146,9 +5253,17 @@ impl State {
                 }
                 bound
             }
-            _ => false,
+            _ => prepare_failed!(self, PipelineKind),
         };
         if !ran {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_indirect_prepare(
+                self.pipeline as This,
+                std::mem::take(&mut self.prepare_failure),
+                (kind, stride, max),
+                (&args, arguments),
+                counter.as_ref(),
+            );
             why("prepare failed");
             return false;
         }
@@ -5195,6 +5310,7 @@ impl State {
         if kind == DISPATCH {
             crate::capture::dump_after(list, self.pipeline as This, &[]);
         } else {
+            self.check_rtv_formats(Some(p), "ExecuteIndirect");
             self.dump_after(list);
         }
         // A listed frame: what the clamped records asked for.
