@@ -85,6 +85,7 @@
 
 mod bitcode;
 mod container;
+pub mod glass_record;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
