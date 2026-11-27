@@ -26,6 +26,9 @@ use crate::object::This;
 pub(crate) mod alias_skip;
 pub(crate) mod blind_hash;
 mod gpu_detile;
+mod inside_copy;
+#[cfg(all(test, windows))]
+mod inside_copy_tests;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
@@ -133,6 +136,16 @@ struct Through {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// For a view placed inside the written texture (`inside_copy`): the
+    /// written texture's subresource for each part; `None`: the part's own.
+    from_parts: Option<Arc<[u32]>>,
+}
+
+impl Through {
+    /// The written texture's subresource that part `index` is copied from.
+    fn from(&self, index: usize) -> usize {
+        self.from_parts.as_ref().map_or(index, |p| p[index] as usize)
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -200,7 +213,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
-    let through = {
+    let inside = crate::resource::placed_inside::inside_parts(placed, source);
+    let through = if let Some(parts) = &inside {
+        let Some(through) = inside_copy::through(host, placed, source, from, to, parts) else {
+            return false;
+        };
+        through
+    } else {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
         match map.get(&(placed as usize)) {
@@ -287,6 +306,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let through = Arc::new(Through {
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    from_parts: None,
                 });
                 map.insert(placed as usize, through.clone());
                 through
@@ -336,8 +356,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     let Some(buffer) = &through.buffer else {
-        alias_skip::under(&list.list, predicate.as_ref(), || {
-            reinterpret::record(&list.list, from, to, through.parts.len());
+        alias_skip::under(&list.list, predicate.as_ref(), || match &through.from_parts {
+            Some(parts) => inside_copy::record_direct(&list.list, from, to, parts),
+            None => reinterpret::record(&list.list, from, to, through.parts.len()),
         });
         return restore(list, source, before);
     };
@@ -361,7 +382,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, through.from(index)), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
