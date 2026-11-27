@@ -107,7 +107,11 @@ const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 fn water_light_out(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
     let out = *OUT.get_or_init(|| std::env::var("VICTORY_WATER_LIGHT").is_ok_and(|v| v.trim() == "0"));
-    out && water_light_named(shaders.iter().map(|s| s.hash.as_str()))
+    let named = out && water_light_named(shaders.iter().map(|s| s.hash.as_str()));
+    if named {
+        tracing::info!(shaders = ?shaders, "the water's tiled light left out (VICTORY_WATER_LIGHT=0)");
+    }
+    named
 }
 
 /// Whether one of these shader hashes is one of [`WATER_LIGHT`].
