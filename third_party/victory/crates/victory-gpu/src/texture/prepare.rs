@@ -439,10 +439,8 @@ fn finish(job: Job, outcome: Outcome) {
             }
         }
     };
-    // Outside the lock: drop staging upload buffers on the reaper thread.
-    if let Some(replaced) = replaced {
-        crate::host::reap_now(replaced);
-    }
+    // Outside the lock: the last of the title's resource may go with it.
+    drop(replaced);
     crate::resource::let_go_kept(job.resource as This);
 }
 
@@ -514,9 +512,7 @@ pub(crate) fn take_ready(resource: This, first: u32, on_demand: bool) -> Option<
         }
         (staging, gone)
     };
-    if !gone.is_empty() {
-        crate::host::reap_now(gone);
-    }
+    drop(gone);
     let staging = staging?;
     if staging.on_demand != on_demand {
         return None;
@@ -576,9 +572,7 @@ pub(crate) fn served(slot: u32, resource: This) {
         }
         gone
     };
-    if !gone.is_empty() {
-        crate::host::reap_now(gone);
-    }
+    drop(gone);
 }
 
 /// The title released `resource`: what was made ready for it goes.
@@ -594,9 +588,7 @@ pub(crate) fn forget(resource: usize) {
         }
         gone
     };
-    if !gone.is_empty() {
-        crate::host::reap_now(gone);
-    }
+    drop(gone);
 }
 
 /// Lets go of what was made ready two seconds and two frames ago and not
@@ -630,9 +622,7 @@ pub(crate) fn prune() {
         gone.extend(stale);
     }
     STATS[8].fetch_add(gone.len() as u64, Relaxed);
-    if !gone.is_empty() {
-        crate::host::reap_now(gone);
-    }
+    drop(gone);
 }
 
 /// For the frame line: textures handed out and not done, made ready and not
@@ -843,7 +833,6 @@ mod tests {
         drop(taken);
         served(11, res);
 
-        crate::host::flush_reaper();
         let census_after = census();
         let slot10_after = slot(10);
         let slot11_after = slot(11);
@@ -931,7 +920,6 @@ mod tests {
             Outcome::Done(Some(staging_c)),
         );
         served(20, res);
-        crate::host::flush_reaper();
         assert_eq!(
             census(),
             [0, 0, 0],

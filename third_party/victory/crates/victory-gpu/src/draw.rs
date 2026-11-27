@@ -886,20 +886,6 @@ pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }
 /// bookkeeping, the sweep, the looks after uploads).
 pub(crate) static HEAP_TEXTURE_PARTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 
-/// The frame whose bake draws are timed and when their time is up
-/// (`crate::host::now_ms`).
-static BAKE_DEADLINE: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((u64::MAX, 0));
-
-/// Milliseconds left of frame `frame`'s bake budget of `bake_ms` at `now`:
-/// the first bake draw of a frame starts the clock for all of them.
-fn bake_left(frame: u64, bake_ms: u64, now: u64) -> u64 {
-    let mut deadline = BAKE_DEADLINE.lock().unwrap_or_else(|e| e.into_inner());
-    if deadline.0 != frame {
-        *deadline = (frame, now + bake_ms);
-    }
-    deadline.1.saturating_sub(now)
-}
-
 /// The parts of a pass's time ([`HEAP_TEXTURE_PARTS`]), in nanoseconds: each
 /// lap adds the time since the one before to a part.
 struct Laps {
@@ -2627,31 +2613,26 @@ impl State {
         let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
         let cfg = early_pass_config();
         let heap_passes = HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed);
-        let world_running = heap_passes > 60;
-        let bake_ms = cfg.bake_ms.unwrap_or(if world_running { 32 } else { 10_000 });
-        // Once gameplay is running, cap bake draws (`VICTORY_BAKE_GAMEPLAY_MS`,
-        // default 32 ms) so a launcher-level `VICTORY_BAKE_TEXTURES_MS=500`
-        // still gives fast loading bakes without 500 ms gameplay hitches.
-        let bake_ms = if world_running {
-            static GAMEPLAY_BAKE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let cap = *GAMEPLAY_BAKE_MS.get_or_init(|| {
-                std::env::var("VICTORY_BAKE_GAMEPLAY_MS")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(32)
-            });
-            bake_ms.min(cap)
-        } else {
-            bake_ms
-        };
+        let bake_ms = cfg.bake_ms.unwrap_or_else(|| {
+            if heap_passes > 60 { 250 } else { 10_000 }
+        });
         if compute || (cfg.early_ms == 0 && bake_ms == 0 && !cfg.loading_drain) {
             return;
         }
         let bake = bake_ms > 0 && p.is_bake;
+        static BAKE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static EARLY_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // The milliseconds this frame's bake draws have taken so far: a
+        // frame has several, and together they get `bake_ms`.
+        static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
+        if BAKE_FRAME.load(Ordering::Relaxed) != frame
+            && BAKE_FRAME.swap(frame, Ordering::Relaxed) != frame
+        {
+            BAKED_MS.store(0, Ordering::Relaxed);
+        }
         let left = if bake {
-            bake_left(crate::queue::present_calls(), bake_ms, crate::host::now_ms())
+            bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed))
         } else {
             0
         };
@@ -2729,10 +2710,13 @@ impl State {
                 );
             }
         }
+        let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
-
+        if is_bake {
+            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
     }
 
     /// The queue's side of the card accounting line
@@ -3006,7 +2990,7 @@ impl State {
                 if HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed) > 60 {
                     if due.len() < 4000 { 4 } else { 10 }
                 } else {
-                    40
+                    200
                 }
             }
         });
@@ -3079,7 +3063,8 @@ impl State {
             }
             let slot_budget = if is_ready { ready_budget } else { budget };
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                || ((uploaded_this_pass > 0 || checked > 0) && entered.elapsed() >= slot_budget)
+                || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
+                    && began.elapsed() >= slot_budget)
             {
                 break;
             }
@@ -6125,22 +6110,5 @@ mod tests {
         list.close();
         list.reset();
         assert_eq!(list.cbv_epoch(), 0);
-    }
-}
-
-#[cfg(test)]
-mod bake_budget_tests {
-    use super::bake_left;
-
-    #[test]
-    fn a_frames_bake_draws_share_one_deadline() {
-        // The first draw of frame 7 at 1000 ms starts 500 ms for all of them.
-        assert_eq!(bake_left(7, 500, 1000), 500);
-        // Another thread's draw 300 ms later has what is left, not 500 less
-        // what finished.
-        assert_eq!(bake_left(7, 500, 1300), 200);
-        assert_eq!(bake_left(7, 500, 1600), 0);
-        // The next frame starts again.
-        assert_eq!(bake_left(8, 500, 1700), 500);
     }
 }

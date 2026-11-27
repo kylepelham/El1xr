@@ -2895,8 +2895,8 @@ impl HostHeap {
         if released_any {
             self.released.notify_all();
         }
-        if !retired.is_empty() {
-            crate::host::retire(retired);
+        for old in retired {
+            crate::host::retire(old);
         }
     }
 

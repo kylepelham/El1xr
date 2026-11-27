@@ -950,14 +950,6 @@ fn system_timestamp() -> u64 {
 
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
-static PRESENT_CALLS: AtomicU64 = AtomicU64::new(0);
-
-/// Title `present()` calls so far: increments synchronously when the title
-/// ends a frame (unlike `FRAMES` which increments on `victory-submit` under
-/// `VICTORY_ASYNC_PRESENT=1`, or `frame::current` which ticks on origin waits).
-pub(crate) fn present_calls() -> u64 {
-    PRESENT_CALLS.load(Ordering::Relaxed)
-}
 
 /// Frames presented so far (also in release builds).
 pub(crate) fn frame_count() -> u64 {
@@ -978,7 +970,6 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
-    PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
     // (Neptune) What the title names, read now: the first plane's first resource, and a
     // second plane's if it is another one.
     #[cfg(windows)]

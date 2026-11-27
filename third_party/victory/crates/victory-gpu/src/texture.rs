@@ -581,45 +581,32 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let (gone, went, bytes) = {
-        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(map) = map.as_mut() else {
-            return;
-        };
-        if map.is_empty() {
-            return;
-        }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        // A list that recorded an upload or a check holds the staging until it
-        // is reset: one only the table holds is named by no list, recorded or
-        // running.
-        let (mut went, mut bytes) = (0u64, 0u64);
-        let evict: Vec<usize> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) <= 1
-                    && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-            })
-            .map(|(&resource, _)| resource)
-            .collect();
-        let mut gone = Vec::with_capacity(evict.len());
-        for resource in evict {
-            if let Some(s) = map.remove(&resource) {
-                // (A live texture: one the title releases leaves the
-                // table first, under this lock.)
-                crate::resource::set_staged_first(resource as This, u32::MAX);
-                LET_GO[0].fetch_add(1, Relaxed);
-                LET_GO[1].fetch_add(s.bytes, Relaxed);
-                went += 1;
-                bytes += s.bytes;
-                gone.push(s);
-            }
-        }
-        (gone, went, bytes)
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_mut() else {
+        return;
     };
-    if !gone.is_empty() {
-        crate::host::reap_now(gone);
+    if map.is_empty() {
+        return;
     }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    // A list that recorded an upload or a check holds the staging until it
+    // is reset: one only the table holds is named by no list, recorded or
+    // running.
+    let (mut went, mut bytes) = (0u64, 0u64);
+    map.retain(|&resource, s| {
+        let keep = Arc::strong_count(s) > 1
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+        if !keep {
+            // (A live texture: one the title releases leaves the
+            // table first, under this lock.)
+            crate::resource::set_staged_first(resource as This, u32::MAX);
+            LET_GO[0].fetch_add(1, Relaxed);
+            LET_GO[1].fetch_add(s.bytes, Relaxed);
+            went += 1;
+            bytes += s.bytes;
+        }
+        keep
+    });
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1313,7 +1300,6 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let _hitch = crate::hitch::span(crate::hitch::Phase::TextureRefresh);
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1624,18 +1610,11 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let removed = {
-        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_mut().and_then(|map| {
-            let removed = map.remove(&(resource as usize));
-            if removed.is_some() {
-                crate::resource::set_staged_first(resource, u32::MAX);
-            }
-            removed
-        })
-    };
-    if let Some(removed) = removed {
-        crate::host::reap_now(removed);
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut()
+        && map.remove(&(resource as usize)).is_some()
+    {
+        crate::resource::set_staged_first(resource, u32::MAX);
     }
 }
 
