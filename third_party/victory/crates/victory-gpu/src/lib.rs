@@ -18,6 +18,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod barrier_skip;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod card_share;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod cold_skip;
