@@ -5630,21 +5630,21 @@ impl Host {
             let twin = shadow
                 .card_sides()
                 .is_some_and(|(_, before, _)| before.is_some());
+            let mut run = crate::card_share::Run::new(crate::card_share::on() && !inflight_fetch());
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let slot = twin
+                    .then(|| run.slot(span.first, span.pieces, &mut at, work.differs.2 / 4))
+                    .flatten();
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
-                    at,
-                    compared,
+                    at: slot.unwrap_or(at),
+                    compared: slot.is_some(),
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         work.taken = at;
@@ -5702,16 +5702,24 @@ impl Host {
                         3,
                         work.differs.0.GetGPUVirtualAddress(),
                     );
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    let key = |r: &CardRange| {
+                        let copy = Arc::as_ptr(&r.shadow) as usize;
+                        r.compared
+                            .then_some((copy, r.span.first, r.span.pieces, r.at))
+                    };
+                    for (i, first, pieces, at) in
+                        crate::card_share::passes(plan.ranges.iter().map(key))
+                    {
+                        let r = &plan.ranges[i];
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
                         let constants = [
-                            r.span.first,
+                            first,
                             r.span.skew,
                             size as u32,
-                            r.span.pieces,
-                            r.at * 4,
+                            pieces,
+                            at * 4,
                             if flown { 2 } else { 1 },
                             snap_base,
                             snap_slots,
@@ -5722,7 +5730,7 @@ impl Host {
                             r.shadow.buffer.GetGPUVirtualAddress(),
                         );
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.min(65_535), 1, 1);
+                        list.Dispatch(pieces.min(65_535), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
@@ -5977,6 +5985,7 @@ impl Host {
                 let mut flags: Vec<(usize, u32, bool)> = Vec::new();
                 let mut numbers: Vec<((usize, u32), u32)> = Vec::new();
                 let mut count = 0u32;
+                let mut counted = std::collections::HashSet::new();
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -5989,6 +5998,7 @@ impl Host {
                         if let Some(base) = plan.snap
                             && r.compared
                             && d != 0
+                            && counted.insert(r.at + p)
                         {
                             count = count.wrapping_add(1);
                             if d >= 2 {
