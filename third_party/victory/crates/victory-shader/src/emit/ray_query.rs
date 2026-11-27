@@ -131,6 +131,53 @@ impl Shader {
             &[rq],
         )
     }
+
+    /// One of the committed hit's indices ([`Committed`]).
+    pub fn ray_query_committed(&mut self, block: usize, rq: V, what: Committed) -> V {
+        let i32t = self.t.i32;
+        self.op(
+            block,
+            "rayQuery_StateScalar.i32",
+            Attr::ReadOnly,
+            i32t,
+            what as u32,
+            &[rq],
+        )
+    }
+
+    /// `RayQuery_CommittedTriangleBarycentrics`: component 0 (DXR's
+    /// `barycentrics.x`, the weight of the triangle's second vertex) or 1
+    /// (`.y`, the third's).
+    pub fn ray_query_committed_barycentric(&mut self, block: usize, rq: V, component: u8) -> V {
+        let f32t = self.t.f32;
+        let c = self.m.i8(component);
+        self.op(
+            block,
+            "rayQuery_StateVector.f32",
+            Attr::ReadOnly,
+            f32t,
+            194,
+            &[rq, c],
+        )
+    }
+}
+
+/// The committed hit's indices an inline ray query reports, by DXIL opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Committed {
+    /// `RayQuery_CommittedInstanceIndex`: the instance's place in the top
+    /// level's instance descriptions.
+    InstanceIndex = 207,
+    /// `RayQuery_CommittedInstanceID`: the description's 24-bit `InstanceID`.
+    InstanceId = 208,
+    /// `RayQuery_CommittedGeometryIndex`: the geometry's place in its bottom
+    /// level.
+    GeometryIndex = 209,
+    /// `RayQuery_CommittedPrimitiveIndex`: the triangle's place in its
+    /// geometry.
+    PrimitiveIndex = 210,
+    /// `RayQuery_CommittedInstanceContributionToHitGroupIndex`.
+    Contribution = 215,
 }
 
 #[cfg(test)]
@@ -166,10 +213,47 @@ mod tests {
         s.m.terminate(b, Term::Br(lp));
         let more = s.ray_query_proceed(lp, rq);
         s.m.terminate(lp, Term::CondBr(more, lp, done));
-        let _status = s.ray_query_committed_status(done, rq);
-        let _t = s.ray_query_committed_t(done, rq);
+        // Every result is stored (u1, a raw buffer), so that none is
+        // dropped as unused before the validator sees it.
+        let status = s.ray_query_committed_status(done, rq);
+        store(&mut s, done, 0, status, false);
+        let t = s.ray_query_committed_t(done, rq);
+        store(&mut s, done, 1, t, true);
+        for (k, what) in [
+            Committed::InstanceIndex,
+            Committed::InstanceId,
+            Committed::GeometryIndex,
+            Committed::PrimitiveIndex,
+            Committed::Contribution,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = s.ray_query_committed(done, rq, what);
+            store(&mut s, done, 2 + k as u32, v, false);
+        }
+        for c in 0..2 {
+            let b = s.ray_query_committed_barycentric(done, rq, c);
+            store(&mut s, done, 7 + u32::from(c), b, true);
+        }
         s.m.terminate(done, Term::Ret);
         s.finish()
+    }
+
+    /// Stores `v` (an f32 when `float`, else an i32) at dword `at` of the
+    /// raw buffer `u1` in the root space.
+    fn store(s: &mut Shader, block: usize, at: u32, v: V, float: bool) {
+        let h = s.root_uav_handle(1);
+        let ty = if float { s.t.f32 } else { s.t.i32 };
+        let off = s.m.i32(at * 4);
+        let i32t = s.t.i32;
+        let iu = s.m.undef(i32t);
+        let u = s.m.undef(ty);
+        let mask = s.m.i8(1);
+        let align = s.m.i32(4);
+        let name = if float { "rawBufferStore.f32" } else { "rawBufferStore.i32" };
+        let void = s.t.void;
+        s.op(block, name, Attr::NoUnwind, void, 140, &[h, off, iu, v, u, u, u, mask, align]);
     }
 
     /// `SFI0`'s feature bits: the first part after the container header

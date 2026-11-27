@@ -3291,6 +3291,16 @@ impl HostHeap {
                 changed.push((index, handle));
             }
         }
+        let compared = super::sync_in_place::now();
+        let mirrored = self.mirror_changed(changed);
+        super::sync_in_place::mirrored_since(compared);
+        mirrored
+    }
+
+    /// The mirroring half of [`HostHeap::mirror_copied_page`]: [`HostHeap::mirror`]
+    /// for each of `changed` (title slot, handle), whose records the caller
+    /// found new. Returns how many.
+    pub(crate) fn mirror_changed(&self, changed: &[(u32, u64)]) -> u64 {
         if !changed.is_empty() {
             // The records' lock once for the batch, and the buffer changes'
             // once, not once for each record mirrored (some 270 a page,
