@@ -3252,12 +3252,16 @@ fn wide(jobs: Vec<Job>) {
         done: Mutex::new(false),
         cv: std::sync::Condvar::new(),
     });
+    #[cfg(test)]
+    let scope = lazy::lazy_test_scope_now();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let wait = wait.clone();
             queue.push_back(Box::new(move || {
                 {
+                    #[cfg(test)]
+                    let _scope = lazy::LazyTestScope::enter(scope);
                     let _guard = WideGuard::enter();
                     job();
                 }

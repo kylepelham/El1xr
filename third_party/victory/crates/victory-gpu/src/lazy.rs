@@ -60,7 +60,7 @@ pub(crate) fn lazy_copyback() -> bool {
     {
         match LAZY_TEST_OVERRIDE.load(Ordering::Acquire) {
             1 => return false,
-            2 => return true,
+            2 if lazy_test_scoped() => return true,
             _ => {}
         }
     }
@@ -70,6 +70,52 @@ pub(crate) fn lazy_copyback() -> bool {
 
 #[cfg(test)]
 static LAZY_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+// A lazy test's override (`LazyTestGuard::enable`) is for the work of that
+// test: its own thread, the threads it starts, the code's own threads, and
+// the wide jobs queued from any of them. The other tests libtest runs at the
+// same time (on threads named after the test, `module::test`) go on without
+// it, as they would without the lazy test: before, they took lazy holds that
+// kept the lazy test's pages from arming, and made opted-in shadows whose
+// pages armed under them, depending on when they ran (#52).
+#[cfg(test)]
+thread_local! {
+    /// 0: by the thread's name; 1: without the override; 2: with it.
+    static LAZY_TEST_SCOPE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn lazy_test_scoped() -> bool {
+    match LAZY_TEST_SCOPE.with(|s| s.get()) {
+        1 => false,
+        2 => true,
+        _ => !std::thread::current().name().is_some_and(|n| n.contains("::")),
+    }
+}
+
+/// This thread's scope, to run a wide job queued from it in (`shadow::wide`).
+#[cfg(test)]
+pub(super) fn lazy_test_scope_now() -> u8 {
+    if lazy_test_scoped() { 2 } else { 1 }
+}
+
+/// Runs this thread in `scope` until dropped.
+#[cfg(test)]
+pub(super) struct LazyTestScope(u8);
+
+#[cfg(test)]
+impl LazyTestScope {
+    pub(super) fn enter(scope: u8) -> Self {
+        Self(LAZY_TEST_SCOPE.with(|s| s.replace(scope)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazyTestScope {
+    fn drop(&mut self) {
+        LAZY_TEST_SCOPE.with(|s| s.set(self.0));
+    }
+}
 
 #[cfg(test)]
 type PostTransitionHook = Box<dyn FnOnce(usize) + Send>;
@@ -82,8 +128,9 @@ static LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 pub(crate) struct LazyTestGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
     prev: u8,
+    _scope: LazyTestScope,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -97,13 +144,21 @@ impl LazyTestGuard {
     pub(super) fn enable() -> Self {
         let lock = LAZY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = LAZY_TEST_OVERRIDE.swap(2, Ordering::AcqRel);
-        Self { _lock: lock, prev }
+        Self {
+            prev,
+            _scope: LazyTestScope::enter(2),
+            _lock: lock,
+        }
     }
 
     pub(super) fn disable() -> Self {
         let lock = LAZY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = LAZY_TEST_OVERRIDE.swap(1, Ordering::AcqRel);
-        Self { _lock: lock, prev }
+        Self {
+            prev,
+            _scope: LazyTestScope::enter(2),
+            _lock: lock,
+        }
     }
 }
 

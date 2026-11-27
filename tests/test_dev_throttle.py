@@ -81,6 +81,7 @@ def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
     dev = load_dev()
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "2")
+    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["bench", "--quiet"])
     with dev._quiet(args, "bench"):
         with pytest.raises(TimeoutError):
@@ -228,3 +229,45 @@ def test_builds_idle_is_a_no_op_without_psutil(monkeypatch):
     monkeypatch.setattr(dev_throttle.os, "name", "posix")
     with dev_throttle.builds_idle() as lowered:
         assert lowered == 0
+
+
+class _SuspendProc:
+    def __init__(self, pid, name, exe=""):
+        self.pid, self.info, self.state = pid, {"name": name, "exe": exe}, "running"
+
+    def children(self, recursive=False):
+        return []
+
+    def suspend(self):
+        self.state = "suspended"
+
+    def resume(self):
+        self.state = "running"
+
+
+class _SuspendPsutil:
+    NoSuchProcess = AccessDenied = Exception
+
+    def __init__(self, procs):
+        self.procs = procs
+
+    def process_iter(self, _attrs):
+        return list(self.procs)
+
+    def Process(self):
+        class _Me:
+            def parents(self):
+                return []
+        return _Me()
+
+
+def test_quiet_suspends_builds_and_worktree_tools_then_resumes():
+    rustc = _SuspendProc(201, "rustc.exe")
+    translate = _SuspendProc(202, "victory.exe", r"E:\Gta6\AnyXboxX-wt\shaderperf\third_party\victory\target\release\victory.exe")
+    browser = _SuspendProc(203, "chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe")
+    ps = _SuspendPsutil([rustc, translate, browser])
+    with dev_throttle.builds_suspended(ps) as paused:
+        assert paused == 2
+        assert rustc.state == translate.state == "suspended"
+        assert browser.state == "running"
+    assert rustc.state == translate.state == "running"
