@@ -22,6 +22,26 @@ from dataclasses import dataclass
 from datetime import datetime
 
 HITCH_RE = re.compile(r"hitch: frame (\d+) took ([0-9.]+) ms")
+ALERT_LEVEL_RE = re.compile(r"\b(WARN|ERROR)\b")
+REFUSED_PATTERNS = (
+    "does not translate",
+    "host pipeline refused",
+    "host mesh pipeline refused",
+    "host root signature refused",
+)
+# victory-gpu `pipeline/translate_ahead.rs` (VICTORY_TRANSLATE_AHEAD): a shader translated ahead that does not
+# translate, before any draw or dispatch needed it. An INFO line; the WARN refusal follows only if one does.
+REFUSED_AHEAD_TEXT = "shader translated ahead is not translatable"
+
+
+def refusal(line: str) -> str | None:
+    """`"refused"` for a refusal a draw, dispatch or pipeline needed (a WARN or ERROR line), `"ahead"` for a shader
+    only translated ahead that does not translate, else None. `line` is without colour codes."""
+    if REFUSED_AHEAD_TEXT in line:
+        return "ahead"
+    if ALERT_LEVEL_RE.search(line) and any(p in line.lower() for p in REFUSED_PATTERNS):
+        return "refused"
+    return None
 WORLD_DRAWS_MIN = 100.0
 LOADING_P50_MS = 100.0
 STREAM_OVER100 = 3

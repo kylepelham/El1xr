@@ -78,7 +78,68 @@ pub(super) fn ahead(shaders: &[Arc<Shader>]) {
     }
 }
 
+thread_local! {
+    static AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread translates ahead: a shader that does not
+/// translate here is not yet one a draw or dispatch needed.
+pub(super) fn on_ahead_thread() -> bool {
+    AHEAD.with(std::cell::Cell::get)
+}
+
+/// The shaders translated ahead that do not translate and that no draw,
+/// dispatch or pipeline has asked for since (`bench`'s `refused` counts
+/// only those that one did, `refused_ahead` these).
+#[derive(Default)]
+struct Refusals(std::collections::HashSet<String>);
+
+impl Refusals {
+    /// A shader translated ahead did not translate.
+    fn ahead(&mut self, hash: &str) {
+        self.0.insert(hash.to_owned());
+    }
+
+    /// Something that needs it asked for shader `hash`, which does not
+    /// translate: whether that is the first such ask after it was refused
+    /// ahead (and so is to be reported now).
+    fn needed(&mut self, hash: &str) -> bool {
+        self.0.remove(hash)
+    }
+}
+
+static REFUSALS: LazyLock<Mutex<Refusals>> = LazyLock::new(|| Mutex::new(Refusals::default()));
+static REFUSED_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// On the thread translating ahead: `shader` does not translate. Logged at
+/// INFO (not a refusal until something needs it: [`needed`]).
+pub(super) fn refused_ahead(shader: &Shader, name: &str, error: &str) {
+    REFUSALS.lock().unwrap_or_else(|e| e.into_inner()).ahead(&shader.hash);
+    let n = REFUSED_AHEAD.fetch_add(1, Relaxed) + 1;
+    tracing::info!(
+        stage = shader.stage,
+        hash = %shader.hash,
+        name,
+        error,
+        refused_ahead = n,
+        "{REFUSED_AHEAD_LINE}"
+    );
+}
+
+/// The INFO line of a shader refused ahead: `tools/dev_stats.py` counts it
+/// as `refused_ahead` (`REFUSED_AHEAD_TEXT`), not as `refused`, so it must
+/// not say "does not translate" or carry a WARN.
+const REFUSED_AHEAD_LINE: &str = "shader translated ahead is not translatable; counted as refused only once a draw or dispatch needs it (VICTORY_TRANSLATE_AHEAD)";
+
+/// A draw, dispatch or pipeline asked for `shader`, which does not
+/// translate: whether it was refused ahead and not reported yet (the
+/// caller then reports it as a refusal, as without the switch).
+pub(super) fn needed(shader: &Shader) -> bool {
+    REFUSED_AHEAD.load(Relaxed) > 0 && REFUSALS.lock().unwrap_or_else(|e| e.into_inner()).needed(&shader.hash)
+}
+
 fn run() {
+    AHEAD.with(|a| a.set(true));
     crate::topology::pin_background("victory-translate-ahead");
     {
         use windows_sys::Win32::System::Threading::{
@@ -125,6 +186,29 @@ fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// A shader refused ahead is reported once, at the first ask that needs
+    /// it; one never refused ahead is not reported here.
+    /// The line `tools/dev_stats.py` reads (`REFUSED_AHEAD_TEXT`), kept
+    /// apart from what it counts as a refusal.
+    #[test]
+    fn the_refused_ahead_line_has_the_shape_dev_py_reads() {
+        let line = super::REFUSED_AHEAD_LINE;
+        assert!(line.starts_with("shader translated ahead is not translatable"));
+        assert!(!line.contains("does not translate") && !line.contains("refused shaders"));
+        assert!(!line.contains("WARN") && !line.contains("ERROR"));
+    }
+
+    #[test]
+    fn a_refusal_ahead_is_reported_once_when_needed() {
+        let mut r = super::Refusals::default();
+        assert!(!r.needed("aa"));
+        r.ahead("aa");
+        r.ahead("bb");
+        assert!(r.needed("aa"));
+        assert!(!r.needed("aa"));
+        assert!(r.needed("bb"));
+    }
+
     #[test]
     fn the_switch_is_off_unless_set() {
         use super::parse_threads;
