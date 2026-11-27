@@ -1584,6 +1584,7 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        crate::present_audit::target_cleared(record.resource as usize, color);
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }

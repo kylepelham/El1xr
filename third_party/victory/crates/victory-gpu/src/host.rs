@@ -8406,6 +8406,7 @@ impl Host {
                 crate::capture::probe(&self.device, list, texture)
             };
             let watched = crate::popwatch::take(&self.device, list, texture);
+            let audited = crate::present_audit::take(&self.device, list, texture, index, frame);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
@@ -8445,6 +8446,9 @@ impl Host {
             };
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
+            }
+            if let Some(audited) = audited {
+                crate::present_audit::sent(audited, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
