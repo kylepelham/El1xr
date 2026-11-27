@@ -20,8 +20,8 @@
 //!
 //! No HUD-less colour exists (the title composes its HUD into the frame we
 //! present), so the HUD is interpolated with the scene: moving HUD parts can
-//! ghost. `VICTORY_FRAME_GEN=dlss` is not supported (DLSS-G needs camera
-//! matrices); it stays off and says so.
+//! ghost. `VICTORY_FRAME_GEN=dlss` is NVIDIA DLSS Frame Generation through
+//! Streamline (`dlssg.rs`); [`create_swap_chain`] hands it the swap chain.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -53,34 +53,31 @@ impl Kind {
     }
 }
 
+/// What `VICTORY_FRAME_GEN` asks for.
+pub(crate) fn kind() -> Kind {
+    static KIND: OnceLock<Kind> = OnceLock::new();
+    *KIND.get_or_init(|| {
+        let Ok(v) = std::env::var("VICTORY_FRAME_GEN") else {
+            return Kind::Off;
+        };
+        Kind::parse(&v).unwrap_or_else(|| {
+            tracing::warn!(value = v, "VICTORY_FRAME_GEN: expected off, fsr or dlss; frame generation stays off");
+            Kind::Off
+        })
+    })
+}
+
 /// `VICTORY_FRAME_GEN=fsr`.
 pub(crate) fn asked() -> bool {
-    static ASKED: OnceLock<bool> = OnceLock::new();
-    *ASKED.get_or_init(|| {
-        let Ok(v) = std::env::var("VICTORY_FRAME_GEN") else {
-            return false;
-        };
-        match Kind::parse(&v) {
-            Some(Kind::Fsr) => true,
-            Some(Kind::Off) => false,
-            Some(Kind::Dlss) => {
-                tracing::warn!("VICTORY_FRAME_GEN=dlss is not supported (DLSS-G needs camera matrices); frame generation stays off");
-                false
-            }
-            None => {
-                tracing::warn!(value = v, "VICTORY_FRAME_GEN: expected off, fsr or dlss; frame generation stays off");
-                false
-            }
-        }
-    })
+    kind() == Kind::Fsr
 }
 
 /// Whether the proxy swap chain presents (frame generation is running).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Whether frame generation owns the presents' pacing.
+/// Whether frame generation (FSR's proxy or DLSS-G's) owns the presents' pacing.
 pub(crate) fn active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+    ACTIVE.load(Ordering::Relaxed) || crate::dlssg::active()
 }
 
 // --- The FidelityFX API (public headers, MIT) ---
@@ -399,14 +396,19 @@ unsafe impl Send for Fg {}
 static FG: Mutex<Option<Fg>> = Mutex::new(None);
 static FRAME_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The window's swap chain as FidelityFX's proxy, when `VICTORY_FRAME_GEN=fsr`
-/// asked and it could be made; `None` makes the plain one.
+/// The window's swap chain as FidelityFX's proxy (`VICTORY_FRAME_GEN=fsr`) or
+/// Streamline's DLSS-G proxy (`dlss`), when asked and it could be made; `None`
+/// makes the plain one.
 pub(crate) fn create_swap_chain(
     factory: &IDXGIFactory2,
+    device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     hwnd: HWND,
     desc: &DXGI_SWAP_CHAIN_DESC1,
 ) -> Option<IDXGISwapChain3> {
+    if kind() == Kind::Dlss {
+        return crate::dlssg::create_swap_chain(factory, device, queue, hwnd, desc);
+    }
     if !asked() {
         return None;
     }
@@ -494,7 +496,7 @@ pub(crate) fn prepare(
     list: &ID3D12GraphicsCommandList,
     inputs: &Inputs<'_>,
 ) {
-    if !active() {
+    if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     let Ok(api) = api() else {

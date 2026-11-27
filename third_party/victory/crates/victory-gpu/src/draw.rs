@@ -2040,7 +2040,7 @@ impl State {
             crate::bake_watch::binding(list as *const HostList as usize, stages, p.is_bake);
         }
         if crate::camera::on() {
-            self.camera_tap(p, compute);
+            self.camera_tap(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
@@ -5489,6 +5489,15 @@ impl State {
             && count.is_none()
             && crate::indirect::ahead_layout(kind, stride, args.offset(arguments))
             && !list.gpu_written(arguments as usize, len as usize)
+            // (El1xr) A record shaders of any list wrote lately stays in place
+            // (`crate::indirect::split_ahead`).
+            && (kind != DISPATCH
+                || crate::indirect::split_ahead::guards().is_some_and(|g| {
+                    crate::indirect::split_ahead::may_go_ahead(
+                        g,
+                        g.written && crate::host::shader_written(arguments as usize, len as usize),
+                    )
+                }))
         {
             args.refresh(list, arguments, len);
             if let Some((slots, at)) =
@@ -5532,6 +5541,16 @@ impl State {
                     self.mesh_scissor(list, true);
                 }
                 if let Some(((param, dword), parts)) = split_parts {
+                    // (El1xr) The wait for every earlier shader write the pass in place
+                    // stood behind (`crate::indirect::split_ahead`).
+                    if crate::indirect::split_ahead::guards()
+                        .is_some_and(crate::indirect::split_ahead::went_ahead)
+                    {
+                        #[cfg(windows)]
+                        crate::gpucost::mark(&list.list, || "ours: wait before a dispatch clamped ahead");
+                        // SAFETY: an open list.
+                        unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+                    }
                     crate::indirect::execute_parts(&list.list, (param, dword), parts, (&slots, at));
                     CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                     DISPATCHED.fetch_add(1, Ordering::Relaxed);

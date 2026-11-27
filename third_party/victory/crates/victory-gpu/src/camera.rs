@@ -118,6 +118,15 @@ pub struct Ui {
     pub target: u64,
 }
 
+/// A texture of the frame: the title's (or, for the HUD-less copy, ours),
+/// its host DXGI format and its size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Surface {
+    pub title: u64,
+    pub format: i32,
+    pub size: [u32; 2],
+}
+
 /// The camera as built from the title's constants.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Derived {
@@ -158,6 +167,20 @@ pub struct FrameCamera {
     pub record: Option<ViewRecord>,
     pub dispatch: Option<Dispatch>,
     pub ui: Option<Ui>,
+    /// The HUD-less colour, copied before the UI blit
+    /// (`VICTORY_CAMERA_HUDLESS=1`; `title` is 0: the texture is ours, from
+    /// `crate::camera_copy::hudless`).
+    pub hudless: Option<Surface>,
+    /// The UI texture the blit composes (alpha: coverage), the UI mask.
+    pub ui_mask: Option<Surface>,
+    /// Depth (reversed: near 1, far 0) and motion vectors (pixels, previous
+    /// minus current, render size) as the velocity pass reads and writes them.
+    pub depth: Option<Surface>,
+    pub motion: Option<Surface>,
+    /// Multiplies the motion vectors into UV units (1 / render size).
+    pub mv_scale: [f32; 2],
+    /// The projection jitter in render pixels (x right, y down).
+    pub jitter_px: [f32; 2],
     /// Title addresses the constants were read at (view record, `b0`).
     pub sources: [u64; 2],
     /// Absolute camera position: not found yet (matrices are camera-relative).
@@ -479,6 +502,10 @@ struct Pending {
     constants: Option<(u64, u64)>,
     dispatch: Option<Dispatch>,
     ui: Option<Ui>,
+    ui_mask: Option<Surface>,
+    hudless: Option<Surface>,
+    depth: Option<Surface>,
+    motion: Option<Surface>,
 }
 
 static PENDING: Mutex<Pending> = Mutex::new(Pending {
@@ -486,6 +513,10 @@ static PENDING: Mutex<Pending> = Mutex::new(Pending {
     constants: None,
     dispatch: None,
     ui: None,
+    ui_mask: None,
+    hudless: None,
+    depth: None,
+    motion: None,
 });
 static LATEST: Mutex<Option<Arc<FrameCamera>>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -511,6 +542,50 @@ pub fn note_ui(ui: Ui) {
     pending().ui = Some(ui);
 }
 
+/// The UI texture as a surface (format and size known at the blit).
+pub fn note_ui_mask(s: Surface) {
+    pending().ui_mask = Some(s);
+}
+
+/// What the velocity pass reads as depth and writes as motion vectors.
+pub fn note_velocity_targets(depth: Option<Surface>, motion: Option<Surface>) {
+    let mut p = pending();
+    if depth.is_some() {
+        p.depth = depth;
+    }
+    if motion.is_some() {
+        p.motion = motion;
+    }
+}
+
+/// The HUD-less copy was recorded this frame.
+pub fn note_hudless(s: Surface) {
+    pending().hudless = Some(s);
+}
+
+/// Whether a HUD-less copy is already noted for the frame being built.
+pub fn hudless_noted() -> bool {
+    pending().hudless.is_some()
+}
+
+/// The index of the frame being built (the next `FrameCamera::frame`).
+pub fn frame() -> u64 {
+    FRAME.load(Ordering::Relaxed)
+}
+
+/// Motion vectors in pixels to UV units, and the jitter in pixels (y down),
+/// for a render target of `size`.
+pub fn frame_scales(c: Option<&Derived>, size: [u32; 2]) -> ([f32; 2], [f32; 2]) {
+    if size[0] == 0 || size[1] == 0 {
+        return ([0.0; 2], [0.0; 2]);
+    }
+    let (w, h) = (size[0] as f32, size[1] as f32);
+    let jitter = c.map_or([0.0; 2], |c| {
+        [c.jitter_ndc[0] * w * 0.5, -c.jitter_ndc[1] * h * 0.5]
+    });
+    ([1.0 / w, 1.0 / h], jitter)
+}
+
 /// The last finished frame's camera, for frame generation.
 pub fn latest() -> Option<Arc<FrameCamera>> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -525,6 +600,10 @@ pub fn finish(read: impl Fn(u64, &mut [u8]) -> bool) -> FrameCamera {
         frame,
         dispatch: p.dispatch,
         ui: p.ui,
+        ui_mask: p.ui_mask,
+        hudless: p.hudless,
+        depth: p.depth,
+        motion: p.motion,
         ..FrameCamera::default()
     };
     let (Some((view_at, view_len)), Some((cb_at, cb_len))) = (p.view, p.constants) else {
@@ -557,6 +636,12 @@ pub fn finish(read: impl Fn(u64, &mut [u8]) -> bool) -> FrameCamera {
             Err(e) => out.why = e,
         },
     }
+    let size = out
+        .motion
+        .map(|m| m.size)
+        .or(out.record.map(|r| [r.viewport[0] as u32, r.viewport[1] as u32]))
+        .unwrap_or_default();
+    (out.mv_scale, out.jitter_px) = frame_scales(out.camera.as_ref(), size);
     out
 }
 
@@ -564,6 +649,8 @@ pub fn finish(read: impl Fn(u64, &mut [u8]) -> bool) -> FrameCamera {
 pub fn frame_end(read: impl Fn(u64, &mut [u8]) -> bool) {
     static LAST_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let cam = finish(read);
+    #[cfg(windows)]
+    crate::camera_mv::frame_end(&cam);
     let due = {
         let mut last = LAST_LOG.lock().unwrap_or_else(|e| e.into_inner());
         let due = last.is_none_or(|t| t.elapsed().as_secs_f32() >= 3.0);
@@ -591,7 +678,22 @@ fn log(cam: &FrameCamera) {
         return;
     };
     let d = cam.dispatch.unwrap_or_default();
+    #[cfg(windows)]
+    let held = {
+        let r = crate::camera_copy::resources();
+        format!(
+            "frame {} depth {} motion {} ui {} hudless {:?}",
+            r.frame,
+            r.depth.is_some(),
+            r.motion.is_some(),
+            r.ui_mask.is_some(),
+            r.hudless.map(|h| (h.frame, h.width, h.height))
+        )
+    };
+    #[cfg(not(windows))]
+    let held = String::new();
     tracing::info!(
+        held,
         frame = cam.frame,
         fov_y = c.fov_y,
         aspect = c.aspect,
@@ -609,6 +711,12 @@ fn log(cam: &FrameCamera) {
         viewport = ?cam.record.map(|r| r.viewport),
         ui = ?cam.ui.map(|u| (u.texture, u.target)),
         hudless_output = d.output,
+        hudless = ?cam.hudless.map(|s| (s.format, s.size)),
+        ui_mask = ?cam.ui_mask.map(|s| (s.title, s.format, s.size)),
+        depth = ?cam.depth.map(|s| (s.title, s.format, s.size)),
+        motion = ?cam.motion.map(|s| (s.title, s.format, s.size)),
+        mv_scale = ?cam.mv_scale,
+        jitter_px = ?cam.jitter_px,
         "camera: found view=srv(stride {VIEW_STRIDE})@{:#x}+0x08..0x4c prev=b0@{:#x}+{PREV_CLIP_OFFSET:#x} {verdict}",
         cam.sources[0],
         cam.sources[1],

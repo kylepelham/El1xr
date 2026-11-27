@@ -1,10 +1,12 @@
 """VIctory copié dans third_party/victory (base Neptune (VIctory Edit.) 2026-11-25c, plus l'oracle XG) et réglages du lanceur."""
 import configparser
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -59,10 +61,10 @@ REGLAGES = {
     "VICTORY_UPLOAD_BLOCKS": "1",
     "VICTORY_GUARD_4K": "1",
     "VICTORY_BAKE_INPUTS": "1",
-    "VICTORY_BAKE_ONE_BUDGET": "1",
     "VICTORY_LOAD_FPS": "60",
     "VICTORY_LOAD_END": "world",
     "VICTORY_LOAD_UNPACED": "1",
+    "VICTORY_HOLD_LAST_FRAME": "1",
     "VICTORY_MENU": "1",
     "VICTORY_ASYNC_SUBMIT": "1",
 }
@@ -226,13 +228,36 @@ FICHIERS_PRECOMPILATION = ("shaders.rpf", "XboxBvhBuilder.dll", "amd_fidelityfx_
 def faux_outil(tmp_path_factory):
     if sys.platform != "win32" or not shutil.which("powershell"):
         pytest.skip("le lanceur est un script Windows PowerShell")
-    dossier = tmp_path_factory.mktemp("faux-outil")
-    source, exe = dossier / "FakeTool.cs", dossier / "FakeTool.exe"
+    # Compilé une fois par version du source pour toute la machine : Add-Type lance csc.exe (1 à 2 s de processeur,
+    # plus de 45 s quand les cœurs sont pris et que les tests tournent en priorité basse). Les sessions, les worktrees
+    # et les workers de pytest-xdist reprennent le même .exe, posé d'un coup (os.replace) une fois compilé.
+    empreinte = hashlib.sha256(FAUX_OUTIL.encode("utf-8")).hexdigest()[:16]
+    exe = Path(tempfile.gettempdir()) / "anyxboxx-faux-outil" / empreinte / "FakeTool.exe"
+    if exe.is_file():
+        return exe
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    source = tmp_path_factory.mktemp("faux-outil") / "FakeTool.cs"
     source.write_text(FAUX_OUTIL, encoding="utf-8")
+    neuf = exe.with_name(f"FakeTool-{os.getpid()}.exe")
     subprocess.run(["powershell", "-NoProfile", "-Command",
-                    f"Add-Type -Path '{source}' -OutputAssembly '{exe}' -OutputType ConsoleApplication"],
+                    f"Add-Type -Path '{source}' -OutputAssembly '{neuf}' -OutputType ConsoleApplication"],
                    check=True, capture_output=True, timeout=120)
+    try:
+        os.replace(neuf, exe)
+    except OSError:                     # un autre processus l'a posé entre-temps et le lance peut-être
+        if not exe.is_file():
+            raise
+        neuf.unlink(missing_ok=True)
     return exe
+
+
+def _poser_outil(faux_outil, cible):
+    """Le faux outil sous le nom `cible` : un lien physique, pas une copie. Chaque copie est un .exe neuf que
+    l'antivirus analyse à son premier lancement (70 ms au calme contre 40, bien plus quand des builds l'occupent)."""
+    try:
+        os.link(faux_outil, cible)
+    except OSError:
+        shutil.copy(faux_outil, cible)
 
 
 def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SORTIE_VICTORY, echo=(), commande=None,
@@ -256,9 +281,9 @@ def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SO
     cible, outils = tmp_path / "cible", tmp_path / "outils"
     for profil in ("diag", "release"):
         (cible / profil).mkdir(parents=True)
-        shutil.copy(faux_outil, cible / profil / "victory.exe")   # compilation déjà présente (peut-être périmée)
+        _poser_outil(faux_outil, cible / profil / "victory.exe")   # compilation déjà présente (peut-être périmée)
     outils.mkdir()
-    shutil.copy(faux_outil, outils / "cargo.exe")
+    _poser_outil(faux_outil, outils / "cargo.exe")
     journal = tmp_path / "appels.log"
     env = {**os.environ, "PATH": f"{outils}{os.pathsep}{os.environ['PATH']}", "CARGO_TARGET_DIR": str(cible),
            "FAKE_TOOL_LOG": str(journal), "FAKE_TOOL_EXIT_CARGO": str(code_cargo),
@@ -406,9 +431,9 @@ def test_launcher_survives_stderr_redirection_in_windows_powershell_51(tmp_path,
         cible, outils = base / "cible", base / "outils"
         for profil in ("diag", "release"):
             (cible / profil).mkdir(parents=True)
-            shutil.copy(faux_outil, cible / profil / "victory.exe")
+            _poser_outil(faux_outil, cible / profil / "victory.exe")
         outils.mkdir()
-        shutil.copy(faux_outil, outils / "cargo.exe")
+        _poser_outil(faux_outil, outils / "cargo.exe")
         journal, errlog = base / "appels.log", base / "victory.log"
         env = {
             **os.environ,

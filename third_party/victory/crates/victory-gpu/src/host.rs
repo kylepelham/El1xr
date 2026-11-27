@@ -7919,6 +7919,7 @@ impl Meter {
             tracing::info!(
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2), of which {split_raw:.0} dispatches in one piece (VICTORY_SPLIT_RAW=1)"
             );
+            crate::indirect::split_ahead::line(frames);
             let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4]
                 .map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + raw + fell > 0.0 {
@@ -8382,15 +8383,28 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            // (racefix, #57) A black present may show the last good frame
+            // (`VICTORY_HOLD_LAST_FRAME`): the texture is read by its scan too.
+            let hold = over.is_none() && crate::hold_frame::most() > 0;
+            let read = if hold {
+                crate::hold_frame::READ
+            } else {
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            };
             list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(texture, state, read),
                 transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            let held = hold
+                .then(|| crate::hold_frame::record(&self.device, list, texture, &back))
+                .flatten();
+            if held.is_none() {
+                list.CopyResource(&back, texture);
+            }
             let shot = shot_now
                 .then(|| crate::screenshot::read_back(&self.device, list, texture))
                 .flatten();
@@ -8421,7 +8435,7 @@ impl Host {
                 )
             });
             list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                transition(texture, read, state),
                 transition(
                     &back,
                     if composed {
@@ -8449,6 +8463,9 @@ impl Host {
             }
             if let Some(audited) = audited {
                 crate::present_audit::sent(audited, flown);
+            }
+            if let Some(slot) = held {
+                crate::hold_frame::sent(slot, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
@@ -8601,7 +8618,7 @@ impl Host {
                 Flags: crate::pacing::swap_chain_flags(&factory).0 as u32,
                 ..Default::default()
             };
-            let swap_chain = match crate::framegen::create_swap_chain(&factory, &self.queue, hwnd, &desc) {
+            let swap_chain = match crate::framegen::create_swap_chain(&factory, &self.device, &self.queue, hwnd, &desc) {
                 Some(proxy) => proxy,
                 None => factory
                     .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?

@@ -117,6 +117,8 @@ mod popwatch;
 #[cfg(windows)]
 mod present_audit;
 #[cfg(windows)]
+mod hold_frame;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -145,10 +147,18 @@ mod dlss;
 #[cfg(windows)]
 pub mod framegen;
 #[cfg(windows)]
+mod dlssg;
+#[cfg(windows)]
+mod streamline;
+#[cfg(windows)]
 mod ngx;
 pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
+#[cfg(windows)]
+pub mod camera_copy;
+#[cfg(windows)]
+pub mod camera_mv;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

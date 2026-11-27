@@ -573,7 +573,26 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => raise_behind(q, &held),
+                    Held::Wait(fence, value) => {
+                        raise_behind(q, &held);
+                        // (racefix, #57) Passed at a present before the fence got there:
+                        // what the lists behind it wait for may run after them.
+                        if all {
+                            let reached = crate::fence::completed(fence.as_this());
+                            if reached < value {
+                                static SEEN: AtomicU64 = AtomicU64::new(0);
+                                if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                                    tracing::warn!(
+                                        queue = format_args!("{q:#x}"),
+                                        value,
+                                        reached,
+                                        frame = presented() + 1,
+                                        "a wait for a fence was not met at a present: the queue runs on"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     Held::Value(wait) => {
                         raise_behind(q, &held);
                         // Passed at a present without being met: what the
