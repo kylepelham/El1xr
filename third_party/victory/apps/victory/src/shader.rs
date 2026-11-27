@@ -42,14 +42,37 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
-        });
+    // (each container as long as its header says, not the rest of the file after it: the run
+    // hashes the bytes the title hands over, so `warm` fills the entries a run looks up)
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        let data = tail.get(..size)?;
+        Container::parse(data).ok()?;
+        Some(Source::Raw { offset, data })
+    });
     out.extend(raw);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sources;
+
+    #[test]
+    fn embedded_containers_keep_runtime_hashes() {
+        // A 32-byte DXBC with no parts; the scan should not add carrier bytes.
+        let shader = b"DXBC\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\x20\0\0\0\0\0\0\0";
+        let first = [b"MZ".as_slice(), shader, b"first suffix"].concat();
+        let second = [b"PE header".as_slice(), shader, b"other suffix", b"DXBC"].concat();
+        let runtime_hash = blake3::hash(shader);
+        for (carrier, label) in [(&first, "@0x2"), (&second, "@0x9")] {
+            let entries = sources(carrier);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].label(), label);
+            assert_eq!(blake3::hash(&entries[0].bytes().unwrap()), runtime_hash);
+        }
+    }
 }
 
 #[derive(Default)]
