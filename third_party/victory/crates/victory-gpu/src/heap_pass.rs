@@ -66,6 +66,19 @@ pub(crate) fn scan_every() -> u64 {
     })
 }
 
+/// How many passes a full heap buffer rescan is spread across
+/// (`VICTORY_HEAP_RESCAN_SLICES`, default 16; 1: single-frame full rescan).
+pub(crate) fn rescan_slices() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RESCAN_SLICES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+            .clamp(1, 1024)
+    })
+}
+
 /// What a pass looks at (see the module).
 pub(crate) struct Picked<C> {
     passes: u64,
@@ -82,14 +95,20 @@ pub(crate) struct Picked<C> {
     full: bool,
     /// Interval for scanning all kept slots for past-the-API record changes.
     scan_every: u64,
+    /// Number of passes across which periodic full rescans are sliced (1: all at once).
+    rescan_slices: u64,
 }
 
 impl<C: Clone> Picked<C> {
     pub(crate) fn new(full: bool) -> Self {
-        Self::with_scan_every(full, if cfg!(test) { 1 } else { scan_every() })
+        Self::with_options(
+            full,
+            if cfg!(test) { 1 } else { scan_every() },
+            if cfg!(test) { 1 } else { rescan_slices() },
+        )
     }
 
-    pub(crate) fn with_scan_every(full: bool, scan_every: u64) -> Self {
+    pub(crate) fn with_options(full: bool, scan_every: u64, rescan_slices: u64) -> Self {
         Picked {
             passes: 0,
             slots: BTreeMap::new(),
@@ -99,6 +118,7 @@ impl<C: Clone> Picked<C> {
             forgotten: None,
             full,
             scan_every: scan_every.max(1),
+            rescan_slices: rescan_slices.clamp(1, 1024),
         }
     }
 
@@ -115,7 +135,9 @@ impl<C: Clone> Picked<C> {
     /// Whether the next `plan_in_ranges` call will scan kept/orphan slots (or
     /// run pass 0 to establish baseline write-watch stamps).
     pub(crate) fn will_scan(&self) -> bool {
-        self.forgotten.is_none() || self.scan_every == 1 || (self.passes + 1).is_multiple_of(self.scan_every)
+        self.forgotten.is_none()
+            || self.scan_every == 1
+            || (self.passes + 1).is_multiple_of(self.scan_every)
     }
 
     /// The slots this pass looks at again, in order. `changed`: the slots
@@ -150,21 +172,47 @@ impl<C: Clone> Picked<C> {
         self.passes += 1;
         let forgotten = self.forgotten.replace(Vec::new());
         if self.full {
-            if pass.is_multiple_of(ORPHANS_EVERY) {
+            if self.rescan_slices <= 1 {
+                if pass.is_multiple_of(ORPHANS_EVERY) {
+                    self.clear();
+                    return all();
+                }
+                return changed;
+            }
+            if pass == 0 {
                 self.clear();
                 return all();
             }
-            return changed;
+            // Spread the full rescan across `rescan_slices` passes (by slot
+            // index) so every slot is revisited every `rescan_slices` passes
+            // without stalling a single frame on ~80,000 views.
+            let mut due = changed;
+            let slices = self.rescan_slices as u32;
+            let part = (pass % self.rescan_slices) as u32;
+            self.rescan_slice(all(), part, slices, &mut due);
+            if due.len() > 1 {
+                due.sort_unstable();
+                due.dedup();
+            }
+            return due;
         }
         let Some(forgotten) = forgotten else {
             self.clear();
             return all();
         };
-        if pass.is_multiple_of(FULL_EVERY) {
+        if self.rescan_slices <= 1 && pass.is_multiple_of(FULL_EVERY) {
             self.clear();
             return all();
         }
         let mut due = changed;
+        if self.rescan_slices > 1 && pass > 0 {
+            let stride = (FULL_EVERY / self.rescan_slices).max(1);
+            if pass.is_multiple_of(stride) {
+                let slices = self.rescan_slices as u32;
+                let part = ((pass / stride) % self.rescan_slices) as u32;
+                self.rescan_slice(all(), part, slices, &mut due);
+            }
+        }
         for e in forgotten {
             if let Some(slots) = self.by_entry.remove(&e) {
                 // Only those whose record still names the entry.
@@ -245,6 +293,23 @@ impl<C: Clone> Picked<C> {
         self.by_entry.clear();
     }
 
+    /// Rescans slots whose index modulo `slices` equals `part`: forgets any
+    /// kept or orphan slot in that slice absent from sorted `all`, and appends
+    /// the live slots in that slice to `due`.
+    fn rescan_slice(&mut self, all: Vec<u32>, part: u32, slices: u32, due: &mut Vec<u32>) {
+        let stale: Vec<u32> = self
+            .slots
+            .keys()
+            .chain(self.orphans.keys())
+            .copied()
+            .filter(|&index| index % slices == part && all.binary_search(&index).is_err())
+            .collect();
+        for index in stale {
+            self.forget(index);
+        }
+        due.extend(all.into_iter().filter(|&index| index % slices == part));
+    }
+
     /// What slot `slot` held is let go (it is looked at now).
     pub(crate) fn forget(&mut self, slot: u32) {
         self.orphans.remove(&slot);
@@ -295,7 +360,15 @@ impl<C: Clone> Picked<C> {
         }
         self.forget(slot);
         self.note_entry(slot, entry);
-        self.slots.insert(slot, Slot { copy: key, from, to, record });
+        self.slots.insert(
+            slot,
+            Slot {
+                copy: key,
+                from,
+                to,
+                record,
+            },
+        );
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
             slots: HashSet::new(),
@@ -364,7 +437,9 @@ impl<C: Clone> Picked<C> {
             }
             return spans
                 .into_iter()
-                .filter_map(|(key, (from, to))| Some((self.copies.get(&key)?.copy.clone(), from, to)))
+                .filter_map(|(key, (from, to))| {
+                    Some((self.copies.get(&key)?.copy.clone(), from, to))
+                })
                 .collect();
         }
         let slots = &self.slots;
@@ -426,7 +501,14 @@ mod tests {
             };
             let copy = slot / 4;
             let from = u64::from(slot) * 16;
-            p.keep(slot, copy as usize, &copy, [from, from + 16], record, entry(record));
+            p.keep(
+                slot,
+                copy as usize,
+                &copy,
+                [from, from + 16],
+                record,
+                entry(record),
+            );
         }
         due
     }
@@ -465,7 +547,12 @@ mod tests {
         let mut heap = heap(8);
         let mut p = Picked::new(false);
         pass(&mut p, &heap, vec![], vec![]);
-        let span = |p: &mut Picked<u32>, copy: u32| p.spans().into_iter().find(|s| s.0 == copy).map(|s| (s.1, s.2));
+        let span = |p: &mut Picked<u32>, copy: u32| {
+            p.spans()
+                .into_iter()
+                .find(|s| s.0 == copy)
+                .map(|s| (s.1, s.2))
+        };
         assert_eq!(span(&mut p, 1), Some((64, 128)));
         heap.records.remove(&7);
         pass(&mut p, &heap, vec![7], vec![]);
@@ -489,7 +576,11 @@ mod tests {
         p.orphan(3, heap.record(3).unwrap(), None);
         for n in 1..FULL_EVERY {
             let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
-            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![3] } else { vec![] };
+            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) {
+                vec![3]
+            } else {
+                vec![]
+            };
             assert_eq!(due, want, "pass {n}");
         }
         let due = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
@@ -502,7 +593,11 @@ mod tests {
         let mut p: Picked<u32> = Picked::new(true);
         for n in 0..40u64 {
             let due = p.plan(vec![2], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
-            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![0, 1, 2, 3] } else { vec![2] };
+            let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) {
+                vec![0, 1, 2, 3]
+            } else {
+                vec![2]
+            };
             assert_eq!(due, want, "pass {n}");
         }
     }
@@ -586,5 +681,60 @@ mod tests {
             assert_eq!(collect(&mut p), vec![(1, 32, 64)]);
             assert_eq!(collect(&mut p), collect_spans(&mut p));
         }
+    }
+
+    #[test]
+    fn sliced_full_rescan_spreads_work_and_drops_removed_slots() {
+        let mut heap = heap(16);
+        let mut p: Picked<u32> = Picked::with_options(true, 1, 4);
+        // Pass 0 populates all slots immediately.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]).len(), 16);
+        assert_eq!(p.views(), 16);
+        // Remove slot 5 (5 % 4 == 1) without reporting it in `changed`.
+        heap.records.remove(&5);
+        // Passes 1..=4 visit slices 1, 2, 3, 0 — each at most 4 slots, covering
+        // every live slot once across the 4 passes and dropping stale slot 5 on pass 1.
+        let mut seen = Vec::new();
+        for round in 1..=4u32 {
+            let due = pass(&mut p, &heap, vec![], vec![]);
+            assert!(
+                due.len() <= 4,
+                "round {round} scanned too many slots: {due:?}"
+            );
+            seen.extend(due);
+            if round == 1 {
+                assert_eq!(p.views(), 15, "stale slot 5 forgotten on slice 1");
+            }
+        }
+        seen.sort_unstable();
+        let expected: Vec<u32> = (0..16).filter(|&s| s != 5).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn sliced_dirty_safety_net_avoids_single_frame_full_clear() {
+        let mut heap = heap(32);
+        // Set scan_every > FULL_EVERY so the periodic sliced safety net is what
+        // visits every slot and drops the silently-removed slot 18.
+        let mut p: Picked<u32> = Picked::with_options(false, FULL_EVERY + 1, 16);
+        // Pass 0 initializes everything.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]).len(), 32);
+        assert_eq!(p.views(), 32);
+        // Remove slot 18 (18 % 16 == 2) silently.
+        heap.records.remove(&18);
+        let mut rescanned = Vec::new();
+        for n in 1..=FULL_EVERY {
+            let due = pass(&mut p, &heap, vec![], vec![]);
+            assert!(
+                due.len() <= 2,
+                "pass {n} rescanned more than one slice: {due:?}"
+            );
+            rescanned.extend(due);
+        }
+        rescanned.sort_unstable();
+        rescanned.dedup();
+        let expected: Vec<u32> = (0..32).filter(|&s| s != 18).collect();
+        assert_eq!(rescanned, expected);
+        assert_eq!(p.views(), 31);
     }
 }
