@@ -33,10 +33,6 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
-const RTV_RING: u32 = 1024;
-
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) queue: ID3D12CommandQueue,
@@ -45,16 +41,9 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     submitted_fence: std::sync::atomic::AtomicU64,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
-    rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
-    dsv_size: u32,
-    next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
-    next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
@@ -914,20 +903,6 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -939,13 +914,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             submitted_fence: std::sync::atomic::AtomicU64::new(0),
             event,
-            rtvs,
-            rtv_size,
-            dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
             messages,
-            next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
         })
@@ -1521,7 +1490,6 @@ fn record_plane_pass(
                 },
                 ..Default::default()
             };
-            let target = host.dsv(depth, Some(&target));
             let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
             let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: base_cpu + slot as usize * step as usize,
@@ -1537,7 +1505,10 @@ fn record_plane_pass(
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
+                host.output_views(|views| {
+                    let dsv = views.dsv(depth, Some(&target));
+                    list.OMSetRenderTargets(0, None, false, Some(&dsv));
+                });
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -3739,7 +3710,7 @@ pub(crate) fn settle_for_fence() {
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
-fn land() {
+pub(crate) fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
@@ -4684,22 +4655,6 @@ impl Host {
                 .ok()?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
-            let rtvs: ID3D12DescriptorHeap = device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
-                    ..Default::default()
-                })
-                .ok()?;
-            let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            let dsvs: ID3D12DescriptorHeap = device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                    NumDescriptors: 1,
-                    ..Default::default()
-                })
-                .ok()?;
-            let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
             Some(Host {
                 device,
                 queue,
@@ -4707,13 +4662,7 @@ impl Host {
                 submitted: Mutex::new(0),
                 submitted_fence: std::sync::atomic::AtomicU64::new(0),
                 event,
-                rtvs,
-                rtv_size,
-                dsvs,
-                dsv_size,
-                next_dsv: AtomicU32::new(0),
                 messages: None,
-                next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 adapter: None,
             })
@@ -6882,7 +6831,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        crate::land_aside::after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -7707,39 +7656,10 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
-    pub(crate) fn rtv(
-        &self,
-        resource: Option<&ID3D12Resource>,
-        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource, or none with a
-        // description (a typed null view).
-        unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
-            self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
-        }
-    }
-
-    /// A host depth view of `resource`, valid until it is recorded.
-    pub(crate) fn dsv(
-        &self,
-        resource: &ID3D12Resource,
-        desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
-        unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
-            self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
-        }
+    /// Prepare and record the CPU descriptors for one output-merger call or clear.
+    /// Each thread owns its scratch heaps through the call (`crate::output_views`).
+    pub(crate) fn output_views(&self, record: impl FnOnce(&mut crate::output_views::OutputViews<'_>)) {
+        crate::output_views::with_output_views(&self.device, record);
     }
 }
 
