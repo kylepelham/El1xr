@@ -82,6 +82,7 @@ mod land_aside;
 mod list_reap;
 #[cfg(windows)]
 mod output_views;
+pub mod menu;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
