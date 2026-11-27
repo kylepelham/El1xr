@@ -17,6 +17,7 @@ use crate::host::host;
 mod flicker;
 mod list_views;
 mod slot_wait;
+pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
@@ -2513,6 +2514,11 @@ impl HostHeap {
             .collect()
     }
 
+    /// This heap, for `view_ages`.
+    fn ages_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -3576,10 +3582,24 @@ impl HostHeap {
                 if same || other {
                     if same { &KEPT_VIEWS } else { &KEPT_OTHER_VIEWS }
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if view_ages::on() {
+                        let kind = if same {
+                            view_ages::Kind::KeptSame
+                        } else {
+                            view_ages::Kind::KeptOther
+                        };
+                        view_ages::waiting(self.ages_key(), index, kind, &view, Some(&old));
+                    }
                     return Some((view, None));
                 }
             }
             if later {
+                if view_ages::on() && !self.sampler && shows_texture(&view) {
+                    let m = made[index as usize];
+                    let old = (m != 0).then(|| view_at(m as u32, (m >> 32) as u32)).flatten();
+                    let kind = view_ages::Kind::Null;
+                    view_ages::waiting(self.ages_key(), index, kind, &view, old.as_ref());
+                }
                 // A slot of ours that never made a view is already null
                 // (`HostHeap::new` makes every slot null, `made` starts 0
                 // and `kept` at `None`): making it null again costs a
@@ -3599,6 +3619,9 @@ impl HostHeap {
                     Some((kept, copy)) => {
                         self.keep(index, kept);
                         resolved = copy;
+                        if view_ages::on() {
+                            view_ages::shown(self.ages_key(), index);
+                        }
                     }
                     None => {
                         if !self.sampler {
@@ -3608,6 +3631,10 @@ impl HostHeap {
                             }
                         }
                         self.keep(index, None);
+                        if view_ages::on() && !self.sampler && shows_texture(&view) {
+                            let kind = view_ages::Kind::Failed;
+                            view_ages::waiting(self.ages_key(), index, kind, &view, None);
+                        }
                     }
                 }
                 self.made_too[index as usize].store(key, std::sync::atomic::Ordering::Release);
@@ -5065,8 +5092,8 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
 /// nothing yet shows magenta: on the screen, a texture that is not there is
 /// told from one whose contents are black. False if it is to be null.
-#[cfg(feature = "diagnostics")]
-fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+/// (In every build since #55: the operator runs release builds.)
+fn magenta_for(desc: &[u32], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
         return false;
@@ -5085,7 +5112,6 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
 }
 
 /// One magenta texel, written by the processor.
-#[cfg(feature = "diagnostics")]
 fn magenta() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
@@ -5160,9 +5186,13 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
+        View::Shader(_, Some(desc)) => {
+            if magenta_for(desc, at) {
+                return;
+            }
+            return null_like(desc, at);
+        }
         View::Placed(false, _, desc) => {
-            #[cfg(feature = "diagnostics")]
             if magenta_for(desc, at) {
                 return;
             }
