@@ -1629,10 +1629,10 @@ pub(crate) fn ask_once_active() -> bool {
 /// left to `writes`.
 fn prepare_flush_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var_os("VICTORY_PREPARE_FLUSH").is_some_and(|v| v == "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREPARE_FLUSH").is_some_and(|v| v == "1"))
 }
 
-/// (`VICTORY_PREPARE_FLUSH`, on unless `0`) Before a wide `Batch::flush`, on the
+/// (`VICTORY_PREPARE_FLUSH=1`, off by default: not yet measured in settled play) Before a wide `Batch::flush`, on the
 /// submitting thread: re-guards the flush's view memory once, merged across its
 /// copies, and asks the kernel for private ranges the submission's asking left
 /// out. The workers then find them published or asked (no `VirtualProtect` or
