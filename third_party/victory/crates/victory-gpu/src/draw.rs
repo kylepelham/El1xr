@@ -2513,6 +2513,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&mut self, list: &HostList) -> Option<u64> {
+        let _hitch = crate::hitch::span(crate::hitch::Phase::HeapBuffers);
         let heap = self
             .heaps
             .iter()
@@ -2714,7 +2715,10 @@ impl State {
         }
         drop(kept);
         let textures_began = std::time::Instant::now();
-        self.heap_textures(list, heap, host);
+        {
+            let _hitch = crate::hitch::span(crate::hitch::Phase::HeapTextures);
+            self.heap_textures(list, heap, host);
+        }
         HEAP_PASS_PARTS[0].fetch_add(
             textures_began.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -2748,6 +2752,7 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
         let cfg = early_pass_config();
         let heap_passes = HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed);
         let bake_ms = cfg.bake_ms.unwrap_or_else(|| {

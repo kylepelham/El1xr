@@ -1441,11 +1441,11 @@ impl Drop for Made {
 }
 
 /// Counts a call of the title that maps or unmaps pages, when it ends.
-struct Call(std::time::Instant);
+struct Call(std::time::Instant, #[allow(dead_code)] victory_gpu::hitch::Span);
 
 impl Call {
     fn begin() -> Call {
-        Call(std::time::Instant::now())
+        Call(std::time::Instant::now(), victory_gpu::hitch::span(victory_gpu::hitch::Phase::Remap))
     }
 }
 
