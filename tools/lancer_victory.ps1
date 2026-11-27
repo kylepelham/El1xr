@@ -286,6 +286,7 @@ if (-not $NoTunedSettings) {
         VICTORY_LOAD_FPS                 = '60'        # batch 4: loading screen up to 60 fps until the world (boot -5 s)
         VICTORY_LOAD_END                 = 'world'     # batch 4: loading rate ends at the first world frame
         VICTORY_LOAD_UNPACED             = '1'         # batch 4: loading screen not paced by our clock
+        VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]
