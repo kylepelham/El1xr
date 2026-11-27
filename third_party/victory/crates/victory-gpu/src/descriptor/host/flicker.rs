@@ -1,7 +1,7 @@
 //! (texflicker, #96) Black flicker: host slots made null, or made to show a
 //! texture with nothing in it, while the title still reads them.
 //!
-//! `VICTORY_FLICKER_KEEP=N` (frames, 1-64; off by default): a slot whose
+//! `VICTORY_FLICKER_KEEP=N` (frames, 1-600; off by default): a slot whose
 //! view a newer view of other memory there made stale
 //! ([`super::HostHeap::mirror`], `VICTORY_STALE_TEXTURES`) is not made null
 //! at once. Made null at once, the slot read zeros in the lists already in
@@ -12,6 +12,21 @@
 //! showing the old host copy for `N` frames and until every submission
 //! begun when it went stale has finished; then it is made null, unless it
 //! was made again meanwhile.
+//!
+//! Batch 5 found nearly every kept slot made null at the end of its wait
+//! (`kept_nulled` = `stale_kept`, `kept_remade` about 2%): the title neither
+//! wrote nor drew from them again within 3 frames. A long wait (`=600`, ten
+//! seconds and more) asks whether it reads them later: if the black flashes
+//! go with it, a stale slot was read after its null; if not, the stale path
+//! is not the flicker (`VICTORY_STALE_TEXTURES=0`, its own launch, says the
+//! same with no slot ever made stale).
+//!
+//! `kept_read` counts kept slots a draw's table read during their wait
+//! (made null anyway): the slots whose null can show as black.
+//! `VICTORY_FLICKER_KEEP_READ=1` (with `VICTORY_FLICKER_KEEP=N`) keeps such
+//! a slot another N frames instead, as long as draws read it, up to
+//! 600 frames after it went stale; a slot no draw read is made null as
+//! before.
 //!
 //! `VICTORY_FLICKER_WATCH=1`: a line a frame (frames with any) counting the
 //! paths that make a slot read black: stale slots made null (and how many
@@ -33,10 +48,21 @@ pub(super) fn keep_frames() -> u64 {
     N.get()
 }
 
+/// `VICTORY_FLICKER_KEEP_READ=1`: a kept slot a draw read during its wait
+/// waits again.
+fn keep_read() -> bool {
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_FLICKER_KEEP_READ");
+    ON.get_bool()
+}
+
+/// The longest wait `VICTORY_FLICKER_KEEP` takes, and the longest a slot
+/// is kept in all (`VICTORY_FLICKER_KEEP_READ`).
+const MOST_FRAMES: u64 = 600;
+
 fn parse_keep(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(0, |n| n.min(64))
+        .map_or(0, |n| n.min(MOST_FRAMES))
 }
 
 /// `VICTORY_FLICKER_WATCH=1`.
@@ -62,9 +88,11 @@ pub(super) enum Count {
     EmptyViews,
     /// Texture views the host could not make (made null).
     Unmade,
+    /// Kept slots a draw's table read during their wait.
+    KeptRead,
 }
 
-const COUNTS: usize = 7;
+const COUNTS: usize = 8;
 const NAMES: [&str; COUNTS] = [
     "stale_nulled",
     "stale_nulled_in_air",
@@ -73,6 +101,7 @@ const NAMES: [&str; COUNTS] = [
     "kept_remade",
     "empty_views",
     "unmade_views",
+    "kept_read",
 ];
 /// Empty views logged one by one in a frame.
 const EMPTY_LOGGED: u64 = 8;
@@ -140,10 +169,13 @@ pub(super) fn made_view(copy: &crate::resource::HostTexture, first: Option<u32>)
 }
 
 /// A stale slot waiting to be made null: (frame it may go, submission that
-/// must finish first, host heap, slot, its key, the host copy it showed).
+/// must finish first, frame it went stale, frame its wait began, host heap,
+/// slot, its key, the host copy it showed).
 struct Held {
     frame: u64,
     after: u64,
+    stale: u64,
+    since: u64,
     host: usize,
     index: u32,
     key: u64,
@@ -209,11 +241,14 @@ impl super::HostHeap {
             too.store(0, Relaxed);
         }
         EVER_HELD.store(true, Relaxed);
+        let now = crate::frame::current();
         LINE.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(Held {
                 frame,
                 after,
+                stale: now,
+                since: now,
                 host: std::ptr::from_ref(self) as usize,
                 index,
                 key,
@@ -251,8 +286,9 @@ impl super::HostHeap {
             return 0;
         }
         let mut nulled = 0;
+        let mut again = Vec::new();
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        for held in due {
+        for mut held in due {
             let shown = self.kept.get(held.index as usize).and_then(|k| {
                 k.lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -264,6 +300,15 @@ impl super::HostHeap {
                 count(Count::KeptRemade);
                 continue;
             }
+            if self.read_since(held.index, held.since, frame) {
+                count(Count::KeptRead);
+                if let Some(until) = wait_again(&held, frame, keep_read(), keep_frames()) {
+                    (held.frame, held.since) = (until, frame);
+                    held.after = crate::host::submissions_started();
+                    again.push(held);
+                    continue;
+                }
+            }
             match super::view_at(held.key as u32, (held.key >> 32) as u32) {
                 Some(view) => super::null_for(&view, self.cpu(held.index)),
                 None => super::null_view(self.cpu(held.index)),
@@ -272,8 +317,28 @@ impl super::HostHeap {
             count(Count::KeptNulled);
             nulled += 1;
         }
+        drop(made);
+        if !again.is_empty() {
+            LINE.lock().unwrap_or_else(|e| e.into_inner()).extend(again);
+        }
         nulled
     }
+
+    /// Whether a draw's table read slot `index` in frame `since` or later
+    /// (up to `frame`).
+    fn read_since(&self, index: u32, since: u64, frame: u64) -> bool {
+        let stamp = self.tabled_stamp(index);
+        let now = (frame as u32).wrapping_add(1) & !super::TABLED_READ;
+        stamp & super::TABLED_READ != 0
+            && u64::from(now.wrapping_sub(stamp & !super::TABLED_READ)) <= frame.saturating_sub(since)
+    }
+}
+
+/// The frame a kept slot a draw read during its wait waits until next
+/// (`VICTORY_FLICKER_KEEP_READ`), or `None`: made null now.
+fn wait_again(held: &Held, frame: u64, read: bool, frames: u64) -> Option<u64> {
+    let until = frame + frames.max(1);
+    (read && frames != 0 && until <= held.stale + MOST_FRAMES).then_some(until)
 }
 
 fn raw_of(resource: &ID3D12Resource) -> usize {
@@ -299,13 +364,16 @@ mod tests {
         assert_eq!(parse_keep(Some("x")), 0);
         assert_eq!(parse_keep(Some("3")), 3);
         assert_eq!(parse_keep(Some(" 5 ")), 5);
-        assert_eq!(parse_keep(Some("1000")), 64);
+        assert_eq!(parse_keep(Some("600")), 600);
+        assert_eq!(parse_keep(Some("1000")), 600);
     }
 
     fn held(frame: u64, after: u64) -> Held {
         Held {
             frame,
             after,
+            stale: frame,
+            since: frame,
             host: 1,
             index: 2,
             key: 3,
@@ -376,7 +444,40 @@ mod tests {
         counts[Count::EmptyViews as usize] = 2;
         assert_eq!(
             line(&counts),
-            "stale_nulled=0 stale_nulled_in_air=0 stale_kept=4 kept_nulled=0 kept_remade=0 empty_views=2 unmade_views=0"
+            "stale_nulled=0 stale_nulled_in_air=0 stale_kept=4 kept_nulled=0 kept_remade=0 empty_views=2 unmade_views=0 kept_read=0"
         );
+    }
+
+    /// With `VICTORY_FLICKER_KEEP_READ` a kept slot a draw read waits
+    /// again, never past [`MOST_FRAMES`] after it went stale; without it,
+    /// or with the wait off, it is made null.
+    #[test]
+    fn a_read_slot_waits_again_only_with_the_switch_and_within_bounds() {
+        let h = held(10, 0);
+        assert_eq!(wait_again(&h, 13, true, 3), Some(16));
+        assert_eq!(wait_again(&h, 13, false, 3), None);
+        assert_eq!(wait_again(&h, 13, true, 0), None);
+        assert_eq!(wait_again(&h, 10 + MOST_FRAMES - 3, true, 3), Some(10 + MOST_FRAMES));
+        assert_eq!(wait_again(&h, 10 + MOST_FRAMES - 2, true, 3), None);
+    }
+
+    /// A draw's table read during the wait is seen; one before it is not.
+    #[test]
+    fn a_table_read_during_the_wait_is_seen() {
+        let Some(heap) = super::super::HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        heap.tabled_in_as(1, true, 50, false);
+        assert!(heap.read_since(1, 48, 52), "read in frame 50, wait from 48");
+        assert!(heap.read_since(1, 50, 52), "read in the frame the wait began");
+        assert!(!heap.read_since(1, 51, 52), "read before the wait");
+        heap.tabled_in_as(2, false, 50, false);
+        assert!(!heap.read_since(2, 48, 52), "a table made, not read");
+        assert!(!heap.read_since(3, 0, 52), "never in a table");
+    }
+
+    #[test]
+    fn keep_read_is_live() {
+        victory_core::settings::check_live("VICTORY_FLICKER_KEEP_READ", "1", keep_read, false, true);
     }
 }
