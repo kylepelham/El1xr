@@ -133,6 +133,7 @@ pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
 
 fn refresh_wide(copies: Vec<HostCopy>) {
     let prof = crate::refresh_prof::on();
+    let one_pass = super::one_pass::on();
     let mut pending = copies;
     while !pending.is_empty() {
         if pending.len() == 1 || only_carded_writes(&pending) {
@@ -143,7 +144,7 @@ fn refresh_wide(copies: Vec<HostCopy>) {
             add(F::AloneUs, alone.elapsed().as_micros() as u64);
             break;
         }
-        if super::one_pass::on() {
+        if one_pass {
             refresh_one_pass(pending);
             return;
         }

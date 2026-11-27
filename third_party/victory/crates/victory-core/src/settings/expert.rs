@@ -17,7 +17,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_ASYNC_PRESENT", Apply::Restart),
     ("VICTORY_AUDIO_CAPTURE", Apply::Restart),
     ("VICTORY_AUTO_A_PERIOD_MS", Apply::Restart),
-    ("VICTORY_BAKE_INPUTS", Apply::Restart),
+    ("VICTORY_BAKE_INPUTS", Apply::Live),
     ("VICTORY_BARRIER_TEST", Apply::Restart),
     ("VICTORY_BCPACK_CASES", Apply::Restart),
     ("VICTORY_BCPACK_TABLES", Apply::Restart),
@@ -124,6 +124,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_EARLY_ROUNDS", Apply::Restart),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
+    // Not live: list stamps and the round floor are kept only while on; turned on mid-run it
+    // would trust a stale floor and skip a heap round a submission needs (stale descriptors).
     ("VICTORY_HEAP_ROUND_SHARE", Apply::Restart),
     ("VICTORY_HEAP_SYNC", Apply::Restart),
     ("VICTORY_HEAP_SYNC_BLOCKS", Apply::Restart),
@@ -151,6 +153,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_KEYS", Apply::Restart),
     ("VICTORY_LAND_ASIDE", Apply::Restart),
     ("VICTORY_LANE_CORE", Apply::Restart),
+    // Not live: how submissions are prepared against flights in the air (late copies, merges
+    // under writes); flights prepared under one stage would be settled under another.
     ("VICTORY_LATE_WAIT", Apply::Restart),
     ("VICTORY_LATE_WAITS", Apply::Restart),
     ("VICTORY_LATE_WAIT_WRITES", Apply::Restart),
@@ -205,7 +209,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_PLACEHOLDER_SKIP", Apply::Restart),
     ("VICTORY_PORT_CBV_PLACE", Apply::Restart),
     ("VICTORY_PREPARE_FLUSH", Apply::Restart),
-    ("VICTORY_PRESENT_AUDIT", Apply::Restart),
+    ("VICTORY_PRESENT_AUDIT", Apply::Live),
     ("VICTORY_PROBE_SECS", Apply::Restart),
     ("VICTORY_QUEUE_WAIT", Apply::Restart),
     ("VICTORY_QUIET_BACK_TOGETHER", Apply::Restart),
@@ -256,7 +260,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_SLOT_EVICT", Apply::Restart),
     ("VICTORY_SLOT_EVICT_MB", Apply::Restart),
     ("VICTORY_SLOT_EVICT_PERCENT", Apply::Restart),
-    ("VICTORY_SLOT_WAIT_ALL", Apply::Restart),
+    ("VICTORY_SLOT_WAIT_ALL", Apply::Live),
     ("VICTORY_SNAP_DIR", Apply::Restart),
     ("VICTORY_SOFT_VIEWS_PROBE", Apply::Restart),
     ("VICTORY_SPLIT_WAITS", Apply::Restart),
@@ -267,6 +271,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STRICT_JOINS", Apply::Retranslate),
     ("VICTORY_SUBMIT_CHUNKS", Apply::Restart),
     ("VICTORY_SWEEP", Apply::Restart),
+    // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
+    // a flip would compare against stale state and miss changed records (wrong descriptors).
     ("VICTORY_SYNC_IN_PLACE", Apply::Restart),
     ("VICTORY_TABLED_TEXTURES", Apply::Restart),
     ("VICTORY_TABLES_BY_CONTENT", Apply::Restart),

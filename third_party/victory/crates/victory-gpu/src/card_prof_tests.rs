@@ -138,8 +138,12 @@ fn joined_spans_join_what_touches_and_keep_what_does_not() {
     );
 }
 
+/// The tests that turn `VICTORY_CARD_PROF` on or look at the sums.
+static STATS_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn laps_go_nowhere_when_off() {
+    let _one = STATS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     // The crate's tests run without VICTORY_CARD_PROF.
     if on() {
         return;
@@ -149,4 +153,38 @@ fn laps_go_nowhere_when_off() {
     add(P::Plans, 1);
     assert_eq!(STATS[P::Declared as usize].load(Ordering::Relaxed), 0);
     assert_eq!(STATS[P::Plans as usize].load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn decl_join_is_live() {
+    // Unchanged, the switch reads what the environment said, as before.
+    assert_eq!(decl_join(), std::env::var_os("VICTORY_CARD_DECL_JOIN").is_some_and(|v| v == "1"));
+    if std::env::var_os("VICTORY_CARD_DECL_JOIN").is_some() {
+        return;
+    }
+    victory_core::settings::set("VICTORY_CARD_DECL_JOIN", "1").unwrap();
+    let now = decl_join();
+    victory_core::settings::set("VICTORY_CARD_DECL_JOIN", "").unwrap();
+    assert!(now, "a change takes effect while running");
+    assert!(!decl_join(), "and clears back to the launch value");
+}
+
+#[test]
+fn card_prof_is_live_and_drops_its_sums_when_off() {
+    let _one = STATS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let old = ["VICTORY_CARD_PROF", "VICTORY_FLUSH_PROF"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"));
+    assert_eq!(on(), old, "unchanged, as before");
+    if old || std::env::var_os("VICTORY_CARD_PROF").is_some() {
+        return;
+    }
+    victory_core::settings::set("VICTORY_CARD_PROF", "1").unwrap();
+    let was_on = on();
+    victory_core::settings::set("VICTORY_CARD_PROF", "").unwrap();
+    assert!(was_on, "a change takes effect while running");
+    assert!(!on());
+    STATS[P::Plans as usize].fetch_add(3, Ordering::Relaxed);
+    log(1.0);
+    assert_eq!(STATS[P::Plans as usize].load(Ordering::Relaxed), 0, "sums from before are dropped");
 }

@@ -18,11 +18,14 @@
 use super::{ShadowBatch, ShadowStep};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
+
+/// Live: read once per wide flush.
+pub(super) static ON: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_FLUSH_ONE_PASS", |v| u64::from(v == Some("1")));
 
 pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FLUSH_ONE_PASS").is_some_and(|v| v == "1"))
+    ON.get_bool()
 }
 
 /// A long refresh's pieces not done yet, and what of the copy follows them.
@@ -238,6 +241,20 @@ pub(super) fn line(frames: f64) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn the_switch_is_live() {
+        // Unchanged, the switch reads what the environment said, as before.
+        assert_eq!(on(), std::env::var_os("VICTORY_FLUSH_ONE_PASS").is_some_and(|v| v == "1"));
+        if std::env::var_os("VICTORY_FLUSH_ONE_PASS").is_some() {
+            return;
+        }
+        victory_core::settings::set("VICTORY_FLUSH_ONE_PASS", "1").unwrap();
+        let now = on();
+        victory_core::settings::set("VICTORY_FLUSH_ONE_PASS", "").unwrap();
+        assert!(now, "a change takes effect while running");
+        assert!(!on(), "and clears back to the launch value");
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Did {

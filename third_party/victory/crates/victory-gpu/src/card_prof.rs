@@ -3,22 +3,30 @@
 //! the two are `card_before` and `stale_flights` on the preparing breakdown
 //! line, and that line gives no split. Summed since the last frame line
 //! and said per frame on a line of its own. Off, it costs one cached load
-//! per submission.
+//! per submission. `VICTORY_CARD_PROF` is live: a change takes effect at
+//! the next submission (sums from before it are dropped at the next line).
 //!
 //! Also the joining of a submission's declared shader writes in one sort
-//! per copy ([`decl_join`], `VICTORY_CARD_DECL_JOIN=1`).
+//! per copy ([`decl_join`], `VICTORY_CARD_DECL_JOIN=1`, live: read once
+//! per `card_before`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use victory_core::settings::Live;
+
+fn is_one(v: Option<&str>) -> u64 {
+    u64::from(v == Some("1"))
+}
+
+static PROF: Live = Live::new("VICTORY_CARD_PROF", is_one);
+static DECL_JOIN: Live = Live::new("VICTORY_CARD_DECL_JOIN", is_one);
+
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        ["VICTORY_CARD_PROF", "VICTORY_FLUSH_PROF"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
-    })
+    static FLUSH_PROF: OnceLock<bool> = OnceLock::new();
+    PROF.get_bool()
+        || *FLUSH_PROF.get_or_init(|| std::env::var_os("VICTORY_FLUSH_PROF").is_some_and(|v| v == "1"))
 }
 
 /// The parts of `card_before`, in the order it runs them, then counts.
@@ -96,7 +104,13 @@ impl Lap {
 }
 
 pub(crate) fn log(frames: f64) {
-    if !on() || frames <= 0.0 {
+    if !on() {
+        for a in &STATS {
+            a.store(0, Ordering::Relaxed);
+        }
+        return;
+    }
+    if frames <= 0.0 {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
@@ -143,8 +157,7 @@ pub(crate) fn log(frames: f64) {
 /// (one pass over them each), then the whole list is copied, sorted and
 /// joined again for the compare. The compare's ranges come out the same.
 pub(crate) fn decl_join() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_DECL_JOIN").is_some_and(|v| v == "1"))
+    DECL_JOIN.get_bool()
 }
 
 /// Per copy (by key, in the order first seen), its ranges sorted and

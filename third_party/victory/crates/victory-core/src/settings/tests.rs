@@ -332,3 +332,139 @@ fn a_hook_makes_a_setting_live() {
     assert_eq!(set("VICTORY_DLSS_SHARPNESS", "0.5"), Ok(Applied::Now));
     assert_eq!(*HOOKED.lock().unwrap(), ["0.5"]);
 }
+
+/// What `dev_live.py`'s `schedule_text` writes for a two-key arm.
+const DEV_LIVE_SCHEDULE: &str = "# dev.py train live arm awake: A=off B=on, 4 x 40 s from 150 s (ABAB)\n\
+at 150s set VICTORY_SKIP_WC_BACK=0\nat 150s set VICTORY_PRESENT_SMOOTH=0\n\
+at 190s set VICTORY_SKIP_WC_BACK=1\nat 190s set VICTORY_PRESENT_SMOOTH=0.5\n\
+at 230s set VICTORY_SKIP_WC_BACK=0\nat 230s set VICTORY_PRESENT_SMOOTH=0\n\
+\n  at 270.5s set VICTORY_SKIP_WC_BACK=1\nat 270.5s set VICTORY_PRESENT_SMOOTH=0.5\n";
+
+#[test]
+fn a_schedule_reads_dev_live_lines_into_numbered_segments() {
+    let steps = schedule::parse(DEV_LIVE_SCHEDULE).unwrap();
+    assert_eq!(steps.len(), 8);
+    let segs: Vec<(f64, usize, &str, &str)> = steps
+        .iter()
+        .map(|s| (s.at, s.segment, s.name, s.value.as_str()))
+        .collect();
+    assert_eq!(segs[0], (150.0, 1, "VICTORY_SKIP_WC_BACK", "0"));
+    assert_eq!(segs[1], (150.0, 1, "VICTORY_PRESENT_SMOOTH", "0"));
+    assert_eq!(segs[3], (190.0, 2, "VICTORY_PRESENT_SMOOTH", "0.5"));
+    assert_eq!(segs[7], (270.5, 4, "VICTORY_PRESENT_SMOOTH", "0.5"));
+    // Out of order: sorted by time, the same time keeping its order.
+    let steps = schedule::parse(
+        "at 20s set VICTORY_SKIP_WC_BACK=1\nat 10s set VICTORY_SKIP_WC_BACK=0\n",
+    )
+    .unwrap();
+    assert_eq!(
+        steps.iter().map(|s| (s.at, s.segment)).collect::<Vec<_>>(),
+        [(10.0, 1), (20.0, 2)]
+    );
+    assert_eq!(schedule::parse("# nothing\n\n"), Ok(Vec::new()));
+}
+
+#[test]
+fn a_schedule_with_a_setting_that_is_not_live_is_refused_whole() {
+    let err = schedule::parse(
+        "at 10s set VICTORY_SKIP_WC_BACK=1\nat 20s set VICTORY_CARD_WINDOWS_MB=1024\n",
+    )
+    .unwrap_err();
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(
+        err[0].starts_with("line 2: VICTORY_CARD_WINDOWS_MB is Restart, not Live"),
+        "{err:?}"
+    );
+    let err = schedule::parse("at 1s set VICTORY_PORT_CBV=1\n").unwrap_err();
+    assert!(err[0].contains("Retranslate, not Live"), "{err:?}");
+    let err = schedule::parse(
+        "at 1s set VICTORY_NO_SUCH_SETTING=1\nat 1s set VICTORY_SKIP_WC_BACK=2\n\
+         at x set VICTORY_SKIP_WC_BACK=1\nat 5 set VICTORY_SKIP_WC_BACK=1\nevery 30s toggle VICTORY_SKIP_WC_BACK\n\
+         at -1s set VICTORY_SKIP_WC_BACK=1\n",
+    )
+    .unwrap_err();
+    assert_eq!(err.len(), 6, "{err:?}");
+    assert!(err[0].contains("no setting is called VICTORY_NO_SUCH_SETTING"));
+    assert!(err[1].contains("does not take \"2\""));
+}
+
+#[test]
+fn a_schedule_sets_each_change_at_its_time_and_logs_its_segment() {
+    if std::env::var_os("VICTORY_SKIP_WC_BACK").is_some() {
+        return;
+    }
+    static ON: Live = Live::new("VICTORY_SKIP_WC_BACK", |v| u64::from(v == Some("1")));
+    let steps = schedule::parse(
+        "at 0.25s set VICTORY_SKIP_WC_BACK=1\nat 0.5s set VICTORY_SKIP_WC_BACK=0\n",
+    )
+    .unwrap();
+    let zero = Instant::now();
+    let mut waits = Vec::new();
+    let mut seen = Vec::new();
+    let mut lines = Vec::new();
+    // Each wait returns at once; what the setting reads after the change is recorded.
+    schedule::run(
+        &steps,
+        zero,
+        |t| {
+            seen.push(ON.get_bool());
+            waits.push(t - zero);
+        },
+        |line| lines.push(line),
+    );
+    assert_eq!(
+        waits,
+        [
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(500)
+        ]
+    );
+    assert_eq!(seen, [false, true], "the first change took effect before the second wait");
+    assert!(!ON.get_bool(), "the second change took effect");
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].starts_with("settings: segment 1 VICTORY_SKIP_WC_BACK=1 at "),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("settings: segment 2 VICTORY_SKIP_WC_BACK=0 at "),
+        "{lines:?}"
+    );
+    set("VICTORY_SKIP_WC_BACK", "").unwrap();
+}
+
+#[test]
+fn the_segment_line_is_the_one_dev_live_reads() {
+    let step = schedule::Step {
+        at: 190.0,
+        segment: 2,
+        name: "VICTORY_PRESENT_SMOOTH",
+        value: "0.5".into(),
+    };
+    // tests/test_dev_live.py `test_the_registry_segment_line_parses` holds the same line.
+    assert_eq!(
+        schedule::segment_line(&step, 190.04),
+        "settings: segment 2 VICTORY_PRESENT_SMOOTH=0.5 at 190.0"
+    );
+}
+
+#[test]
+fn every_live_setting_is_read_through_a_live_cell_or_a_hook() {
+    let mut files = Vec::new();
+    rs_files(&victory_root().join("crates"), &mut files);
+    let text: String = files
+        .iter()
+        .filter(|f| !f.ends_with("tests.rs"))
+        .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+        .collect::<String>()
+        .split_whitespace()
+        .collect();
+    for i in infos().iter().filter(|i| i.apply == Apply::Live) {
+        assert!(
+            text.contains(&format!("Live::new(\"{}\"", i.name))
+                || text.contains(&format!("on_change(\"{}\"", i.name)),
+            "{} is Live but nothing reads it through settings::Live or settings::on_change",
+            i.name
+        );
+    }
+}

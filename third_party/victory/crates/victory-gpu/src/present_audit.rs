@@ -32,19 +32,22 @@ const STRIDE: u64 = 512;
 /// A present is "mostly black" with at least this many black samples.
 const MOSTLY: usize = 12;
 
+/// Live: the first present after it is turned on may count binds and
+/// clears from part of its frame only.
+static MODE: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PRESENT_AUDIT", |v| u64::from(parse(v)));
+
 /// 0 off, 1 black presents and a summary, 2 every present.
 pub(crate) fn mode() -> u8 {
-    static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        let mode = parse(std::env::var("VICTORY_PRESENT_AUDIT").ok().as_deref());
-        if mode > 0 {
-            tracing::info!(
-                mode,
-                "present audit: 16 texels of every presented texture read back, black presents logged with their context (VICTORY_PRESENT_AUDIT=1; 2: every present)"
-            );
-        }
-        mode
-    })
+    static LOGGED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let mode = MODE.get() as u8;
+    if LOGGED.load(Relaxed) != mode && LOGGED.swap(mode, Relaxed) != mode && mode > 0 {
+        tracing::info!(
+            mode,
+            "present audit: 16 texels of every presented texture read back, black presents logged with their context (VICTORY_PRESENT_AUDIT=1; 2: every present)"
+        );
+    }
+    mode
 }
 
 fn parse(value: Option<&str>) -> u8 {
@@ -420,6 +423,20 @@ fn read(taken: &Taken) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        // Unchanged, the switch reads what the environment said, as before.
+        assert_eq!(mode(), parse(std::env::var("VICTORY_PRESENT_AUDIT").ok().as_deref()));
+        if std::env::var_os("VICTORY_PRESENT_AUDIT").is_some() {
+            return;
+        }
+        victory_core::settings::set("VICTORY_PRESENT_AUDIT", "2").unwrap();
+        let now = mode();
+        victory_core::settings::set("VICTORY_PRESENT_AUDIT", "").unwrap();
+        assert_eq!(now, 2, "a change takes effect while running");
+        assert_eq!(mode(), 0, "and clears back to the launch value");
+    }
 
     #[test]
     fn the_switch_is_off_unless_one_or_two() {
