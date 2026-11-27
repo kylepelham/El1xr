@@ -174,6 +174,7 @@ fn store() -> Option<&'static Store> {
             std::thread::Builder::new()
                 .name("texture store".into())
                 .spawn(move || {
+                    crate::topology::pin_background("victory-texstore");
                     let Ok(mut index) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)

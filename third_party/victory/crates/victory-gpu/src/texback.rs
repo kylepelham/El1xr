@@ -508,6 +508,7 @@ fn writer() -> Option<&'static Writer> {
         let started = std::thread::Builder::new()
             .name("victory-texback".into())
             .spawn(move || {
+                crate::topology::pin_background("victory-texback");
                 loop {
                     let batch: Vec<Landing> = {
                         let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());

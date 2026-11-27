@@ -757,6 +757,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::topology::pin_hot("title-record");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()

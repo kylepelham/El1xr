@@ -172,6 +172,7 @@ fn wake_releaser() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-submit".into()).spawn(|| {
+            crate::topology::pin_hot("victory-submit");
             RELEASER.with(|mine| mine.set(true));
             loop {
                 {
