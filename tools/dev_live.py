@@ -242,6 +242,28 @@ def _figures(log: LiveLog, lo: datetime, hi: datetime) -> dict[str, float] | Non
     }
 
 
+def summarise(segments: list[dict[str, object]], metrics: tuple = METRICS) -> tuple[dict, dict, dict, list[str]]:
+    """Per side (A, B) the median of every figure over its segments with figures, B-A, the largest same-side
+    spread (max - min, sides with 2 segments or more) and the figures whose spread exceeds |B-A| (noisy)."""
+    sets, spreads = {}, {}
+    for label in ("A", "B"):
+        rows = [s["figures"] for s in segments if s["label"] == label and "figures" in s]
+        if rows:
+            sets[label] = {"segments": float(len(rows)),
+                           **{k: statistics.median(r[k] for r in rows) for k, *_ in metrics}}
+            if len(rows) >= 2:
+                spreads[label] = {k: max(r[k] for r in rows) - min(r[k] for r in rows) for k, *_ in metrics}
+    delta, noisy, spread = {}, [], {}
+    if "A" in sets and "B" in sets:
+        for k, *_ in metrics:
+            delta[k] = sets["B"][k] - sets["A"][k]
+            if spreads:
+                spread[k] = max(s[k] for s in spreads.values())
+                if spread[k] > abs(delta[k]):
+                    noisy.append(k)
+    return sets, delta, spread, noisy
+
+
 def analyse(arm: LiveArm, text: str) -> dict[str, object]:
     """Segments, per-set medians, B-A deltas, noisy figures and problems of a live arm's log."""
     log = parse_log(text)
@@ -276,22 +298,7 @@ def analyse(arm: LiveArm, text: str) -> dict[str, object]:
     seen = [str(s["label"]) for s in segments]
     if groups and seen != expected[: len(seen)]:
         problems.append(f"segment order {''.join(seen)}, scheduled {''.join(expected)}")
-    sets, spreads = {}, {}
-    for label in ("A", "B"):
-        rows = [s["figures"] for s in segments if s["label"] == label and "figures" in s]
-        if rows:
-            sets[label] = {"segments": float(len(rows)),
-                           **{k: statistics.median(r[k] for r in rows) for k, *_ in METRICS}}
-            if len(rows) >= 2:
-                spreads[label] = {k: max(r[k] for r in rows) - min(r[k] for r in rows) for k, *_ in METRICS}
-    delta, noisy, spread = {}, [], {}
-    if "A" in sets and "B" in sets:
-        for k, *_ in METRICS:
-            delta[k] = sets["B"][k] - sets["A"][k]
-            if spreads:
-                spread[k] = max(s[k] for s in spreads.values())
-                if spread[k] > abs(delta[k]):
-                    noisy.append(k)
+    sets, delta, spread, noisy = summarise(segments)
     return {"a": arm.a, "b": arm.b, "keys": {k: list(v) for k, v in arm.keys.items()}, "segments": segments,
             "sets": sets, "delta": delta, "spread": spread, "noisy": noisy, "problems": problems}
 
