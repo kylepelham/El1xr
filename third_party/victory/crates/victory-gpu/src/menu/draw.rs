@@ -354,6 +354,13 @@ impl Painter {
         let label = "EXPERT";
         let lw = t.measure(CAPS, label).0;
         t.mid(&mut bm, CAPS, label, e.right() - sw - px(8.0) - lw, e, DIM);
+        // What the tags mean, ending before the expert switch when there is room.
+        let sub_w = t.measure(TAB, "Settings").0;
+        let room = (
+            l.panel.x + pad + nw + px(12.0) + sub_w + px(40.0),
+            e.right() - sw - px(8.0) - lw - px(40.0),
+        );
+        self.legend(&mut bm, l, Rect { x: room.0, y: e.y, w: room.1 - room.0, h: e.h });
         t.centre(&mut bm, TAB, "\u{2715}", l.close, SOFT);
         // Tabs: plain titles, the current one bright with the thin accent underline.
         for &(tab, r) in &l.tabs {
@@ -424,7 +431,7 @@ impl Painter {
             "{} / Esc close   \u{2191}\u{2193} select   \u{2190}\u{2192} change   Q E tabs   X expert      Pad: A change  B close  LB RB tabs  Y expert",
             super::hotkey_name()
         );
-        let status = menu.status.clone().unwrap_or_default();
+        let status = t.fit(SMALL, menu.status.as_deref().unwrap_or_default(), (f.w - 2 * pad) * 3 / 5);
         let sw = t.measure(SMALL, &status).0;
         let hints = t.fit(SMALL, &hints, f.w - 2 * pad - sw - px(24.0));
         t.mid(&mut bm, SMALL, &hints, f.x + pad, f, DIM);
@@ -495,6 +502,29 @@ impl Painter {
     }
 
     /// The apply class as small capitals, left-aligned in its column.
+    /// The tags and when each change applies, right-aligned in `r`; nothing if it does not fit.
+    fn legend(&self, bm: &mut Bitmap, l: &Layout, r: Rect) {
+        let t = &self.text;
+        let parts = [
+            ("LIVE", LIVE, "now"),
+            ("RESTART", RESTART, "next launch"),
+            ("REBUILD", REBUILD, "next launch, shaders rebuilt"),
+        ];
+        let (gap, space) = (l.px(22.0), l.px(6.0));
+        let width = |(tag, _, when): &(&str, [u8; 3], &str)| t.measure(CAPS, tag).0 + space + t.measure(SMALL, when).0;
+        let total: i32 = parts.iter().map(width).sum::<i32>() + gap * (parts.len() as i32 - 1);
+        if total > r.w {
+            return;
+        }
+        let mut x = r.right() - total;
+        for part in &parts {
+            let (tag, rgb, when) = *part;
+            t.mid(bm, CAPS, tag, x, r, rgb);
+            t.mid(bm, SMALL, when, x + t.measure(CAPS, tag).0 + space, r, DIM);
+            x += width(part) + gap;
+        }
+    }
+
     fn apply_class(&self, bm: &mut Bitmap, b: Rect, apply: Apply) {
         let (text, rgb) = match apply {
             Apply::Live => ("LIVE", LIVE),

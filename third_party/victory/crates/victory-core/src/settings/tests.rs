@@ -234,6 +234,27 @@ fn saved_files_read_back_the_same() {
     assert!(problems.is_empty());
 }
 
+/// A read-only settings file is not replaced, and no temporary file is left beside it.
+#[test]
+fn a_read_only_file_is_refused_and_left_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, "VICTORY_PRESENT_CAP = \"30\"\n").unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms.clone()).unwrap();
+    let mut values = BTreeMap::new();
+    values.insert("VICTORY_PRESENT_CAP".to_string(), "60".to_string());
+    let err = write_file(&path, &values).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "VICTORY_PRESENT_CAP = \"30\"\n");
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["settings.toml"]);
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
 #[test]
 fn changes_merge_over_the_file_and_a_cleared_one_leaves_it() {
     let file: BTreeMap<String, String> = [("VICTORY_A1", "1"), ("VICTORY_B1", "2")]

@@ -259,6 +259,21 @@ def test_snaps_set_the_switch_and_clear_an_earlier_runs_pictures(tmp_path):
     assert dev.build_parser().parse_args(["bench"]).snap_every == 0.0
 
 
+def test_menu_selftest_sends_its_grabs_to_the_snap_folder_and_turns_the_menu_on(tmp_path):
+    dev = load_dev()
+    snap_dir = tmp_path / "snaps"
+    snap_dir.mkdir()
+    (snap_dir / "menu-60s-01-display.png").write_bytes(b"old")
+    out = dev.apply_snaps({"VICTORY_MENU_SELFTEST": "60,120"}, 0.0, snap_dir)
+    assert out == {"VICTORY_SNAP_DIR": str(snap_dir), "VICTORY_MENU": "1", "VICTORY_MENU_SELFTEST": "60,120"}
+    assert "VICTORY_SNAP_EVERY_S" not in out
+    assert list(snap_dir.iterdir()) == []
+    assert dev.apply_snaps({"VICTORY_MENU_SELFTEST": "5", "VICTORY_MENU": "0"}, 0.0, snap_dir)["VICTORY_MENU"] == "0"
+    (snap_dir / "menu-5s-closed.png").write_bytes(b"png")
+    assert dev.menu_pngs_field({"VICTORY_MENU_SELFTEST": "5"}, snap_dir) == " menu_pngs=1"
+    assert dev.menu_pngs_field({}, snap_dir) == ""
+
+
 def test_train_runs_one_step_per_call_and_reports(tmp_path, monkeypatch, capsys):
     dev = load_dev()
     monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")

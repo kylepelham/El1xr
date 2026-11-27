@@ -14,6 +14,7 @@
 pub mod input;
 pub mod layout;
 pub mod model;
+pub mod selftest;
 pub mod state;
 
 #[cfg(windows)]
@@ -303,6 +304,7 @@ mod tests {
             include_str!("state.rs"),
             include_str!("input.rs"),
             include_str!("model.rs"),
+            include_str!("selftest.rs"),
         ];
         for s in sources {
             let code: String = s

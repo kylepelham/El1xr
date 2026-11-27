@@ -490,7 +490,9 @@ fn write_file(path: &Path, values: &BTreeMap<String, String>) -> std::io::Result
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, render(values))?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// A live setting's parsed value, kept in an atomic: [`Live::get`] costs two

@@ -193,6 +193,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_MAPPED_BY_PAGE", Apply::Restart),
     ("VICTORY_MEMORY_MAP", Apply::Restart),
     ("VICTORY_MENU_PNG_DIR", Apply::Restart),
+    ("VICTORY_MENU_SELFTEST", Apply::Restart),
     ("VICTORY_MERGE_RACE", Apply::Restart),
     ("VICTORY_MERGE_RUNS", Apply::Restart),
     ("VICTORY_MESH_OUTPUT_STRICT", Apply::Retranslate),
