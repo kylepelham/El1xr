@@ -4556,6 +4556,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        crate::shadow::refresh_stamp::expire();
         let parts_before = crate::submit_chunk::parts();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6779,6 +6780,7 @@ impl Batch {
         self.flush_fills();
         self.flush_textures();
         self.flush();
+        crate::shadow::refresh_stamp::expire();
         self.textures.clear();
     }
 

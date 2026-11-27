@@ -31,6 +31,8 @@ mod build;
 mod placement;
 #[path = "shadow_plan_split.rs"]
 pub(crate) mod plan_split;
+#[path = "shadow_refresh_stamp.rs"]
+pub(crate) mod refresh_stamp;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -744,6 +746,9 @@ pub(crate) struct Shadow {
     /// Lock-free mirror of `!pending.is_empty()` so read-only buffers and
     /// windows skip acquiring `pending` on every refresh and flight check.
     has_pending: AtomicBool,
+    /// With `VICTORY_REFRESH_STAMP`: the last range refreshed whole and when
+    /// ([`refresh_stamp`]).
+    stamp: refresh_stamp::Stamp,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -5092,6 +5097,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
+            stamp: refresh_stamp::Stamp::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -5572,6 +5578,7 @@ impl Shadow {
         now: &mut Vec<u8>,
         title: &mut Vec<u8>,
     ) -> usize {
+        self.stamp.clear();
         let written = self.relay_merge_inner(at, n, now, title);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event("relay merge", self.start + at as u64, n as u64, written as u64);
@@ -5914,6 +5921,7 @@ impl Shadow {
         if !self.has_pending.load(Ordering::Acquire) {
             return false;
         }
+        self.stamp.clear();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -6177,8 +6185,20 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // (`VICTORY_REFRESH_STAMP`) Refreshed whole already in this stretch of the submission.
+        let stamp = refresh_stamp::epoch_if_on().filter(|_| self.stampable());
+        if let Some(epoch) = stamp
+            && self.stamp.holds(epoch, from, to)
+        {
+            refresh_stamp::answered();
+            return 0;
+        }
         if !self.has_pending.load(Ordering::Acquire) {
-            return self.update_free(from, to, &[]);
+            let bytes = self.update_free(from, to, &[]);
+            if let Some(epoch) = stamp {
+                self.stamp.set(epoch, from, to);
+            }
+            return bytes;
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -6205,7 +6225,11 @@ impl Shadow {
             }
             return bytes;
         }
-        self.update_free(from, to, &[])
+        let bytes = self.update_free(from, to, &[]);
+        if let Some(epoch) = stamp {
+            self.stamp.set(epoch, from, to);
+        }
+        bytes
     }
 
     /// Which kind of copy this is, for `crate::copy_profile`.
@@ -7017,6 +7041,7 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        self.stamp.clear();
         let start = self.start as usize;
         if self.card.is_none() || self.transient() || at + gpu.len() > self.len as usize {
             return 0;
@@ -7089,6 +7114,7 @@ impl Shadow {
         fetched_after: u64,
         title: &mut Vec<u8>,
     ) -> usize {
+        self.stamp.clear();
         let written = self.card_merge_relay_inner(at, gpu, fetched_after, title);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event(
@@ -7237,6 +7263,7 @@ impl Shadow {
     /// those bytes: they are not read again for it. Not the pages of `theirs`, which the
     /// title wrote too, nor one this copy had not taken the last write of.
     fn holds(&self, marks: &[(usize, u64, u64)], theirs: &[usize]) {
+        self.stamp.clear();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         for &(page, before, now) in marks {
