@@ -918,6 +918,11 @@ impl TextureQueue {
         self.rechecks.remove(&index);
     }
 
+    /// Whether at least one queued slot is due at `frame`.
+    fn has_due(&self, frame: u64) -> bool {
+        self.slots.values().any(|w| w.due <= frame)
+    }
+
     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
     /// fingerprint is `print`: looked at again ([`RECHECK_FRAMES`]), unless
     /// it was written again meanwhile and waits in the queue.
@@ -1695,6 +1700,14 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
+    /// Whether any slot in the queue of textures picked by index is due at `frame`.
+    pub(crate) fn texture_slots_has_due(&self, frame: u64) -> bool {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_due(frame)
+    }
+
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -5534,6 +5547,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             memory[at] ^= 1;
         }
         assert_ne!(print(&memory[..100]), print(&memory[..200]));
+    }
+
+    #[test]
+    fn has_due_reports_whether_any_slot_is_ready_at_frame() {
+        let mut q = TextureQueue::default();
+        assert!(!q.has_due(0));
+        q.written(3, 1, 5, false);
+        assert!(!q.has_due(4));
+        assert!(q.has_due(5));
+        let write = q.due(5, 1)[0].1;
+        q.done(3, write);
+        assert!(!q.has_due(10));
     }
 
     #[test]
