@@ -161,18 +161,14 @@ pub(super) fn close(block: usize, now: &mut dyn FnMut() -> u64) -> Closed {
         return Closed::None;
     }
     let base = block * BLOCK;
-    let mut k = 0;
-    while k < BLOCK / KERNEL_PAGE {
-        if pages & (1 << k) == 0 {
-            k += 1;
-            continue;
-        }
-        let run = k;
-        while k < BLOCK / KERNEL_PAGE && pages & (1 << k) != 0 {
-            k += 1;
-        }
-        let (from, len) = (base + run * KERNEL_PAGE, (k - run) * KERNEL_PAGE);
-        if !protect_run(from, len, windows_sys::Win32::System::Memory::PAGE_READONLY) {
+    for (run, end) in close_runs(pages, join()) {
+        let (from, len) = (base + run * KERNEL_PAGE, (end - run) * KERNEL_PAGE);
+        // (#88) Timed apart from the block guards' calls: the split line's 4 KiB part.
+        let t = crate::refresh_prof::start();
+        let done = protect_run(from, len, windows_sys::Win32::System::Memory::PAGE_READONLY);
+        crate::refresh_prof::add(crate::refresh_prof::P::Protect4kCalls, 1);
+        crate::refresh_prof::finish(crate::refresh_prof::P::Protect4kUs, t);
+        if !done {
             // Noted open again, and the block written whole.
             cell.fetch_or(pages, AcqRel);
             count(3, 1);
@@ -188,6 +184,57 @@ pub(super) fn close(block: usize, now: &mut dyn FnMut() -> u64) -> Closed {
     let only = taken & ONLY != 0;
     count(if only { 1 } else { 2 }, 1);
     Closed::Pages { only }
+}
+
+/// (feedcard, #88) `VICTORY_GUARD_4K_JOIN=1` (Live; off by default): the check makes a block's
+/// open pages read-only in one `VirtualProtect`, from the first open page to the end of the last,
+/// not one call per run of open pages. The pages between the runs are read-only already (the block
+/// is protected, its claim is held, and only [`fault`] makes a page of it writable, noting it
+/// first), so the protection after the call is the same; only the number of calls (each a trip
+/// under the process's address-space lock and, for a cut in rights, a TLB flush on every core
+/// running the title) goes down. Not in the cache key: no shader or pipeline output.
+static JOIN: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_GUARD_4K_JOIN", |v| u64::from(v == Some("1")));
+
+pub(super) fn join() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = JOIN_FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    JOIN.get_bool()
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOIN_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The 4 KiB page ranges `[a, b)` of a block whose open pages are `pages` that the check makes
+/// read-only: each run of open pages, or with `join` one range over all of them.
+fn close_runs(pages: u64, join: bool) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    if pages == 0 {
+        return runs;
+    }
+    if join {
+        let first = pages.trailing_zeros() as usize;
+        let last = 63 - pages.leading_zeros() as usize;
+        runs.push((first, last + 1));
+        return runs;
+    }
+    let mut k = 0;
+    while k < BLOCK / KERNEL_PAGE {
+        if pages & (1 << k) == 0 {
+            k += 1;
+            continue;
+        }
+        let run = k;
+        while k < BLOCK / KERNEL_PAGE && pages & (1 << k) != 0 {
+            k += 1;
+        }
+        runs.push((run, k));
+    }
+    runs
 }
 
 fn protect_page(at: usize, flags: u32) -> bool {
@@ -218,7 +265,7 @@ mod tests {
         BLOCK, KERNEL_PAGE, PAGE, VIEWS, clean_set, guard_shared, install, title_memory_remapped,
         written_in,
     };
-    use super::{FORCED, open_of};
+    use super::{FORCED, JOIN_FORCED, close_runs, open_of};
 
     /// A fresh view of a pagefile section, `bytes` long, taken for title memory.
     fn view(bytes: usize) -> (usize, usize) {
@@ -363,5 +410,134 @@ mod tests {
         assert_eq!(open_of(b), (1 << 3, true), "closed again after the whole check");
         FORCED.with(|f| f.set(false));
         drop_view(section, at, SIZE);
+    }
+    #[test]
+    fn joined_closing_is_one_range_over_the_runs() {
+        assert_eq!(close_runs(0, false), Vec::<(usize, usize)>::new());
+        assert_eq!(close_runs(0, true), Vec::<(usize, usize)>::new());
+        let pages = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 9) | (1 << 15);
+        assert_eq!(close_runs(pages, false), vec![(1, 3), (5, 6), (9, 10), (15, 16)]);
+        assert_eq!(close_runs(pages, true), vec![(1, 16)]);
+        assert_eq!(close_runs(1 << 4, true), vec![(4, 5)]);
+        assert_eq!(close_runs(0xffff, false), vec![(0, 16)]);
+        assert_eq!(close_runs(0xffff, true), vec![(0, 16)]);
+    }
+
+    /// Protection of every 4 KiB page of the block at `at`: read-only or not.
+    fn read_only_pages(at: usize) -> Vec<bool> {
+        (0..BLOCK / KERNEL_PAGE).map(|k| !super::super::writable(at + k * KERNEL_PAGE)).collect()
+    }
+
+    #[test]
+    fn a_joined_check_leaves_the_same_pages_read_only_and_noted_as_runs_do() {
+        // The same writes checked with and without the switch: the same blocks written, the block
+        // noted written, every page read-only again, and the next write faults again.
+        const SIZE: usize = 2 * BLOCK;
+        FORCED.with(|f| f.set(true));
+        install();
+        let mut seen = Vec::new();
+        for joined in [false, true] {
+            JOIN_FORCED.with(|f| f.set(Some(joined)));
+            let (section, at) = view(SIZE);
+            let (first, last) = (at / BLOCK, (at + SIZE) / BLOCK);
+            let b = first + 1;
+            let block = at + BLOCK;
+            check(first, last);
+            check(first, last);
+            // SAFETY: the view, guarded: the handler opens the 4 KiB pages written.
+            unsafe {
+                for k in [1, 2, 5, 9, 15] {
+                    poke(block + k * KERNEL_PAGE);
+                }
+            }
+            assert_eq!(open_of(b).0, (1 << 1) | (1 << 2) | (1 << 5) | (1 << 9) | (1 << 15));
+            let before = stamp(b);
+            let written = check(first, last);
+            assert!(stamp(b) > before, "noted written");
+            assert_eq!(read_only_pages(block), vec![true; BLOCK / KERNEL_PAGE], "joined={joined}");
+            assert_eq!(open_of(b), (0, false));
+            // SAFETY: as above; read-only again, so handled and noted again.
+            unsafe { poke(block + 7 * KERNEL_PAGE) };
+            assert_eq!(open_of(b), (1 << 7, true));
+            check(first, last);
+            seen.push(written);
+            drop_view(section, at, SIZE);
+        }
+        JOIN_FORCED.with(|f| f.set(None));
+        FORCED.with(|f| f.set(false));
+        assert_eq!(seen[0], seen[1], "the same with the switch as without");
+    }
+
+    /// (#88) Sizes the switch: `blocks` guarded blocks with five open pages in four runs each,
+    /// closed run by run and joined. Ignored; `--ignored --nocapture`, release for real numbers.
+    #[test]
+    #[ignore]
+    fn bench_close_joined() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+        const BLOCKS: usize = 400;
+        const ROUNDS: usize = 20;
+        let (section, at) = view(BLOCKS * BLOCK);
+        let base = at.div_ceil(BLOCK) * BLOCK;
+        let blocks = (at + BLOCKS * BLOCK - base) / BLOCK;
+        // SAFETY: the view is ours and not guarded (no check ran on it); touch every page once.
+        for k in 0..blocks * BLOCK / KERNEL_PAGE {
+            unsafe { poke(base + k * KERNEL_PAGE) };
+        }
+        assert!(super::protect_run(base, blocks * BLOCK, PAGE_READONLY));
+        let pages: u64 = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 9) | (1 << 15);
+        // Threads closing their own blocks at once, as the kept threads of a wide flush do.
+        for threads in [1usize, 16] {
+            for joined in [false, true, false, true] {
+                let spent_ns = std::sync::atomic::AtomicU64::new(0);
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let wall = std::time::Instant::now();
+                std::thread::scope(|sc| {
+                    for t in 0..threads {
+                        let (spent_ns, calls) = (&spent_ns, &calls);
+                        sc.spawn(move || {
+                            let mine = (t..blocks).step_by(threads);
+                            for _ in 0..ROUNDS {
+                                for b in mine.clone() {
+                                    for k in 0..16 {
+                                        if pages & (1 << k) != 0 {
+                                            assert!(super::protect_page(
+                                                base + b * BLOCK + k * KERNEL_PAGE,
+                                                PAGE_READWRITE
+                                            ));
+                                        }
+                                    }
+                                }
+                                let at = std::time::Instant::now();
+                                for b in mine.clone() {
+                                    for (r, e) in close_runs(pages, joined) {
+                                        assert!(super::protect_run(
+                                            base + b * BLOCK + r * KERNEL_PAGE,
+                                            (e - r) * KERNEL_PAGE,
+                                            PAGE_READONLY
+                                        ));
+                                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                spent_ns.fetch_add(
+                                    at.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        });
+                    }
+                });
+                let spent = spent_ns.into_inner() as f64 / 1e3;
+                let calls = calls.into_inner();
+                println!(
+                    "closing {blocks} blocks x {ROUNDS} (5 open pages in 4 runs each) on {threads} threads, \
+                     joined={joined}: {:.2} us a block, {:.2} us a call (all threads), {calls} calls, wall {:.1} ms",
+                    spent / (blocks * ROUNDS) as f64,
+                    spent / calls as f64,
+                    wall.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        assert!(super::protect_run(base, blocks * BLOCK, PAGE_READWRITE));
+        drop_view(section, at, BLOCKS * BLOCK);
     }
 }
