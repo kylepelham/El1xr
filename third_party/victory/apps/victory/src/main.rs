@@ -184,7 +184,7 @@ enum Unimplemented {
     Zero,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Console {
     SeriesX,
     SeriesS,
@@ -271,6 +271,8 @@ fn main() -> Result<()> {
             console,
             title_args,
         } => {
+            let env_console = std::env::var("VICTORY_CONSOLE").ok();
+            let console = resolve_console(console, env_console.as_deref());
             let result = run::run(&exe, unimplemented, strict, execute, console, &title_args);
             // The process's own end, as `main`'s Result maps it: Ok is 0,
             // Err is 1. A title that ends the process itself logs its own
@@ -327,4 +329,22 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+fn resolve_console(flag: Console, env: Option<&str>) -> Console {
+    match env {
+        Some("series-s") => Console::SeriesS,
+        Some("series-x") => Console::SeriesX,
+        _ => flag,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn victory_console_env_overrides_flag_only_when_explicit() {
+    assert_eq!(resolve_console(Console::SeriesX, Some("series-s")), Console::SeriesS);
+    assert_eq!(resolve_console(Console::SeriesS, Some("series-x")), Console::SeriesX);
+    assert_eq!(resolve_console(Console::SeriesX, None), Console::SeriesX);
+    assert_eq!(resolve_console(Console::SeriesS, Some("")), Console::SeriesS);
+    assert_eq!(resolve_console(Console::SeriesX, Some("unknown")), Console::SeriesX);
 }
