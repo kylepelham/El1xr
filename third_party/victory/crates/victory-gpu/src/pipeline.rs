@@ -1049,6 +1049,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    translate_ahead::ahead(&shaders);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -1276,6 +1278,8 @@ mod library;
 pub(crate) mod samplers;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod translate_ahead;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
