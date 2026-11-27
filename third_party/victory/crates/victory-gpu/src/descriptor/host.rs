@@ -164,6 +164,8 @@ pub(crate) struct HostHeap {
     id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    /// The heap's shader-visible start, read once (PR #347).
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1622,6 +1624,7 @@ impl HostHeap {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -3322,10 +3325,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -5884,6 +5885,24 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         };
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// (PR #347) The cached start gives the handles the heap's own start does.
+    #[test]
+    fn gpu_handles_match_the_heaps_own_start() {
+        for sampler in [false, true] {
+            let Some(heap) = HostHeap::new(sampler, 8) else {
+                return; // no host GPU
+            };
+            // SAFETY: a live shader-visible heap.
+            let start = unsafe { heap.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+            for index in [0, 1, 7, heap.count + heap.dynamic - 1] {
+                assert_eq!(
+                    heap.gpu_handle(index).ptr,
+                    start + u64::from(index) * u64::from(heap.step)
+                );
+            }
+        }
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
