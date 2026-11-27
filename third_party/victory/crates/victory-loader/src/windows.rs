@@ -284,6 +284,35 @@ impl LoadedImage {
         Ok(report)
     }
 
+    /// After [`Self::bind_imports`]: for each import from `dll`, `wrap` gets its
+    /// name and the address bound and may give another address to bind
+    /// instead (a wrapper that calls the first). Returns how many it wrapped.
+    pub fn wrap_imports(
+        &self,
+        dll: &str,
+        wrap: &dyn Fn(&str, usize) -> Option<usize>,
+    ) -> Result<usize> {
+        let mut slots = Vec::new();
+        for module in self.info.imports.iter().chain(&self.info.delay_imports) {
+            if !module.dll.eq_ignore_ascii_case(dll) {
+                continue;
+            }
+            for entry in &module.entries {
+                let ImportSymbol::Name { name, .. } = &entry.symbol else {
+                    continue;
+                };
+                let slot = (self.base() + entry.iat_slot_rva as usize) as *const u64;
+                // SAFETY: the parser only yields slots inside the image; bound already.
+                let bound = unsafe { slot.read() } as usize;
+                if let Some(address) = wrap(name, bound) {
+                    slots.push((entry.iat_slot_rva, address));
+                }
+            }
+        }
+        self.write_slots(&slots)?;
+        Ok(slots.len())
+    }
+
     /// Protects and restores each slot on its own: import tables can sit in
     /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
