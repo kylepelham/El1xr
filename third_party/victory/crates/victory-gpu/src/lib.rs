@@ -166,6 +166,8 @@ mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
 #[cfg(windows)]
+mod stale_batch;
+#[cfg(windows)]
 mod card_prof;
 #[cfg(windows)]
 mod submit_chunk;
