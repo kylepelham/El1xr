@@ -13,6 +13,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod sync_in_place;
+#[cfg(windows)]
 mod tabled_all;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -221,6 +223,10 @@ pub(crate) fn sync_heaps() {
     let mut batch_asked: Vec<u32> = Vec::new();
     let mut batch_pages: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut changed: Vec<(u32, u64)> = Vec::new();
+    // `VICTORY_SYNC_IN_PLACE=1`: view heaps' records compared where they are.
+    let mut all_held = sync_in_place::on().then(sync_in_place::all);
+    let mut live: Vec<u64> = Vec::new();
+    let mut scratch = sync_in_place::Scratch::default();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
@@ -234,6 +240,11 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        live.push(host.id());
+        let mut held = all_held
+            .as_mut()
+            .filter(|_| step == 32)
+            .map(|all| all.of(host.id(), mirrored_count));
         let mut ranges = written.take(start as usize, end as usize);
         let mut retries = heap
             .table_retries
@@ -260,6 +271,20 @@ pub(crate) fn sync_heaps() {
                     retries.after_read(page, retry_at);
                 }
                 pages += 1;
+                if let Some(held) = held.as_deref_mut() {
+                    mirrored += sync_in_place::page(
+                        host,
+                        held,
+                        start,
+                        from,
+                        to,
+                        mirrored_count,
+                        &asked,
+                        &mut scratch,
+                    );
+                    page += crate::watch::PAGE;
+                    continue;
+                }
                 if asked.is_empty() {
                     mirrored += flush_sync_batch(
                         host,
@@ -304,6 +329,10 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
+    if let Some(all) = all_held.as_mut() {
+        all.keep_only(&live);
+    }
+    drop(all_held);
     for (count, n) in SYNCED.iter().zip([
         pages,
         looked,
@@ -450,6 +479,23 @@ fn flush_sync_batch(
     if batch_pages.is_empty() {
         return 0;
     }
+    let began = sync_in_place::now();
+    let mirrored = flush_sync_pages(host, start, step, batch_pages, batch_asked, page_bytes, changed);
+    sync_in_place::batch_since(began);
+    mirrored
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn flush_sync_pages(
+    host: &host::HostHeap,
+    start: u64,
+    step: u64,
+    batch_pages: &mut Vec<(usize, usize, usize, usize)>,
+    batch_asked: &mut Vec<u32>,
+    page_bytes: &mut Vec<u8>,
+    changed: &mut Vec<(u32, u64)>,
+) -> u64 {
     let batch_from = batch_pages[0].0;
     let batch_to = batch_pages.last().unwrap().1;
     let mut mirrored = 0u64;
@@ -537,6 +583,7 @@ pub(crate) fn sync_line(frames: f64) {
         c[9],
         place.join(", ")
     );
+    sync_in_place::line(frames);
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
