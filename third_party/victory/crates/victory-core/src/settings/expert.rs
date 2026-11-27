@@ -155,6 +155,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HOST_WAVE", Apply::Retranslate),
     ("VICTORY_INDIRECT_FIT", Apply::Restart),
     ("VICTORY_INDIRECT_PREPARE_LOG", Apply::Restart),
+    ("VICTORY_INDIRECT_REST", Apply::Live),
     ("VICTORY_INDIRECT_WINDOW", Apply::Restart),
     ("VICTORY_INPLACE", Apply::Restart),
     ("VICTORY_INPLACE_MB", Apply::Restart),
