@@ -8585,6 +8585,7 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             crate::overlay::start(hwnd, self.adapter.clone());
+            crate::menu::start(hwnd);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
