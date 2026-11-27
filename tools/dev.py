@@ -651,10 +651,10 @@ def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
             yield
         return
     with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled, \
-            dev_throttle.builds_suspended(builds=False) as tools:
+            dev_throttle.builds_aside() as aside:
         print(
             f"DEV {what}: holding {len(held)} of {dev_throttle.build_slots()} build slots for the run; "
-            f"{idled} build processes at idle priority, {tools} worktree tests/tools suspended",
+            f"{idled} build processes at idle priority, {aside} builds/tests moved to CPUs 16-31",
             flush=True,
         )
         yield

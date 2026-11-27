@@ -88,6 +88,7 @@ def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
             with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
                 pass
     monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
+    monkeypatch.setattr(dev.dev_throttle, "builds_aside", lambda **_: contextlib.nullcontext(0))
     loud = dev.build_parser().parse_args(["bench"])
     with dev._quiet(loud, "bench"):
         with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
@@ -143,7 +144,7 @@ def test_loud_capture_holds_free_slots(tmp_path, monkeypatch):
     monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
     monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
     monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
-    monkeypatch.setattr(dev.dev_throttle, "builds_suspended", lambda **_: contextlib.nullcontext(0))
+    monkeypatch.setattr(dev.dev_throttle, "builds_aside", lambda **_: contextlib.nullcontext(0))
     args = dev.build_parser().parse_args(["capture"])
     with dev._quiet(args, "capture"):
         with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3):
@@ -297,12 +298,34 @@ def test_quiet_suspends_tests_started_during_the_run_but_spares_the_game():
     assert late.state == "running"
 
 
-def test_loud_runs_suspend_worktree_tools_but_not_builds():
-    rustc = _SuspendProc(401, "rustc.exe")
-    test_exe = _SuspendProc(402, "victory_gpu-2.exe", r"E:\Gta6\AnyXboxX-wt\feedcard\third_party\victory\target\debug\deps\victory_gpu-2.exe")
-    ps = _SuspendPsutil([rustc, test_exe])
-    with dev_throttle.builds_suspended(ps, rescan_s=0, builds=False) as paused:
-        assert paused == 1
-        assert rustc.state == "running"
-        assert test_exe.state == "suspended"
-    assert test_exe.state == "running"
+class _AsideProc(_SuspendProc):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.cpus, self.prio = list(range(32)), "normal"
+
+    def cpu_affinity(self, cpus):
+        self.cpus = list(cpus)
+
+    def nice(self, value):
+        self.prio = value
+
+
+class _AsidePsutil(_SuspendPsutil):
+    IDLE_PRIORITY_CLASS = "idle"
+
+    def cpu_count(self):
+        return 32
+
+
+def test_loud_runs_move_builds_and_tests_to_the_second_ccd_then_give_cpus_back():
+    rustc = _AsideProc(401, "rustc.exe")
+    test_exe = _AsideProc(402, "victory_gpu-2.exe", r"E:\Gta6\AnyXboxX-wt\feedcard\third_party\victory\target\debug\deps\victory_gpu-2.exe")
+    game = _AsideProc(403, "victory.exe", r"E:\Gta6\AnyXboxX-wt\train\third_party\victory\target\release\victory.exe")
+    ps = _AsidePsutil([rustc, test_exe, game], children_of_me=[game])
+    with dev_throttle.builds_aside(ps, rescan_s=0) as moved:
+        assert moved == 2
+        assert rustc.cpus == test_exe.cpus == list(range(16, 32))
+        assert rustc.prio == test_exe.prio == "idle"
+        assert game.cpus == list(range(32)) and game.prio == "normal"
+        assert test_exe.state == "running"
+    assert rustc.cpus == test_exe.cpus == list(range(32))
