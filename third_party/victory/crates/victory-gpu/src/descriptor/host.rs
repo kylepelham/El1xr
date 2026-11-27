@@ -3526,14 +3526,16 @@ impl HostHeap {
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
             // here when a draw reads the slot through a table.
+            // `VICTORY_HEAP_SYNC_BUSY_LATER`: not waiting for a texture's lock.
             let waiting = if for_draw {
                 None
             } else {
-                view.waiting_texture()
+                super::busy_later::waiting_texture(&view)
             };
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
+            if let Some((texture, busy)) = waiting {
+                super::busy_later::wait_for(texture, handle, busy);
             }
+            let waiting = waiting.map(|(texture, _)| texture);
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with

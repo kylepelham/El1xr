@@ -127,6 +127,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_ROUND_SHARE", Apply::Restart),
     ("VICTORY_HEAP_SYNC", Apply::Restart),
     ("VICTORY_HEAP_SYNC_BLOCKS", Apply::Restart),
+    ("VICTORY_HEAP_SYNC_BUSY_LATER", Apply::Restart),
     ("VICTORY_HEAP_SYNC_TABLES", Apply::Restart),
     ("VICTORY_HEAP_TEXTURES", Apply::Restart),
     ("VICTORY_HEAP_TEXTURES_MS", Apply::Restart),

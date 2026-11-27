@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+mod busy_later;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod sync_in_place;
@@ -637,6 +639,7 @@ pub(crate) fn sync_line(frames: f64) {
         place.join(", ")
     );
     sync_in_place::line(frames);
+    busy_later::line(frames);
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -1283,21 +1286,6 @@ impl View {
             _ => [0, 0],
         }
     }
-
-    /// The texture object the view is of, if that texture has no host copy
-    /// yet (`crate::resource::host_waits`): a slot written with such a
-    /// view is left null until the texture is first used.
-    #[cfg(windows)]
-    fn waiting_texture(&self) -> Option<usize> {
-        match *self {
-            View::Shader(r, _) | View::Unordered(r, _, _)
-                if crate::resource::host_waits(r as This) =>
-            {
-                Some(r)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Title slots (their handles) written with a view of a texture object
@@ -1421,7 +1409,9 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    // `VICTORY_HEAP_SYNC_BUSY_LATER`: textures a mirroring found held.
+    made.extend(busy_later::ready());
     if made.is_empty() {
         return;
     }
