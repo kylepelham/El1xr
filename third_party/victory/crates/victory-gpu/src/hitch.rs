@@ -66,7 +66,7 @@ pub enum Phase {
     Bind,
 }
 
-const PHASES: usize = 15;
+pub(crate) const PHASES: usize = 15;
 
 /// Banks of [`MICROS`]: the presenting thread, the title's thread that
 /// called the present (if another), all other threads.
@@ -181,6 +181,7 @@ fn every_frame() -> bool {
 fn credit(phase: Phase, micros: u64, call: bool) {
     let bank = bank();
     MICROS[bank][phase as usize].fetch_add(micros, Ordering::Relaxed);
+    crate::boot_prof::phase(phase as usize, micros);
     if call {
         CALLS[bank][phase as usize].fetch_add(1, Ordering::Relaxed);
     }

@@ -42,6 +42,7 @@ mod ambient;
 mod ambient_miss;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
+mod boot_prof;
 #[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]

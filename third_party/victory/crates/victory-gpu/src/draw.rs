@@ -2781,7 +2781,10 @@ impl State {
             Ordering::Relaxed,
         );
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if HEAP_BUFFER_PASSES_TOTAL.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::boot_prof::world_frame();
+            crate::load_rate::world_frame();
+        }
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
@@ -2918,6 +2921,9 @@ impl State {
             }
         }
         let began = std::time::Instant::now();
+        if is_bake {
+            crate::boot_prof::bake_pass();
+        }
         PASS_BUDGET.set(Some(budget));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
@@ -3274,8 +3280,11 @@ impl State {
         HEAP_TEXTURE_PARTS[14].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
         // (bootfast) `VICTORY_BAKE_PARALLEL=N`: a bake draw's run makes its
         // textures' host copies on N threads first (`crate::bake_ahead`).
+        let mut budget = budget;
         if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
+            let ahead = std::time::Instant::now();
             crate::bake_ahead::host_copies(heap, &due, budget);
+            budget = crate::bake_ahead::left_after(budget, ahead.elapsed());
         }
         let mut laps = Laps::new();
         let began = std::time::Instant::now();
