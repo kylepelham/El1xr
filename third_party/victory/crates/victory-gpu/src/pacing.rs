@@ -88,7 +88,7 @@ fn parse_smooth(v: Option<&str>) -> Option<f64> {
         .map_or(Some(SMOOTH_DEFAULT), |f| (f > 0.0).then_some(f.min(1.0)))
 }
 
-/// The sync interval, cap and smoothing, live: the in-game menu changes
+/// The sync interval, cap and smoothing, live: a settings change (`set`) reaches
 /// them while the title runs (`victory_core::settings`). Parsed as at
 /// start; a cap of 0 ns and a smoothing of 0 stand for none.
 static SYNC: victory_core::settings::Live =
@@ -102,7 +102,7 @@ static SMOOTH: victory_core::settings::Live =
         parse_smooth(v).unwrap_or(0.0).to_bits()
     });
 
-/// What [`present`] paces by now: the start's values until the menu
+/// What [`present`] paces by now: the start's values until a setting
 /// changes one (logged when it does).
 fn live() -> (u32, Option<Duration>, Option<f64>) {
     let c = config();
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn the_live_cells_hold_what_the_start_parsed() {
         // Unset, empty, junk and real values: the live cells' bits read back as
-        // the start's `Config` fields, so nothing changes until the menu does.
+        // the start's `Config` fields, so nothing changes until a setting does.
         for v in [
             None,
             Some(""),
