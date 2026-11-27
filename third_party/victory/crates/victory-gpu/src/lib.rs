@@ -137,6 +137,8 @@ mod readable_once;
 #[cfg(windows)]
 mod dlss;
 #[cfg(windows)]
+pub mod framegen;
+#[cfg(windows)]
 mod ngx;
 pub mod upscale;
 pub mod upscale_live;

@@ -217,6 +217,8 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     far: d.camera_far,
                     frame_ms: d.frame_time_delta,
                     dlss: live == Some(victory_gpu::upscale_live::Live::Dlss),
+                    fov_y: d.camera_fov,
+                    metres_per_unit: d.view_to_meters,
                 };
                 if victory_gpu::upscale::upscale(d.list, &up) {
                     return 0;

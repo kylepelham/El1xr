@@ -36,12 +36,16 @@ pub struct Upscale {
     pub near: f32,
     pub far: f32,
     pub frame_ms: f32,
-    /// Use DLSS when built with the `dlss` feature and NGX initialises; else stretch.
+    /// Use DLSS when NGX initialises; else stretch.
     pub dlss: bool,
+    /// Vertical field of view (radians) and view units per metre, for frame
+    /// generation (`crate::framegen`).
+    pub fov_y: f32,
+    pub metres_per_unit: f32,
 }
 
 impl Upscale {
-    pub const WORDS: usize = 11;
+    pub const WORDS: usize = 12;
 
     pub fn to_words(self) -> [u64; Self::WORDS] {
         let pair = |a: f32, b: f32| u64::from(a.to_bits()) | (u64::from(b.to_bits()) << 32);
@@ -57,6 +61,7 @@ impl Upscale {
             pair(self.pre_exposure, self.frame_ms),
             pair(self.near, self.far),
             u64::from(self.reset) | (u64::from(self.dlss) << 1),
+            pair(self.fov_y, self.metres_per_unit),
         ]
     }
 
@@ -67,6 +72,7 @@ impl Upscale {
         let pair = |v: u64| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)];
         let [pre_exposure, frame_ms] = pair(w[8]);
         let [near, far] = pair(w[9]);
+        let [fov_y, metres_per_unit] = pair(w[11]);
         Some(Self {
             colour: w[0],
             depth: w[1],
@@ -82,6 +88,8 @@ impl Upscale {
             far,
             reset: w[10] & 1 != 0,
             dlss: w[10] & 2 != 0,
+            fov_y,
+            metres_per_unit,
         })
     }
 }
@@ -176,41 +184,39 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
         crate::list::ensure_state(list, colour, SHADER_READ);
         crate::list::ensure_state(list, output, UNORDERED);
 
-        if up.dlss {
-            {
-                let input = |addr: u64| {
-                    if addr == 0 {
-                        return None;
-                    }
-                    let r: This = addr as This;
-                    if !crate::resource::is_texture(r) {
-                        return None;
-                    }
-                    let host_tex = crate::resource::host_resource(r)?;
-                    if crate::texture::title_written(host_tex) {
-                        crate::texture::upload(list, r, host_tex);
-                    }
-                    list.twin_use(r, false, false);
-                    crate::list::ensure_state(list, r, SHADER_READ);
-                    Some(host_tex)
-                };
-                let inputs = crate::dlss::Inputs {
-                    colour: from,
-                    depth: input(up.depth),
-                    motion: input(up.motion),
-                    exposure: input(up.exposure),
-                    output: to,
-                    jitter: up.jitter,
-                    motion_scale: up.motion_scale,
-                    render: up.render,
-                    reset: up.reset,
-                    pre_exposure: up.pre_exposure,
-                    near: up.near,
-                    far: up.far,
-                    frame_ms: up.frame_ms,
-                };
-                done = crate::dlss::record(&host.device, &list.list, &inputs);
+        let input = |addr: u64| {
+            if addr == 0 {
+                return None;
             }
+            let r: This = addr as This;
+            if !crate::resource::is_texture(r) {
+                return None;
+            }
+            let host_tex = crate::resource::host_resource(r)?;
+            if crate::texture::title_written(host_tex) {
+                crate::texture::upload(list, r, host_tex);
+            }
+            list.twin_use(r, false, false);
+            crate::list::ensure_state(list, r, SHADER_READ);
+            Some(host_tex)
+        };
+        if up.dlss {
+            let inputs = crate::dlss::Inputs {
+                colour: from,
+                depth: input(up.depth),
+                motion: input(up.motion),
+                exposure: input(up.exposure),
+                output: to,
+                jitter: up.jitter,
+                motion_scale: up.motion_scale,
+                render: up.render,
+                reset: up.reset,
+                pre_exposure: up.pre_exposure,
+                near: up.near,
+                far: up.far,
+                frame_ms: up.frame_ms,
+            };
+            done = crate::dlss::record(&host.device, &list.list, &inputs);
         }
 
         if !done {
@@ -218,6 +224,29 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
         }
         if done {
             crate::texture::host_written(output);
+            if crate::framegen::active() {
+                let (depth, motion) = (input(up.depth), input(up.motion));
+                // SAFETY: a live resource.
+                let max = unsafe { from.GetDesc() };
+                crate::framegen::prepare(
+                    &host.device,
+                    &list.list,
+                    &crate::framegen::Inputs {
+                        depth,
+                        motion,
+                        render: up.render,
+                        max_render: [max.Width as u32, max.Height],
+                        jitter: up.jitter,
+                        motion_scale: up.motion_scale,
+                        frame_ms: up.frame_ms,
+                        reset: up.reset,
+                        near: up.near,
+                        far: up.far,
+                        fov_y: up.fov_y,
+                        metres_per_unit: up.metres_per_unit,
+                    },
+                );
+            }
         }
         state.after_external(list);
     });
@@ -268,6 +297,8 @@ mod tests {
             far: 0.1,
             frame_ms: 16.666,
             dlss: true,
+            fov_y: 0.9,
+            metres_per_unit: 1.0,
         };
         let words = up.to_words();
         assert_eq!(Upscale::from_words(&words), Some(up));
