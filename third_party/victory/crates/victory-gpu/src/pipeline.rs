@@ -576,10 +576,10 @@ pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
 /// For a program that walks the ray-tracing structures (`RayOnly::Trace`,
 /// `RayOnly::VBuffer`): whether it is a `CS_RaytraceVBuffer*`, whether it
 /// is the glass one ([`GLASS_TRACE`]), and the buffer views it reads from
-/// tables as (root parameter, dword in the table) (`crate::rt_bind`).
+/// tables as (root parameter, dword in the table, register) (`crate::rt_bind`).
 /// `None` for any other program.
 #[cfg(windows)]
-pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32)>)> {
+pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32, u32)>)> {
     if this.is_null() {
         return None;
     }
@@ -595,7 +595,7 @@ pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32)>)> {
         .used
         .iter()
         .filter(|u| u.kind == victory_shader::ResourceType::Srv && u.root == victory_shader::RootType::Table && u.dwords == 4)
-        .map(|u| (u.slot, u.table_offset_dwords))
+        .map(|u| (u.slot, u.table_offset_dwords, u.lower_bound))
         .collect();
     Some((vbuffer, shader.hash.starts_with(GLASS_TRACE), views))
 }
@@ -1295,6 +1295,8 @@ mod library;
 pub(crate) mod samplers;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod eager;
 #[cfg(windows)]
 mod recipe;
 #[cfg(windows)]

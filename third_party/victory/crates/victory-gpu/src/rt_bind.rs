@@ -2,9 +2,9 @@
 //! and `VICTORY_NATIVE_BVH=1`): each dispatch of a program that walks the
 //! ray-tracing structures (`CS_RaytraceVBuffer*`, the BVH traces) is
 //! matched to the host top level `crate::native_rt` built for the same
-//! title structure. Nothing is bound or changed yet: this counts, every
-//! 5 s, the dispatches a hardware replacement could serve (a host top level
-//! is there) and the ones that would fall back to the title's own program.
+//! title structure. This counts, every 5 s, the dispatches a hardware
+//! replacement could serve (a host top level is there) and the ones that
+//! would fall back to the title's own program.
 //!
 //! The title names its top level to a trace program through a buffer view
 //! in one of its descriptor tables: a ray-tracing structure view (dimension
@@ -14,7 +14,16 @@
 //! (`t355`): the program reads the structure's header at its address + 48
 //! and starts its walk at the address shifted right by 8. That address is
 //! what `crate::native_rt` keys its structures by (the build's
-//! destination), so the two meet without the program's help.
+//! destination), so the two meet without the program's help. The glass
+//! trace also walks a second structure, the view at dword 32 (`t354`), for
+//! the rays whose offset is short (its near walk): both are matched and
+//! counted apart (`glass_*` for `t355`, `glass354_*`).
+//!
+//! `VICTORY_NATIVE_GLASS=1` (off by default; needs `VICTORY_NATIVE_BVH=1`)
+//! also matches without `VICTORY_NATIVE_RT_BIND` and keeps the glass
+//! dispatch's two host top levels for its root SRVs
+//! (`victory_shader::emit::SLOT_TLAS`, `SLOT_TLAS_NEAR`): what [`dispatch`]
+//! returns.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,11 +31,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::descriptor::View;
 use crate::object::This;
 
-/// Whether dispatches are matched (`VICTORY_NATIVE_RT_BIND=1`).
+/// Whether dispatches are matched (`VICTORY_NATIVE_RT_BIND=1`, or
+/// `VICTORY_NATIVE_GLASS=1`).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_BIND").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_BIND").is_some_and(|v| v == "1")
+            || victory_shader::emit::native_glass()
+    })
 }
+
+/// The glass trace's structure registers: its far walk's (`t355`, the one
+/// a dispatch is counted by) and its near walk's (`t354`).
+const GLASS_FAR: u32 = 355;
+const GLASS_NEAR: u32 = 354;
 
 /// `D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`.
 const STRUCTURE: u32 = 11;
@@ -56,21 +74,28 @@ enum Found {
     NoView,
 }
 
-/// Counts since the last summary: [glass, other VBuffer, other traces] ×
-/// [host, no host, no view].
-static COUNTS: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
+/// Counts since the last summary: [glass `t355`, glass `t354`, other
+/// VBuffer, other traces] × [host, no host, no view].
+static COUNTS: [[AtomicU64; 3]; 4] = [const { [const { AtomicU64::new(0) }; 3] }; 4];
 
 /// The first title addresses that found no host top level (a few, for the
 /// log: whether they are near what was built tells a wrong key from a
 /// missing build).
 static MISSED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// The first structure address among `views`, `view(slot, dword)` giving
-/// the title's view at that dword of the table at root parameter `slot`.
-fn find_structure(views: &[(u8, u32)], view: impl Fn(u8, u32) -> Option<View>) -> Option<u64> {
+/// The first structure address among `views` (root parameter, dword,
+/// register) whose register `register` allows (any with `None`),
+/// `view(slot, dword)` giving the title's view at that dword of the table at
+/// root parameter `slot`.
+fn find_structure(
+    views: &[(u8, u32, u32)],
+    register: Option<u32>,
+    view: impl Fn(u8, u32) -> Option<View>,
+) -> Option<u64> {
     views
         .iter()
-        .find_map(|&(slot, dword)| view(slot, dword).as_ref().and_then(structure_address))
+        .filter(|v| register.is_none_or(|r| r == v.2))
+        .find_map(|&(slot, dword, _)| view(slot, dword).as_ref().and_then(structure_address))
 }
 
 fn classify(address: Option<u64>, host: impl Fn(u64) -> Option<u64>) -> Found {
@@ -83,38 +108,59 @@ fn classify(address: Option<u64>, host: impl Fn(u64) -> Option<u64>) -> Found {
 
 /// A dispatch of `this` (one hook in `crate::draw`); `table(slot)` gives
 /// the first descriptor of the table bound at compute root parameter `slot`.
-pub(crate) fn dispatch(this: This, alpha: bool, table: impl Fn(u8) -> Option<u64>) {
+/// For the glass trace with both structures matched: their host top levels
+/// (`t355`, `t354`), for root SRVs (`SLOT_TLAS`, `SLOT_TLAS_NEAR`); `None`
+/// otherwise, when the dispatch takes the title's own walk.
+pub(crate) fn dispatch(
+    this: This,
+    alpha: bool,
+    table: impl Fn(u8) -> Option<u64>,
+) -> Option<[u64; 2]> {
     if !on() {
-        return;
+        return None;
     }
-    let Some((vbuffer, glass, views)) = crate::pipeline::ray_views(this) else {
-        return;
-    };
-    let address = find_structure(&views, |slot, dword| {
-        crate::descriptor::view(table(slot)? + u64::from(dword) * 4)
-    });
-    let found = classify(address, crate::native_rt::top_level);
-    if let (Found::NoHost, Some(at)) = (found, address) {
-        let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
-        if missed.len() < 4 && !missed.contains(&at) {
-            missed.push(at);
-            tracing::info!(
-                address = format_args!("{at:#x}"),
-                glass,
-                alpha,
-                "native rt bind: a trace names a structure the host did not build"
-            );
-        }
-    }
-    let row = if glass {
-        0
+    let (vbuffer, glass, views) = crate::pipeline::ray_views(this)?;
+    let view = |slot: u8, dword: u32| crate::descriptor::view(table(slot)? + u64::from(dword) * 4);
+    let mut matched = [0u64; 2];
+    let walks: &[(Option<u32>, usize)] = if glass {
+        &[(Some(GLASS_FAR), 0), (Some(GLASS_NEAR), 1)]
     } else if vbuffer {
-        1
+        &[(None, 2)]
     } else {
-        2
+        &[(None, 3)]
     };
-    COUNTS[row][found as usize].fetch_add(1, Ordering::Relaxed);
+    for &(register, row) in walks {
+        let address = find_structure(&views, register, view);
+        let host = address.and_then(crate::native_rt::top_level);
+        let found = classify(address, |_| host);
+        if let (Found::NoHost, Some(at)) = (found, address) {
+            let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
+            if missed.len() < 4 && !missed.contains(&at) {
+                missed.push(at);
+                tracing::info!(
+                    address = format_args!("{at:#x}"),
+                    glass,
+                    register,
+                    alpha,
+                    "native rt bind: a trace names a structure the host did not build"
+                );
+            }
+        }
+        if row < 2 {
+            matched[row] = host.unwrap_or(0);
+        }
+        COUNTS[row][found as usize].fetch_add(1, Ordering::Relaxed);
+    }
     summary();
+    if glass {
+        both(matched)
+    } else {
+        None
+    }
+}
+
+fn both(m: [u64; 2]) -> Option<[u64; 2]> {
+    (m[0] != 0 && m[1] != 0).then_some(m)
 }
 
 /// Every 5 s: the dispatches matched since.
@@ -130,11 +176,14 @@ fn summary() {
     let take = |row: usize| -> [u64; 3] {
         std::array::from_fn(|i| COUNTS[row][i].swap(0, Ordering::Relaxed))
     };
-    let [glass, vbuffer, trace] = [take(0), take(1), take(2)];
+    let [glass, near, vbuffer, trace] = [take(0), take(1), take(2), take(3)];
     tracing::info!(
         glass_host = glass[0],
         glass_fallback = glass[1] + glass[2],
         glass_no_view = glass[2],
+        glass354_host = near[0],
+        glass354_fallback = near[1] + near[2],
+        glass354_no_view = near[2],
         vbuffer_host = vbuffer[0],
         vbuffer_fallback = vbuffer[1] + vbuffer[2],
         trace_host = trace[0],
@@ -189,15 +238,34 @@ mod tests {
     #[test]
     fn the_first_structure_view_is_the_one() {
         // The glass trace's table views: the structure at dword 8 of root 1.
-        let views = [(1, 0), (1, 8), (1, 16), (4, 8)];
-        let found = find_structure(&views, |slot, dword| match (slot, dword) {
+        let views = [(1, 0, 400), (1, 8, 355), (1, 16, 356), (4, 8, 346)];
+        let found = find_structure(&views, None, |slot, dword| match (slot, dword) {
             (1, 8) => Some(rt_view(0xabc00)),
             (4, 8) => Some(rt_view(0xdef00)),
             (1, 0) => Some(View::Constant(0x10, 16)),
             _ => None,
         });
         assert_eq!(found, Some(0xabc00));
-        assert_eq!(find_structure(&views, |_, _| None), None);
+        assert_eq!(find_structure(&views, None, |_, _| None), None);
+    }
+
+    #[test]
+    fn the_glass_trace_names_two_structures_by_register() {
+        // t355 at dword 8 and t354 at dword 32 of root parameter 1, as the
+        // glass trace 6d7fe7745ab9c6d8 declares them.
+        let views = [(1, 8, GLASS_FAR), (1, 32, GLASS_NEAR), (0, 8, 346)];
+        let view = |slot, dword| match (slot, dword) {
+            (1, 8) => Some(rt_view(0xa000)),
+            (1, 32) => Some(rt_view(0xb000)),
+            _ => None,
+        };
+        assert_eq!(find_structure(&views, Some(GLASS_FAR), view), Some(0xa000));
+        assert_eq!(find_structure(&views, Some(GLASS_NEAR), view), Some(0xb000));
+        assert_eq!(find_structure(&views, Some(999), view), None);
+        // Bound only when both have a host top level.
+        assert_eq!(both([0x10, 0x20]), Some([0x10, 0x20]));
+        assert_eq!(both([0x10, 0]), None);
+        assert_eq!(both([0, 0x20]), None);
     }
 
     #[test]

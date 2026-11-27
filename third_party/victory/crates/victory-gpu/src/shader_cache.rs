@@ -100,6 +100,9 @@ fn build(wave_wide: bool, wave_pairs: bool) -> [u8; 32] {
     if wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0") {
         h.update(b"VICTORY_WAVE_PAIRS_ONLY=1");
     }
+    if victory_shader::emit::native_glass() {
+        h.update(b"VICTORY_NATIVE_GLASS=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }

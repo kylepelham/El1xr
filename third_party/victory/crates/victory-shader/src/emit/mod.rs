@@ -86,6 +86,7 @@
 mod bitcode;
 mod container;
 pub mod glass_record;
+mod glass_splice;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
@@ -96,12 +97,15 @@ mod intersect_tests;
 pub mod host;
 mod idiom;
 mod link;
+mod loops_wave;
 mod lower;
 pub mod meet;
 mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
 mod ray_query;
+#[cfg(all(test, windows))]
+mod ray_query_warp_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -128,9 +132,10 @@ pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
+pub use glass_splice::{GLASS_TRACE, native_glass};
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 
@@ -1093,8 +1098,25 @@ fn paired(
     lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// The translated program, and the wave size it requires of the host: [`emit_program_plain`],
+/// and with `VICTORY_LOOPS_WAVE=1` its loops taken by each host wave together where that helps
+/// ([`loops_wave::again`]).
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    loops_wave::again(first, native, p, st, |st, res| {
+        emit_program_plain(c, native, p, st, io, res)
+    })
+}
+
+/// The translated program, and the wave size it requires of the host.
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

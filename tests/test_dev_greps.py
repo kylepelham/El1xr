@@ -212,3 +212,25 @@ def test_train_report_reads_each_runs_log(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "| merged | `merged: ([0-9]+)` | 1 / med 7 / last 7 |" in out, "02_off has no log: no column"
     assert "- **01_on**: panicked x1" in out
+
+
+def test_hang_lines_keep_the_dred_report_and_the_hang_watch_once_each():
+    text = "\n".join([
+        info("dred: device-removed data on (breadcrumbs, page faults; a marker before each title command)"),
+        info("hang watch: on (VICTORY_HANG_WATCH)"),
+        info("hang watch: the card's fence has stood at 1702 for 3.0 s with work queued up to 1703", target="victory_gpu::hang_watch"),
+        info("relay: fence 18446744073709551615 did not reach 1703; device removed: hung (0x887A0006)"),
+        "dred: removal reason 0x887a0006: hung",
+        "dred: victory list #7 (submission 412) stopped at command 1 of 3 (Dispatch)",
+        "VIctory: host GPU failure: relay: fence 18446744073709551615 did not reach 1703; device removed",
+        "dred: removal reason 0x887a0006: hung",
+    ])
+    assert dev_greps.hang_lines(text) == [
+        "hang watch: the card's fence has stood at 1702 for 3.0 s with work queued up to 1703",
+        "dred: removal reason 0x887a0006: hung",
+        "dred: victory list #7 (submission 412) stopped at command 1 of 3 (Dispatch)",
+    ]
+    assert dev_greps.hang_lines(text, most=1) == [
+        "hang watch: the card's fence has stood at 1702 for 3.0 s with work queued up to 1703",
+    ]
+    assert dev_greps.scan_log(text, {}).hang[1] == "dred: removal reason 0x887a0006: hung"
