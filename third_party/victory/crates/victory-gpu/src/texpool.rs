@@ -35,6 +35,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 mod buffers;
+#[cfg(test)]
+mod unmap_costs;
 pub(crate) use buffers::{card_buffer, shared_buffer, upload_buffer};
 
 /// Bytes of a block. Pieces of more than half of one are not cut (with
@@ -247,6 +249,9 @@ struct Pool<B> {
     /// (zeros); a block every piece of which has come back is let go
     /// (`buffers`: memory the card writes that we cannot clear here).
     fresh: bool,
+    /// A thread is making a block for this pool outside its lock
+    /// ([`take_from`]).
+    making: bool,
 }
 
 impl<B: Clone> Pool<B> {
@@ -258,6 +263,7 @@ impl<B: Clone> Pool<B> {
             retry_at: 0,
             alive,
             fresh: false,
+            making: false,
         }
     }
 
@@ -270,6 +276,7 @@ impl<B: Clone> Pool<B> {
             retry_at: 0,
             alive,
             fresh: true,
+            making: false,
         }
     }
 
@@ -286,6 +293,7 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes, the memory it lies in, and whether that part
     /// was used before; `make` makes a block when none has room.
+    #[cfg(test)]
     fn take(
         &mut self,
         len: u64,
@@ -298,6 +306,9 @@ impl<B: Clone> Pool<B> {
 
     /// The same from a ripe block if one has room, else from the oldest;
     /// `make` makes one ahead too while fewer than `ripe.ahead` are empty.
+    /// (All under the caller's lock: the tests'. The pools themselves go
+    /// through [`take_from`], which makes blocks outside it.)
+    #[cfg(test)]
     fn take_ripe(
         &mut self,
         len: u64,
@@ -306,14 +317,32 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if too_big(len, ripe) {
             return None;
         }
-        self.reclaim(
-            now,
-            crate::host::submissions_finished(),
-            SPARES.load(Ordering::Relaxed),
-        );
+        let mut freed = Vec::new();
+        let taken = match self.cut(len, align, now, ripe, &mut freed) {
+            Some(taken) => taken,
+            None => {
+                let memory = self.grow(now, &mut make)?;
+                self.add(memory, ripe.started);
+                self.cut(len, align, now, ripe, &mut freed)?
+            }
+        };
+        if self.wants_ahead(ripe)
+            && let Some(memory) = self.grow(now, &mut make)
+        {
+            self.add(memory, ripe.started);
+        }
+        Some(taken)
+    }
+
+    /// A piece of `len` bytes from the blocks there are (none is made):
+    /// from a ripe block if one has room, else from the oldest. The blocks
+    /// [`Pool::reclaim`] lets go of are put in `freed`, for the caller to
+    /// drop outside its lock.
+    fn cut(&mut self, len: u64, align: u64, now: u64, ripe: Ripe, freed: &mut Vec<B>) -> Option<(Piece, B, bool)> {
+        freed.extend(self.reclaim(now, crate::host::submissions_finished(), SPARES.load(Ordering::Relaxed)));
         let mut found = None;
         let fresh = self.fresh;
         for (i, block) in self.blocks.iter_mut().enumerate() {
@@ -326,69 +355,50 @@ impl<B: Clone> Pool<B> {
             }
         }
         if found.is_none() && ripe.ahead > 0 {
-            let mut unripe: Vec<(u64, usize)> = self
-                .blocks
-                .iter()
-                .enumerate()
-                .filter_map(|(i, b)| Some((b.as_ref()?.made, i)))
-                .collect();
+            let mut unripe: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| {
                 let least = self.least(self.blocks[i].as_ref()?);
                 Some((i, self.blocks[i].as_mut()?.free.take(len, align, least)?))
             });
         }
-        let (i, start) = match found {
-            Some(found) => found,
-            None => {
-                let memory = self.grow(now, &mut make)?;
-                let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align, 0)?)
-            }
-        };
-        if ripe.ahead > 0 {
-            if !ripe.is(self.blocks[i].as_ref()?) {
-                let n = STATS[3].fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::info!(
-                        "pieces cut from blocks made while lists ran that still run: {n}"
-                    );
-                }
-            }
-            let empty = self
-                .blocks
-                .iter()
-                .flatten()
-                .filter(|b| self.empty(b))
-                .count();
-            if empty < ripe.ahead
-                && let Some(memory) = self.grow(now, &mut make)
-            {
-                self.add(memory, ripe.started);
+        let (i, start) = found?;
+        if ripe.ahead > 0 && !ripe.is(self.blocks[i].as_ref()?) {
+            let n = STATS[3].fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("pieces cut from blocks made while lists ran that still run: {n}");
             }
         }
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
-        Some((
-            Piece {
-                block: i,
-                start,
-                len,
-            },
-            block.memory.clone(),
-            again,
-        ))
+        Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// Fewer than `ripe.ahead` blocks are empty: one is to be made ahead.
+    fn wants_ahead(&self, ripe: Ripe) -> bool {
+        ripe.ahead > 0 && self.blocks.iter().flatten().filter(|b| self.empty(b)).count() < ripe.ahead
+    }
+
+    /// No block is asked for: the host refused one in the last half second.
+    fn held_back(&self, now: u64) -> bool {
+        now < self.retry_at
+    }
+
+    fn refused(&mut self, now: u64) {
+        self.retry_at = now.saturating_add(crate::alloc_backoff::RETRY_MS);
     }
 
     /// A new block, unless the host refused one in the last half second.
+    #[cfg(test)]
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
-        if now < self.retry_at {
+        if self.held_back(now) {
             return None;
         }
         let block = make();
         if block.is_none() {
-            self.retry_at = now.saturating_add(crate::alloc_backoff::RETRY_MS);
+            self.refused(now);
         }
         block
     }
@@ -416,8 +426,11 @@ impl<B: Clone> Pool<B> {
     }
 
     /// Frees the pieces that rested long enough, and lets go of the empty
-    /// blocks past `spares` (and past the pool's most).
-    fn reclaim(&mut self, now: u64, finished: u64, spares: usize) {
+    /// blocks past `spares` (and past the pool's most): returned, to be
+    /// dropped outside the pool's lock (a block of mapped memory is
+    /// unmapped and freed when it goes).
+    fn reclaim(&mut self, now: u64, finished: u64, spares: usize) -> Vec<B> {
+        let mut gone = Vec::new();
         let mut any = false;
         while let Some(&(resting, piece)) = self.resting.front()
             && resting.over(now, finished)
@@ -429,7 +442,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         if !any {
-            return;
+            return gone;
         }
         let most = spares.min(self.most);
         let fresh = self.fresh;
@@ -440,17 +453,197 @@ impl<B: Clone> Pool<B> {
             {
                 spare += 1;
                 if spare > most || (fresh && b.used_to > 0) {
-                    *block = None;
+                    gone.extend(block.take().map(|b| b.memory));
                     self.alive.fetch_sub(1, Ordering::Relaxed);
                 }
             }
         }
+        gone
     }
 
     #[cfg(test)]
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+}
+
+/// A piece too large for a block of the pool (more than half of one, or
+/// with blocks made ahead more than one), or of nothing.
+fn too_big(len: u64, ripe: Ripe) -> bool {
+    len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 }
+}
+
+/// The pools, for their time lines ([`TIME`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Which {
+    Texture,
+    Staging,
+    Card,
+    Shared,
+    Upload,
+}
+
+const NAMES: [&str; 5] = ["texture", "staging", "card", "shared", "upload"];
+
+/// Per pool, since its last time line: pieces taken, microseconds taking
+/// them (lock waits, cuts, placing, zeroing), of which waiting for the
+/// pool's lock; blocks made and their microseconds, of which making them
+/// resident and waiting for the card to map them; blocks let go and their
+/// microseconds; bytes of reused pieces zeroed and the microseconds;
+/// pieces left to a committed allocation of their own because another
+/// thread was making the block they needed.
+pub(crate) static TIME: [[AtomicU64; 11]; 5] = [const { [const { AtomicU64::new(0) }; 11] }; 5];
+pub(crate) const T_PIECES: usize = 0;
+pub(crate) const T_TAKE_US: usize = 1;
+pub(crate) const T_WAIT_US: usize = 2;
+pub(crate) const T_MADE: usize = 3;
+pub(crate) const T_MAKE_US: usize = 4;
+pub(crate) const T_RESIDENT_US: usize = 5;
+pub(crate) const T_FREED: usize = 6;
+pub(crate) const T_FREE_US: usize = 7;
+pub(crate) const T_ZERO_BYTES: usize = 8;
+pub(crate) const T_ZERO_US: usize = 9;
+pub(crate) const T_BUSY: usize = 10;
+
+pub(crate) fn time(which: Which, field: usize, value: u64) {
+    TIME[which as usize][field].fetch_add(value, Ordering::Relaxed);
+}
+
+fn us(since: std::time::Instant) -> u64 {
+    since.elapsed().as_micros() as u64
+}
+
+/// The pools' time lines, one a pool that did anything, at most every five
+/// seconds: grep `pool time (` (and `title memory remapped` beside them).
+fn time_lines(now: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let secs = if last == 0 { 5.0 } else { (now - last) as f64 / 1e3 };
+    for (i, name) in NAMES.iter().enumerate() {
+        let t = TIME[i].each_ref().map(|t| t.swap(0, Ordering::Relaxed));
+        if t.iter().all(|&v| v == 0) {
+            continue;
+        }
+        tracing::info!(
+            "pool time ({name}) over {secs:.1} s: {} pieces, {:.1} ms taking them ({:.1} ms of it waiting for the lock), \
+             {} blocks made in {:.1} ms ({:.1} ms of it making them resident), {} let go in {:.1} ms, {:.1} MB zeroed in {:.1} ms, \
+             {} left to committed while a block was made",
+            t[T_PIECES],
+            t[T_TAKE_US] as f64 / 1e3,
+            t[T_WAIT_US] as f64 / 1e3,
+            t[T_MADE],
+            t[T_MAKE_US] as f64 / 1e3,
+            t[T_RESIDENT_US] as f64 / 1e3,
+            t[T_FREED],
+            t[T_FREE_US] as f64 / 1e3,
+            t[T_ZERO_BYTES] as f64 / 1e6,
+            t[T_ZERO_US] as f64 / 1e3,
+            t[T_BUSY],
+        );
+    }
+}
+
+/// Drops blocks a pool let go of, outside its lock, timed.
+fn let_go<B>(which: Which, freed: Vec<B>) {
+    if freed.is_empty() {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let n = freed.len() as u64;
+    drop(freed);
+    time(which, T_FREED, n);
+    time(which, T_FREE_US, us(began));
+}
+
+/// Makes a block for `pool` outside its lock, then adds it.
+fn make_into<B: Clone>(
+    pool: &'static Mutex<Pool<B>>,
+    which: Which,
+    started: u64,
+    make: &impl Fn() -> Option<B>,
+) -> bool {
+    let began = std::time::Instant::now();
+    let memory = make();
+    let made = us(began);
+    let mut p = lock(pool);
+    p.making = false;
+    match memory {
+        Some(memory) => {
+            p.add(memory, started);
+            drop(p);
+            time(which, T_MADE, 1);
+            time(which, T_MAKE_US, made);
+            true
+        }
+        None => {
+            p.refused(now());
+            false
+        }
+    }
+}
+
+/// A piece of `len` bytes of `pool` (as [`Pool::take_ripe`]), with every
+/// block made and let go outside the pool's lock: a block's making
+/// (`CreateHeap`, making it resident and waiting for the card to map it,
+/// mapping it) took tens of milliseconds in the game, and with it under
+/// the lock every thread that wanted a piece waited (batch 1: card pieces
+/// took 222 us each in the game against 6 on a quiet card). One thread
+/// makes a pool's block at a time; another that needs one meanwhile gets
+/// `None` and makes a committed allocation of its own, as without the pool.
+fn take_from<B: Clone>(
+    pool: &'static Mutex<Pool<B>>,
+    which: Which,
+    len: u64,
+    align: u64,
+    ripe: Ripe,
+    make: impl Fn() -> Option<B>,
+) -> Option<(Piece, B, bool)> {
+    if too_big(len, ripe) {
+        return None;
+    }
+    let began = std::time::Instant::now();
+    let at = now();
+    time_lines(at);
+    let mut freed = Vec::new();
+    let mut tries = 0;
+    let taken = loop {
+        let waited = std::time::Instant::now();
+        let mut p = lock(pool);
+        time(which, T_WAIT_US, us(waited));
+        if let Some(taken) = p.cut(len, align, at, ripe, &mut freed) {
+            let ahead = p.wants_ahead(ripe) && !p.making && !p.held_back(at);
+            p.making |= ahead;
+            drop(p);
+            let_go(which, std::mem::take(&mut freed));
+            if ahead {
+                make_into(pool, which, ripe.started, &make);
+            }
+            break Some(taken);
+        }
+        if tries > 0 || p.making || p.held_back(at) {
+            if p.making {
+                time(which, T_BUSY, 1);
+            }
+            drop(p);
+            let_go(which, std::mem::take(&mut freed));
+            break None;
+        }
+        p.making = true;
+        drop(p);
+        let_go(which, std::mem::take(&mut freed));
+        if !make_into(pool, which, ripe.started, &make) {
+            break None;
+        }
+        tries += 1;
+    };
+    if taken.is_some() {
+        time(which, T_PIECES, 1);
+    }
+    time(which, T_TAKE_US, us(began));
+    taken
 }
 
 /// A mapped upload buffer.
@@ -536,7 +729,7 @@ pub(crate) fn staging(
         return None;
     }
     let bytes = bytes.max(1).next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = take_from(&STAGING, Which::Staging, bytes, 512, Ripe::ALL, || {
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -549,8 +742,11 @@ pub(crate) fn staging(
     if again {
         // What is not detiled into it (memory not there yet) uploads zeros,
         // as from a buffer of its own.
+        let began = std::time::Instant::now();
         // SAFETY: the piece is ours alone.
         unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        time(Which::Staging, T_ZERO_BYTES, bytes);
+        time(Which::Staging, T_ZERO_US, us(began));
     }
     Some((owned, memory.0, piece.start, data))
 }
@@ -682,10 +878,12 @@ fn texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
         return None;
     }
     let heap = heap?;
+    let began = std::time::Instant::now();
     if resident && let Err(e) = made_resident(device, &heap) {
         tracing::warn!(error = %e, "a block of texture memory is not resident");
         return None;
     }
+    time(Which::Texture, T_RESIDENT_US, us(began));
     STATS[2].fetch_add(1, Ordering::Relaxed);
     crate::host::name(&heap, || "host textures (a block)".into());
     Some(heap)
@@ -828,10 +1026,11 @@ pub(crate) unsafe fn texture(
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let taken = lock(&TEXTURES).take_ripe(
+    let taken = take_from(
+        &TEXTURES,
+        Which::Texture,
         info.SizeInBytes,
         info.Alignment.max(1),
-        at,
         Ripe::now(),
         || texture_block(device),
     );
@@ -902,6 +1101,50 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    /// Blocks are made outside the pool's lock, one at a time: a thread
+    /// that needs one while another makes it is told to go without; a
+    /// refusal holds the next block back; blocks are made ahead.
+    #[test]
+    fn blocks_are_made_outside_the_lock_one_at_a_time() {
+        static ALIVE_HERE: AtomicU64 = AtomicU64::new(0);
+        static POOL: Mutex<Pool<u64>> = Mutex::new(Pool::new(4, &ALIVE_HERE));
+        let made = AtomicU64::new(0);
+        let make = || {
+            // The pool is not locked while a block is made.
+            assert!(POOL.try_lock().is_ok());
+            Some(made.fetch_add(1, Ordering::Relaxed) + 1)
+        };
+        let (p, b, again) = take_from(&POOL, Which::Upload, 65536, 65536, Ripe::ALL, make).unwrap();
+        assert_eq!((p.start, b, again), (0, 1, false));
+        assert_eq!(take_from(&POOL, Which::Upload, BLOCK / 2, 65536, Ripe::ALL, make).unwrap().1, 1);
+        // Another thread is making a block: no piece, nothing made.
+        lock(&POOL).making = true;
+        assert!(take_from(&POOL, Which::Upload, BLOCK / 2, 65536, Ripe::ALL, make).is_none());
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        lock(&POOL).making = false;
+        // Room in the block there is: no block made.
+        assert_eq!(take_from(&POOL, Which::Upload, 65536, 65536, Ripe::ALL, make).unwrap().1, 1);
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        // Made ahead: two empty blocks kept.
+        let ahead = Ripe { started: 0, finished: 0, ahead: 2 };
+        take_from(&POOL, Which::Upload, 65536, 65536, ahead, make).unwrap();
+        take_from(&POOL, Which::Upload, 65536, 65536, ahead, make).unwrap();
+        assert_eq!(made.load(Ordering::Relaxed), 3);
+        assert!(!lock(&POOL).making);
+        // Refused: none, and the next is not asked for at once.
+        static ALIVE_REFUSED: AtomicU64 = AtomicU64::new(0);
+        static REFUSING: Mutex<Pool<u64>> = Mutex::new(Pool::new(4, &ALIVE_REFUSED));
+        let asked = AtomicU64::new(0);
+        let refuse = || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        assert!(take_from(&REFUSING, Which::Upload, 65536, 65536, Ripe::ALL, refuse).is_none());
+        assert!(take_from(&REFUSING, Which::Upload, 65536, 65536, Ripe::ALL, refuse).is_none());
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert!(!lock(&REFUSING).making);
     }
 
     #[test]

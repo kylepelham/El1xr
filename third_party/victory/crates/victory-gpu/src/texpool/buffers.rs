@@ -105,6 +105,10 @@ impl Kind {
         })
     }
 
+    fn which(self) -> super::Which {
+        [super::Which::Card, super::Which::Shared, super::Which::Upload][self.at()]
+    }
+
     fn pool(self) -> &'static Mutex<Pool<Mem>> {
         [&CARD, &SHARED, &UPLOAD][self.at()]
     }
@@ -182,10 +186,12 @@ fn block(device: &ID3D12Device, kind: Kind) -> Option<Mem> {
         return None;
     }
     let heap = heap?;
+    let began = std::time::Instant::now();
     if resident && let Err(e) = made_resident(device, &heap) {
         tracing::warn!(error = %e, kind = kind.name(), "a block of buffer memory is not resident");
         return None;
     }
+    super::time(kind.which(), super::T_RESIDENT_US, super::us(began));
     let (mut whole, mut data) = (None, std::ptr::null_mut());
     if kind != Kind::Card {
         let mut made: Option<ID3D12Resource> = None;
@@ -221,7 +227,7 @@ fn block(device: &ID3D12Device, kind: Kind) -> Option<Mem> {
     })
 }
 
-fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+pub(super) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(1),
@@ -254,10 +260,11 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
         return None;
     }
     let started = std::time::Instant::now();
-    let taken = lock(kind.pool()).take_ripe(
+    let taken = super::take_from(
+        kind.pool(),
+        kind.which(),
         len,
         u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
-        now(),
         Ripe::ahead(KEPT),
         || block(device, kind),
     );
@@ -297,8 +304,11 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
         data = unsafe { mem.data.add(piece.start as usize) };
         if again {
             // As a committed buffer starts.
+            let began = std::time::Instant::now();
             // SAFETY: the piece is ours alone.
             unsafe { std::ptr::write_bytes(data, 0, size.max(1) as usize) };
+            super::time(kind.which(), super::T_ZERO_BYTES, size.max(1));
+            super::time(kind.which(), super::T_ZERO_US, super::us(began));
         }
     } else {
         debug_assert!(!again, "a card piece is cut only from fresh memory");
