@@ -7127,7 +7127,7 @@ impl Host {
         if !PINNED.with(|pinned| pinned.replace(true)) {
             crate::cores::keep_on_fast_cores();
         }
-        crate::timeline::prep_begins();
+        crate::timeline::prep_begins(runs.len());
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -7143,6 +7143,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::timeline::mark(0);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -7160,6 +7161,7 @@ impl Host {
             }
             heap_rounds.wrote();
         }
+        crate::timeline::mark(1);
         let needs_heap_sync = runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed));
         let async_heap_sync = needs_heap_sync && crate::descriptor::async_sync_on();
         if needs_heap_sync && !async_heap_sync {
@@ -7185,6 +7187,7 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {
             // Overlap `sync_heaps()` on `victory-heap-sync` with submission

@@ -57,11 +57,68 @@ static PREP_IDLE: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 
 const PARTS: usize = 10;
 
+/// The batch flushes' copies, bytes and textures so far (`host_flush`).
+static FLUSHED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The stretches with the longest preparing since the last line, longest first.
+static LONGEST: Mutex<Vec<Long>> = Mutex::new(Vec::new());
+const LONGEST_KEPT: usize = 4;
+
+/// A long idle stretch and the submission that ended it.
+#[derive(Clone, Copy)]
+struct Long {
+    idle_us: u64,
+    prepare_us: u64,
+    /// Waiting for the title (`title` + `queued`), microseconds.
+    title_us: u64,
+    lists: usize,
+    /// The preparing parts in the submission, microseconds (all of it, not only the idle share).
+    parts: [u64; PARTS],
+    /// Copies, bytes and textures its batch flushes refreshed.
+    flushed: [u64; 3],
+    /// In the stretch: waiting for the submission lock, for flights (settle or relay wait),
+    /// and the sweep with what follows up to the parts, microseconds ([`mark`]).
+    steps: [u64; 3],
+}
+
+/// Since the last line: microseconds of the stretches' [`Long::steps`], all stretches.
+static STEPS_IDLE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 thread_local! {
-    /// When this thread began preparing its current submission.
-    static PREP: Cell<u64> = const { Cell::new(0) };
-    /// The preparing parts' counters then.
-    static PREP_AT: Cell<[u64; PARTS]> = const { Cell::new([0; PARTS]) };
+    /// When this thread began preparing its current submission, and its lists.
+    static PREP: Cell<(u64, usize)> = const { Cell::new((0, 0)) };
+    /// The preparing parts' and flushes' counters then.
+    static PREP_AT: Cell<([u64; PARTS], [u64; 3])> = const { Cell::new(([0; PARTS], [0; 3])) };
+    /// When this thread got the submission lock, was past the wait for flights, and past the
+    /// sweep, in its current preparing.
+    static STEPS: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
+}
+
+/// This thread's preparing reached step `k` ([`Long::steps`]).
+pub(crate) fn mark(k: usize) {
+    if on() {
+        STEPS.with(|s| {
+            let mut v = s.get();
+            v[k] = now();
+            s.set(v);
+        });
+    }
+}
+
+/// Microseconds of `[a, b]` within `[i0, i1]`.
+fn within(a: u64, b: u64, i0: u64, i1: u64) -> u64 {
+    b.min(i1).saturating_sub(a.max(i0))
+}
+
+/// A batch flush refreshed `n` more copies (`what` 0), bytes (1) or textures (2).
+pub(crate) fn flushed(what: usize, n: u64) {
+    if on() {
+        FLUSHED[what].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+fn flushed_now() -> [u64; 3] {
+    std::array::from_fn(|i| FLUSHED[i].load(Ordering::Relaxed))
 }
 
 fn prep_parts() -> [u64; PARTS] {
@@ -89,11 +146,12 @@ pub(crate) fn title_submit() {
     }
 }
 
-/// This thread begins preparing a submission.
-pub(crate) fn prep_begins() {
+/// This thread begins preparing a submission of `lists` lists.
+pub(crate) fn prep_begins(lists: usize) {
     if on() {
-        PREP.with(|p| p.set(now()));
-        PREP_AT.with(|p| p.set(prep_parts()));
+        PREP.with(|p| p.set((now(), lists)));
+        STEPS.with(|s| s.set([0; 3]));
+        PREP_AT.with(|p| p.set((prep_parts(), flushed_now())));
     }
 }
 
@@ -118,7 +176,7 @@ pub(crate) fn card_idle(idle: std::time::Duration) {
     }
     let i1 = now();
     let i0 = i1.saturating_sub(idle.as_micros() as u64);
-    let p = PREP.with(Cell::get);
+    let (p, lists) = PREP.with(Cell::get);
     SUMS[5].fetch_add(1, Ordering::Relaxed);
     if i1 - i0 >= 1000 {
         SUMS[6].fetch_add(1, Ordering::Relaxed);
@@ -141,16 +199,47 @@ pub(crate) fn card_idle(idle: std::time::Duration) {
     for (sum, part) in SUMS.iter().zip(parts) {
         sum.fetch_add(part, Ordering::Relaxed);
     }
+    let (parts_at, flushed_at) = PREP_AT.with(Cell::get);
+    let spent: [u64; PARTS] = {
+        let now = prep_parts();
+        std::array::from_fn(|i| now[i].saturating_sub(parts_at[i]))
+    };
+    let [m0, m1, m2] = STEPS.with(Cell::get);
+    let steps = if m0 >= p && m1 >= m0 && m2 >= m1 {
+        [within(p, m0, i0, i1), within(m0, m1, i0, i1), within(m1, m2, i0, i1)]
+    } else {
+        [0; 3]
+    };
+    for (sum, step) in STEPS_IDLE.iter().zip(steps) {
+        sum.fetch_add(step, Ordering::Relaxed);
+    }
     let whole = i1.saturating_sub(p);
     if whole > 0 {
-        let at = PREP_AT.with(Cell::get);
         let share = parts[4] as f64 / whole as f64;
-        for ((sum, now), at) in PREP_IDLE.iter().zip(prep_parts()).zip(at) {
-            sum.fetch_add(
-                (now.saturating_sub(at) as f64 * share) as u64,
-                Ordering::Relaxed,
-            );
+        for (sum, spent) in PREP_IDLE.iter().zip(spent) {
+            sum.fetch_add((spent as f64 * share) as u64, Ordering::Relaxed);
         }
+    }
+    if i1 - i0 >= 1000 {
+        let now = flushed_now();
+        keep_longest(Long {
+            idle_us: i1 - i0,
+            prepare_us: parts[4],
+            title_us: parts[2] + parts[3],
+            lists,
+            parts: spent,
+            flushed: std::array::from_fn(|i| now[i].saturating_sub(flushed_at[i])),
+            steps,
+        });
+    }
+}
+
+fn keep_longest(long: Long) {
+    let mut kept = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
+    let at = kept.partition_point(|k| k.prepare_us >= long.prepare_us);
+    if at < LONGEST_KEPT {
+        kept.insert(at, long);
+        kept.truncate(LONGEST_KEPT);
     }
 }
 
@@ -225,11 +314,55 @@ pub(crate) fn line(frames: f64) {
         p[8],
         p[9],
     );
+    let st: Vec<f64> = STEPS_IDLE
+        .iter()
+        .map(|v| v.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames)
+        .collect();
+    tracing::info!(
+        "card idle prepare per frame before the parts: the submission lock {:.2} ms, flights waited for {:.2} ms, \
+         sweep and heap sync {:.2} ms (VICTORY_FENCE_TIMELINE)",
+        st[0],
+        st[1],
+        st[2],
+    );
+    let kept = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
+    for k in kept {
+        let ms = |us: u64| us as f64 / 1000.0;
+        tracing::info!(
+            "card idle long stretch: {:.2} ms idle, {:.2} ms of it preparing, {:.2} ms waiting for the title; the submission \
+             {} lists, preparing parts ask_once {:.2} ms, stale_flights {:.2} ms, run_other {:.2} ms, batch_flush {:.2} ms, \
+             card_before {:.2} ms, sync_heaps {:.2} ms; its flushes {} copies, {:.2} MB, {} textures; in the stretch the lock \
+             {:.2} ms, flights {:.2} ms, sweep {:.2} ms (VICTORY_FENCE_TIMELINE)",
+            ms(k.idle_us),
+            ms(k.prepare_us),
+            ms(k.title_us),
+            k.lists,
+            ms(k.parts[2]),
+            ms(k.parts[3]),
+            ms(k.parts[5] + k.parts[4]),
+            ms(k.parts[6]),
+            ms(k.parts[8]),
+            ms(k.parts[0]),
+            k.flushed[0],
+            k.flushed[1] as f64 / (1 << 20) as f64,
+            k.flushed[2],
+            ms(k.steps[0]),
+            ms(k.steps[1]),
+            ms(k.steps[2]),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn within_cuts_to_the_stretch() {
+        assert_eq!(within(50, 150, 100, 1000), 50);
+        assert_eq!(within(200, 300, 100, 1000), 100);
+        assert_eq!(within(10, 90, 100, 1000), 0);
+    }
 
     #[test]
     fn prepared_before_the_card_went_idle_is_all_prepare() {
