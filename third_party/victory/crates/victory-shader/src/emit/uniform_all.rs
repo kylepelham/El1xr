@@ -24,14 +24,35 @@ use super::Lower;
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
-/// Whether `VICTORY_UNIFORM_STRICT_ALL=1`. A test can choose for its own thread.
+/// Whether `VICTORY_UNIFORM_STRICT_ALL=1`, or this thread translates inside
+/// [`with_strict`]`(true, ..)`. A test can choose for its own thread.
 pub(super) fn on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_STRICT_ALL.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_UNIFORM_STRICT_ALL").is_ok_and(|v| v.trim() == "1"))
+    HERE.get() || *ON.get_or_init(|| std::env::var("VICTORY_UNIFORM_STRICT_ALL").is_ok_and(|v| v.trim() == "1"))
+}
+
+thread_local! {
+    /// [`with_strict`]'s choice, for this thread's translations.
+    static HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Translations inside `f` on this thread take the stricter proof when `on`, as with
+/// `VICTORY_UNIFORM_STRICT_ALL=1` (`victory-gpu`'s shader cache names the containers by
+/// their log hash with `VICTORY_UNIFORM_STRICT=<hash,hash,..>`, and only their cache keys
+/// change).
+pub fn with_strict<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(HERE.replace(on));
+    f()
 }
 
 #[cfg(test)]
@@ -314,6 +335,16 @@ mod tests {
             }
         }
         panic!("no v_readfirstlane_b32");
+    }
+
+    /// `with_strict` turns the proof on for its own translations only.
+    #[test]
+    fn with_strict_holds_only_inside_and_only_on_its_thread() {
+        let outside = super::on();
+        assert!(super::with_strict(true, super::on));
+        assert_eq!(super::with_strict(false, super::on), outside);
+        assert_eq!(super::on(), outside);
+        assert!(super::with_strict(true, || std::thread::spawn(super::on).join().unwrap()) == outside);
     }
 
     #[test]

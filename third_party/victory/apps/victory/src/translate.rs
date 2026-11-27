@@ -549,7 +549,12 @@ fn translate(
     // (`VICTORY_WAVE_PAIRS_VT=1`: the programs the run's shader cache gives Vice-Tay #208's
     // paired form)
     let vt = victory_gpu::shader_cache::wave_pairs_vt_listed(&bytes);
-    emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks));
+    // (`VICTORY_UNIFORM_STRICT=<hashes>`: the containers the run's shader cache gives the
+    // stricter first-lane proof)
+    let strict = victory_gpu::shader_cache::uniform_strict_listed(&bytes);
+    emit::with_uniform_strict(strict, || {
+        emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks))
+    });
     if vt {
         eprintln!("WAVE64-PAIRS-VT {}: {:?}", example(), emit::take_wave_pairs_vt());
     }
