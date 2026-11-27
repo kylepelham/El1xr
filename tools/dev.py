@@ -611,15 +611,32 @@ def bench_fields(stats: dict[str, object]) -> str:
     )
 
 
+MENU_SELFTEST = "VICTORY_MENU_SELFTEST"
+
+
 def apply_snaps(overrides: dict[str, str], every_s: float, snap_dir: Path) -> dict[str, str]:
     """`--snap-every N`: the game writes a PNG every N seconds (victory-gpu `snap.rs`) into
-    `snap_dir`, emptied of an earlier run's snaps first."""
-    if every_s <= 0:
+    `snap_dir`, emptied of an earlier run's snaps first. With `VICTORY_MENU_SELFTEST` (the menu's
+    scripted pass, which implies `VICTORY_MENU=1`), its `menu-*.png` grabs go there too."""
+    selftest = MENU_SELFTEST in overrides
+    if every_s <= 0 and not selftest:
         return overrides
     snap_dir.mkdir(parents=True, exist_ok=True)
-    for old in snap_dir.glob("snap-*.png"):
+    for old in [*snap_dir.glob("snap-*.png"), *snap_dir.glob("menu-*.png")]:
         old.unlink()
-    return {"VICTORY_SNAP_EVERY_S": f"{every_s:g}", "VICTORY_SNAP_DIR": str(snap_dir), **overrides}
+    out = {"VICTORY_SNAP_DIR": str(snap_dir)}
+    if every_s > 0:
+        out["VICTORY_SNAP_EVERY_S"] = f"{every_s:g}"
+    if selftest:
+        out["VICTORY_MENU"] = "1"
+    return {**out, **overrides}
+
+
+def menu_pngs_field(overrides: dict[str, str], snap_dir: Path) -> str:
+    """` menu_pngs=N` for a run with the menu's selftest, else nothing."""
+    if MENU_SELFTEST not in overrides:
+        return ""
+    return f" menu_pngs={len(list(snap_dir.glob('menu-*.png')))}"
 
 
 def run_bench(
@@ -662,15 +679,18 @@ def bench_ok(stats: dict[str, object]) -> bool:
 def cmd_bench(args: argparse.Namespace) -> int:
     log_path = DEV_DIR / "bench.log"
     snap_dir = DEV_DIR / "bench_snaps"
+    user_overrides: dict[str, str] = {}
     try:
-        stats, resets_before, resets_after, snaps = run_bench(args, parse_overrides(args.override), log_path, snap_dir)
+        user_overrides = parse_overrides(args.override)
+        stats, resets_before, resets_after, snaps = run_bench(args, user_overrides, log_path, snap_dir)
     except (FileNotFoundError, ValueError) as exc:
         ensure_coord_dirs()
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
         print(f"DEV bench FAIL {bench_fields(parse_victory_log(''))}")
         return 1
     ok = bench_ok(stats)
-    snapped = f" snaps={snaps} snap_dir={snap_dir}" if args.snap_every > 0 else ""
+    menu = menu_pngs_field(user_overrides, snap_dir)
+    snapped = f" snaps={snaps}{menu} snap_dir={snap_dir}" if args.snap_every > 0 or menu else ""
     print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}")
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
@@ -740,6 +760,9 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "VICTORY_CAPTURE": str(cap_dir),
         "VICTORY_CAPTURE_WORLD": "1",
     }
+    menu_dir = cap_dir / "menu"
+    if MENU_SELFTEST in user_overrides:
+        overrides = apply_snaps({**overrides, **user_overrides}, 0.0, menu_dir)
     overrides.update(user_overrides)
     overrides, mute = apply_mute_default(overrides, args.unmute)
     with isolated_save_data_dir(args.save, f"capture_{safe_tag}") as data_dir:
@@ -764,7 +787,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(
         f"DEV capture {status} boot_s={float(stats['boot_s']):.1f} "
         f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} refused_ahead={int(stats['refused_ahead'])} "
-        f"driver_resets={_count(resets_after)} dir={cap_dir}"
+        f"driver_resets={_count(resets_after)}{menu_pngs_field(user_overrides, menu_dir)} dir={cap_dir}"
     )
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
