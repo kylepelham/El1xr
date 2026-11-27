@@ -6,7 +6,9 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::thread::LocalKey;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -520,16 +522,32 @@ thread_local! {
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Restore the previous mode even when a worker catches a panic and
+/// translates another shader on the same thread.
+fn with_lowering_mode<R>(mode: &'static LocalKey<Cell<bool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        mode: &'static LocalKey<Cell<bool>>,
+        previous: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.mode.set(self.previous);
+        }
+    }
+    let _restore = Restore {
+        mode,
+        previous: mode.replace(true),
+    };
+    f()
+}
+
 /// Runs `f` with LDS reads and writes inside one lane-branch region accepted
 /// ([`lds_meetings`]): the two host waves of a console wave meet only where
 /// such a region is entered and left. APPROXIMATE: a value one half writes and
 /// the other half reads inside the region may be read stale. The last resort
 /// for console wave64 programs a 32-lane host would otherwise refuse.
 pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
-    let was = LDS_LOOSE.replace(true);
-    let r = f();
-    LDS_LOOSE.set(was);
-    r
+    with_lowering_mode(&LDS_LOOSE, f)
 }
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
@@ -549,10 +567,7 @@ pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
 // console's 32-lane programs that share LDS within a wave), the fences only keeping its
 // compiler from moving one thread's accesses past each other.
 pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
-    let was = PAIRED.replace(true);
-    let r = f();
-    PAIRED.set(was);
-    r
+    with_lowering_mode(&PAIRED, f)
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -563,10 +578,7 @@ pub(super) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    with_lowering_mode(&LOCAL_ANY, || with_local_waves(f))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -586,10 +598,7 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    with_lowering_mode(&LOCAL_WAVES, f)
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
@@ -634,10 +643,7 @@ thread_local! {
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
 pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
-    let before = FIRST_HALF_PAIRS.replace(true);
-    let result = translate();
-    FIRST_HALF_PAIRS.set(before);
-    result
+    with_lowering_mode(&FIRST_HALF_PAIRS, translate)
 }
 
 /// Whether programs with console lanes in groups of several host waves take their console
@@ -11366,6 +11372,56 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn scoped_lowering_modes_restore_after_a_panic() {
+        use super::{
+            FIRST_HALF_PAIRS, LDS_LOOSE, LOCAL_ANY, LOCAL_WAVES, PAIRED, with_first_half_pairs,
+            with_local_waves, with_local_waves_any, with_loose_lds, with_paired_lanes,
+        };
+
+        let modes = || {
+            (
+                LOCAL_WAVES.get(),
+                LOCAL_ANY.get(),
+                FIRST_HALF_PAIRS.get(),
+                LDS_LOOSE.get(),
+                PAIRED.get(),
+            )
+        };
+        assert_eq!(modes(), (false, false, false, false, false));
+
+        with_local_waves(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| {
+                    with_loose_lds(|| {
+                        with_paired_lanes(|| assert_eq!(modes(), (true, true, true, true, true)));
+                        assert_eq!(modes(), (true, true, true, true, false));
+                    });
+                    assert_eq!(modes(), (true, true, true, false, false));
+                });
+                assert_eq!(modes(), (true, true, false, false, false));
+            });
+            assert_eq!(modes(), (true, false, false, false, false));
+        });
+        assert_eq!(modes(), (false, false, false, false, false));
+
+        let failure = std::panic::catch_unwind(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| {
+                    with_loose_lds(|| {
+                        with_paired_lanes(|| {
+                            assert_eq!(modes(), (true, true, true, true, true));
+                            panic!("synthetic lowering panic");
+                        });
+                    });
+                });
+            });
+        })
+        .expect_err("the lowering panic should be caught");
+        assert_eq!(failure.downcast_ref::<&str>(), Some(&"synthetic lowering panic"));
+        assert_eq!(modes(), (false, false, false, false, false));
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
