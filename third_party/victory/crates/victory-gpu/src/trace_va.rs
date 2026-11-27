@@ -93,6 +93,8 @@ fn config() -> Option<&'static Config> {
 static RANGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 static ANY: AtomicBool = AtomicBool::new(false);
 static LINES: AtomicU64 = AtomicU64::new(0);
+/// Host lists a watched shader was dispatched into.
+static LISTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The watched shader of the dispatch this thread is recording, if any.
@@ -147,6 +149,20 @@ fn line(what: &str, from: u64, to: u64, extra: u64) {
     );
 }
 
+/// A list-wide command (`what`: a sync, a barrier) recorded into host list
+/// `list`; logged for the lists watched shaders were dispatched into.
+pub(crate) fn list_op(what: &str, list: usize, extra: u64) {
+    if !on() || !LISTS.lock().unwrap_or_else(|e| e.into_inner()).contains(&list) {
+        return;
+    }
+    line(what, list as u64, list as u64, extra);
+}
+
+/// Whether `[address, address + len)` touches a traced range.
+pub(crate) fn watched(address: u64, len: u64) -> bool {
+    on() && overlaps(address, address.saturating_add(len))
+}
+
 /// A host action on title memory `[address, address + len)`; `extra` is its
 /// count (bytes copied, written...).
 pub(crate) fn event(what: &str, address: u64, len: u64, extra: u64) {
@@ -179,6 +195,12 @@ pub(crate) fn dispatch(this: crate::object::This, list: usize) -> Option<Tagged>
         .find(|d| d == hash)
         .unwrap_or_else(|| Box::leak(hash.clone().into_boxed_str()));
     TAG.set(Some(hash));
+    {
+        let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+        if !lists.contains(&list) {
+            lists.push(list);
+        }
+    }
     line("dispatch", list as u64, list as u64, 0);
     Some(Tagged)
 }

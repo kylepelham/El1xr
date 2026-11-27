@@ -5581,6 +5581,11 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        for &(a, e) in ranges {
+            crate::trace_va::event("copy back done", a as u64, (e - a) as u64, 0);
+            self.trace_differs("after copy back differs", a, e - a);
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self
@@ -5980,10 +5985,60 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(self: &Arc<Self>, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        if crate::trace_va::on() {
+            let end = address + len;
+            let busy = if self.has_pending.load(Ordering::Acquire) {
+                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                pending.iter().filter(|&&(a, e)| a < end && e > address).count() as u64
+            } else {
+                0
+            };
+            crate::trace_va::event("refresh pending", address as u64, len as u64, busy);
+            self.trace_differs("refresh differs", address, len);
+        }
         let n = self.update_inner(address, len);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event("refresh copied", address as u64, len as u64, n as u64);
         n
+    }
+
+    /// (diagnostics, `VICTORY_TRACE_VA`) Logs how many bytes of title memory
+    /// `[address, address + len)` differ from the copy's CPU side, and where
+    /// the first one is; only for traced ranges of a copy not in place.
+    #[cfg(feature = "diagnostics")]
+    fn trace_differs(&self, what: &str, address: usize, len: usize) {
+        if self.place.is_some()
+            || self.window
+            || self.transient()
+            || self.data.is_null()
+            || !crate::trace_va::watched(address as u64, len as u64)
+        {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into_fast(from as *const u8, &mut title) {
+            return;
+        }
+        // SAFETY: inside the mapping of the copy's CPU side.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        let mut first = None;
+        let mut n = 0u64;
+        for (i, (a, b)) in title.iter().zip(held).enumerate() {
+            if a != b {
+                first.get_or_insert(i);
+                n += 1;
+            }
+        }
+        if let Some(i) = first {
+            let kind = if self.card.is_some() { " (card)" } else { " (host)" };
+            crate::trace_va::event(&format!("{what}{kind}"), (from + i) as u64, 1, n);
+        }
     }
 
     fn update_inner(self: &Arc<Self>, address: usize, len: usize) -> usize {
@@ -6621,6 +6676,16 @@ impl Shadow {
             None
         };
         let iter = merged.as_deref().unwrap_or(runs);
+        #[cfg(feature = "diagnostics")]
+        if let (Some(first), Some(last)) = (iter.first(), iter.last()) {
+            let bytes: usize = iter.iter().map(|&(_, m)| m).sum();
+            crate::trace_va::event(
+                if coalesce { "card send (refresh)" } else { "card send (under writes)" },
+                self.start + (at + first.0) as u64,
+                (last.0 + last.1 - first.0) as u64,
+                bytes as u64,
+            );
+        }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         for &(r, m) in iter {
             let (from, to) = (at + r, at + r + m);

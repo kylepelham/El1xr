@@ -851,6 +851,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::list_op("barrier", list as *const crate::host::HostList as usize, u64::from(count));
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -1713,7 +1715,12 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(_this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(list) = host_list(_this) {
+        crate::trace_va::list_op("sync", list as *const crate::host::HostList as usize, u64::from(_flags));
+    }
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2281,6 +2288,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::list_op("barrier groups", list as *const crate::host::HostList as usize, u64::from(count));
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier =
