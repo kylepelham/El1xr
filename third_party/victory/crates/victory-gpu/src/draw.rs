@@ -3663,6 +3663,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -5601,6 +5603,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        #[cfg(feature = "diagnostics")]
+        crate::trace_va::view(kind == ResourceType::Uav, address, len);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

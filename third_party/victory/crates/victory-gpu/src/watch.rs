@@ -1403,6 +1403,8 @@ fn clear_subpages_range(first: usize, last: usize) {
 /// Notes `page` written at asking `now`; what it held before (0: nothing). Says nothing of
 /// which 4 KiB pages, so with [`watch_4k`] or [`dirty4k_kept`] the whole page counts.
 fn written_set(page: usize, now: u64) -> u64 {
+    #[cfg(feature = "diagnostics")]
+    crate::trace_va::event("title write", (page * PAGE) as u64, PAGE as u64, now);
     if watch_4k() {
         // Before the page's stamp, which a reader looks at first.
         match part_of(&WHOLE, page, true) {

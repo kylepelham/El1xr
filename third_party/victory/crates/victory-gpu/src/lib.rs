@@ -95,6 +95,8 @@ mod ramline;
 mod shadow;
 #[cfg(windows)]
 mod copy_profile;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
 #[cfg(windows)]
