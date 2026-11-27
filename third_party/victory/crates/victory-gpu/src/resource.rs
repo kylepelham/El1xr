@@ -1559,6 +1559,67 @@ pub(crate) fn host_waits(this: This) -> bool {
             .is_none()
 }
 
+/// [`host_waits`] without waiting for the texture's lock: `None` while
+/// another thread holds it (making its host copy, mostly, which takes
+/// milliseconds; `VICTORY_HEAP_SYNC_BUSY_LATER`).
+#[cfg(windows)]
+pub(crate) fn host_waits_now(this: This) -> Option<bool> {
+    if this.is_null() || !lazy() {
+        return Some(false);
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.host.refused.load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(false);
+    }
+    match r.host.made.try_lock() {
+        Ok(made) => Some(made.is_none()),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().is_none()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// A 4x4 title texture without its host copy, for other modules' tests;
+/// let go with [`test_release_texture`].
+#[cfg(all(test, windows))]
+pub(crate) fn test_lazy_texture() -> This {
+    let null = std::ptr::null();
+    let mut image = null;
+    let properties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 4,
+        height: 4,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 0,
+    };
+    let made = create_committed(null, &properties, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image);
+    assert_eq!(made, S_OK);
+    image
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_release_texture(this: This) {
+    crate::object::release_boxed::<Resource>(this);
+}
+
+/// Holds texture `this`'s lock, as a thread making its host copy does.
+#[cfg(all(test, windows))]
+pub(crate) fn test_hold_texture(this: This) -> Box<dyn std::any::Any> {
+    Box::new(resource(this).host.made.lock().unwrap())
+}
+
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
