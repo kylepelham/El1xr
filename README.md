@@ -23,7 +23,8 @@ El1xr is Bone/Nevaa's GTA VI emulation project: a fork of [AnyXboxX](https://git
 >
 > - 🎮 **The world is playable at 4K, 24-25 fps once settled** on an RTX 5090 (three quiet benchmark runs: 24.9, 25.2 and 24.2 fps). The goal is a steady 30 fps.
 > - ✅ **0 refused GPU pipelines** and no GPU device loss in benchmark runs.
-> - ✅ Cutscenes play in full and the first missions have been played through; the first frame of the world appears 46-52 s after launch.
+> - ✅ Cutscenes play in full and the first missions have been played through.
+> - ⚡ **Batch 1 merged**: launch to the first world frame now about 31-33 s (was 41-54 s), and the worst freeze when entering the world 1.5-1.9 s (was 7.6-8.1 s).
 > - 🚧 About **60 more speed-ups are written and in testing** (see [In testing](#in-testing)).
 
 ## At a glance
@@ -35,10 +36,10 @@ El1xr is Bone/Nevaa's GTA VI emulation project: a fork of [AnyXboxX](https://git
 | 99th-percentile frame | 68-73 ms | no hitches |
 | CPU time to prepare a frame | 25-26 ms | under the GPU's time |
 | Refused GPU pipelines | **0** | 0 |
-| Launch to first world frame | 46-52 s | |
+| Launch to first world frame | ~31-33 s | |
 | Streaming after entering the world | 52-63 s | a few seconds |
 
-Measured with `python tools/dev.py bench --quiet --seconds 200`: fast boot from a fixed checkpoint, nothing else running on the machine, numbers read from the emulator's own frame log.
+Measured with `python tools/dev.py bench --quiet --seconds 200`: fast boot from a fixed checkpoint, nothing else running on the machine, numbers read from the emulator's own frame log. The launch time comes from batch 1's runs, made while other work was building, so a quiet machine should do a little better.
 
 ## Test machine
 
@@ -92,8 +93,8 @@ Both are what the work in testing goes after.
 
 Work is written in parallel and tested in batches on the one GPU: every change sits behind its own `VICTORY_*` switch, a batch runs all new switches on against all off, and each switch is kept or dropped on the numbers and the screenshots.
 
-- **Batch 1 (running)**: memory pools for textures and buffers, unlocked texture staging, fewer descriptor rebuilds, memory mapping on 8 threads, parallel character baking at load, shaders translated as soon as the game creates them, merged GPU submissions, cheaper alias copies, and the face and hair fixes.
-- **Batch 2 (next)**: title memory in 2 MiB sections (mapping time 55.5 s → 7.3 s upstream), game buffers kept in GPU memory (−15 % frame time upstream on an RTX 5090), DLSS upscaling, higher priority for the emulator's frame threads, offline shader and pipeline pre-warming, and hardware ray tracing on the RT cores.
+- **Batch 1 (done, 20 switches kept)**: unlocked texture staging, fewer descriptor rebuilds and lock waits, parallel character baking at load, shaders translated as soon as the game creates them, faster pipeline-library loads, leaner memory mapping, and the outfit, face and hair fixes (Lucia's diner top was right in 4 of 5 runs, against 0 of 2 before). Dropped for now: the texture and buffer memory pools (they slowed memory unmaps) and two switches that crashed; their writers are fixing them.
+- **Batch 2 (running)**: title memory in 2 MiB sections (mapping time 55.5 s → 7.3 s upstream), game buffers kept in GPU memory (−15 % frame time upstream on an RTX 5090), DLSS upscaling, higher priority for the emulator's frame threads, offline shader and pipeline pre-warming, and hardware ray tracing on the RT cores.
 
 ## Run it
 
