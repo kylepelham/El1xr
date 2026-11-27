@@ -2808,6 +2808,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    reads: step_reads::Reads,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -3403,7 +3404,7 @@ pub(crate) fn joinable(before: &[&HostList], after: &[&HostList]) -> bool {
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by_walk(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -8507,20 +8508,17 @@ impl HostList {
             COPIES_JOINED[1].fetch_add(1, Ordering::Relaxed);
             if join_copies() {
                 *n += len;
+                deferred.copy_joined(dst as usize, src as usize, len);
                 return;
             }
         }
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.push_step(Step::Copy(dst as usize, src as usize, len));
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, false));
+        self.deferred().push_step(Step::Fill(dst as usize, src as usize, len, false));
     }
 
     /// (Neptune) As [`HostList::defer_fill`], for the bytes of a constant
@@ -8538,9 +8536,7 @@ impl HostList {
         static WAIT: OnceLock<bool> = OnceLock::new();
         let wait = *WAIT
             .get_or_init(|| std::env::var_os("VICTORY_CONSTANTS_WAIT").is_some_and(|v| v == "1"));
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, !wait));
+        self.deferred().push_step(Step::Fill(dst as usize, src as usize, len, !wait));
     }
 
     /// Records a submission-time fill for a misaligned root CBV. Copies and
@@ -8998,7 +8994,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.changes.fetch_add(1, Ordering::Relaxed);
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.push_step(Step::Run(Box::new(work)));
         deferred.title_write();
         self.cbv_epoch.fetch_add(1, Ordering::Relaxed);
     }
@@ -9015,7 +9011,7 @@ impl HostList {
     /// submitted and records its upload on the prelude if changed, keeping
     /// both staging and host texture alive until the list is reset.
     pub(crate) fn defer_texture(&self, upload: crate::texture::PreludeUpload) {
-        self.deferred().copies.push(Step::Texture(upload));
+        self.deferred().push_step(Step::Texture(upload));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -10627,6 +10623,7 @@ impl Meter {
         }
         {
             crate::card_constants::line(frames);
+            step_reads::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
@@ -11838,6 +11835,9 @@ mod readcopy;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_step_reads.rs"]
+mod step_reads;
+use step_reads::blocked_by;
 
 #[cfg(test)]
 #[path = "host_tests.rs"]
