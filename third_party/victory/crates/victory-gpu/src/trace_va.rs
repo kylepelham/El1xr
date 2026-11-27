@@ -99,6 +99,9 @@ static LISTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 thread_local! {
     /// The watched shader of the dispatch this thread is recording, if any.
     static TAG: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// The first shader of any other dispatch this thread is recording, so
+    /// the binds of the passes around the watched ones are named too.
+    static OTHER: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 pub(crate) fn on() -> bool {
@@ -144,7 +147,7 @@ fn line(what: &str, from: u64, to: u64, extra: u64) {
         from = format_args!("{from:#x}"),
         len = to - from,
         extra,
-        tag = TAG.get().unwrap_or("-"),
+        tag = TAG.get().or(OTHER.get()).unwrap_or("-"),
         "trace_va {what}"
     );
 }
@@ -189,14 +192,32 @@ pub(crate) struct Tagged;
 impl Drop for Tagged {
     fn drop(&mut self) {
         TAG.set(None);
+        OTHER.set(None);
     }
+}
+
+/// `hash` as a string that lives for the run (one per shader).
+fn interned(hash: &str) -> &'static str {
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&n) = names.iter().find(|&&n| n == hash) {
+        return n;
+    }
+    let n: &'static str = Box::leak(hash.to_owned().into_boxed_str());
+    names.push(n);
+    n
 }
 
 /// A dispatch of title pipeline `this` into host list `list` begins.
 pub(crate) fn dispatch(this: crate::object::This, list: usize) -> Option<Tagged> {
     let c = config()?;
     let shaders = crate::pipeline::shaders_of(this);
-    let hash = c.hashes.iter().find(|h| shaders.contains(h.as_str()))?;
+    let Some(hash) = c.hashes.iter().find(|h| shaders.contains(h.as_str())) else {
+        // `[compute 0123456789abcdef]`: the first shader's hash.
+        let first = shaders.split_whitespace().nth(1).map(|h| h.trim_end_matches([']', ',']));
+        OTHER.set(first.filter(|h| h.len() == 16).map(interned));
+        return Some(Tagged);
+    };
     let hash: &'static str = DEFAULT_HASHES
         .iter()
         .copied()
