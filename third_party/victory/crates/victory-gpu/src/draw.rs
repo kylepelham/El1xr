@@ -3646,6 +3646,9 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             uploads += 1;
             let live = host.texture_slot_done(index, write, again);
+            if live {
+                crate::descriptor::host::live_watch::uploaded(index, resource);
+            }
             // Whole and uploaded: looked at again (`texture_slots_rechecked`).
             let recheck = memory.map(|(at, len)| {
                 (
@@ -6002,6 +6005,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         crate::bake_watch::view(address as u64, len as u64, kind == ResourceType::Uav);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
+            crate::descriptor::host::live_watch::uav_wrote(address as u64, len as u64);
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {

@@ -197,6 +197,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_LIST_REAP", Apply::Restart),
     ("VICTORY_LIST_SLOTS", Apply::Restart),
     ("VICTORY_LIVE_TEXTURES", Apply::Restart),
+    ("VICTORY_LIVE_TEXTURES_DIAG", Apply::Live),
+    ("VICTORY_LIVE_TEXTURES_SKIP_GPU_WRITTEN", Apply::Live),
     ("VICTORY_LOADING_DRAIN", Apply::Live),
     ("VICTORY_LOOKUP_CACHE", Apply::Restart),
     ("VICTORY_MAPPED_BY_PAGE", Apply::Restart),

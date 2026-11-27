@@ -187,6 +187,17 @@ fn holder(targets: &BTreeMap<u64, usize>, r: &Resource) -> Option<This> {
     (address < start.checked_add(size)?).then_some(other as This)
 }
 
+/// (#115, `crate::descriptor::host::live_watch`) The start of a texture
+/// the host writes whose memory holds part of `[at, at + len)`: the last
+/// one starting before its end, if it reaches it.
+pub(crate) fn target_over(at: u64, len: u64) -> Option<u64> {
+    let end = at.checked_add(len.max(1))?;
+    let targets = super::TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &other) = targets.range(..end).next_back()?;
+    let size = super::footprint(&super::resource(other as This).desc)?.size;
+    (at < start.checked_add(size)?).then_some(start)
+}
+
 /// [`super::alias_of`]'s answer from the table of targets, held locked,
 /// for a placed texture no target twins: with `VICTORY_PLACED_INSIDE`, the
 /// target whose memory holds it, if its levels and layers line up. Says
