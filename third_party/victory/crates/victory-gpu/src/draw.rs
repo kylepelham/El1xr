@@ -3387,8 +3387,11 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: what the slot showed is let go. (`VICTORY_BAKE_KEEP_GONE=1`:
+                    // not a bake draw's own input, which would read the null view.)
+                    if !crate::bake_publish::keeps_gone(i < pinned) {
+                        host.texture_slot_gone(index);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }

@@ -19,6 +19,8 @@
 //! held back by another list (its upload was recorded in a list that is in the air, or not sent
 //! yet if the title sends its lists out of order). Off: nothing is shown before its list has run,
 //! as before.
+//!
+//! `VICTORY_BAKE_KEEP_GONE=1` (`keeps_gone`): a bake input unmapped at record time keeps its slot.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -39,6 +41,24 @@ fn parse(v: Option<&str>) -> u64 {
 /// 0 off, 1 the bake's own list, 2 every list.
 pub(crate) fn mode() -> u64 {
     MODE.get()
+}
+
+/// `VICTORY_BAKE_KEEP_GONE=1` (live): a bake draw's own input (pinned by `VICTORY_BAKE_INPUTS`)
+/// whose memory the title has not mapped when the draw is recorded keeps what its slot showed.
+/// The texture pass lets go of a texture streamed out (`HostHeap::texture_slot_gone`), and that
+/// writes a null view into the shader-visible slot at once: the bake, run on the card later,
+/// reads zeros, a black face the title keeps until it bakes again. The title may map the pages
+/// after it records the draw and before it submits; the slot stays due either way.
+pub(crate) static KEEP_GONE: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_BAKE_KEEP_GONE");
+
+/// Whether the texture pass keeps the slot of an unmapped texture (`pinned`: a bake's own input).
+pub(crate) fn keeps_gone(pinned: bool) -> bool {
+    if !pinned || !KEEP_GONE.get_bool() {
+        return false;
+    }
+    add(C::KeptGone, 1);
+    true
 }
 
 /// `2`: the shows held back by any list, by (title heap, slot): the slot's descriptor handle and
@@ -92,8 +112,10 @@ pub(crate) enum C {
     Moved,
     /// Bake draws whose parameters or records could not be read.
     Unread,
+    /// Unmapped bake inputs whose slot was kept, not nulled (`VICTORY_BAKE_KEEP_GONE=1`).
+    KeptGone,
 }
-const N: usize = 6;
+const N: usize = 7;
 const NAMES: [&str; N] = [
     "bakes",
     "inputs",
@@ -101,6 +123,7 @@ const NAMES: [&str; N] = [
     "other_list",
     "moved",
     "unread",
+    "kept_gone",
 ];
 static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -120,7 +143,7 @@ fn roll() {
         return;
     }
     let c: [u64; N] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed));
-    if c[C::Bakes as usize] == 0 && c[C::Unread as usize] == 0 {
+    if c[C::Bakes as usize] == 0 && c[C::Unread as usize] == 0 && c[C::KeptGone as usize] == 0 {
         return;
     }
     if LINES.fetch_add(1, Relaxed) >= MAX_LINES {
@@ -159,6 +182,19 @@ pub(crate) fn take_mine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_gone_only_for_a_bakes_own_input() {
+        assert!(!keeps_gone(false));
+        if std::env::var_os("VICTORY_BAKE_KEEP_GONE").is_some() {
+            return;
+        }
+        assert!(!keeps_gone(true), "off");
+        victory_core::settings::set("VICTORY_BAKE_KEEP_GONE", "1").unwrap();
+        let (own, other) = (keeps_gone(true), keeps_gone(false));
+        victory_core::settings::set("VICTORY_BAKE_KEEP_GONE", "").unwrap();
+        assert!(own && !other);
+    }
 
     #[test]
     fn values() {
@@ -231,7 +267,7 @@ mod tests {
         c[C::SameList as usize] = 2;
         assert_eq!(
             line(&c),
-            "bakes=3 inputs=0 same_list=2 other_list=0 moved=0 unread=0"
+            "bakes=3 inputs=0 same_list=2 other_list=0 moved=0 unread=0 kept_gone=0"
         );
     }
 }
