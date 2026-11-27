@@ -82,6 +82,9 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    /// `[earlydepthstencil]`: depth and stencil are tested (and written)
+    /// before the pixel program runs. No `SFI0` bit.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -483,6 +486,23 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// Sets `EARLY_DEPTH` (`[earlydepthstencil]`) when the console's
+    /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12) is set and the
+    /// pixel program exports neither depth nor stencil ref (which DXIL
+    /// forbids alongside early depth/stencil).
+    pub fn set_early_depth(&mut self, db_shader_control: u32) {
+        const Z_EXPORT: u32 = 1 << 0;
+        const STENCIL_EXPORT: u32 = 1 << 1;
+        const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+        if self.pixel
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & (Z_EXPORT | STENCIL_EXPORT) == 0
+            && !self.outputs.iter().any(|o| matches!(o.kind, 17..=20))
+        {
+            self.flags |= flags::EARLY_DEPTH;
+        }
     }
 
     /// The finished container.
@@ -933,5 +953,64 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig(kind: u8) -> SigElement {
+        SigElement {
+            name: String::new(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn early_depth_follows_db_shader_control_and_forbids_depth_or_stencil_exports() {
+        const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+        const Z_EXPORT: u32 = 1 << 0;
+        const STENCIL_EXPORT: u32 = 1 << 1;
+
+        // Pixel shader with DEPTH_BEFORE_SHADER and no depth/stencil export sets EARLY_DEPTH.
+        let mut ps = Shader::new(true);
+        ps.set_early_depth(DEPTH_BEFORE_SHADER);
+        assert_ne!(ps.flags & flags::EARLY_DEPTH, 0);
+
+        // Without DEPTH_BEFORE_SHADER, EARLY_DEPTH stays clear.
+        let mut plain = Shader::new(true);
+        plain.set_early_depth(0);
+        assert_eq!(plain.flags & flags::EARLY_DEPTH, 0);
+
+        // Z_EXPORT or STENCIL_EXPORT in DB_SHADER_CONTROL suppresses EARLY_DEPTH.
+        let mut z_bit = Shader::new(true);
+        z_bit.set_early_depth(DEPTH_BEFORE_SHADER | Z_EXPORT);
+        assert_eq!(z_bit.flags & flags::EARLY_DEPTH, 0);
+
+        let mut stencil_bit = Shader::new(true);
+        stencil_bit.set_early_depth(DEPTH_BEFORE_SHADER | STENCIL_EXPORT);
+        assert_eq!(stencil_bit.flags & flags::EARLY_DEPTH, 0);
+
+        // Declared SV_Depth* (17..=19) or SV_StencilRef (20) outputs suppress EARLY_DEPTH.
+        for kind in 17..=20 {
+            let mut out_ps = Shader::new(true);
+            out_ps.outputs.push(sig(kind));
+            out_ps.set_early_depth(DEPTH_BEFORE_SHADER);
+            assert_eq!(out_ps.flags & flags::EARLY_DEPTH, 0, "output kind {kind}");
+        }
+
+        // Non-pixel shaders never set EARLY_DEPTH.
+        let mut vs = Shader::new(false);
+        vs.set_early_depth(DEPTH_BEFORE_SHADER);
+        assert_eq!(vs.flags & flags::EARLY_DEPTH, 0);
     }
 }

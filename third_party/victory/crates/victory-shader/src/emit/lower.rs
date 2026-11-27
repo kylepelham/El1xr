@@ -884,6 +884,9 @@ impl<'a> Lower<'a> {
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps { db_shader_control, .. } = x.native.io {
+            s.set_early_depth(db_shader_control);
+        }
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
         // the like are found by the elements around them; what is left out goes at the end)
         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
