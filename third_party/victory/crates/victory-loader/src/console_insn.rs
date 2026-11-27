@@ -559,11 +559,11 @@ mod tests {
             VirtualFree(code_page as _, 0, MEM_RELEASE);
             VirtualFree(base as _, 0, MEM_RELEASE);
         }
-        // Free memory: refused, the exception stays the title's.
-        // Re-allocate code_page just for the final check on the freed `base` address.
+        // Free memory: refused, the exception stays the title's. The null page is free and can
+        // never be allocated, unlike the freed `base`, which a test running in parallel may get.
         let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
         ctx.Rip = lone.as_ptr() as u64;
-        ctx.Rax = (base + 0x40) as u64;
+        ctx.Rax = 0x40;
         assert_eq!(unsafe { emulate(&mut ctx) }, 0);
     }
 }
