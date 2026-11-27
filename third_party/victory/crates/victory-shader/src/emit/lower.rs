@@ -4895,6 +4895,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad reads in a pixel
+    /// program (`VICTORY_QUAD_HELPERS=1`; Belobug, via VItoriaBr 2b3c339ef1). At a
+    /// triangle's edge the quad's other pixels are helpers (and so are discarded ones), which
+    /// only quad reads see: wave reads leave them out, so a derivative taken by hand
+    /// (`quad_perm`) was the whole value there, the texture read that used it took its
+    /// smallest level, and the triangles' edges showed as lines on car paint, glass and skin.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel && super::quad_helpers::on()
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -5049,7 +5059,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)

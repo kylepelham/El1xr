@@ -104,6 +104,7 @@ mod mesh_launch;
 mod miss_sky;
 pub mod nvidia;
 mod own_bits;
+mod quad_helpers;
 mod ray_query;
 #[cfg(all(test, windows))]
 mod ray_query_warp_tests;
@@ -3006,6 +3007,35 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A derivative taken by hand (`quad_perm:[1,0,3,2]`, the neighbour across x) reads its
+    /// neighbour through quad reads with `VICTORY_QUAD_HELPERS=1` (a helper lane at a
+    /// triangle's edge is in the quad, not in the wave's reads); off, the translation is
+    /// byte-identical to before, and a program without quad reads is the same either way.
+    #[test]
+    fn a_pixel_quad_permutation_reads_helpers_only_with_the_switch() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_02FA, // v_mov_b32 v3, v2 quad_perm:[1,0,3,2] bound_ctrl:1
+            0xFF08_B102,
+            v_add_f32(2, 2, 3),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let off = quad_helpers::with(false, || pixel(&words, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&words, PERSP_CENTER)).unwrap();
+        assert_ne!(on.dxil, off.dxil);
+        assert_eq!(off.dxil, pixel(&words, PERSP_CENTER).unwrap().dxil);
+        validate(&off);
+        validate(&on);
+        let plain = [0xC808_0000, 0xC809_0001, e0, e1, S_ENDPGM];
+        let off = quad_helpers::with(false, || pixel(&plain, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&plain, PERSP_CENTER)).unwrap();
+        assert_eq!(on.dxil, off.dxil);
     }
 
     /// A pixel program with TEXCOORD0..2 in rows 0..2 that reads only attribute 2's z
