@@ -228,6 +228,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_QUIET_BACK_WATCHED", Apply::Restart),
     ("VICTORY_READY_TABLES", Apply::Restart),
     ("VICTORY_READ_BACK", Apply::Restart),
+    ("VICTORY_RECHECK_TAIL", Apply::Restart),
     ("VICTORY_REFLECT_KNEE", Apply::Restart),
     ("VICTORY_REFRESH_CHECK", Apply::Restart),
     ("VICTORY_REF_PS", Apply::Retranslate),

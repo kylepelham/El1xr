@@ -16,6 +16,7 @@ use crate::host::host;
 
 mod flicker;
 mod list_views;
+mod recheck_tail;
 mod slot_wait;
 pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
@@ -1073,9 +1074,7 @@ impl TextureQueue {
                 };
                 self.rechecks.insert(index, next);
             }
-            None => {
-                self.rechecks.remove(&index);
-            }
+            None => self.looks_over(index, seen, frame, recheck_tail::every()),
         }
     }
 
@@ -1956,6 +1955,7 @@ impl HostHeap {
             };
             found[usize::from(changed)] += 1;
             if changed {
+                recheck_tail::changed(index, &seen, frame);
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 40 || n.is_multiple_of(1000) {
