@@ -218,13 +218,15 @@ def _worktree_tools(psutil) -> list:
 
 
 @contextlib.contextmanager
-def builds_suspended(psutil_module=None, rescan_s: float = 1.0) -> Iterator[int]:
+def builds_suspended(psutil_module=None, rescan_s: float = 1.0, builds: bool = True) -> Iterator[int]:
     """`--quiet` without the wait: suspends every build (`_build_tree`) and worktree tool or test
     executable (`_worktree_tools`, which includes writers' GPU tests) for the duration and resumes
     them after, so a quiet run starts at once and nothing competes with the game for the CPU or the
     card. Rescans every `rescan_s` seconds so programs started during the run are caught too. This
-    dev.py, its parents and everything it starts (the game, its prewarm) are spared. Yields how many
-    were suspended at the start. A no-op without psutil."""
+    dev.py, its parents and everything it starts (the game, its prewarm) are spared. `builds=False`
+    leaves builds running and suspends only the worktree tools (loud runs: builds go on at idle
+    priority, but no test may share the card with the game). Yields how many were suspended at the
+    start. A no-op without psutil."""
     psutil = psutil_module
     if psutil is None:
         try:
@@ -251,7 +253,7 @@ def builds_suspended(psutil_module=None, rescan_s: float = 1.0) -> Iterator[int]
             spared.update(c.pid for c in me.children(recursive=True))
         except Exception:
             pass
-        for proc in _build_tree(psutil) + _worktree_tools(psutil):
+        for proc in (_build_tree(psutil) if builds else []) + _worktree_tools(psutil):
             if proc.pid in spared or proc.pid in paused:
                 continue
             try:
