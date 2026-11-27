@@ -418,7 +418,7 @@ def test_a_train_run_holds_the_gpu_lock_and_quiets_builds_as_train(tmp_path, mon
         events.append(("gpu", tag))
         yield
 
-    def fake_run(cmd, log_path, seconds):
+    def fake_run(cmd, log_path, seconds, monitor=None):
         events.append(("run", seconds))
         log_path.write_text("", encoding="utf-8")
 

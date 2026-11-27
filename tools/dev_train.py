@@ -37,8 +37,12 @@ Plan (TOML or JSON; every key optional but `sets`):
     prewarm_ahead = true                # while an arm runs (not a quiet one), translate the next arm's
                                         # variant at idle priority
     ahead_jobs = 8                      # its worker threads
+    early_stop = true                   # end a run once the settled world is steady (tools/dev_early.py);
+                                        # default: on for loud arms, off for quiet ones
+    min_seconds = 90                    # early stop never before this (from launch), never after `seconds`
+    steady_seconds = 60                 # steady windows needed after the world settled
 
-A set may say `quiet = true|false` (its runs only; not inherited through `from`). `[live.<name>]` tables are
+A set may say `quiet = true|false` and `early_stop = true|false` (its runs only; not inherited through `from`). `[live.<name>]` tables are
 live arms (one launch, Live settings switched A/B/A/B; see tools/dev_live.py); `order` names them like sets.
 
 Values are strings, numbers or booleans (true is "1", false "0"). Results go to
@@ -68,8 +72,14 @@ DEFAULT_SECONDS = 200
 DEFAULT_SNAP_EVERY = 15.0
 PLAN_KEYS = {
     "seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets", "greps",
-    "live", "prewarm", "prewarm_ahead", "ahead_jobs",
+    "live", "prewarm", "prewarm_ahead", "ahead_jobs", "early_stop", "min_seconds", "steady_seconds",
 }
+SET_FLAGS = ("from", "quiet", "early_stop")
+DEFAULT_MIN_SECONDS = 90
+DEFAULT_STEADY_SECONDS = 60
+# `--all`: per arm beyond its seconds (boot, prewarm made ahead, report), plus once for the first prewarm and a retry.
+ALL_ARM_EXTRA_S = 150
+ALL_EXTRA_S = 300
 PREWARM_MODES = ("pipelines", "shaders", "none")
 DEFAULT_AHEAD_JOBS = 8
 # A run's Drift gpu lock: its seconds, plus boot grace, prewarm and margin, never under 20 minutes (AGENTS.md).
@@ -115,6 +125,10 @@ class Plan:
     prewarm: str = "pipelines"
     prewarm_ahead: bool = True
     ahead_jobs: int = DEFAULT_AHEAD_JOBS
+    early_stop: bool | None = None
+    set_early: dict[str, bool] = field(default_factory=dict)
+    min_seconds: int = DEFAULT_MIN_SECONDS
+    steady_seconds: int = DEFAULT_STEADY_SECONDS
 
 
 def _value(key: str, value: object) -> str:
@@ -130,7 +144,7 @@ def _overrides(where: str, table: object) -> dict[str, str]:
         raise PlanError(f"{where}: a table of VICTORY_* values")
     out: dict[str, str] = {}
     for key, value in table.items():
-        if key in ("from", "quiet"):
+        if key in SET_FLAGS:
             continue
         if not OVERRIDE_KEY_RE.match(key):
             raise PlanError(f"{where}: '{key}' is not a VICTORY_* name")
@@ -209,6 +223,10 @@ def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None 
         prewarm=prewarm,
         prewarm_ahead=bool(data.get("prewarm_ahead", True)),
         ahead_jobs=int(data.get("ahead_jobs", DEFAULT_AHEAD_JOBS)),
+        early_stop=bool(data["early_stop"]) if "early_stop" in data else None,
+        set_early={n: bool(t["early_stop"]) for n, t in raw_sets.items() if isinstance(t, dict) and "early_stop" in t},
+        min_seconds=int(data.get("min_seconds", DEFAULT_MIN_SECONDS)),
+        steady_seconds=int(data.get("steady_seconds", DEFAULT_STEADY_SECONDS)),
     )
 
 
@@ -234,6 +252,33 @@ def step_quiet(plan: Plan, name: str) -> bool:
     if name in plan.live and plan.live[name].quiet is not None:
         return bool(plan.live[name].quiet)
     return plan.set_quiet.get(name, plan.quiet)
+
+
+def step_early_stop(plan: Plan, name: str, quiet: bool) -> bool:
+    """Whether a run of this set ends early once steady: the set's `early_stop`, else the plan's, else on for a
+    loud run and off for a quiet one. Never for a live arm (its segments are scheduled)."""
+    if name in plan.live:
+        return False
+    if name in plan.set_early:
+        return plan.set_early[name]
+    return plan.early_stop if plan.early_stop is not None else not quiet
+
+
+def pending_steps(plan: Plan, done: dict[int, dict[str, object]]) -> list[tuple[int, str]]:
+    """What `--all` runs: every step of the order not run yet, and every step a stop ended (run again)."""
+    return [
+        (step, name) for step, name in enumerate(plan.order, 1)
+        if step not in done or done[step].get("stopped")
+    ]
+
+
+def all_ttl_minutes(plan: Plan, pending: list[tuple[int, str]]) -> int:
+    """The Drift gpu lock's ttl_minutes for one `--all` call over these steps (every arm at its full seconds)."""
+    if not pending:
+        return TTL_MIN_MINUTES
+    secs = sum(step_seconds(plan, n) + ALL_ARM_EXTRA_S for _, n in pending)
+    secs += ALL_EXTRA_S + max(step_seconds(plan, n) for _, n in pending)
+    return max(TTL_MIN_MINUTES, -(-secs // 60))
 
 
 def ttl_minutes(plan: Plan, name: str) -> int:

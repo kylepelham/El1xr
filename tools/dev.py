@@ -18,16 +18,20 @@ import statistics
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import dev_autovis
 import dev_driver
+import dev_early
 import dev_gate
 import dev_greps
 import dev_live
+import dev_look
 import dev_png
 import dev_prewarm
+import dev_runner
 import dev_stats
 import dev_throttle
 import dev_train
@@ -74,6 +78,7 @@ OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 WORLD_DRAWS_MIN = 100.0
 LOADING_P50_MS = 100.0
 BUILD_GRACE_SECS = 600.0
+MONITOR_POLL_SECS = 2.0
 
 
 def ensure_coord_dirs() -> None:
@@ -306,8 +311,14 @@ def kill_process_tree(pid: int) -> None:
             pass
 
 
-def run_timed_victory(cmd: list[str], log_path: Path, seconds: int) -> tuple[bool, int]:
+def run_timed_victory(
+    cmd: list[str], log_path: Path, seconds: int, monitor: dev_early.Monitor | None = None
+) -> tuple[bool, int]:
+    """Runs the launcher until `seconds` after the game mapped (or BUILD_GRACE_SECS without it); a `monitor` reads
+    the log's new lines every MONITOR_POLL_SECS and may end the run sooner (early stop, fatal lines)."""
     ensure_coord_dirs()
+    tail = dev_early.LogTail(log_path) if monitor is not None else None
+    polled = 0.0
     with log_path.open("wb") as logf:
         proc = subprocess.Popen(
             cmd,
@@ -331,6 +342,11 @@ def run_timed_victory(cmd: list[str], log_path: Path, seconds: int) -> tuple[boo
                 elif now - launched_at >= seconds:
                     timed_out = True
                     break
+                elif tail is not None and now - polled >= MONITOR_POLL_SECS:
+                    polled = now
+                    if monitor.feed(tail.read(), now - launched_at):
+                        timed_out = True
+                        break
                 time.sleep(0.5)
         finally:
             if proc.poll() is None:
@@ -399,6 +415,9 @@ def parse_victory_log(text: str) -> dict[str, object]:
     world_window_ts: list[tuple[datetime, float]] = []
     timed_windows: list[dev_stats.Window] = []
     hitches: list[tuple[datetime, int, float]] = []
+    last_ts: datetime | None = None
+    frame_lines = 0
+    hang_stall_s = 0.0
 
     for raw_line in text.splitlines():
         line = ANSI_RE.sub("", raw_line)
@@ -408,6 +427,10 @@ def parse_victory_log(text: str) -> dict[str, object]:
             line_ts = datetime.fromisoformat(ts_match.group(1).replace("Z", "+00:00"))
             if first_ts is None:
                 first_ts = line_ts
+            last_ts = line_ts
+        stood = dev_early.stall_seconds(line)
+        if stood is not None:
+            hang_stall_s = max(hang_stall_s, stood)
         if ALERT_LEVEL_RE.search(line) and "device removed" in line.lower():
             device_removed = True
         kind = dev_stats.refusal(line)
@@ -417,6 +440,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
             refused_ahead += 1
         m_frame = FRAME_RE.search(line)
         if m_frame:
+            frame_lines += 1
             fps = float(m_frame.group(1))
             prep_ms = float(m_frame.group(3))
             gpu_ms = float(m_frame.group(8))
@@ -460,6 +484,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
     boot_s = (first_world_ts - first_ts).total_seconds() if (first_ts and first_world_ts) else 0.0
     settled_ts = settled_world_ts(world_window_ts)
     settled_s = (settled_ts - first_ts).total_seconds() if (first_ts and settled_ts) else 0.0
+    frames = int(sum(w["frames"] for w in pacing_windows)) if pacing_windows else frame_lines
     return {
         "world_samples": len(world_rows),
         "boot_s": boot_s,
@@ -472,6 +497,9 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "refused": refused,
         "refused_ahead": refused_ahead,
         "device_removed": device_removed,
+        "frames": frames,
+        "world_s": (last_ts - first_world_ts).total_seconds() if (last_ts and first_world_ts) else 0.0,
+        "hang_stall_s": hang_stall_s,
         **summarize_pacing(pacing_windows),
         **dev_stats.world_phase(timed_windows, hitches),
     }
@@ -602,9 +630,10 @@ def run_bench(
             data_dir=data_dir,
             title_args=title_args,
         )
+        monitor = getattr(args, "monitor", None)
         with acquire_gpu_lock(what), _quiet(args, what):
             resets_before = dev_driver.resets_since_boot()
-            run_timed_victory(cmd, log_path, args.seconds)
+            run_timed_victory(cmd, log_path, args.seconds, *([monitor] if monitor is not None else []))
             resets_after = dev_driver.resets_since_boot()
     stats = parse_victory_log(read_log_text(log_path))
     snaps = len(list(snap_dir.glob("snap-*.png"))) if args.snap_every > 0 else 0
@@ -829,7 +858,10 @@ def train_lives(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_
     return out
 
 
-def train_verdict(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> int:
+def write_verdict(
+    plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path
+) -> tuple[str, list[dict[str, object]], list[str]]:
+    """verdict.md and verdict.json: (text, rows, floor sources)."""
     scans = train_scans(plan, done, train_dir)
     base = dev_greps.baseline_warns([scans[s] for s in sorted(scans) if done[s]["set"] == plan.baseline])
     flagged: dict[str, list[str]] = {}
@@ -844,6 +876,11 @@ def train_verdict(plan: dev_train.Plan, done: dict[int, dict[str, object]], trai
     train_dir.mkdir(parents=True, exist_ok=True)
     (train_dir / "verdict.md").write_text(text, encoding="utf-8")
     (train_dir / "verdict.json").write_text(json.dumps({"floor": floor, "rows": rows}, indent=2), encoding="utf-8")
+    return text, rows, sources
+
+
+def train_verdict(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> int:
+    text, rows, sources = write_verdict(plan, done, train_dir)
     print(text, end="")
     counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in ("KEEP", "DROP", "INCONCLUSIVE")}
     print(f"DEV train-verdict PASS rows={len(rows)} keep={counts['KEEP']} drop={counts['DROP']} "
@@ -959,6 +996,9 @@ def cmd_train(args: argparse.Namespace) -> int:
     done = dev_train.load_results(train_dir)
     if args.list:
         print(dev_train.listing(plan, done), end="")
+        pending = dev_train.pending_steps(plan, done)
+        print(f"--all: {len(pending)} arms pending; hold the Drift gpu lock with "
+              f"ttl_minutes>={dev_train.all_ttl_minutes(plan, pending)} for the whole call")
         print(f"DEV train-list PASS runs={len(done)} next={dev_train.next_pending(plan, done)} dir={train_dir}")
         return 0
     if args.compare:
@@ -974,23 +1014,74 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.warm:
         return train_warm_only(plan, done, train_dir, args)
     if args.report:
-        text, figures = dev_train.report(plan, done, train_scans(plan, done, train_dir), train_lives(plan, done, train_dir))
-        visual = dev_visual.report_section(train_dir)
-        if visual:
-            text += "\n".join(visual) + "\n"
-        train_dir.mkdir(parents=True, exist_ok=True)
-        (train_dir / "report.md").write_text(text, encoding="utf-8")
-        (train_dir / "report.json").write_text(json.dumps(figures, indent=2), encoding="utf-8")
+        text = write_report(plan, done, train_dir)
         print(text, end="")
         print(f"DEV train-report PASS runs={len(done)} next={dev_train.next_pending(plan, done)} "
               f"report={train_dir / 'report.md'}")
         return 0
+    if args.autovis:
+        return train_autovis(plan, done, train_dir)
+    if args.all:
+        return train_all(plan, done, train_dir, args)
+    if args.quick:
+        return train_quick(plan, done, train_dir, args)
     try:
         step, name = dev_train.pick(plan, done, args.run)
     except dev_train.PlanError as exc:
         print(f"error: {exc}")
         print("DEV train FAIL reason=run")
         return 1
+    rid = dev_train.run_id(step, name)
+    record, why = train_arm(plan, done, train_dir, step, name, args)
+    if record is None:
+        log = f" log={train_dir / f'prewarm_{name}.log'}" if why == "prewarm" else ""
+        print(f"DEV train FAIL run={rid} reason={why}{log}")
+        return 1
+    ok = bool(record["ok"])
+    stats, after = record["stats"], record["resets_after"]
+    nxt_id = dev_train.next_pending(plan, done)
+    nxt_after = dev_train.next_after(plan, done, 0)
+    ttl = f" next_ttl_min={dev_train.ttl_minutes(plan, nxt_after[1])}" if nxt_after else ""
+    ahead_info = record["ahead"]
+    ahead_field = f"{ahead_info['set']}:{ahead_info['translated'] if ahead_info['ok'] else 'failed'}" if ahead_info else "none"
+    print(
+        f"{_dev_line('train', ok, {'run': rid})} {bench_fields(stats)} driver_resets={_count(after)} "
+        f"snaps={record['snaps']} next={nxt_id}{ttl} prewarm={record['prewarm']} ahead={ahead_field} "
+        f"ended={record['ended']['how']}:{record['ended'].get('at_s', record['seconds'])}s log={record['log']}"
+    )
+    if "live" in record:
+        print(_live_line(rid, record["live"]))
+    _print_driver_warning(record["resets_before"], after)
+    _print_hang_lines(Path(str(record["log"])))
+    return 0 if ok else 1
+
+
+def write_report(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> str:
+    """report.md and report.json (with the `--visual` hints when they ran); returns the text."""
+    text, figures = dev_train.report(plan, done, train_scans(plan, done, train_dir), train_lives(plan, done, train_dir))
+    visual = dev_visual.report_section(train_dir)
+    if visual:
+        text += "\n".join(visual) + "\n"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    (train_dir / "report.md").write_text(text, encoding="utf-8")
+    (train_dir / "report.json").write_text(json.dumps(figures, indent=2), encoding="utf-8")
+    return text
+
+
+def append_log_line(path: Path, line: str) -> None:
+    """Appends a line to a run's log in its own encoding (UTF-16 after a byte order mark, else UTF-8)."""
+    head = path.read_bytes()[:2] if path.exists() else b""
+    encoding = "utf-16-le" if head == b"\xff\xfe" else "utf-16-be" if head == b"\xfe\xff" else "utf-8"
+    with path.open("ab") as fh:
+        fh.write(f"{line}\n".encode(encoding))
+
+
+def train_arm(
+    plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, step: int, name: str,
+    args: argparse.Namespace, ahead_next: bool = True,
+) -> tuple[dict[str, object] | None, str]:
+    """One arm: its prewarm, the prewarm ahead of the next pending arm, the run (early stop and the fatal watch of
+    `dev_early`), and its record saved into `done` and `train_dir`. (record, "") or (None, "prewarm"|"setup")."""
     rid = dev_train.run_id(step, name)
     train_dir.mkdir(parents=True, exist_ok=True)
     log_path = train_dir / f"{rid}.log"
@@ -1001,18 +1092,21 @@ def cmd_train(args: argparse.Namespace) -> int:
         schedule.write_text(dev_live.schedule_text(arm), encoding="utf-8")
         overrides["VICTORY_SETTINGS_SCHEDULE"] = str(schedule)
     quiet = args.quiet if args.quiet is not None else dev_train.step_quiet(plan, name)
+    seconds = getattr(args, "seconds", None) or dev_train.step_seconds(plan, name)
+    monitor = dev_early.Monitor(
+        early=dev_train.step_early_stop(plan, name, quiet), min_s=plan.min_seconds, steady_s=plan.steady_seconds,
+    )
     bench_args = argparse.Namespace(
         game_dir=args.game_dir, fast_boot=plan.fast_boot, save=plan.save, skip_intro=False, title_args=[],
-        unmute=plan.unmute, diag=False, seconds=dev_train.step_seconds(plan, name), quiet=quiet,
-        snap_every=plan.snap_every,
+        unmute=plan.unmute, diag=False, seconds=seconds, quiet=quiet, snap_every=plan.snap_every, monitor=monitor,
     )
     ahead = None
+    t0 = time.monotonic()
     try:
         warm_ok, warm = train_warm(plan, name, args.game_dir, train_dir)
         if not warm_ok:
-            print(f"DEV train FAIL run={rid} reason=prewarm log={train_dir / f'prewarm_{name}.log'}")
-            return 1
-        nxt = dev_train.next_after(plan, done, step)
+            return None, "prewarm"
+        nxt = dev_train.next_after(plan, done, step) if ahead_next else None
         # Not during a quiet run: those are the final before/after numbers and must have the machine to themselves.
         if plan.prewarm_ahead and plan.prewarm != "none" and not quiet and nxt is not None:
             ahead = start_ahead(plan, nxt[1], resolve_game_dir(args.game_dir), train_dir)
@@ -1021,32 +1115,122 @@ def cmd_train(args: argparse.Namespace) -> int:
         if ahead is not None:
             finish_ahead(ahead, kill=True)
         print(f"error: {exc}")
-        print(f"DEV train FAIL run={rid} reason=setup")
-        return 1
+        return None, "setup"
+    except BaseException:
+        if ahead is not None:
+            finish_ahead(ahead, kill=True)
+        raise
     ahead_info = finish_ahead(ahead) if ahead is not None else None
-    ok = bench_ok(stats)
+    ended = monitor.ended or {"how": "time"}
+    if monitor.ended:
+        line = monitor.summary()
+        append_log_line(log_path, f"dev.py train: {line}")
+        print(f"DEV train: {rid}: {line}", flush=True)
+    text = read_log_text(log_path)
     done[step] = {
-        "step": step, "set": name, "kind": "live" if arm is not None else "set", "overrides": overrides, "ok": ok,
-        "stats": stats, "resets_before": before, "resets_after": after, "snaps": snaps, "log": str(log_path),
-        "quiet": quiet, "prewarm": warm, "ahead": ahead_info,
-        "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "step": step, "set": name, "kind": "live" if arm is not None else "set", "overrides": overrides,
+        "ok": bench_ok(stats), "stats": stats, "resets_before": before, "resets_after": after, "snaps": snaps,
+        "log": str(log_path), "quiet": quiet, "prewarm": warm, "ahead": ahead_info, "seconds": seconds,
+        "ended": ended, "fatal": dev_greps.scan_log(text, {}).fatal, "wall_s": round(time.monotonic() - t0, 1),
+        "finished": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     if arm is not None:
-        done[step]["live"] = dev_live.analyse(arm, read_log_text(log_path))
+        done[step]["live"] = dev_live.analyse(arm, text)
     dev_train.save_result(train_dir, step, done[step])
-    nxt_id = dev_train.next_pending(plan, done)
-    nxt_after = dev_train.next_after(plan, done, 0)
-    ttl = f" next_ttl_min={dev_train.ttl_minutes(plan, nxt_after[1])}" if nxt_after else ""
-    ahead_field = f"{ahead_info['set']}:{ahead_info['translated'] if ahead_info['ok'] else 'failed'}" if ahead_info else "none"
-    print(
-        f"{_dev_line('train', ok, {'run': rid})} {bench_fields(stats)} driver_resets={_count(after)} "
-        f"snaps={snaps} next={nxt_id}{ttl} prewarm={warm} ahead={ahead_field} log={log_path}"
+    return done[step], ""
+
+
+def train_autovis(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> int:
+    """`--autovis`: the automatic visual diff of every run with snaps against its baseline run."""
+    missing = dev_autovis.missing()
+    if missing:
+        print(f"DEV train-autovis FAIL reason=deps ({missing})")
+        return 1
+    summary = dev_autovis.update(plan, done, train_dir)
+    for line in dev_autovis.summary_lines(summary):
+        print(line)
+    print(f"DEV train-autovis PASS pairs={len(summary['pairs'])} flagged={summary['flagged']} "
+          f"black={len(summary['black'])} visual={train_dir / 'autovis' / 'visual.json'}")
+    return 0
+
+
+def train_all(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, args: argparse.Namespace) -> int:
+    """`--all`: every pending arm back to back (`dev_runner.run_all`), the report, verdict and visual diff after
+    each."""
+    pending = dev_train.pending_steps(plan, done)
+    train_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_arm(step: int, name: str) -> dict[str, object] | None:
+        record, why = train_arm(plan, done, train_dir, step, name, args)
+        if record is None and why == "prewarm":
+            record = {"step": step, "set": name, "kind": "set", "ok": False, "stats": parse_victory_log(""),
+                      "prewarm_failed": True, "snaps": 0, "resets_before": None, "resets_after": None}
+            done[step] = record
+            dev_train.save_result(train_dir, step, record)
+        return record
+
+    def after_arm(step: int) -> str:
+        write_report(plan, done, train_dir)
+        write_verdict(plan, done, train_dir)
+        if dev_autovis.missing():
+            return "visual=skipped"
+        try:
+            summary = dev_autovis.update(plan, done, train_dir)
+        except (OSError, ValueError) as exc:
+            return f"visual=error({exc})"
+        rid = dev_train.run_id(step, str(done[step]["set"]))
+        flagged, black = dev_autovis.arm_entries(summary, rid)
+        return f"visual_flagged={len(flagged)} black={len(black)}"
+
+    return dev_runner.run_all(
+        plan, done, train_dir, pending, run_arm, after_arm, args.max_minutes, read_log_text,
     )
-    if arm is not None:
-        print(_live_line(rid, done[step]["live"]))
-    _print_driver_warning(before, after)
-    _print_hang_lines(log_path)
-    return 0 if ok else 1
+
+
+def train_quick(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, args: argparse.Namespace) -> int:
+    """`--quick SET`: one run of a set into `<train dir>/quick/` (not a step of the plan), then `look` against the
+    plan's last baseline run."""
+    name = args.quick
+    if name not in plan.sets:
+        print(f"error: no set '{name}' (sets: {', '.join(plan.sets)})")
+        print("DEV train-quick FAIL reason=run")
+        return 1
+    quick_dir = train_dir / "quick"
+    qdone = dev_train.load_results(quick_dir)
+    step = max(qdone, default=0) + 1
+    record, why = train_arm(plan, qdone, quick_dir, step, name, args, ahead_next=False)
+    if record is None:
+        print(f"DEV train-quick FAIL run=quick/{dev_train.run_id(step, name)} reason={why}")
+        return 1
+    rid = dev_train.run_id(step, name)
+    visual = None
+    base = dev_look.last_baseline(plan, done)
+    if base is not None and not dev_autovis.missing():
+        base_rid = dev_train.run_id(base, str(done[base]["set"]))
+        visual = dev_autovis.compare_runs(
+            f"quick_{rid}", quick_dir / f"{rid}_snaps", base_rid, train_dir / f"{base_rid}_snaps", quick_dir / "autovis",
+        )
+    lines = dev_look.look(plan, done, train_dir, record, f"quick/{rid}", read_log_text, visual=visual, base_step=base)
+    print("\n".join(lines))
+    print(f"{_dev_line('train-quick', bool(record['ok']), {'run': f'quick/{rid}'})} log={record['log']}")
+    return 0 if record["ok"] else 1
+
+
+def cmd_look(args: argparse.Namespace) -> int:
+    """`look PLAN ARM`: one screen of an arm against the baseline (numbers, greps, visual sheets, verdict)."""
+    try:
+        plan = dev_train.load_plan(Path(args.plan), dev_warm.apply_kinds(REPO_ROOT))
+        train_dir = DEV_DIR / f"train_{plan.name}"
+        done = dev_train.load_results(train_dir)
+        step = dev_train.find_run(plan, done, args.arm)
+    except (OSError, dev_train.PlanError) as exc:
+        print(f"error: {exc}")
+        print("DEV look FAIL reason=run")
+        return 1
+    rid = dev_train.run_id(step, str(done[step]["set"]))
+    print("\n".join(dev_look.look(plan, done, train_dir, done[step], rid, read_log_text)))
+    print(f"{_dev_line('look', True, {'run': rid})} dir={train_dir}")
+    return 0
 
 
 def warm_dir() -> Path:
@@ -1270,6 +1454,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="KEEP/DROP/INCONCLUSIVE per set (and live arm) against the baseline, with noise floors from same-set repeats.",
     )
     mode.add_argument(
+        "--all", action="store_true",
+        help="Run every pending step back to back (stops on a driver reset, device removed, a hang watch stall, "
+        "0 frames or settled fps under 5; see <train dir>/STOPPED.md); --list prints the gpu lock ttl it needs.",
+    )
+    mode.add_argument(
+        "--quick", metavar="SET",
+        help="One probe run of SET into <train dir>/quick/ (not a plan step), then `look` against the last baseline run.",
+    )
+    mode.add_argument(
+        "--autovis", action="store_true",
+        help="Visual diff of every run's snaps against its baseline run: autovis/visual.json and flagged sheets.",
+    )
+    mode.add_argument(
         "--warm", nargs="?", const="next", metavar="next|N|SET",
         help="Prewarm check: make the step's shader variant warm as `--run` would before its run (no-op when stamped).",
     )
@@ -1278,8 +1475,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="This run only: hold every build slot (--quiet) or not (--no-quiet), whatever the plan says.",
     )
     p_train.add_argument("--at", nargs="+", type=float, metavar="T", help="Seconds for --region.")
+    p_train.add_argument(
+        "--max-minutes", type=float, default=0.0, metavar="N",
+        help="--all: start no arm that would end more than N minutes after the call started.",
+    )
+    p_train.add_argument("--seconds", type=int, metavar="S", help="This call's runs last at most S seconds (default: the plan's).")
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_train.set_defaults(func=cmd_train)
+
+    p_look = sub.add_parser("look", help="One screen of a train arm against the baseline: numbers, greps, visual, verdict.")
+    p_look.add_argument("plan", help="Plan file (.toml or .json).")
+    p_look.add_argument("arm", help="Step, run id (03_on) or set (its latest passed run).")
+    p_look.set_defaults(func=cmd_look)
 
     p_pre = sub.add_parser(
         "prewarm",
