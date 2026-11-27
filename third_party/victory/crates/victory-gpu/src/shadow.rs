@@ -1356,6 +1356,11 @@ pub(crate) type Uploads = (Arc<Shadow>, Vec<(usize, usize, crate::windowup::Chun
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let lap = crate::joined_apart::lap(ranges.len());
+    if crate::joined_apart::on() && crate::joined_apart::apart(&ranges) {
+        lap.as_they_were();
+        return ranges;
+    }
     if !ranges.is_sorted() {
         ranges.sort_unstable();
     }
@@ -1739,6 +1744,22 @@ mod card_tests {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             assert_eq!(joined(sorted.clone()), two_vectors(sorted), "sorted {ranges:?}");
+            // (`crate::joined_apart`, Vice-Tay #286) Ranges it returns as they are are what
+            // the join gives, for these and for ranges in order and apart.
+            let mut at = next(64);
+            let spaced: Vec<(usize, usize)> = (0..n)
+                .map(|_| {
+                    let from = at + 1 + next(3);
+                    at = from + next(300);
+                    (from, at)
+                })
+                .collect();
+            assert!(crate::joined_apart::apart(&spaced));
+            for r in [&ranges, &spaced] {
+                if crate::joined_apart::apart(r) {
+                    assert_eq!(*r, two_vectors(r.clone()), "{r:?}");
+                }
+            }
         }
     }
 }
