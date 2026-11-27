@@ -371,14 +371,22 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+/// With the `mimalloc` feature the blocks come from mimalloc instead, or
+/// from the process heap when `VICTORY_ALLOC=system` (`crate::heap`).
 struct Counting;
 
-// SAFETY: every call goes to the system's allocator unchanged; only
+/// Where [`Counting`] gets its blocks.
+#[cfg(not(feature = "mimalloc"))]
+const INNER: std::alloc::System = std::alloc::System;
+#[cfg(feature = "mimalloc")]
+const INNER: crate::heap::Chosen = crate::heap::Chosen;
+
+// SAFETY: every call goes to the inner allocator unchanged; only
 // counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { INNER.alloc(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -388,7 +396,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { INNER.alloc_zeroed(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -400,12 +408,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         own(layout.size(), false);
         big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { INNER.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { INNER.realloc(at, layout, size) };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);
@@ -1179,6 +1187,17 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
+    #[cfg(feature = "mimalloc")]
+    crate::heap::log_once();
+    #[cfg(not(feature = "mimalloc"))]
+    {
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, Relaxed) {
+            tracing::info!(
+                "the Rust side's blocks come from the process heap (built without mimalloc)"
+            );
+        }
+    }
     let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
     let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);

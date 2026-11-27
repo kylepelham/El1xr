@@ -6058,7 +6058,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         // Where the piece's last compare kept these bytes,
@@ -6405,7 +6408,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         let from = inflight_piece_from(&r.span, p);
@@ -6641,7 +6647,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -9445,12 +9454,12 @@ impl Batch {
             && !crate::watch::ask_once_active();
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = copies
-                .iter()
-                .filter(|c| !c.shadow.unwatched())
-                .filter_map(|c| c.refresh_span)
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            crate::watch::ask_ahead(
+                copies
+                    .iter()
+                    .filter(|c| !c.shadow.unwatched())
+                    .filter_map(|c| c.refresh_span),
+            );
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && copies.len() >= 2 {
