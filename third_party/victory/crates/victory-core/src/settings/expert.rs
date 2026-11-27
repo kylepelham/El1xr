@@ -298,6 +298,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STRICT_JOINS", Apply::Retranslate),
     ("VICTORY_SUBMIT_CHUNKS", Apply::Restart),
     ("VICTORY_SWEEP", Apply::Restart),
+    ("VICTORY_SWEEP_EVERY_MS", Apply::Restart),
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
     // a flip would compare against stale state and miss changed records (wrong descriptors).
     ("VICTORY_SYNC_IN_PLACE", Apply::Restart),
