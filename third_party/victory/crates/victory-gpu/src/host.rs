@@ -6378,7 +6378,7 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
-                    } else if !batch.pending_textures.is_empty() {
+                    } else if !batch.pending_textures.is_empty() || batch.early.started() {
                         // Host callbacks can use a refresh result, including the
                         // mip mask that maps a reserved texture for this upload.
                         batch.flush_textures();
@@ -6410,7 +6410,12 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        if crate::tex_check::parallel_refresh() {
+                        if crate::tex_check::parallel_refresh() && crate::tex_early::on() {
+                            let staging = upload.staging.clone();
+                            batch
+                                .early
+                                .start(move || crate::shadow::as_wide_job(|| staging.refresh()));
+                        } else if crate::tex_check::parallel_refresh() {
                             batch.pending_textures.push(upload.staging.clone());
                         } else {
                             upload.staging.refresh();
@@ -6647,6 +6652,9 @@ struct Batch {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Due staging buffers deferred until the next title write or flush.
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Due checks started at their step (`VICTORY_TEX_EARLY=1`), joined where
+    /// `pending_textures` are run.
+    early: crate::tex_early::Early,
     /// Disjoint upload-memory fills (`dst`, `src`, `len`) deferred until the
     /// next title write or flush so large batches copy in parallel.
     pending_fills: Vec<(usize, usize, usize)>,
@@ -6748,11 +6756,17 @@ impl Batch {
 
     /// Refreshes any queued due textures side by side (`crate::tex_check`).
     fn flush_textures(&mut self) {
+        if let Some(joined) = self.early.join() {
+            crate::tex_early::account(joined);
+            flush::textures(joined.checks, joined.wall_us);
+        }
         if !self.pending_textures.is_empty() {
             let started = std::time::Instant::now();
             let textures = self.pending_textures.len();
             crate::tex_check::check_textures(std::mem::take(&mut self.pending_textures));
-            flush::textures(textures, started.elapsed().as_micros() as u64);
+            let us = started.elapsed().as_micros() as u64;
+            flush::textures(textures, us);
+            crate::tex_early::waited_today(textures, us);
         }
     }
 
@@ -7859,6 +7873,7 @@ impl Meter {
         crate::port::log(frames);
         crate::port_cbv::log(frames);
         crate::tex_check::log(frames);
+        crate::tex_early::log(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         crate::resource::room_line();
