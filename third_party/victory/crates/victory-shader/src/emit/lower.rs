@@ -68,6 +68,11 @@ pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_mee
 
 #[path = "halves.rs"]
 mod halves;
+
+/// The exchanges of two host waves taking turns between two sets of dwords
+/// (`VICTORY_EXCHANGE_PAIRS=1`).
+#[path = "exchange_pairs.rs"]
+pub(super) mod exchange_pairs;
 pub(crate) use halves::nan_scrub;
 use halves::{all_lane_blocks, lane_constant_masks, lane_scalars, lds_meetings, whole_masks};
 pub(super) use halves::{branches_around, lane_uniform};
@@ -157,6 +162,9 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// The exchanges took turns and left out more meetings than they added
+    /// ([`exchange_pairs`]).
+    pub turns_pay: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -197,8 +205,14 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut turns = exchange_pairs::enabled();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, turns).run() {
+            // the turns saved no meeting: lowered again as with them off
+            Ok(l) if turns && !l.turns_pay => {
+                turns = false;
+                bad.clear();
+            }
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -370,6 +384,9 @@ struct Lower<'a> {
     /// Whether each console wave has four exchange dwords (`[a_lo, a_hi, b_lo, b_hi]`) so a
     /// two-word exchange (`exchange_halves_two`) uses two barriers instead of four.
     exchange_quad: bool,
+    /// With `exchange`: the exchanges take turns between two sets of dwords
+    /// ([`exchange_pairs`]).
+    xpairs: exchange_pairs::ExchangePairs,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -969,7 +986,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, turns: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1008,6 +1025,7 @@ impl<'a> Lower<'a> {
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         let mut exchange_quad = false;
+        let mut exchange_turns = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -1121,7 +1139,11 @@ impl<'a> Lower<'a> {
                                     && s.lds_dwords + 4 * waves <= 8192;
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 exchange_quad = quad;
-                                s.lds_dwords += (if quad { 4 } else { 2 }) * waves;
+                                let per = (if quad { 4 } else { 2 }) * waves;
+                                exchange_turns = turns
+                                    && group > 32
+                                    && s.lds_dwords + 2 * per <= 8192;
+                                s.lds_dwords += if exchange_turns { 2 * per } else { per };
                             }
                         }
                     }
@@ -1364,6 +1386,11 @@ impl<'a> Lower<'a> {
                 }
                 _ => Default::default(),
             },
+            xpairs: exchange_pairs::ExchangePairs::new(
+                exchange_turns,
+                if exchange_quad { 4 } else { 2 },
+                p.blocks.len(),
+            ),
             exchange,
             exchange_quad,
             clane: None,
@@ -2272,6 +2299,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.exchange_entry(b);
             self.meet.lds_run = None;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
@@ -2322,6 +2350,7 @@ impl<'a> Lower<'a> {
             // After the exit: a meet while the branch is emitted moves the terminator
             // into the continuation, and the joins name that block.
             self.tail[b] = Some(self.cur);
+            self.exchange_exit(b);
         }
         self.fill_phis()?;
         // (the paired form: the other lane's joins too; filling one lane's can ask for lane
@@ -2379,6 +2408,7 @@ impl<'a> Lower<'a> {
         self.meet.record_counts();
         Ok(Lowered {
             wave_size,
+            turns_pay: self.xpairs.on && self.xpairs.saved > self.xpairs.added,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -4147,7 +4177,9 @@ impl<'a> Lower<'a> {
             return (lo, hi);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
+        let (at, turn) = self.exchange_turn(at);
         let pair = self.exchange_pair(slot);
+        let pair = self.exchange_set(at, pair, turn);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4163,7 +4195,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        let _at = self.order_waves(at, self.reached_by_group());
+        let _at = self.exchange_done(at, turn);
         (lo, hi)
     }
 
@@ -4195,7 +4227,9 @@ impl<'a> Lower<'a> {
             let hi_b = self.s.m.select(at, upper, b, z);
             return ((lo_a, hi_a), (lo_b, hi_b));
         }
+        let (at, turn) = self.exchange_turn(at);
         let base = self.exchange_pair(slot);
+        let base = self.exchange_set(at, base, turn);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4221,7 +4255,7 @@ impl<'a> Lower<'a> {
         let hi_a = self.s.m.load(at, p1);
         let lo_b = self.s.m.load(at, p2);
         let hi_b = self.s.m.load(at, p3);
-        let _at = self.order_waves(at, self.reached_by_group());
+        let _at = self.exchange_done(at, turn);
         ((lo_a, hi_a), (lo_b, hi_b))
     }
 
@@ -4235,7 +4269,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let shift = self.s.m.i32(if self.exchange_quad { 2 } else { 1 });
+        let shift = self.s.m.i32(u32::from(self.exchange_quad) + 1 + u32::from(self.xpairs.on));
         let scaled = self.s.m.bin(e, Bin::Shl, wave, shift);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, scaled);
