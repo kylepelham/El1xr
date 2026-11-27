@@ -146,7 +146,44 @@ fn queue() -> MutexGuard<'static, Queue> {
 /// textures made ready that nothing took (let go after two seconds).
 pub(crate) static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
-/// Where the pass stands with a slot before it looks at it.
+impl Queue {
+    /// Drops slots currently being prepared (`waiting`, returning how many were
+    /// skipped) and moves slots with prepared textures (`ready_slots`) to the
+    /// front of `due`, preserving relative order within each group.
+    fn prioritize_due(&self, due: &mut Vec<(u32, u64)>) -> (usize, u64) {
+        if self.waiting.is_empty() && self.ready_slots.is_empty() {
+            return (0, 0);
+        }
+        let mut ready = Vec::new();
+        let mut other = Vec::with_capacity(due.len());
+        let mut waiting = 0u64;
+        for &(slot, write) in due.iter() {
+            if self.waiting.contains_key(&slot) {
+                waiting += 1;
+            } else if self.ready_slots.contains_key(&slot) {
+                ready.push((slot, write));
+            } else {
+                other.push((slot, write));
+            }
+        }
+        let ready_count = ready.len();
+        due.clear();
+        due.extend(ready);
+        due.extend(other);
+        (ready_count, waiting)
+    }
+}
+
+/// Classifies a batch of due `(slot, write)` entries under a single lock of the
+/// prepare queue: drops slots currently being prepared (returning how many were
+/// skipped) and moves slots whose prepared textures are ready to the front so
+/// they drain before new work burns the pass budget.
+pub(crate) fn prioritize_due(due: &mut Vec<(u32, u64)>) -> (usize, u64) {
+    queue().prioritize_due(due)
+}
+
+/// Where the pass stands with a slot before it looks at it (tests).
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Slot {
     /// Its texture is handed out and not ready: passed over.
@@ -158,6 +195,7 @@ pub(crate) enum Slot {
 }
 
 /// See [`Slot`].
+#[cfg(test)]
 pub(crate) fn slot(index: u32) -> Slot {
     let q = queue();
     if q.waiting.contains_key(&index) {
@@ -631,6 +669,26 @@ pub(crate) fn wait_idle(most: std::time::Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `prioritize_due` moves ready slots to the front, skips waiting slots,
+    /// preserves relative order inside each group, and is a no-op when idle.
+    #[test]
+    fn prioritize_due_puts_ready_first_and_skips_waiting() {
+        let mut q = Queue::default();
+        let mut due = vec![(1, 10), (2, 11), (3, 12), (4, 13), (5, 14)];
+        assert_eq!(q.prioritize_due(&mut due), (0, 0));
+        assert_eq!(due, [(1, 10), (2, 11), (3, 12), (4, 13), (5, 14)]);
+
+        q.wait(2);
+        q.wait(4);
+        q.hint(&[3, 5]);
+        // Slot 2 is both waiting and ready: waiting wins (still pending newer work).
+        q.hint(&[2]);
+        let (ready_count, skipped) = q.prioritize_due(&mut due);
+        assert_eq!(ready_count, 2);
+        assert_eq!(skipped, 2);
+        assert_eq!(due, [(3, 12), (5, 14), (1, 10)]);
+    }
 
     /// The switch is off unless set: the pass makes its textures itself.
     #[test]

@@ -198,6 +198,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -339,9 +340,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
     Ok(Translated {
         host,
         used,
+        tables,
         stores,
         dxil,
     })
@@ -741,10 +744,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // A set, not a list: every draw and dispatch checks each of its shaders
+    // against `VICTORY_SKIP_PIPELINES`.
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes(&value).into_iter().collect()
     });
     if hashes.is_empty() {
         return None;
@@ -1175,5 +1180,18 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn parse_skip_hashes_normalizes_and_filters_entries() {
+        let set: std::collections::HashSet<String> = parse_skip_hashes(
+            " 0123456789ABCDEF , invalid , fedcba9876543210, 0123456789abcdef ",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("0123456789abcdef"));
+        assert!(set.contains("fedcba9876543210"));
     }
 }
