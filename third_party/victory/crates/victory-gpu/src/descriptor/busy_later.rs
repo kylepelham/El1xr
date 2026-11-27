@@ -27,9 +27,11 @@ use crate::object::This;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+/// Live: textures put in [`BUSY`] while it was on are still asked for by
+/// [`ready`] after it is turned off.
 pub(super) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BUSY_LATER").is_some_and(|v| v == "1"))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_HEAP_SYNC_BUSY_LATER");
+    ON.get_bool()
 }
 
 /// Textures whose lock a mirroring found held, for [`ready`].
@@ -81,6 +83,7 @@ pub(super) fn wait_for(resource: usize, handle: u64, busy: bool) {
             slots.push(handle);
         }
     }
+    HELD.store(true, Relaxed);
     BUSY.lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(resource);
@@ -89,11 +92,15 @@ pub(super) fn wait_for(resource: usize, handle: u64, busy: bool) {
 /// Of the textures put in [`BUSY`], those with their host copy now, whose
 /// waiting slots `make_waiting` makes. Never waits for a texture's lock.
 pub(super) fn ready() -> Vec<usize> {
-    if !on() {
+    if !on() && !HELD.load(Relaxed) {
         return Vec::new();
     }
     ready_now()
 }
+
+/// Whether a texture was ever put in [`BUSY`]: [`ready`] then runs with
+/// the switch off too, so none is left waiting when it is turned off.
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn ready_now() -> Vec<usize> {
     let mut busy = std::mem::take(&mut *BUSY.lock().unwrap_or_else(|e| e.into_inner()));
@@ -150,6 +157,11 @@ pub(super) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_HEAP_SYNC_BUSY_LATER", "1", on, false, true);
+    }
 
     /// The tests share `BUSY` and `ready_now` takes all of it.
     static SERIAL: Mutex<()> = Mutex::new(());

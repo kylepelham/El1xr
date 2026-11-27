@@ -78,8 +78,9 @@ fn kin(old: &View, new: &View) -> Kin {
 
 /// `VICTORY_KEEP_SHOWN`: 0 unset (any texture stands in).
 fn keep_shown() -> u8 {
-    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| parse(std::env::var("VICTORY_KEEP_SHOWN").ok().as_deref()))
+    static KEEP: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_KEEP_SHOWN", |v| u64::from(parse(v)));
+    KEEP.get() as u8
 }
 
 fn parse(value: Option<&str>) -> u8 {
@@ -125,6 +126,11 @@ fn stand_in_as(old: &View, new: &View, keep: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_KEEP_SHOWN", "2", keep_shown, 0, 2);
+    }
 
     fn placed(resource: [u32; 14], format: u32, dimension: u32, address: u32) -> View {
         let mut desc = [0u32; 16];

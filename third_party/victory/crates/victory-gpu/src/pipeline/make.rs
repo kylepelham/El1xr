@@ -151,22 +151,26 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
 /// The longest one scene-input wait may be, whatever is asked.
 const SCENE_WAIT_MOST: u64 = 10_000;
 
-fn ms_from_env(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+fn ms_of(value: Option<&str>, default: u64) -> u64 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 /// What one scene-input wait may last: `VICTORY_SCENE_INPUT_WAIT_MS`
 /// (3000), at most [`SCENE_WAIT_MOST`].
 fn scene_input_wait() -> u64 {
-    static MS: OnceLock<u64> = OnceLock::new();
-    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_WAIT_MS", 3000).min(SCENE_WAIT_MOST))
+    static MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_SCENE_INPUT_WAIT_MS", |v| {
+        ms_of(v, 3000).min(SCENE_WAIT_MOST)
+    });
+    MS.get()
 }
 
 /// What all scene-input waits of a run may last together:
-/// `VICTORY_SCENE_INPUT_TOTAL_MS` (15000).
+/// `VICTORY_SCENE_INPUT_TOTAL_MS` (15000). Live: what was taken stays
+/// taken; a larger total gives the rest.
 fn scene_input_total() -> u64 {
-    static MS: OnceLock<u64> = OnceLock::new();
-    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_TOTAL_MS", 15_000))
+    static MS: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_SCENE_INPUT_TOTAL_MS", |v| ms_of(v, 15_000));
+    MS.get()
 }
 
 /// Takes what a scene-input wait may last, in milliseconds, from the run's
@@ -329,24 +333,24 @@ fn wait_budget(compute: bool) -> Duration {
     if let Some(budget) = TEST_BUDGET.get() {
         return budget;
     }
-    static BUDGET: OnceLock<(Duration, Duration)> = OnceLock::new();
-    let (graphics, compute_budget) = *BUDGET.get_or_init(|| {
-        let override_ms = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok());
-        let graphics = override_ms.unwrap_or(DEFAULT_WAIT_MS);
-        let compute_ms = override_ms.unwrap_or(DEFAULT_WAIT_COMPUTE_MS);
+    // Live: logged at its first use and when it changes.
+    static OVERRIDE: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_PIPELINE_WAIT_MS", |v| {
+        // Plus one: 0 unset.
+        v.and_then(|value| value.trim().parse::<u64>().ok()).map_or(0, |ms| ms.saturating_add(1))
+    });
+    static LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let bits = OVERRIDE.get();
+    let override_ms = bits.checked_sub(1);
+    let graphics = override_ms.unwrap_or(DEFAULT_WAIT_MS);
+    let compute_ms = override_ms.unwrap_or(DEFAULT_WAIT_COMPUTE_MS);
+    if LOGGED.swap(bits, Ordering::Relaxed) != bits {
         tracing::info!(
             graphics,
             compute = compute_ms,
             "host pipeline wait budget per frame, per kind (ms)"
         );
-        (
-            Duration::from_millis(graphics),
-            Duration::from_millis(compute_ms),
-        )
-    });
-    if compute { compute_budget } else { graphics }
+    }
+    Duration::from_millis(if compute { compute_ms } else { graphics })
 }
 
 /// The default gameplay base budgets of [`wait_budget`]: short enough that
@@ -1234,6 +1238,13 @@ mod loading_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wait_budgets_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_SCENE_INPUT_WAIT_MS", "50000", scene_input_wait, 3000, SCENE_WAIT_MOST);
+        check_live("VICTORY_SCENE_INPUT_TOTAL_MS", "100", scene_input_total, 15_000, 100);
+    }
 
     #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {

@@ -20,9 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use super::View;
 
 /// The switch (`VICTORY_VIEW_AGES`; on only when `1`).
+/// Live (a diagnostic): slots that began waiting while it was off are not
+/// counted; turned off, the waits noted are left as they are.
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| switch(std::env::var_os("VICTORY_VIEW_AGES").as_deref()))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_VIEW_AGES", |v| {
+        u64::from(switch(v.map(std::ffi::OsStr::new)))
+    });
+    ON.get_bool()
 }
 
 fn switch(value: Option<&std::ffi::OsStr>) -> bool {
@@ -184,6 +188,11 @@ pub(crate) fn text(view: Option<&View>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_VIEW_AGES", "1", on, false, true);
+    }
 
     #[test]
     fn the_switch_is_on_only_when_one() {
