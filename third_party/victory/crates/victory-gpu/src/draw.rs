@@ -5108,6 +5108,11 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // (`crate::port_order`) Arguments or count in place: never clamped ahead of their place.
+        let at_place = crate::port_order::indirect_at_place(
+            args.in_place(),
+            counter.as_ref().is_some_and(|(s, _)| s.in_place()),
+        );
         if raw_indirect() && kind == MESH && max == 1 && count.is_none() {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5261,6 +5266,7 @@ impl State {
         // the list has recorded so far lets its shaders write: clamped in
         // the list's prelude, and drawn from its slot there.
         if clamp_ahead()
+            && !at_place
             && !windows()
             && kind != DISPATCH
             && max == 1
@@ -5333,6 +5339,7 @@ impl State {
             None
         };
         let windowed = windows()
+            && !at_place
             && kind != DISPATCH
             && max == 1
             && count.is_none()

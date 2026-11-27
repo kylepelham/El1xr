@@ -44,6 +44,8 @@ pub mod hitch;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
+mod port_order;
+#[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
 mod host;
