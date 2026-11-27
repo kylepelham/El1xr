@@ -1908,6 +1908,10 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        // `VICTORY_SKIN_FILL=1`: skin's probe inputs before its first draw of a frame.
+        if crate::skin_fill::on() {
+            self.skin_fill(list, p);
+        }
         if self.depth != 0 {
             // A depth texture shaders also write: sync its depth/stencil plane
             // before `bind` sets heaps, root signature, and pipeline state, so
@@ -5832,6 +5836,7 @@ mod reflect_views;
 
 mod bake_pass;
 mod material_pass;
+mod skin_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

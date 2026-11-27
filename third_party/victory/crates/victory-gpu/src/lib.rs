@@ -174,6 +174,8 @@ mod material_demand;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod skin_fill;
+#[cfg(windows)]
 mod ramline;
 #[cfg(windows)]
 mod shadow;
