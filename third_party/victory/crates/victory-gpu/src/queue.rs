@@ -734,6 +734,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    #[cfg(windows)]
+    crate::timeline::title_submit();
     let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {

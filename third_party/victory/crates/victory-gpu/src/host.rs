@@ -688,6 +688,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
+    crate::timeline::line(frames);
     let [idle, behind, stood] =
         [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -4929,6 +4930,7 @@ impl Host {
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
+            crate::timeline::card_idle(since.elapsed());
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
         }
@@ -6556,6 +6558,7 @@ impl Host {
             }
         }
         // In the order given: what tells the title the card is done.
+        let told = items.iter().filter(|i| !matches!(i, Late::Run(_))).count();
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -6578,6 +6581,7 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
+        crate::timeline::landed(now_us().saturating_sub(landing.elapsed().as_micros() as u64), told);
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
@@ -7123,6 +7127,7 @@ impl Host {
         if !PINNED.with(|pinned| pinned.replace(true)) {
             crate::cores::keep_on_fast_cores();
         }
+        crate::timeline::prep_begins();
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
