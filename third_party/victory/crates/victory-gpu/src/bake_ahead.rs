@@ -99,6 +99,30 @@ fn stage_ahead() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_STAGE_AHEAD").is_some_and(|v| v == "1"))
 }
 
+/// (bootfast) `VICTORY_BAKE_ONE_BUDGET=1`: the threads' time comes out of
+/// the pass's budget. Without it the threads take up to the budget and the
+/// pass then takes the budget again: bake passes of 1,016-1,188 ms at
+/// `VICTORY_BAKE_TEXTURES_MS=500` while the title loaded, with its
+/// recording thread waiting (batch 3 q04: 3.3 s of 11.4 s of bake passes
+/// over their budget; frames 299-411 of the loading screen 0.5-2.2 s each).
+fn one_budget() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ONE_BUDGET").is_some_and(|v| v == "1"))
+}
+
+/// What the pass may take after the threads took `spent` of `budget`
+/// ([`one_budget`]; without it all of `budget` again).
+pub(crate) fn left_after(budget: Duration, spent: Duration) -> Duration {
+    if one_budget() { left_of(budget, spent) } else { budget }
+}
+
+/// `budget` less `spent`, and at least a fifth of `budget`: the pass still
+/// records the uploads of what the threads made ready (well under a
+/// millisecond each), which would be let go unused otherwise.
+fn left_of(budget: Duration, spent: Duration) -> Duration {
+    budget.saturating_sub(spent).max(budget / 5)
+}
+
 /// The most bytes of staging buffers made ready ahead for one pass: what
 /// the pass does not take in its time is let go two seconds later
 /// (`crate::texture::prepare::prune`).
@@ -235,6 +259,20 @@ mod tests {
         assert!(hits.iter().all(|h| h.load(Relaxed) == 1));
         assert_eq!(workers(3, 8), 3);
         assert_eq!(workers(100, 8), 8);
+    }
+
+    /// The threads' time comes out of the pass's budget, a fifth of it left
+    /// at least; off, the whole budget again.
+    #[test]
+    fn one_budget_for_the_threads_and_the_pass() {
+        let ms = Duration::from_millis;
+        assert_eq!(left_of(ms(500), ms(166)), ms(334));
+        assert_eq!(left_of(ms(500), ms(500)), ms(100));
+        assert_eq!(left_of(ms(500), ms(900)), ms(100));
+        assert_eq!(left_of(ms(500), ms(0)), ms(500));
+        if std::env::var_os("VICTORY_BAKE_ONE_BUDGET").is_none() {
+            assert_eq!(left_after(ms(500), ms(500)), ms(500));
+        }
     }
 
     /// Nothing is started past the deadline.

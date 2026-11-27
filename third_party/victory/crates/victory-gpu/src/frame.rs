@@ -84,6 +84,15 @@ pub(crate) fn restart(interval: Duration) {
     });
 }
 
+/// (bootfast) Our clock started again from now at its own interval, after
+/// the last tick handed out: frame waits that did not sleep
+/// (`VICTORY_LOAD_UNPACED`) took ticks ahead of the clock, and paced again
+/// the next wait would sleep until them.
+pub(crate) fn rebase() {
+    let interval = clock().as_ref().map_or(SIXTIETH, |c| c.interval);
+    restart(interval);
+}
+
 /// Device method: events are scheduled at every tick.
 pub(crate) extern "system" fn schedule(
     _: This,
@@ -166,6 +175,9 @@ pub(crate) extern "system" fn wait(
 ) -> HRESULT {
     let origin = kind == ORIGIN;
     crate::load_rate::gate(origin);
+    if origin {
+        crate::boot_prof::tick();
+    }
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the
@@ -181,7 +193,8 @@ pub(crate) extern "system" fn wait(
     // once, a blocking wait ends at once on the next tick): an experiment, to see how much
     // of a slow frame is the title waiting for its own clock.
     static PACED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let paced = *PACED.get_or_init(|| std::env::var_os("VICTORY_PACE").is_none_or(|v| v != "0"));
+    let paced = *PACED.get_or_init(|| std::env::var_os("VICTORY_PACE").is_none_or(|v| v != "0"))
+        && crate::load_rate::paced_now();
     let started = Instant::now();
     let hr = if wait > limit {
         if paced {
@@ -200,6 +213,7 @@ pub(crate) extern "system" fn wait(
     let slot = usize::from(hr != S_OK) * 2 + usize::from(!origin);
     WAITS[slot].fetch_add(1, Ordering::Relaxed);
     WAITS[4 + slot].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    crate::boot_prof::paced(origin, started.elapsed().as_micros() as u64);
     WAITS[8].fetch_max(u64::from(timeout_ms.min(100_000)), Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
@@ -314,5 +328,17 @@ mod tests {
         let (t1, _) = next_tick(FLIP, Some((Duration::from_secs(1), true)));
         let (t2, _) = next_tick(FLIP, Some((Duration::from_secs(1), true)));
         assert!(t2 > t1);
+
+        // (bootfast) Waits that did not sleep (`VICTORY_LOAD_UNPACED`) took
+        // ticks a second ahead of the clock; rebased, the next is within an
+        // interval, after every tick handed out.
+        let ahead = next_tick(ORIGIN, None).0 + 200;
+        LAST[0].fetch_max(ahead, Ordering::Relaxed);
+        let (_, delay) = next_tick(ORIGIN, None);
+        assert!(delay > Duration::from_millis(500), "{delay:?}");
+        rebase();
+        let (tick, delay) = next_tick(ORIGIN, None);
+        assert!(delay <= FLIP_INTERVAL, "{delay:?}");
+        assert!(tick > ahead);
     }
 }

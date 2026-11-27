@@ -269,6 +269,18 @@ if (-not $NoTunedSettings) {
         VICTORY_SAMPLER_ORDER            = '1'         # batch 1: static samplers in a fixed order (fxceless #1461)
         VICTORY_ALIAS_AFTER_UPLOAD       = '1'         # batch 1: GPU-written texture copy kept after a CPU upload (Vice-Tay #141)
         VICTORY_PREFILL_RETRY            = '1'         # batch 1: cached mips kept when upload room runs out (Vice-Tay)
+        VICTORY_CARD_SIDE                = '1'         # batch 3: card-side copies
+        VICTORY_SECTION_MB               = '2'         # batch 3: 2 MB sections
+        VICTORY_HELPER_PRIORITY          = '1'         # batch 3: helper threads above normal
+        VICTORY_DSTORAGE_PRIORITY        = '-1'        # batch 3: DirectStorage thread below normal
+        VICTORY_JOINED_APART             = '1'         # batch 3: joined copies kept apart
+        VICTORY_SCENE_INPUT              = '1'         # batch 3: scene input
+        VICTORY_ALIAS_PINS               = '1'         # batch 3: alias pins
+        VICTORY_STAGING_BLOCKS           = '1'         # batch 3: staging from pooled blocks (boot 32 s vs 60 s)
+        VICTORY_CARD_BUFFER_BLOCKS       = '1'         # batch 3: card buffers from pooled blocks
+        VICTORY_SHARED_BUFFER_BLOCKS     = '1'         # batch 3: shared buffers from pooled blocks
+        VICTORY_UPLOAD_BLOCKS            = '1'         # batch 3: uploads from pooled blocks
+        VICTORY_GUARD_4K                 = '1'         # batch 3: 4 KiB guards, no crash, neutral
     }
     foreach ($name in $tuned.Keys) {
         Set-Item -Path "Env:$name" -Value $tuned[$name]

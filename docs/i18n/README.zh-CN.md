@@ -128,7 +128,7 @@ python tools/dev.py gate       # 全部测试，出现任何警告即失败
 
 | 数字 | 内容 |
 |---|---|
-| 1600+ 个自动化测试 | Python 工具和 Rust crate，由 `dev.py gate` 运行 |
+| 1800+ 个自动化测试 | Python 工具和 Rust crate，由 `dev.py gate` 运行 |
 | 26,148 个着色器程序 | 从 RDNA 2 翻译为 DXIL，缓存在磁盘上 |
 | 0 个被拒绝的管线 | 在 RTX 5090 上 |
 

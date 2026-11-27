@@ -128,7 +128,7 @@ A meta é 30 fps estáveis em 4K na RTX 5090 e, depois, nenhum engasgo e nenhuma
 
 | Número | O quê |
 |---|---|
-| 1600+ testes automatizados | ferramentas em Python e crates em Rust, executados por `dev.py gate` |
+| 1800+ testes automatizados | ferramentas em Python e crates em Rust, executados por `dev.py gate` |
 | 26.148 programas de shader | traduzidos de RDNA 2 para DXIL, em cache no disco |
 | 0 pipelines recusados | na RTX 5090 |
 
