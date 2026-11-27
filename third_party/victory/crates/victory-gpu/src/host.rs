@@ -689,6 +689,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     crate::timeline::line(frames);
+    crate::merge_runs::line(frames);
     let [idle, behind, stood] =
         [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -3424,6 +3425,27 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         line.written.clone()
     };
     blocked_by(&written, runs, true)
+}
+
+/// (feedcard) Whether `after` may go to the card in the same host submission as `before`,
+/// behind it (`crate::merge_runs`): nothing `after` does on the CPU at submission meets what
+/// `before`'s shaders and texture copy-backs write ([`late_blocked`]'s test, with `before` in
+/// the air), and it holds no work of ours that may go anywhere.
+pub(crate) fn joinable(before: &[&HostList], after: &[&HostList]) -> bool {
+    if after.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Run(_)))) {
+        return false;
+    }
+    let mut written = Vec::new();
+    join_ranges(
+        &mut written,
+        declared_writes(before)
+            .into_iter()
+            .flat_map(|(_, ranges)| ranges)
+            .chain(before.iter().flat_map(|l| {
+                l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>()
+            })),
+    );
+    blocked_by(&written, after, false).is_none()
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders

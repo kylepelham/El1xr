@@ -578,6 +578,7 @@ pub(crate) fn release_held(all: bool) {
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
+                            let (lists, order) = take_along(&mut held, lists, order);
                             // Not waited for: the host keeps the lists
                             // until they are settled.
                             if async_submit() {
@@ -638,6 +639,52 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// (feedcard) `VICTORY_MERGE_SUBMISSIONS=1`: the submissions right behind this one in its
+/// queue's line that may go to the card with it, taken out of `held` and put behind it
+/// ([`crate::merge_runs`]).
+#[cfg(windows)]
+fn take_along(
+    held: &mut Vec<Held>,
+    mut lists: Vec<crate::list::Detached>,
+    mut order: Vec<usize>,
+) -> (Vec<crate::list::Detached>, Vec<usize>) {
+    use crate::merge_runs::Next;
+    if !crate::merge_runs::on() || held.is_empty() {
+        return (lists, order);
+    }
+    let mut refused = false;
+    let taken = {
+        let mut runs: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        crate::merge_runs::take(
+            order.len(),
+            held.iter().map(|h| match h {
+                Held::Wait(fence, value) if crate::fence::completed(fence.as_this()) >= *value => Next::Met,
+                Held::Value(wait) if wait.met() => Next::Met,
+                Held::Wait(..) | Held::Value(_) | Held::Signal(..) => Next::Stop,
+                Held::Run(more, more_order) => {
+                    let after: Vec<&crate::host::HostList> = more_order.iter().map(|&i| more[i].host()).collect();
+                    if crate::host::joinable(&runs, &after) {
+                        runs.extend(after);
+                        Next::Run(more_order.len())
+                    } else {
+                        refused = true;
+                        Next::Refused
+                    }
+                }
+            }),
+        )
+    };
+    let mut along = 0;
+    for h in held.drain(..taken) {
+        if let Held::Run(more, more_order) = h {
+            crate::merge_runs::join(&mut lists, &mut order, more, more_order);
+            along += 1;
+        }
+    }
+    crate::merge_runs::gathered(along, refused);
+    (lists, order)
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
