@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="250" viewBox="0 0 900 250" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>Where a 40 ms frame goes on the RTX 5090 (GTA VI, 4K, El1xr, 2026-11-27)</title>
+  <rect width="900" height="250" rx="14" fill="#0d1117"/>
+  <text x="30" y="40" fill="#e6edf3" font-size="20" font-weight="600">Where a frame goes: RTX 5090, 4K, settled play</text>
+  <text x="30" y="64" fill="#8b949e" font-size="13">GPU time per frame, measured with VICTORY_GPU_COST (2026-11-27). 20 px = 1 ms.</text>
+  <g transform="translate(30,90)">
+    <rect x="0" y="0" width="456" height="56" fill="#3fb950"/>
+    <rect x="456" y="0" width="140" height="56" fill="#58a6ff"/>
+    <rect x="596" y="0" width="76" height="56" fill="#a371f7"/>
+    <rect x="672" y="0" width="124" height="56" fill="#f85149"/>
+    <text x="228" y="25" fill="#0d1117" font-size="15" font-weight="700" text-anchor="middle">Game's own GPU passes</text>
+    <text x="228" y="44" fill="#0d1117" font-size="14" text-anchor="middle">22.8 ms</text>
+    <text x="526" y="25" fill="#0d1117" font-size="14" font-weight="700" text-anchor="middle">Emulator GPU work</text>
+    <text x="526" y="44" fill="#0d1117" font-size="14" text-anchor="middle">7.0 ms</text>
+    <text x="634" y="25" fill="#0d1117" font-size="13" font-weight="700" text-anchor="middle">Untimed</text>
+    <text x="634" y="44" fill="#0d1117" font-size="13" text-anchor="middle">3.8 ms</text>
+    <text x="734" y="25" fill="#0d1117" font-size="13" font-weight="700" text-anchor="middle">GPU idle</text>
+    <text x="734" y="44" fill="#0d1117" font-size="13" text-anchor="middle">6.2 ms</text>
+    <line x1="666" y1="-10" x2="666" y2="72" stroke="#e3b341" stroke-width="3" stroke-dasharray="6 4"/>
+    <text x="666" y="90" fill="#e3b341" font-size="13" font-weight="600" text-anchor="middle">30 fps target: 33.3 ms</text>
+    <text x="796" y="90" fill="#8b949e" font-size="13" text-anchor="end">now: ~40 ms (24-25 fps)</text>
+  </g>
+  <g font-size="13" fill="#c9d1d9">
+    <rect x="30" y="200" width="14" height="14" fill="#3fb950"/><text x="52" y="212">title passes (lighting, shadows, post)</text>
+    <rect x="300" y="200" width="14" height="14" fill="#58a6ff"/><text x="322" y="212">clamps, alias copies, card checks, uploads</text>
+    <rect x="600" y="200" width="14" height="14" fill="#f85149"/><text x="622" y="212">waiting for the CPU to prepare work</text>
+  </g>
+</svg>
