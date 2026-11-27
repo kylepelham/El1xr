@@ -5166,7 +5166,7 @@ impl State {
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
             && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && match role {
-                crate::ambient::Role::Miss => crate::ambient::specular().is_some(),
+                crate::ambient::Role::Miss => crate::ambient::specular().is_some() || crate::ambient_sky::sky_bound().is_some(),
                 role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
             }
             && crate::ambient::on()

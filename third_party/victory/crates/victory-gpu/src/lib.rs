@@ -43,6 +43,8 @@ mod ambient;
 mod ambient_miss;
 #[cfg(windows)]
 mod ambient_reflect;
+#[cfg(windows)]
+mod ambient_sky;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 mod boot_prof;
