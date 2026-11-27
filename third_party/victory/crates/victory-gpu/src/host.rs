@@ -10811,6 +10811,9 @@ impl Meter {
                 crate::descriptor::host::KEPT_OTHER_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            if let Some(line) = crate::texstore::line() {
+                tracing::info!("{line}");
+            }
             {
                 let [same, changed, waiting] = [0, 1, 2]
                     .map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));

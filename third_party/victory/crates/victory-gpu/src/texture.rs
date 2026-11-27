@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The title texture's shape, for `crate::texstore`.
+    shape: crate::texstore::Shape,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a list's prelude last
@@ -891,7 +893,18 @@ impl PreludeUpload {
 
     /// Records `CopyTextureRegion` onto `cmd_list` (the prelude command list).
     /// `self.copy.texture` must already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
-    pub(crate) fn record(&self, _host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+    pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+        // A host copy made whole from the store (`crate::texstore`): its larger
+        // levels, once, before the ones from title memory.
+        let prefill = self
+            .copy
+            .prefill
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((levels, bytes)) = prefill {
+            prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes);
+        }
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
@@ -916,6 +929,75 @@ impl PreludeUpload {
             unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
     }
+}
+
+/// Records copies of levels `0..levels` of `copy` (in the copy destination
+/// state) from `bytes`, laid out as the host lays out those subresources;
+/// its views show them from then on.
+fn prefill_levels(
+    host_list: &HostList,
+    cmd_list: &ID3D12GraphicsCommandList,
+    copy: &crate::resource::HostTexture,
+    levels: u32,
+    bytes: &[u8],
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else {
+        return false;
+    };
+    let texture = &copy.texture;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
+        return false;
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `levels` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            levels,
+            0,
+            Some(footprints.as_mut_ptr()),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    if total as usize > bytes.len() {
+        return false;
+    }
+    let Some((buffer, data)) = host.upload_buffer(total) else {
+        return false;
+    };
+    // SAFETY: the mapping holds `total` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
+    host_list.keep(&buffer);
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: an open prelude list; both locations name live resources.
+        unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    copy.prefilled.store(levels, Relaxed);
+    crate::texstore::PREFILLED.fetch_add(1, Relaxed);
+    true
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1371,6 +1453,7 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
+                self.keep_whole(tiled, Some(hash));
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1390,6 +1473,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        self.keep_whole(tiled, Some(hash));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1434,7 +1518,40 @@ impl Staging {
     /// of staying all zeros; otherwise nothing is taken and the texture is
     /// looked at again at its next refresh. Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        refresh_unlocked_with(self.memory, last, size, |bytes| self.detile(bytes))
+        refresh_unlocked_with(self.memory, last, size, |bytes, whole, hash| {
+            self.detile(bytes);
+            if whole {
+                self.keep_whole(bytes, Some(hash));
+            }
+        })
+    }
+
+    /// `tiled`, read whole, was detiled: a texture of all its levels from
+    /// level 0 is given to the store (`crate::texstore`); detiling, digests
+    /// and disk writes run on the store's own thread.
+    fn keep_whole(&self, tiled: &[u8], hash: Option<blake3::Hash>) {
+        if !crate::texstore::on()
+            || self.first != 0
+            || self.on_demand
+            || self.layout.slices != 1
+            || tiled.len() as u64 != self.layout.size
+            || self.footprints.len() != self.mips as usize
+        {
+            return;
+        }
+        let parts: Vec<(u64, u32, u32)> = self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .map(|(f, &rows)| (f.Offset, f.Footprint.RowPitch, rows * f.Footprint.Depth))
+            .collect();
+        crate::texstore::keep(
+            self.shape,
+            &self.layout,
+            tiled,
+            parts,
+            hash.map(crate::texstore::digest_hash),
+        );
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -2023,6 +2140,7 @@ fn build_staging_untimed(
         first,
         size,
         bytes: total,
+        shape: desc.shape(),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -2100,7 +2218,7 @@ fn refresh_unlocked_with(
     memory: *const u8,
     last: &mut Last,
     size: usize,
-    detile: impl FnOnce(&[u8]),
+    detile: impl FnOnce(&[u8], bool, blake3::Hash),
 ) -> usize {
     use std::sync::atomic::Ordering::Relaxed;
     let read = with_read(size, |read| {
@@ -2108,7 +2226,7 @@ fn refresh_unlocked_with(
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                detile(read);
+                detile(read, true, hash);
             }
             return true;
         }
@@ -2118,9 +2236,10 @@ fn refresh_unlocked_with(
         if last.hash.is_none() {
             crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
             if read.iter().any(|&b| b != 0) {
-                last.hash = Some(blake3::hash(read));
+                let hash = blake3::hash(read);
+                last.hash = Some(hash);
                 last.partial = Some(crate::frame::current());
-                detile(read);
+                detile(read, false, hash);
                 return true;
             }
         }
@@ -2155,9 +2274,12 @@ mod title_memory_tests {
 
             let mut last = super::Last { asked: 7, ..Default::default() };
             let mut detiled = Vec::new();
-            let read = super::refresh_unlocked_with(base, &mut last, SIZE, |bytes| {
+            let mut was_whole = true;
+            let read = super::refresh_unlocked_with(base, &mut last, SIZE, |bytes, whole, _| {
                 detiled = bytes.to_vec();
+                was_whole = whole;
             });
+            assert!(!was_whole);
             assert_eq!(read, SIZE);
             assert!(last.hash.is_some());
             assert!(last.partial.is_some());
@@ -2167,7 +2289,7 @@ mod title_memory_tests {
 
             // Once filled, a failed `read_into` does not overwrite the staging buffer.
             let mut detiled_again = false;
-            let read2 = super::refresh_unlocked_with(base, &mut last, SIZE, |_| {
+            let read2 = super::refresh_unlocked_with(base, &mut last, SIZE, |_, _, _| {
                 detiled_again = true;
             });
             assert_eq!(read2, 0);
