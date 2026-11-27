@@ -60,6 +60,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtv_trace;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -451,6 +454,8 @@ fn windows() -> bool {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    #[cfg(feature = "diagnostics")]
+    bound_rtv_formats: [(i32, bool); 8],
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -1123,6 +1128,12 @@ impl State {
         self.targets.clear();
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
+        #[cfg(feature = "diagnostics")]
+        let trace_rtvs = rtv_trace::enabled();
+        #[cfg(feature = "diagnostics")]
+        if trace_rtvs {
+            self.bound_rtv_formats = [(0, false); 8];
+        }
         host.output_views(|output| {
             let mut rtvs = Vec::new();
             for snapshot in self
@@ -1143,6 +1154,11 @@ impl State {
                         .desc()
                         .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                     if let Some(desc) = null {
+                        #[cfg(feature = "diagnostics")]
+                        if trace_rtvs && rtvs.len() < self.bound_rtv_formats.len() {
+                            self.bound_rtv_formats[rtvs.len()] =
+                                rtv_trace::slot_format(None, Some(&desc));
+                        }
                         rtvs.push(output.rtv(None, Some(&desc)));
                     }
                     continue;
@@ -1150,7 +1166,13 @@ impl State {
                 self.targets.push(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
-                rtvs.push(output.rtv(Some(texture), record.desc().as_ref()));
+                let desc = record.desc();
+                #[cfg(feature = "diagnostics")]
+                if trace_rtvs && rtvs.len() < self.bound_rtv_formats.len() {
+                    self.bound_rtv_formats[rtvs.len()] =
+                        rtv_trace::slot_format(Some(texture), desc.as_ref());
+                }
+                rtvs.push(output.rtv(Some(texture), desc.as_ref()));
             }
             let dsv = self.depth_view.and_then(|snapshot| {
                 let record = snapshot.restore();
@@ -3635,6 +3657,11 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    self.check_rtv_formats(
+                        crate::pipeline::host_pipeline(self.pipeline as This),
+                        "DispatchMesh",
+                    );
                     self.mesh_scissor(list, false);
                     #[cfg(feature = "diagnostics")]
                     self.dump_after(list);
@@ -4288,6 +4315,11 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(
+                crate::pipeline::host_pipeline(self.pipeline as This),
+                "DrawInstanced",
+            );
+            #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4394,6 +4426,11 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(
+                crate::pipeline::host_pipeline(self.pipeline as This),
+                "DrawIndexedInstanced",
+            );
+            #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4427,6 +4464,23 @@ impl State {
             self.dropped_records(list, (kind, stride, max), arguments, count);
         }
         ran
+    }
+
+    /// Checks bound RTV formats against the graphics PSO's declared formats
+    /// when `VICTORY_RTV_FORMAT_LOG=1` is active.
+    #[cfg(feature = "diagnostics")]
+    fn check_rtv_formats(&self, p: Option<&HostPipeline>, draw_call: &'static str) {
+        if let Some(pipeline) = p
+            && let Some((key, declared)) = &pipeline.traced_targets
+        {
+            rtv_trace::check(
+                key,
+                declared,
+                &self.bound_rtv_formats,
+                draw_call,
+                &pipeline.name,
+            );
+        }
     }
 
     /// Straight after a draw: its render targets and depth, and what it
@@ -4598,6 +4652,8 @@ impl State {
                     0,
                 )
             };
+            #[cfg(feature = "diagnostics")]
+            self.check_rtv_formats(Some(p), "ExecuteIndirect");
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -4691,6 +4747,8 @@ impl State {
             if kind == DISPATCH {
                 DISPATCHED.fetch_add(1, Ordering::Relaxed);
             } else {
+                #[cfg(feature = "diagnostics")]
+                self.check_rtv_formats(Some(p), "ExecuteIndirect");
                 DRAWN.fetch_add(1, Ordering::Relaxed);
             }
             return true;
@@ -4739,6 +4797,8 @@ impl State {
                 if kind == MESH {
                     self.mesh_scissor(list, false);
                 }
+                #[cfg(feature = "diagnostics")]
+                self.check_rtv_formats(Some(p), "ExecuteIndirect");
                 CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -4915,6 +4975,7 @@ impl State {
         if kind == DISPATCH {
             crate::capture::dump_after(list, self.pipeline as This, &[]);
         } else {
+            self.check_rtv_formats(Some(p), "ExecuteIndirect");
             self.dump_after(list);
         }
         // A listed frame: what the clamped records asked for.
