@@ -80,6 +80,9 @@ pub(super) mod exchange_pairs;
 /// Each exchange of two host waves its own LDS dwords (`VICTORY_EXCHANGE_SITES=1`).
 #[path = "exchange_sites.rs"]
 pub(super) mod exchange_sites;
+/// A mask's lane bit by console lane in the halves form (`VICTORY_HALVES_LANE=1`).
+#[path = "halves_lane.rs"]
+pub(super) mod halves_lane;
 /// The wave-wide form before the deep form without skips (`VICTORY_WAVE_WIDE_AUTO=1`).
 #[path = "wide_auto.rs"]
 pub(super) mod wide_auto;
@@ -4149,7 +4152,8 @@ impl<'a> Lower<'a> {
     /// wave holds a 32-aligned run of console lanes (in the paired form, the lane being
     /// lowered). Without `exchange` or the paired form: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() && self.twin.is_none() {
+        let by_console = self.halves.is_some() && halves_lane::enabled();
+        if self.exchange.is_none() && self.twin.is_none() && !by_console {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4485,7 +4489,8 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() || self.twin.is_some() {
+        let by_console = self.halves.is_some() && halves_lane::enabled();
+        let lane = if self.exchange.is_some() || self.twin.is_some() || by_console {
             self.console_lane()
         } else {
             self.s.op(

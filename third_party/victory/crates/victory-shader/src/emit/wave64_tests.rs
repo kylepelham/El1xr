@@ -539,6 +539,46 @@ fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Ve
     Some(out[0].clone())
 }
 
+/// A 64-bit mask the program does not track (s[0:1], root constants), read as a number by a
+/// select, in a console wave of 64 run as two host waves of 32 (the DPP move makes it take the
+/// console's lanes, so the halves form): each lane takes its own bit, lanes 32-63 the high
+/// dword's. Their host lanes are 0-31, so with `VICTORY_HALVES_LANE=1` they are numbered by
+/// their console lane (PR #108 of trustno1-coder/VIctory-NVIDIA); off, they take the low dword.
+#[test]
+fn lanes_past_32_take_the_high_dword_of_a_mask_held_as_a_number() {
+    let words = [
+        0x7E0E_02FA,
+        0xFFFF_B100, // v_mov_b32_dpp v7, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+        0xD501_0005,
+        0x0001_0280, // v_cndmask_b32 v5, 0, 1, s[0:1]
+        0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+        0xE070_1000,
+        0x8002_0506, // buffer_store_dword v5, v6, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let lower_with = |on: bool| {
+        let was = lower::halves_lane::TEST_HALVES_LANE.replace(Some(on));
+        let r = lowered_on(&native, &p, &HashSet::new(), 32);
+        lower::halves_lane::TEST_HALVES_LANE.set(was);
+        r.expect("lower")
+    };
+    let (off, on) = (lower_with(false), lower_with(true));
+    assert_ne!(off.dxil, on.dxil, "the halves form numbers lanes by console lane");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (lo, hi) in [(0x5555_0F0F, 0xA0F0_1234), (u32::MAX, 0), (0, u32::MAX)] {
+        let Some(out) = whole_uav(&on, [lo, hi], 64) else {
+            return;
+        };
+        for lane in 0..64u32 {
+            let bit = if lane < 32 { (lo >> lane) & 1 } else { (hi >> (lane - 32)) & 1 };
+            assert_eq!(out[lane as usize], bit, "lane {lane} of the mask {hi:08x}{lo:08x}");
+        }
+        let old = whole_uav(&off, [lo, hi], 64).expect("ran once");
+        assert!((32..64).all(|l| old[l] == (lo >> (l - 32)) & 1), "off: the low dword's bits");
+    }
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack

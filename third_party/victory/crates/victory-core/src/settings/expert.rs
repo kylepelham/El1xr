@@ -137,6 +137,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_GUARD_ASK", Apply::Restart),
     ("VICTORY_GUARD_HOLES", Apply::Restart),
     ("VICTORY_GUARD_OPEN_AHEAD", Apply::Restart),
+    ("VICTORY_HALVES_LANE", Apply::Retranslate),
     ("VICTORY_HEAP_EARLY_ROUNDS", Apply::Restart),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
