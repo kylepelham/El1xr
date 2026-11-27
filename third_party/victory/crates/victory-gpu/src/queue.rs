@@ -279,6 +279,15 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
     #[cfg(feature = "diagnostics")]
     crate::trace_va::submit(
         this as usize,
@@ -375,6 +384,15 @@ fn submit_split(this: This, lists: &[This]) {
     } else {
         0
     };
+    #[cfg(windows)]
+    if crate::bake_watch::on() {
+        crate::bake_watch::submit(
+            &lists
+                .iter()
+                .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                .collect::<Vec<_>>(),
+        );
+    }
     #[cfg(feature = "diagnostics")]
     crate::trace_va::submit(
         this as usize,
@@ -834,6 +852,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let (taken, order) = crate::list::detach(lists);
             Held::Run(taken, order)
         });
+        #[cfg(windows)]
+        if crate::bake_watch::on() {
+            crate::bake_watch::submit(
+                &lists
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l).map(|h| std::ptr::from_ref(h) as usize))
+                    .collect::<Vec<_>>(),
+            );
+        }
         #[cfg(feature = "diagnostics")]
         if !this.is_null() {
             crate::trace_va::submit(

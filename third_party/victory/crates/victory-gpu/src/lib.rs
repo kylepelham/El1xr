@@ -41,6 +41,8 @@ mod ambient;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
+mod bake_watch;
+#[cfg(windows)]
 mod draw;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
