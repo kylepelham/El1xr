@@ -212,6 +212,46 @@ pub(super) fn loose_outside(
     }
 }
 
+/// The rest of #238: the tables' read-only walks take them to read, not
+/// to write (which also made every recording thread forget what its
+/// look-ups found, `super::SHAPE`), and a copy of a view's own bytes that
+/// is there already is found beside the other readers
+/// (`VICTORY_SHADOW_READ_LOCKS=1`; off unless set).
+pub(super) fn read_locks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| switch(std::env::var_os("VICTORY_SHADOW_READ_LOCKS").as_deref()))
+}
+
+/// A table taken for a walk that changes nothing: to read with
+/// [`read_locks_on`], to write as before without.
+pub(super) enum Walk<'a, T> {
+    Read(std::sync::RwLockReadGuard<'a, T>),
+    Write(std::sync::RwLockWriteGuard<'a, T>),
+}
+
+impl<T> std::ops::Deref for Walk<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self {
+            Walk::Read(guard) => guard,
+            Walk::Write(guard) => guard,
+        }
+    }
+}
+
+/// `table` for a walk: `write` takes it as before (and counts the taking).
+pub(super) fn walk<'a, T>(
+    table: &'a std::sync::RwLock<T>,
+    read: bool,
+    write: impl FnOnce() -> std::sync::RwLockWriteGuard<'a, T>,
+) -> Walk<'a, T> {
+    if read {
+        Walk::Read(table.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        Walk::Write(write())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +287,23 @@ mod tests {
         let map: Windows = BTreeMap::new();
         assert_eq!(found(&map, (0x1000, 64), (0x1000, 64)), Found::Make);
         assert_eq!(found(&map, (0x1000, 64), (0x1000, 128)), Found::Other);
+    }
+
+    /// A walk to read leaves the table to other readers; one to write
+    /// takes it alone, as before.
+    #[test]
+    fn a_walk_reads_beside_others_only_when_asked() {
+        let table = std::sync::RwLock::new(7u32);
+        {
+            let walk = walk(&table, true, || table.write().unwrap());
+            assert_eq!(*walk, 7);
+            assert!(table.try_read().is_ok());
+        }
+        {
+            let walk = walk(&table, false, || table.write().unwrap());
+            assert_eq!(*walk, 7);
+            assert!(table.try_read().is_err());
+        }
     }
 
     #[test]

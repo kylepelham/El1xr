@@ -1180,6 +1180,20 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
         }
     }
     let _changing = changing(physical, base, n * PAGE);
+    if side_by_side::all_on() {
+        // The slices up to an unknown page, which fails the call after
+        // those before it are mapped, as below.
+        let slices: Vec<Option<Slice>> = pages
+            .map(|p| p[..n].iter().map_while(|page| physical.pages.get(page).cloned().map(Some)).collect())
+            .unwrap_or_default();
+        let maps = side_by_side::runs(base, &slices);
+        let done = side_by_side::change(physical, base, n * PAGE, maps, map);
+        if let Some(pages) = pages.filter(|_| slices.len() < n) {
+            tracing::warn!(page = pages[slices.len()], "XMemMapPhysicalPages: unknown page");
+            return false;
+        }
+        return done;
+    }
     unmap(physical, base, n * PAGE);
     let Some(pages) = pages else {
         return true;
@@ -1336,7 +1350,11 @@ fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -
         let (start, len) = (base + lo * PAGE, (hi - lo) * PAGE);
         let _changing = changing(physical, start, len);
         if side_by_side::threads() > 1 {
-            if !side_by_side::change(physical, start, &want[lo..hi]) {
+            // A view per page, as below; every page of a run is known.
+            let maps = (lo..hi)
+                .filter_map(|k| Some((base + k * PAGE, PAGE, physical.pages.get(&want[k]?)?.clone())))
+                .collect();
+            if !side_by_side::change(physical, start, len, maps, map) {
                 return false;
             }
             continue;
@@ -1385,7 +1403,7 @@ fn map_run(physical: &mut Physical, base: usize, n: usize, first: Slice) -> bool
 /// (`VICTORY_SCATTER_RUNS=0`: page by page, as before).
 fn scatter_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_RUNS").is_some_and(|v| v != "0"))
 }
 
 /// Since the last line ([`work_line`]): pages of scatters handled as runs,
@@ -1439,6 +1457,37 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     }
     // As in `map_pages`: no read in place meets the gap.
     let _changing = changing(&physical, to, len);
+    let apart = from.saturating_add(len) <= to || to.saturating_add(len) <= from;
+    if side_by_side::all_on() && (from == 0 || apart && alias_runs()) {
+        // The source's slices up to one that is not mapped, which fails
+        // the call after those before it are mapped, as below.
+        let slices: Vec<Option<Slice>> = if from == 0 {
+            Vec::new()
+        } else {
+            (0..len / PAGE)
+                .map_while(|k| {
+                    let at = from + k * PAGE;
+                    physical
+                        .views
+                        .range(..=at)
+                        .next_back()
+                        .filter(|(base, (size, _))| at < *base + size)
+                        .map(|(base, (_, s))| {
+                            Some(Slice {
+                                index: s.index + (at - base) / PAGE,
+                                section: s.section.clone(),
+                            })
+                        })
+                })
+                .collect()
+        };
+        let maps = side_by_side::runs(to, &slices);
+        let again = |physical: &mut Physical, at: usize, len: usize, first: Slice| {
+            map_run(physical, at, len / PAGE, first)
+        };
+        let done = side_by_side::change(&mut physical, to, len, maps, again);
+        return done && (from == 0 || slices.len() == len / PAGE);
+    }
     unmap(&mut physical, to, len);
     // (Neptune) One view for each run of pages that follow one another in their section, as
     // `map_pages` makes them: page by page, a texture level of 16 MiB was 256 views, each
@@ -1446,7 +1495,6 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // and in a load two threads of the title stood in those calls for most of the frames
     // that took seconds. (Not where the two ranges overlap: there each page is looked up
     // after the ones before it are mapped, as before.)
-    let apart = from.saturating_add(len) <= to || to.saturating_add(len) <= from;
     if from != 0 && apart && alias_runs() {
         let slice_at = |physical: &Physical, at: usize| {
             physical
@@ -1562,6 +1610,13 @@ pub fn map_alias_constant(to: u64, from: u64, len: u64) -> bool {
         }
         let (start, sub_len) = (to + lo * PAGE, (i - lo) * PAGE);
         let _changing = changing(&physical, start, sub_len);
+        if side_by_side::all_on() {
+            let maps = (0..i - lo).map(|k| (start + k * PAGE, PAGE, source.clone())).collect();
+            if !side_by_side::change(&mut physical, start, sub_len, maps, map) {
+                return false;
+            }
+            continue;
+        }
         unmap(&mut physical, start, sub_len);
         for k in 0..(i - lo) {
             if !map(&mut physical, start + k * PAGE, PAGE, source.clone()) {
@@ -2239,12 +2294,91 @@ mod tests {
         /// This thread's `side_by_side::threads`, when set.
         pub(super) static THREADS: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+        /// This thread's `side_by_side::all_on` switch, when set.
+        pub(super) static THREADS_ALL: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
     }
 
-    /// Scatters of many pages with `VICTORY_MAP_THREADS=8` (lean too, then
-    /// not): mapped, moved over each other's addresses, unmapped, given
-    /// twice in one list, across a view of several pages, and with a page
-    /// that is not the title's; every page shows what it held.
+    /// With `VICTORY_MAP_THREADS=8 VICTORY_MAP_THREADS_ALL=1` (lean on, then
+    /// off), the tests of maps of several pages, page-mapping copies and
+    /// scatters hold as they do one after the other: the same views, the
+    /// same bytes, the same failures.
+    #[test]
+    fn maps_and_copies_side_by_side_are_what_one_after_the_other_are() {
+        THREADS.with(|t| t.set(Some(8)));
+        THREADS_ALL.with(|t| t.set(Some(true)));
+        for lean in [true, false] {
+            FORCE.with(|f| f.set([Some(lean), None]));
+            physical_pages_map_alias_and_unmap();
+            a_scatter_of_many_pages_maps_each_address();
+            mapping_no_pages_changes_nothing();
+            writes_cross_runs_and_allocations();
+            pages_know_where_they_are_shown();
+            pages_say_where_they_are_mapped();
+            a_page_committed_through_one_view_is_committed_in_another();
+            a_view_of_pages_committed_already_is_readable_and_writable();
+            a_scatter_unmaps_a_run_once_and_keeps_pages_independent();
+            map_alias_constant_unmaps_once_and_never_coalesces_placeholders();
+            many_pages_and_a_copy_of_them_side_by_side();
+        }
+        FORCE.with(|f| f.set([None; 2]));
+        THREADS_ALL.with(|t| t.set(None));
+        THREADS.with(|t| t.set(None));
+    }
+
+    /// 96 pages in 2 runs mapped at once, then 3 other runs over the views
+    /// (a map must lie in one placeholder, as ever), copied page-mapping-wise
+    /// into another range (a view per run), half unmapped by a copy from 0,
+    /// and a copy whose source is mapped only in part.
+    fn many_pages_and_a_copy_of_them_side_by_side() {
+        let pages = allocate(96);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 96 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let b = XMemVirtualAlloc(std::ptr::null_mut(), 96 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null() && !b.is_null());
+        let at = |base: *mut c_void, k: usize| base.wrapping_byte_add(k * PAGE).cast::<u32>();
+        let first: Vec<usize> = (64..96).chain(0..64).collect();
+        let order: Vec<usize> = first.iter().map(|&k| pages[k]).collect();
+        assert_eq!(XMemMapPhysicalPages(a, 96, order.as_ptr()), a);
+        assert_eq!(views_in(a, 96), [(0, 32), (32, 64)]);
+        for k in 0..96 {
+            // SAFETY: mapped read-write.
+            unsafe { at(a, k).write(k as u32) };
+        }
+        // Each view's pages moved: page `p` holds where it was first.
+        let then: Vec<usize> = (0..32).chain(64..96).chain(32..64).collect();
+        let order: Vec<usize> = then.iter().map(|&k| pages[k]).collect();
+        assert_eq!(XMemMapPhysicalPages(a, 96, order.as_ptr()), a);
+        let held = |p: usize| first.iter().position(|&q| q == p).unwrap() as u32;
+        // SAFETY: mapped read-write.
+        assert!((0..96).all(|k| unsafe { at(a, k).read() } == held(then[k])));
+        assert!(map_alias(b as u64, a as u64, (96 * PAGE) as u64));
+        assert_eq!(views_in(b, 96), [(0, 32), (32, 32), (64, 32)]);
+        // SAFETY: mapped read-write, the same pages as at `a`.
+        unsafe {
+            at(b, 5).write(555);
+            assert_eq!(at(a, 5).read(), 555);
+        }
+        assert!(map_alias(b as u64, 0, (48 * PAGE) as u64));
+        assert!((0..48).all(|k| query(at(b, k).cast()).host.State == MEM_RESERVE));
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { at(b, 50).read() }, held(then[50]));
+        // A source mapped up to its middle: that half is copied, then it fails.
+        assert_eq!(XMemMapPhysicalPages(a.wrapping_byte_add(48 * PAGE), 48, std::ptr::null()), a.wrapping_byte_add(48 * PAGE));
+        assert!(!map_alias(b as u64, a.wrapping_byte_add(40 * PAGE) as u64, (16 * PAGE) as u64));
+        // SAFETY: the copied half is mapped.
+        assert!((0..8).all(|k| unsafe { at(b, k).read() } == held(then[40 + k])));
+        assert_eq!(XMemMapPhysicalPages(a, 96, std::ptr::null()), a);
+        assert!(map_alias(b as u64, 0, (96 * PAGE) as u64));
+        assert!(physical().views.range(b as usize..b as usize + 96 * PAGE).next().is_none());
+        assert_eq!(XMemFreePhysicalPages(96, pages.as_ptr()), 1);
+    }
+
+    /// The same, one after the other.
+    #[test]
+    fn many_pages_and_a_copy_of_them() {
+        many_pages_and_a_copy_of_them_side_by_side();
+    }
+
     #[test]
     fn a_scatter_side_by_side_is_what_one_after_the_other_is() {
         THREADS.with(|t| t.set(Some(8)));

@@ -18,6 +18,8 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod barrier_skip;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod card_share;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod cold_skip;
@@ -51,6 +53,7 @@ mod flight_settle;
 pub mod frame;
 pub mod frametime;
 pub mod hitch;
+pub mod host_facts;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
@@ -61,6 +64,8 @@ mod heap_rounds;
 mod host;
 #[cfg(windows)]
 mod land_aside;
+#[cfg(windows)]
+mod list_reap;
 #[cfg(windows)]
 mod output_views;
 #[cfg(windows)]
@@ -111,6 +116,8 @@ pub mod root;
 mod stretch;
 #[cfg(windows)]
 mod table_defer;
+#[cfg(windows)]
+mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;

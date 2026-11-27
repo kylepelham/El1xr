@@ -268,7 +268,21 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm { paths, jobs, no_pipelines } => {
+            // (bootfast) Translating only, with the host's facts given
+            // (`VICTORY_HOST_WAVE`, `VICTORY_VIEW_LIMIT`, as a run's log
+            // states them): no device is made on the card, and the
+            // translations go under the key a run on that GPU looks for.
+            if no_pipelines
+                && let (Some(wave), Some(views)) = (
+                    std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.trim().parse().ok()),
+                    std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.trim().parse().ok()),
+                )
+            {
+                victory_gpu::host_facts::assume_host_facts(wave, views);
+            }
+            translate::warm(paths, jobs, !no_pipelines)
+        }
         Command::Run {
             exe,
             unimplemented,

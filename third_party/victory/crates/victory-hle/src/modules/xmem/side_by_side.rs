@@ -1,5 +1,8 @@
 //! A run of a scatter changed with its system calls on several threads
-//! (`VICTORY_MAP_THREADS`, after cool_fox 565f4a5603 / ac11bbbe5f).
+//! (`VICTORY_MAP_THREADS`, after cool_fox 565f4a5603 / ac11bbbe5f), and with
+//! `VICTORY_MAP_THREADS_ALL=1` also the title's maps of several pages
+//! (`XMemMapPhysicalPages`) and the GPU's page-mapping copies
+//! (`CopyPageMappings*`: [`super::map_alias`], [`super::map_alias_constant`]).
 //!
 //! Mapping and unmapping a view wait for the process's address-space lock,
 //! which every protection change takes too, and our guards make 100,000 of
@@ -15,7 +18,7 @@
 //! after them. Placeholders are split by the caller too, before: a thread
 //! that maps a piece of one while another cuts it can fail.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -27,7 +30,7 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use super::{PAGE, Physical, SCATTER, Slice, WORK, commit, lean, map, noted, unmap, unshow};
+use super::{PAGE, Physical, SCATTER, Slice, WORK, commit, lean, noted, unmap, unshow};
 
 /// How many threads make the system calls of one run of a scatter
 /// (`VICTORY_MAP_THREADS`, 1 to 32; unset or 1: the caller alone, a page
@@ -47,13 +50,26 @@ pub(super) fn threads() -> usize {
     })
 }
 
+/// Whether maps of several pages and page-mapping copies use the threads
+/// too (`VICTORY_MAP_THREADS_ALL=1`, with `VICTORY_MAP_THREADS` above 1;
+/// off: only scatters do).
+pub(super) fn all_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = super::tests::THREADS_ALL.with(|t| t.get()) {
+        return on && threads() > 1;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_THREADS_ALL").is_some_and(|v| v == "1"))
+        && threads() > 1
+}
+
 /// A system call for one view or page.
 enum Op {
     /// Return the view at this address, `len` long, to its placeholder.
     Unmap(usize, usize),
-    /// Map this slice over the page's own placeholder at the address, and
-    /// commit it unless all its pages are.
-    Map(usize, Slice),
+    /// Map `len` bytes of slices from this one on over the placeholder of
+    /// exactly that range at the address, and commit them unless all are.
+    Map(usize, usize, Slice),
 }
 
 /// How an op ended.
@@ -86,7 +102,9 @@ impl Op {
                 WORK[1].fetch_add(taken.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if gone != 0 { DONE } else { NOT_MAPPED }
             }
-            Op::Map(at, slice) => {
+            Op::Map(at, len, slice) => {
+                let (at, len) = (*at, *len);
+                let n = len / PAGE;
                 // SAFETY: maps the section over the page's own placeholder;
                 // acts only on one, failing if it is not exactly that.
                 let made = Instant::now();
@@ -94,16 +112,16 @@ impl Op {
                     MapViewOfFile3(
                         slice.section.handle,
                         GetCurrentProcess(),
-                        *at as *const c_void,
+                        at as *const c_void,
                         (slice.index * PAGE) as u64,
-                        PAGE,
+                        len,
                         MEM_REPLACE_PLACEHOLDER,
                         PAGE_READWRITE,
                         std::ptr::null_mut(),
                         0,
                     )
                 };
-                if view.Value as usize != *at {
+                if view.Value as usize != at {
                     return NOT_MAPPED;
                 }
                 // The calls' time, as `Made` counts it in `map_view` (the
@@ -111,18 +129,18 @@ impl Op {
                 let done = || {
                     WORK[3].fetch_add(made.elapsed().as_micros() as u64, Ordering::Relaxed);
                 };
-                if slice.section.all_committed(slice.index, 1) {
+                if slice.section.all_committed(slice.index, n) {
                     done();
                     return DONE_COMMITTED;
                 }
-                if !commit(*at, PAGE) {
+                if !commit(at, len) {
                     // SAFETY: the view just mapped, back to a placeholder.
                     unsafe {
                         UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER)
                     };
                     return NOT_COMMITTED;
                 }
-                slice.section.mark_committed(slice.index, 1);
+                slice.section.mark_committed(slice.index, n);
                 done();
                 DONE
             }
@@ -130,15 +148,25 @@ impl Op {
     }
 }
 
-/// [`super::map_pages`] for `want` at `base`, a run of a scatter in which
-/// every page changes (`want[k]`: a page to map, or none to unmap), with
-/// [`super::PHYSICAL`] and the remapping lock for the run held. False if a
-/// page is not the title's or the host refuses one; what was done is noted
-/// either way.
-pub(super) fn change(physical: &mut Physical, base: usize, want: &[Option<usize>]) -> bool {
-    let end = base + want.len() * PAGE;
+/// `[base, base + len)` changed with [`super::PHYSICAL`] and the remapping
+/// lock for it held: what is mapped there is taken away, then `maps`
+/// (address, bytes, first slice: views inside the range, apart) are mapped.
+/// A map whose placeholder turns out not to be its own is done again by
+/// `again` (as one after the other does it). False if the host refuses one;
+/// what was done is noted either way.
+pub(super) fn change(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    maps: Vec<(usize, usize, Slice)>,
+    again: impl Fn(&mut Physical, usize, usize, Slice) -> bool,
+) -> bool {
+    if len == 0 {
+        return maps.is_empty();
+    }
+    let end = base + len;
     // The views there: whole ones go side by side, what reaches past the
-    // run is taken away and mapped again in part by `unmap`, as before.
+    // range is taken away and mapped again in part by `unmap`, as before.
     let first = physical
         .views
         .range(..=base)
@@ -168,62 +196,85 @@ pub(super) fn change(physical: &mut Physical, base: usize, want: &[Option<usize>
         victory_gpu::title_memory_remapped(at, size);
         ops.push(Op::Unmap(at, size));
     }
-    let mut own = HashSet::new();
+    // The placeholders the views taken away left: each exactly its view.
+    let mut own = HashMap::new();
     for (op, how) in all(ops) {
         let Op::Unmap(at, size) = op else { continue };
         if how == DONE {
-            if size == PAGE {
-                own.insert(at);
-            }
+            own.insert(at, size);
             if lean() {
                 physical.holes.insert(at, size);
             }
         }
     }
-    let mut ok = true;
     let mut ops = Vec::new();
-    for (k, page) in want.iter().enumerate() {
-        let Some(page) = page else { continue };
-        let Some(slice) = physical.pages.get(page).cloned() else {
-            tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
-            ok = false;
-            break;
-        };
-        let at = base + k * PAGE;
-        if physical.holes.remove(&at) != Some(PAGE) && !own.contains(&at) {
+    for (at, len, slice) in maps {
+        let hole = physical.holes.remove(&at);
+        let inside: Vec<usize> = physical.holes.range(at + 1..at + len).map(|(&at, _)| at).collect();
+        for at in inside {
+            physical.holes.remove(&at);
+        }
+        if hole != Some(len) && own.get(&at) != Some(&len) {
             // SAFETY: acts only on placeholders; fails harmlessly when the
-            // page is a whole placeholder already.
+            // range is a whole placeholder already or spans several (the
+            // map then fails, and `again` has it).
             unsafe {
                 VirtualFree(
                     at as *mut c_void,
-                    PAGE,
+                    len,
                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
                 )
             };
         } else {
             SCATTER[2].fetch_add(1, Ordering::Relaxed);
         }
-        ops.push(Op::Map(at, slice));
+        ops.push(Op::Map(at, len, slice));
     }
+    let mut ok = true;
     for (op, how) in all(ops) {
-        let Op::Map(at, slice) = op else { continue };
+        let Op::Map(at, len, slice) = op else { continue };
         match how {
             DONE | DONE_COMMITTED => {
                 if how == DONE_COMMITTED {
                     SCATTER[3].fetch_add(1, Ordering::Relaxed);
                 }
-                noted(physical, at, PAGE, slice, true, Instant::now());
+                noted(physical, at, len, slice, true, Instant::now());
             }
-            // The placeholder was not the page's own after all: as one
-            // after the other does (split, map).
+            // The placeholder was not the range's own after all.
             NOT_MAPPED => {
                 SCATTER[4].fetch_add(1, Ordering::Relaxed);
-                ok &= map(physical, at, PAGE, slice);
+                ok &= again(physical, at, len, slice);
             }
             _ => ok = false,
         }
     }
     ok
+}
+
+/// Consecutive slices of one section in `slices` (by page, from `base`),
+/// as (address, bytes, first slice): one view each, as `map_pages` makes
+/// them. Pages without a slice are left out (unmapped).
+pub(super) fn runs(base: usize, slices: &[Option<Slice>]) -> Vec<(usize, usize, Slice)> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < slices.len() {
+        let Some(first) = &slices[k] else {
+            k += 1;
+            continue;
+        };
+        let run = 1 + slices[k + 1..]
+            .iter()
+            .zip(1..)
+            .take_while(|&(s, j)| {
+                s.as_ref().is_some_and(|s| {
+                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + j
+                })
+            })
+            .count();
+        out.push((base + k * PAGE, run * PAGE, first.clone()));
+        k += run;
+    }
+    out
 }
 
 /// A batch of ops the threads take one at a time.
@@ -350,7 +401,7 @@ fn all(ops: Vec<Op>) -> Vec<(Op, u8)> {
         .map(|(op, how)| {
             let op = match op {
                 Op::Unmap(at, len) => Op::Unmap(*at, *len),
-                Op::Map(at, slice) => Op::Map(*at, slice.clone()),
+                Op::Map(at, len, slice) => Op::Map(*at, *len, slice.clone()),
             };
             (op, how.load(Ordering::Acquire))
         })

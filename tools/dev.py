@@ -26,6 +26,7 @@ import dev_driver
 import dev_gate
 import dev_greps
 import dev_png
+import dev_prewarm
 import dev_stats
 import dev_throttle
 import dev_train
@@ -264,6 +265,7 @@ def build_launcher_command(
     skip_intro: bool = False,
     data_dir: Path | None = None,
     title_args: list[str] | None = None,
+    extra: list[str] | None = None,
 ) -> list[str]:
     parts = [
         "&",
@@ -286,6 +288,8 @@ def build_launcher_command(
     if overrides:
         entries = "; ".join(f"{_ps_quote(k)} = {_ps_quote(v)}" for k, v in overrides.items())
         parts.extend(["-Override", f"@{{ {entries} }}"])
+    if extra:
+        parts.extend(extra)
     return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", " ".join(parts)]
 
 
@@ -574,9 +578,10 @@ def apply_snaps(overrides: dict[str, str], every_s: float, snap_dir: Path) -> di
 
 
 def run_bench(
-    args: argparse.Namespace, overrides: dict[str, str], log_path: Path, snap_dir: Path
+    args: argparse.Namespace, overrides: dict[str, str], log_path: Path, snap_dir: Path, what: str = "bench"
 ) -> tuple[dict[str, object], int | None, int | None, int]:
-    """One timed release run under gpu.lock: (stats, driver resets before and after, snaps written).
+    """One timed release run under gpu.lock and `_quiet(args, what)`: (stats, driver resets before
+    and after, snaps written).
     Raises FileNotFoundError or ValueError (before anything runs) for a bad game folder or save."""
     game_dir = resolve_game_dir(args.game_dir)
     overrides = apply_fast_boot(args, overrides)
@@ -595,7 +600,7 @@ def run_bench(
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock("bench"), _quiet(args, "bench"):
+        with acquire_gpu_lock(what), _quiet(args, what):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
@@ -629,11 +634,24 @@ def _count(value: int | None) -> str:
     return "?" if value is None else str(value)
 
 
-def _quiet(args: argparse.Namespace, what: str):
-    """`--quiet`: hold every build slot for the run so no build competes with the game."""
-    if getattr(args, "quiet", False):
-        return dev_throttle.all_build_slots(LOCKS_DIR, f"{JOB or 'main'}:quiet-{what}")
-    return contextlib.nullcontext()
+@contextlib.contextmanager
+def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
+    """`--quiet`: hold every build slot for the run so no build competes with the game.
+    Otherwise: hold the slots free right now without waiting (writers keep at least one), and run
+    the builds already going at idle priority, until the run ends."""
+    quiet = getattr(args, "quiet", False)
+    tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
+    if quiet:
+        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+            yield
+        return
+    with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:
+        print(
+            f"DEV {what}: holding {len(held)} of {dev_throttle.build_slots()} build slots for the run; "
+            f"{idled} build processes at idle priority",
+            flush=True,
+        )
+        yield
 
 
 def _print_driver_warning(before: int | None, after: int | None) -> None:
@@ -675,7 +693,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock(f"capture:{safe_tag}"):
+        with acquire_gpu_lock(f"capture:{safe_tag}"), _quiet(args, "capture"):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
@@ -782,7 +800,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         unmute=plan.unmute, diag=False, seconds=plan.seconds, quiet=plan.quiet, snap_every=plan.snap_every,
     )
     try:
-        stats, before, after, snaps = run_bench(bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps")
+        stats, before, after, snaps = run_bench(
+            bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps", what="train"
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}")
         print(f"DEV train FAIL run={rid} reason=setup")
@@ -799,6 +819,59 @@ def cmd_train(args: argparse.Namespace) -> int:
         f"snaps={snaps} next={dev_train.next_pending(plan, done)} log={log_path}"
     )
     _print_driver_warning(before, after)
+    return 0 if ok else 1
+
+
+@throttled("prewarm")
+def cmd_prewarm(args: argparse.Namespace) -> int:
+    """Translate every shader the title ships into the shader cache for these switch values, without the title
+    (`dev_prewarm`). Holds a build slot (it is a build's worth of CPU); `--pipelines` also takes the gpu lock."""
+    profile = "diag" if args.diag else "release"
+    log_path = DEV_DIR / f"prewarm_{profile}.log"
+    try:
+        game_dir = resolve_game_dir(args.game_dir)
+        missing = [str(p) for p in dev_prewarm.needed_files(game_dir) if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(f"prewarm needs {', '.join(missing)}")
+        overrides = parse_overrides(args.override)
+    except (FileNotFoundError, ValueError) as exc:
+        log_path.write_text(f"error: {exc}\n", encoding="utf-8")
+        print(f"DEV prewarm FAIL profile={profile} secs=0.0 shaders=0 hits=0 translated=0 refused=0 log={log_path}")
+        return 1
+    # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
+    # overrides, mute and skip-intro (not in the key, but kept identical).
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    overrides = dev_prewarm.prewarm_overrides(overrides, args.pipelines, args.host_wave, args.view_limit)
+    cmd = build_launcher_command(
+        game_dir=game_dir,
+        diag=args.diag,
+        overrides=overrides,
+        mute=mute,
+        skip_intro=True,
+        extra=dev_prewarm.launcher_extra(args.pipelines, args.jobs),
+    )
+    gpu = acquire_gpu_lock("prewarm") if args.pipelines else contextlib.nullcontext()
+    t0 = time.monotonic()
+    with gpu:
+        ok, outputs = run_logged_steps([("prewarm", cmd, REPO_ROOT)], log_path)
+    secs = time.monotonic() - t0
+    text = outputs.get("prewarm", "")
+    counts = dev_prewarm.parse_summary(text)
+    device = dev_prewarm.device_made(text)
+    ok = ok and counts["shaders"] > 0 and (args.pipelines or not device)
+    fields = {
+        "profile": profile,
+        "secs": f"{secs:.1f}",
+        "warm_s": str(counts["warm_s"]),
+        "shaders": str(counts["shaders"]),
+        "hits": str(counts["hits"]),
+        "translated": str(counts["translated"]),
+        "refused": str(counts["refused"]),
+        "pipelines": str(counts["pipelines"]),
+        "device": "1" if device else "0",
+        "log": str(log_path),
+    }
+    print(_dev_line("prewarm", ok, fields))
     return 0 if ok else 1
 
 
@@ -914,6 +987,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_train.set_defaults(func=cmd_train)
+
+    p_pre = sub.add_parser(
+        "prewarm",
+        help="Translate every shader the title ships into the shader cache for these switch values (no game run).",
+    )
+    p_pre.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override (the arm's).")
+    p_pre.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_pre.add_argument("--diag", action="store_true", help="Warm the diag build's cache (what `capture` runs).")
+    p_pre.add_argument("--unmute", action="store_true", help="As bench/capture --unmute (not in the key).")
+    p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
+    p_pre.add_argument(
+        "--pipelines", action="store_true",
+        help="Also make the compute pipelines (makes a device on the card: takes the gpu lock).",
+    )
+    p_pre.add_argument(
+        "--host-wave", type=int, default=dev_prewarm.DEFAULT_HOST_WAVE,
+        help="The host's most wave lanes, as a run's log states it (default: 32, this RTX 5090).",
+    )
+    p_pre.add_argument(
+        "--view-limit", type=int, default=dev_prewarm.DEFAULT_VIEW_LIMIT,
+        help="The host view heap's null slot: its views minus one (default: 999999, this RTX 5090).",
+    )
+    p_pre.set_defaults(func=cmd_prewarm)
 
     p_scout = sub.add_parser("scout", help="Run tools/scout_ecosystem.py.")
     p_scout.add_argument("scout_args", nargs=argparse.REMAINDER, help="Extra arguments forwarded to scout.")
