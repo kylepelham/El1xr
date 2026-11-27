@@ -87,6 +87,7 @@ mod bitcode;
 mod container;
 pub mod glass_record;
 mod glass_splice;
+mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
@@ -104,6 +105,7 @@ mod mesh_launch;
 mod miss_sky;
 pub mod nvidia;
 mod own_bits;
+mod quad_helpers;
 mod ray_query;
 #[cfg(all(test, windows))]
 mod ray_query_warp_tests;
@@ -136,11 +138,13 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, native_glass};
 pub use miss_sky::miss_sky_key;
+pub use hit_only::with_rays_missed;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
+    USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
+pub use lower::thread_limit::on as dispatchx_mask;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -3006,6 +3010,35 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A derivative taken by hand (`quad_perm:[1,0,3,2]`, the neighbour across x) reads its
+    /// neighbour through quad reads with `VICTORY_QUAD_HELPERS=1` (a helper lane at a
+    /// triangle's edge is in the quad, not in the wave's reads); off, the translation is
+    /// byte-identical to before, and a program without quad reads is the same either way.
+    #[test]
+    fn a_pixel_quad_permutation_reads_helpers_only_with_the_switch() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_02FA, // v_mov_b32 v3, v2 quad_perm:[1,0,3,2] bound_ctrl:1
+            0xFF08_B102,
+            v_add_f32(2, 2, 3),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let off = quad_helpers::with(false, || pixel(&words, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&words, PERSP_CENTER)).unwrap();
+        assert_ne!(on.dxil, off.dxil);
+        assert_eq!(off.dxil, pixel(&words, PERSP_CENTER).unwrap().dxil);
+        validate(&off);
+        validate(&on);
+        let plain = [0xC808_0000, 0xC809_0001, e0, e1, S_ENDPGM];
+        let off = quad_helpers::with(false, || pixel(&plain, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&plain, PERSP_CENTER)).unwrap();
+        assert_eq!(on.dxil, off.dxil);
     }
 
     /// A pixel program with TEXCOORD0..2 in rows 0..2 that reads only attribute 2's z

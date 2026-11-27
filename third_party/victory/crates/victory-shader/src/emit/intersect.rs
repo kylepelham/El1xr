@@ -161,7 +161,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
-        if no_hit() {
+        if no_hit() || crate::emit::hit_only::missed() {
             // No structures: a box enters no child, anything else is
             // missed ([`no_hit`]). Nothing is read, and nothing asked of
             // the directory of title memory.

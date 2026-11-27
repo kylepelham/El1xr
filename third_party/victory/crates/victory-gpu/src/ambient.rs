@@ -751,6 +751,24 @@ static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 /// stand-in without a depth read of them.
 static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What `crate::skin_fill` fills skin's probe inputs with: the cells' buffer (the room's
+/// slow mean), the share of it, the constant. None while the diffuse stand-in is off or,
+/// for the estimate, before a frame's light has been kept.
+pub(crate) fn skin_light() -> Option<crate::skin_fill::Light<'static>> {
+    if !on() {
+        return None;
+    }
+    let (level, constant) = match set() {
+        Set::Off => return None,
+        Set::Estimate(level) => (level, 0.0),
+        Set::Constant(level) => (0.0, level),
+    };
+    if constant == 0.0 && !KEPT.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(crate::skin_fill::Light { cells: &pass()?.cells, level, constant })
+}
+
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
     /// The image the title's program just wrote.

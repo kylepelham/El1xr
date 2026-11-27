@@ -1815,6 +1815,9 @@ impl State {
         if kind == USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return crate::rt_diag::thread_limit();
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1907,6 +1910,10 @@ impl State {
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
+        }
+        // `VICTORY_SKIN_FILL=1`: skin's probe inputs before its first draw of a frame.
+        if crate::skin_fill::on() {
+            self.skin_fill(list, p);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: sync its depth/stencil plane
@@ -3798,8 +3805,8 @@ impl State {
     /// Runs a dispatch on the host.
     /// `DispatchX`: its dimensions may be thread counts (`crate::rt_diag`).
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
-        let [x, y, z] = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
-        self.dispatch(list, x, y, z);
+        let ([x, y, z], limit) = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
+        crate::rt_diag::with_thread_limit(limit, || self.dispatch(list, x, y, z));
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
@@ -5832,6 +5839,7 @@ mod reflect_views;
 
 mod bake_pass;
 mod material_pass;
+mod skin_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

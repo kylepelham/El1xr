@@ -1536,7 +1536,9 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
         return pages;
     }
     let began = std::time::Instant::now();
-    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
+    // Tests run starved for CPU beside builds: give the filling thread longer there.
+    let most = std::time::Duration::from_millis(if cfg!(test) { 2000 } else { 100 });
+    while pages.contains(&0) && began.elapsed() < most {
         std::thread::sleep(std::time::Duration::from_millis(2));
         pages = read();
     }

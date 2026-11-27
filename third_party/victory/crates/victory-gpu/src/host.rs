@@ -8131,7 +8131,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {} slots taken out by a table read after the first of their frame \
+                     (VICTORY_TABLED_REREAD=1)",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -8139,7 +8140,8 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed)
                 );
                 let [
                     views,

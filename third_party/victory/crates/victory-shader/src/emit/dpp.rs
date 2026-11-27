@@ -25,6 +25,9 @@ impl Lower<'_> {
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
+        // Pixel quads read through quad reads too (`VICTORY_QUAD_HELPERS=1`): they reach
+        // helper lanes, which wave reads and ballots leave out.
+        let by_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
         let lane = self.lane_index();
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
@@ -105,7 +108,7 @@ impl Lower<'_> {
             Some(ok) => self.s.m.select(c, ok, src, lane),
             None => src,
         };
-        let mut r = if mesh_quad {
+        let mut r = if by_quad {
             self.quad_pick(x, safe_src)
         } else {
             self.read_lane(x, safe_src)
@@ -114,7 +117,7 @@ impl Lower<'_> {
         // (`EXEC == 0`) yields 0 when `bound_ctrl:1` or leaves `vdst` untouched otherwise.
         let src_active = if fi {
             None
-        } else if mesh_quad {
+        } else if by_quad {
             guard.map(|g| {
                 let g32 = self.s.m.cast(c, Cast::ZExt, g, self.s.t.i32);
                 let picked = self.quad_pick(g32, safe_src);

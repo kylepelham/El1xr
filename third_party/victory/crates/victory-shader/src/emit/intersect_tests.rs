@@ -678,6 +678,18 @@ fn a_node_test_that_answers_no_hit_reads_nothing() {
     }
 }
 
+/// `VICTORY_RT_HIT_ONLY`: a program the caller misses (`with_rays_missed`)
+/// answers no hit as with `VICTORY_BVH_NO_HIT`; the others walk.
+#[test]
+fn a_program_with_its_rays_missed_reads_nothing() {
+    for wide in [true, false] {
+        let (shader, _) = super::with_rays_missed(true, || build(wide, WHOLE)).expect("missed");
+        assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+        let (shader, _) = super::with_rays_missed(false, || build(wide, WHOLE)).expect("walks");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    }
+}
+
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two

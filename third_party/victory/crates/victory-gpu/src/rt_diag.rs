@@ -17,9 +17,14 @@
 //! ranges and a rehydrated bottom level's root became `ffffffff`. `=1`
 //! counts threads where bit 5 is set and bit 15 is not (what that replay
 //! measured); `=2` wherever bit 5 is set (the register's meaning).
-//! shortcut: the lanes past the count in the last group still run (up to
-//! one group less one lane); the replay also masked them.
+//! The lanes past the count in the last group (up to one group less one
+//! lane) still run unless `VICTORY_DISPATCHX_MASK=1`: then a call read as a
+//! thread count hands its `x` to the program as a host word
+//! (`victory_shader::emit::USER_THREAD_LIMIT`, [`thread_limit`]), and the
+//! builder's programs make their stores only below it, as the replay
+//! masked them.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -49,6 +54,37 @@ fn parse_mode(value: Option<&str>) -> u8 {
         Some("2") => 2,
         _ => 0,
     }
+}
+
+thread_local! {
+    /// The thread count in x of the `DispatchX` this thread is recording
+    /// ([`with_thread_limit`]); `u32::MAX` outside one.
+    static LIMIT: Cell<u32> = const { Cell::new(u32::MAX) };
+}
+
+/// Whether `VICTORY_DISPATCHX_MASK=1` (the translator reads it too, for its
+/// programs and the shader cache key).
+fn mask_on() -> bool {
+    victory_shader::emit::dispatchx_mask()
+}
+
+/// The host word `victory_shader::emit::USER_THREAD_LIMIT`: the thread
+/// count in x of the `DispatchX` being recorded on this thread, `u32::MAX`
+/// for any other dispatch.
+pub(crate) fn thread_limit() -> u32 {
+    LIMIT.get()
+}
+
+/// Runs `f` (the dispatch) with `limit` as [`thread_limit`] when it is
+/// `Some`.
+pub(crate) fn with_thread_limit<R>(limit: Option<u32>, f: impl FnOnce() -> R) -> R {
+    let Some(limit) = limit else {
+        return f();
+    };
+    let before = LIMIT.replace(limit);
+    let r = f();
+    LIMIT.set(before);
+    r
 }
 
 /// Whether a `DispatchX` with `flags` counts threads under `mode`.
@@ -93,15 +129,17 @@ pub(crate) fn builder(ran: bool) {
 }
 
 /// At a `DispatchX(x, y, z, flags)` of the title's pipeline `this`: the
-/// group counts to dispatch.
-pub(crate) fn dispatch_x(this: This, dims: [u32; 3], flags: u32) -> [u32; 3] {
+/// group counts to dispatch, and the thread limit in x for its programs
+/// (`VICTORY_DISPATCHX_MASK=1`, [`with_thread_limit`]).
+pub(crate) fn dispatch_x(this: This, dims: [u32; 3], flags: u32) -> ([u32; 3], Option<u32>) {
     let threads = counts_threads(threads_mode(), flags);
     if !threads && !on() {
-        return dims;
+        return (dims, None);
     }
     let Some((hash, group)) = group_of(this) else {
-        return dims;
+        return (dims, None);
     };
+    let limit = (threads && mask_on()).then_some(dims[0]);
     let out = if threads {
         groups_for(dims, group)
     } else {
@@ -111,7 +149,7 @@ pub(crate) fn dispatch_x(this: This, dims: [u32; 3], flags: u32) -> [u32; 3] {
         note(this as usize, &hash, group, dims, flags, threads);
         summary();
     }
-    out
+    (out, limit)
 }
 
 /// `this`'s shader hash and thread-group size, the size parsed once per
@@ -223,6 +261,15 @@ mod tests {
         for flags in [0, 0x20, 0x8020] {
             assert!(!counts_threads(0, flags));
         }
+    }
+
+    #[test]
+    fn the_thread_limit_holds_only_inside_its_dispatch() {
+        assert_eq!(thread_limit(), u32::MAX);
+        assert_eq!(with_thread_limit(Some(100), thread_limit), 100);
+        assert_eq!(thread_limit(), u32::MAX);
+        assert_eq!(with_thread_limit(None, thread_limit), u32::MAX);
+        assert!(!mask_on());
     }
 
     #[test]

@@ -133,6 +133,8 @@ pub mod native_rt;
 mod rt_bind;
 #[cfg(windows)]
 mod rt_diag;
+#[cfg(windows)]
+mod rt_hit_only;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -173,6 +175,10 @@ pub mod shader_cache;
 mod material_demand;
 #[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+pub mod bvh_premap;
+#[cfg(windows)]
+mod skin_fill;
 #[cfg(windows)]
 mod ramline;
 #[cfg(windows)]
