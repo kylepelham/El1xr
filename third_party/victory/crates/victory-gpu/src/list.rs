@@ -21,6 +21,27 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+/// The most rectangles one host clear call carries.
+///
+/// NVIDIA's user-mode driver aborts the process when a render-target clear
+/// carries 64 or more rectangles (Belobug #185); 16 is D3D12's scissor bound
+/// and safe on every driver. Depth clears share the treatment.
+pub(crate) const MAX_CLEAR_RECTS: usize = 16;
+
+/// Splits a clear's rectangle list into calls of at most [`MAX_CLEAR_RECTS`].
+///
+/// `None` (no rectangles: the whole view) stays one call with `None`, since
+/// zero rectangles means "everything" and must not become an empty slice.
+pub(crate) fn clear_batches<T>(rects: Option<&[T]>) -> impl Iterator<Item = Option<&[T]>> {
+    let (whole, chunks) = match rects {
+        Some(r) if !r.is_empty() => (None, Some(r.chunks(MAX_CLEAR_RECTS))),
+        _ => (Some(None), None),
+    };
+    whole
+        .into_iter()
+        .chain(chunks.into_iter().flatten().map(Some))
+}
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -735,6 +756,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    crate::topology::pin_hot("title-record");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
@@ -1543,7 +1566,9 @@ extern "system" fn clear_rtv(
             }
             host.output_views(|views| {
                 let rtv = views.rtv(Some(texture), record.desc().as_ref());
-                list.list.ClearRenderTargetView(rtv, color, rects);
+                for batch in clear_batches(rects) {
+                    list.list.ClearRenderTargetView(rtv, color, batch);
+                }
             });
         }
     }
@@ -1591,13 +1616,15 @@ extern "system" fn clear_dsv(
             let dsv = views.dsv(texture, record.depth_desc().as_ref());
             // SAFETY: an open list, a fresh view of a live texture.
             unsafe {
-                list.list.ClearDepthStencilView(
-                    dsv,
-                    D3D12_CLEAR_FLAGS(flags as i32 & 3),
-                    depth,
-                    stencil,
-                    rects,
-                )
+                for batch in clear_batches(rects) {
+                    list.list.ClearDepthStencilView(
+                        dsv,
+                        D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                        depth,
+                        stencil,
+                        batch,
+                    );
+                }
             };
         });
     }
@@ -2543,6 +2570,26 @@ mod tests {
         assert_eq!(stale(std::iter::empty(), 1000, 100), 0);
         // A clock that reads earlier than a push does not make it stale.
         assert_eq!(stale([2000u64].into_iter(), 1000, 100), 0);
+    }
+
+    #[test]
+    fn clears_split_into_batches_of_sixteen() {
+        // No rectangle list: one call for the whole view.
+        let whole: Vec<_> = clear_batches::<u32>(None).collect();
+        assert_eq!(whole, vec![None]);
+        let empty: Vec<Option<&[u32]>> = clear_batches(Some(&[][..])).collect();
+        assert_eq!(empty, vec![None]);
+        let rects: Vec<u32> = (0..70).collect();
+        let b: Vec<_> = clear_batches(Some(&rects[..]))
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(
+            b.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            [16, 16, 16, 16, 6]
+        );
+        assert_eq!(b.concat(), rects);
+        let one = [7u32; MAX_CLEAR_RECTS];
+        assert_eq!(clear_batches(Some(&one[..])).count(), 1);
     }
 
     #[test]

@@ -333,6 +333,7 @@ enum Outcome {
 }
 
 fn run() {
+    crate::topology::pin_background("victory-texture-prepare");
     loop {
         let job = {
             let mut q = queue();
