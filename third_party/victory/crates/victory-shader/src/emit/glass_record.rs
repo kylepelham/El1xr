@@ -143,6 +143,149 @@ pub fn unpack(words: [u32; 3]) -> Option<Hit> {
     })
 }
 
+/// No bin: the trace's "nothing to shade" value for either bin.
+pub const NO_BIN: u32 = 0xffff;
+/// The pixel image's mark for a value from bin `a`.
+pub const BIN_A_MARK: u32 = 0x8000;
+
+/// The two shading bins of a ray, read from the trace's tail (0xb734-0xba88).
+/// `a` is counted in the table's UAV at dword 88 (`u42`), `b` in the one at
+/// dword 120 (`u40`), one `buffer_atomic_add` per bin and wave (the sum is
+/// what a per-ray add of 1 gives); either may be [`NO_BIN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bins {
+    pub a: u32,
+    pub b: u32,
+}
+
+/// What decides a hit's bins (0x9b7c-0x9c4c of the trace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinInputs {
+    /// `InstanceContributionToHitGroupIndex + geometry`: the material
+    /// record's index (`t339`, 116 bytes); the bin is this, `& 0x3fff`.
+    pub material: u32,
+    /// The material record's word 0; bits 22-31 == 0x3ff: never shaded.
+    pub material_word0: u32,
+    /// The hit was taken from the screen instead (a reprojection test on
+    /// the previous frame's depth): no bin at all.
+    pub from_screen: bool,
+    /// Scalar `s8` at 0x9be8 (not traced): when clear, the material goes
+    /// to bin `b`.
+    pub split: bool,
+    /// When `split`: the lane condition `s2` and the per-layer bit of the
+    /// frame CB at 0x2c0 (`1 << (group z & 31)`) both set send it to `b`,
+    /// anything else to `a`.
+    pub layer_to_b: bool,
+}
+
+/// The bins of a hit.
+pub fn hit_bins(i: &BinInputs) -> Bins {
+    let none = Bins {
+        a: NO_BIN,
+        b: NO_BIN,
+    };
+    if i.from_screen || i.material_word0 >= 0xffc0_0000 {
+        return none;
+    }
+    let m = i.material & 0x3fff;
+    if !i.split || i.layer_to_b {
+        Bins { a: NO_BIN, b: m }
+    } else {
+        Bins { a: m, b: NO_BIN }
+    }
+}
+
+/// The bins of a miss: `b` is the sky bin, the frame CB's dword at 0x2f0.
+pub fn miss_bins(sky: u32) -> Bins {
+    Bins { a: NO_BIN, b: sky }
+}
+
+/// The value the trace stores at the ray's pixel of the 2D image at table
+/// dword 152 (`u36`, the value in all four channels); `None` leaves it.
+pub fn pixel_bin(bins: Bins) -> Option<u32> {
+    if bins.a != NO_BIN {
+        Some(bins.a | BIN_A_MARK)
+    } else if bins.b != NO_BIN {
+        Some(bins.b)
+    } else {
+        None
+    }
+}
+
+/// The trace's per-object stamp in the UAV at table dword 104 (`u50`,
+/// stride 8), written on a hit that is not taken from the screen and has a
+/// shaded material (0x9c54-0x9d28). Not a bin list: a "seen by a
+/// reflection this frame" mark keyed by the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    /// Element index: bits 10-22 of the D3D12 instance description's dword
+    /// 12 (`InstanceID`), from the description table of word 2's bit 29.
+    pub slot: u32,
+    /// Word 0: dword 6 (+24) of the 68-byte record `slot` of `t346`.
+    /// Word 1: the frame CB's dword at 0x308 (a frame number).
+    pub words: [u32; 2],
+}
+
+/// The stamp a hit writes, if any. `instance_dword12` is the instance
+/// description's dword 12 (`InstanceID | InstanceMask << 24`); `hint` is a
+/// lane value from before the walk's tail (`v13`, not traced) that also
+/// allows the stamp; `record6` reads dword 6 of `t346[slot]`.
+pub fn hit_stamp(
+    instance_dword12: u32,
+    material_word0: u32,
+    material_word1: u32,
+    hint: bool,
+    frame: u32,
+    record6: impl Fn(u32) -> u32,
+) -> Option<Stamp> {
+    let wanted = (material_word1 & 0x200 != 0 || hint) && material_word1 & 0x110 == 0;
+    let marked = instance_dword12 & 0x4000_0000 != 0 || material_word0 & 1 != 0;
+    if !wanted || !marked {
+        return None;
+    }
+    let slot = (instance_dword12 >> 10) & 0x1fff;
+    Some(Stamp {
+        slot,
+        words: [record6(slot), frame],
+    })
+}
+
+/// The counter changes, pixel value and record words when a ray the title
+/// traced as a miss (all-miss today) is found to hit opaque geometry: what
+/// the hardware glass kernel must do after the title's pass, so that bins
+/// match a title run that hit. The title's miss already counted the ray in
+/// the sky bin (`b` = `sky`) and stored `sky` at its pixel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissToHit {
+    /// (counter: `false` = `a`/`u42`, `true` = `b`/`u40`, bin, delta).
+    pub counters: Vec<(bool, u32, i32)>,
+    /// The pixel image's new value. A hit without a bin leaves the pixel in
+    /// the title (its earlier clear value, not read yet), but the miss has
+    /// already stored `sky` there: [`NO_BIN`] is a guess at that clear.
+    pub pixel: u32,
+    pub record: [u32; 3],
+}
+
+/// See [`MissToHit`].
+pub fn miss_to_hit(sky: u32, hit: &Hit, bins: Bins) -> MissToHit {
+    let mut counters = Vec::new();
+    let was = miss_bins(sky);
+    if was.b != NO_BIN {
+        counters.push((true, was.b, -1));
+    }
+    if bins.a != NO_BIN {
+        counters.push((false, bins.a, 1));
+    }
+    if bins.b != NO_BIN {
+        counters.push((true, bins.b, 1));
+    }
+    MissToHit {
+        counters,
+        pixel: pixel_bin(bins).unwrap_or(NO_BIN),
+        record: pack_hit(hit),
+    }
+}
+
 /// f16 bits to f32.
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = u32::from(h & 0x8000) << 16;
@@ -247,6 +390,97 @@ mod tests {
         assert_eq!(w1, 0);
         // Word 2 as a miss leaves it (cleared here): no hit bit.
         assert_eq!(unpack([w0, w1, 0]), None);
+    }
+
+    fn bin_inputs() -> BinInputs {
+        BinInputs {
+            material: 0x1_2345,
+            material_word0: 0x0040_0000,
+            from_screen: false,
+            split: false,
+            layer_to_b: false,
+        }
+    }
+
+    #[test]
+    fn a_hit_goes_to_one_bin_by_its_material() {
+        let i = bin_inputs();
+        assert_eq!(
+            hit_bins(&i),
+            Bins {
+                a: NO_BIN,
+                b: 0x2345
+            }
+        );
+        let a = hit_bins(&BinInputs { split: true, ..i });
+        assert_eq!(
+            a,
+            Bins {
+                a: 0x2345,
+                b: NO_BIN
+            }
+        );
+        assert_eq!(pixel_bin(a), Some(0x2345 | BIN_A_MARK));
+        let b = BinInputs {
+            split: true,
+            layer_to_b: true,
+            ..i
+        };
+        assert_eq!(
+            hit_bins(&b),
+            Bins {
+                a: NO_BIN,
+                b: 0x2345
+            }
+        );
+        assert_eq!(pixel_bin(hit_bins(&b)), Some(0x2345));
+        // Resolve id 0x3ff, or a hit taken from the screen: no bin, the
+        // pixel is left.
+        let never = BinInputs {
+            material_word0: 0xffc0_0000,
+            ..i
+        };
+        assert_eq!(pixel_bin(hit_bins(&never)), None);
+        let screen = BinInputs {
+            from_screen: true,
+            ..i
+        };
+        assert_eq!(
+            hit_bins(&screen),
+            Bins {
+                a: NO_BIN,
+                b: NO_BIN
+            }
+        );
+    }
+
+    #[test]
+    fn a_miss_turned_into_a_hit_moves_its_count_off_the_sky() {
+        let bins = hit_bins(&bin_inputs());
+        let m = miss_to_hit(7, &hit(), bins);
+        assert_eq!(m.counters, vec![(true, 7, -1), (true, 0x2345, 1)]);
+        assert_eq!(m.pixel, 0x2345);
+        assert_eq!(m.record, pack_hit(&hit()));
+        // No sky bin: nothing to take back.
+        let m = miss_to_hit(NO_BIN, &hit(), Bins { a: 3, b: NO_BIN });
+        assert_eq!(m.counters, vec![(false, 3, 1)]);
+        assert_eq!(m.pixel, 3 | BIN_A_MARK);
+    }
+
+    #[test]
+    fn stamps_key_on_the_instance_id() {
+        // InstanceID 0x12_3456, mask 0x40 (dword bit 30).
+        let dword12 = 0x40 << 24 | 0x12_3456;
+        let s = hit_stamp(dword12, 0, 0x200, false, 99, |slot| slot * 2).expect("a stamp");
+        assert_eq!(s.slot, (0x12_3456 >> 10) & 0x1fff);
+        assert_eq!(s.words, [s.slot * 2, 99]);
+        // Material word 1 bit 4 or 8 forbids it; neither 0x200 nor the
+        // hint: no stamp; no mask bit 30 and no material bit 0: none.
+        assert_eq!(hit_stamp(dword12, 0, 0x210, false, 99, |_| 0), None);
+        assert_eq!(hit_stamp(dword12, 0, 0, false, 99, |_| 0), None);
+        assert!(hit_stamp(dword12, 0, 0, true, 99, |_| 0).is_some());
+        assert_eq!(hit_stamp(0x12_3456, 0, 0x200, false, 99, |_| 0), None);
+        assert!(hit_stamp(0x12_3456, 1, 0x200, false, 99, |_| 0).is_some());
     }
 
     #[test]
