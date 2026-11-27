@@ -95,6 +95,73 @@ static ANY: AtomicBool = AtomicBool::new(false);
 static LINES: AtomicU64 = AtomicU64::new(0);
 /// Host lists a watched shader was dispatched into.
 static LISTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Host lists recorded since their last submission, with the role they
+/// play for the trace: a watched shader ("chain") or one of
+/// `VICTORY_TRACE_VA_ORDER` (default the face network's last op,
+/// `CS_GatherOperation`).
+static ROLES: Mutex<Vec<(usize, &'static str)>> = Mutex::new(Vec::new());
+
+fn order_hashes() -> &'static [String] {
+    static H: OnceLock<Vec<String>> = OnceLock::new();
+    H.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_VA_ORDER")
+            .unwrap_or_else(|_| "aaf7da7a94dc72a9".to_owned())
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+fn note_role(list: usize, role: &'static str) {
+    let mut roles = ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    if !roles.iter().any(|&(l, r)| l == list && r == role) {
+        roles.push((list, role));
+    }
+}
+
+/// The positions in `lists` of the lists with a role, as `role@index`.
+fn roles_in(roles: &[(usize, &'static str)], lists: &[usize]) -> Vec<String> {
+    lists
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            roles
+                .iter()
+                .filter(move |&&(r, _)| r == *l)
+                .map(move |&(_, role)| format!("{role}@{i}"))
+        })
+        .collect()
+}
+
+/// A title submission of host lists `lists` (in order) to a queue of
+/// `kind`: logged when it holds a list with a role; those lists' roles are
+/// then forgotten (the title records them again).
+pub(crate) fn submit(queue: usize, kind: u32, lists: &[usize]) {
+    if !on() {
+        return;
+    }
+    let mut roles = ROLES.lock().unwrap_or_else(|e| e.into_inner());
+    let found = roles_in(&roles, lists);
+    if found.is_empty() {
+        return;
+    }
+    roles.retain(|(l, _)| !lists.contains(l));
+    drop(roles);
+    let Some(c) = config() else { return };
+    let frame = crate::queue::frame_count();
+    if frame < c.frames.0 || frame > c.frames.1 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        queue = format_args!("{queue:#x}"),
+        kind,
+        count = lists.len(),
+        roles = found.join(" "),
+        "trace_va submit"
+    );
+}
 
 thread_local! {
     /// The watched shader of the dispatch this thread is recording, if any.
@@ -215,7 +282,14 @@ pub(crate) fn dispatch(this: crate::object::This, list: usize) -> Option<Tagged>
     let Some(hash) = c.hashes.iter().find(|h| shaders.contains(h.as_str())) else {
         // `[compute 0123456789abcdef]`: the first shader's hash.
         let first = shaders.split_whitespace().nth(1).map(|h| h.trim_end_matches([']', ',']));
-        OTHER.set(first.filter(|h| h.len() == 16).map(interned));
+        let first = first.filter(|h| h.len() == 16).map(interned);
+        if let Some(h) = first
+            && order_hashes().iter().any(|o| o == h)
+        {
+            note_role(list, "ml");
+            line("ml dispatch", list as u64, list as u64, 0);
+        }
+        OTHER.set(first);
         return Some(Tagged);
     };
     let hash: &'static str = DEFAULT_HASHES
@@ -230,6 +304,7 @@ pub(crate) fn dispatch(this: crate::object::This, list: usize) -> Option<Tagged>
             lists.push(list);
         }
     }
+    note_role(list, "chain");
     line("dispatch", list as u64, list as u64, 0);
     Some(Tagged)
 }
@@ -259,7 +334,14 @@ pub(crate) fn view(uav: bool, address: u64, len: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, learn, parse};
+    use super::{Config, learn, parse, roles_in};
+
+    #[test]
+    fn roles_are_named_by_their_place_in_the_submission() {
+        let roles = [(7, "ml"), (9, "chain"), (7, "chain")];
+        assert_eq!(roles_in(&roles, &[1, 9, 7]), vec!["chain@1", "ml@2", "chain@2"]);
+        assert!(roles_in(&roles, &[1, 2]).is_empty());
+    }
 
     #[test]
     fn parses_auto_ranges_hashes_and_frames() {
