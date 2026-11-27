@@ -5,6 +5,10 @@
 - `below_normal_priority`: lowers this process (and the cargo/rustc/test processes it starts,
   which inherit the class on Windows) so builds never starve the desktop or a game run.
 - `disk_free_gb`: builds refuse to start under `MIN_FREE_GB`; a full drive fails every job.
+- `free_build_slots`: for a game run that is not `--quiet`, holds the build slots free right now
+  without waiting, always leaving writers at least one, so fewer builds compete with the game.
+- `builds_idle`: lowers running cargo/rustc processes (and what they started) to the idle priority
+  class for a game run, and puts them back after.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from typing import Iterator
 BUILD_SLOTS = 3
 MIN_FREE_GB = 40.0
 BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+IDLE_PRIORITY_CLASS = 0x40
 POLL_S = 0.25
 
 
@@ -73,17 +78,20 @@ def hold_first_free(paths: list[Path], tag: str, timeout_s: float) -> Iterator[P
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"Timed out waiting for a free lock among {[str(p) for p in paths]}")
                 time.sleep(POLL_S)
-        fd = fds[held]
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()} tag={tag} started={stamp}\n".encode("utf-8"))
+        _stamp(fds[held], tag)
         yield paths[held]
     finally:
         if held >= 0:
             _unlock(fds[held])
         for fd in fds:
             os.close(fd)
+
+
+def _stamp(fd: int, tag: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()} tag={tag} started={stamp}\n".encode("utf-8"))
 
 
 def build_slot(locks_dir: Path, tag: str, timeout_s: float = 4 * 3600.0):
@@ -99,6 +107,102 @@ def all_build_slots(locks_dir: Path, tag: str, timeout_s: float = 4 * 3600.0) ->
         for i in range(build_slots()):
             stack.enter_context(hold_first_free([locks_dir / f"build{i}.lock"], tag, timeout_s))
         yield
+
+
+@contextlib.contextmanager
+def free_build_slots(locks_dir: Path, tag: str, leave: int = 1) -> Iterator[list[Path]]:
+    """Holds every build slot nobody holds right now, without waiting, but at most
+    `build_slots() - leave` of them, so writers always keep `leave` slots. Builds already running
+    keep theirs. Yields the slots held; all are released on exit."""
+    paths = [locks_dir / f"build{i}.lock" for i in range(build_slots())]
+    most = max(0, len(paths) - max(0, leave))
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    held: list[tuple[int, Path]] = []
+    try:
+        for path in paths:
+            if len(held) >= most:
+                break
+            fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+            if _try_lock(fd):
+                _stamp(fd, tag)
+                held.append((fd, path))
+            else:
+                os.close(fd)
+        yield [path for _, path in held]
+    finally:
+        for fd, _ in held:
+            _unlock(fd)
+            os.close(fd)
+
+
+BUILD_PROCESSES = frozenset({"cargo.exe", "rustc.exe", "clippy-driver.exe", "rustdoc.exe"})
+
+
+def _build_tree(psutil) -> list:
+    """Running cargo/rustc processes and everything they started (linkers, build scripts, tests)."""
+    found: dict[int, object] = {}
+    for proc in psutil.process_iter(["name"]):
+        if (proc.info.get("name") or "").lower() not in BUILD_PROCESSES:
+            continue
+        found[proc.pid] = proc
+        try:
+            for child in proc.children(recursive=True):
+                found.setdefault(child.pid, child)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    found.pop(os.getpid(), None)
+    return list(found.values())
+
+
+@contextlib.contextmanager
+def builds_idle(psutil_module=None) -> Iterator[int]:
+    """Windows: lowers running builds (`_build_tree`) to the idle priority class for the duration,
+    then restores each to the class it had (if it is still the same process and still idle).
+    Processes they start meanwhile inherit the idle class; those still running at the end are put
+    at below normal, the class `dev.py` builds run at. Yields how many were lowered. A no-op
+    elsewhere or without psutil (`psutil_module`: for tests)."""
+    psutil = psutil_module
+    if psutil is None and os.name == "nt":
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+    if psutil is None:
+        yield 0
+        return
+    started = time.time()
+    lowered: list[tuple[object, float, int]] = []
+    for proc in _build_tree(psutil):
+        try:
+            before = proc.nice()
+            if before == IDLE_PRIORITY_CLASS:
+                continue
+            created = proc.create_time()
+            proc.nice(IDLE_PRIORITY_CLASS)
+            lowered.append((proc, created, before))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    try:
+        yield len(lowered)
+    finally:
+        restored = set()
+        for proc, created, before in lowered:
+            try:
+                if proc.create_time() == created and proc.nice() == IDLE_PRIORITY_CLASS:
+                    proc.nice(before)
+                restored.add(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        for proc in _build_tree(psutil):
+            try:
+                if (
+                    proc.pid not in restored
+                    and proc.create_time() >= started
+                    and proc.nice() == IDLE_PRIORITY_CLASS
+                ):
+                    proc.nice(BELOW_NORMAL_PRIORITY_CLASS)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
 
 def below_normal_priority() -> None:

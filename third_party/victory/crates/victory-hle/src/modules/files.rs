@@ -914,8 +914,25 @@ mod tests {
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
-        assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
-        assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
+        // Another process (a virus scanner) may hold the new file for a
+        // moment, more so on a busy machine: the delete is then pending and
+        // the folder not yet empty. Each call must succeed within 5 s.
+        let settles = |call: &dyn Fn() -> i32| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if call() != 0 {
+                    return true;
+                }
+                if std::time::Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let file = w(&format!("{deep}/f.txt"));
+        assert!(settles(&|| DeleteFileW(file.as_ptr())), "delete {deep}/f.txt");
+        let deep_w = w(&deep);
+        assert!(settles(&|| RemoveDirectoryW(deep_w.as_ptr())), "remove {deep}");
     }
 
     #[test]

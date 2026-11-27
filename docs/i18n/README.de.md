@@ -97,7 +97,7 @@ Beide Testspiele laufen ohne vertikale Synchronisation: etwa 11.700 Bilder/s fü
 | Tabelle der 396 GDK-Funktionen: Schnittstelle und Methodennummer, aus `xgameruntime.lib` extrahiert (`tools/gdk_interfaces.py`) | ✅ erledigt |
 | `XTaskQueue`, `XAsync`, `XThread` von El1xr bereitgestellt: testgdk läuft ohne die Runtime von Windows | ✅ erledigt |
 | Übrige GDK-Schnittstellen: an die GDK-Runtime von Windows delegiert, von der Ablaufverfolgung benannt | 🟡 in Arbeit |
-| 1600+ automatisierte Tests | ✅ erledigt |
+| 1700+ automatisierte Tests | ✅ erledigt |
 | D3D12.X: `D3D12XboxCreateDevice`, `ID3D12*`-Schnittstellen der Konsole und `DXGIXPresentArray`, bereitgestellt von TomBox' Rust-`d3d12_xs.dll` (MIT, 48 implementierte Exporte, gebaut mit `tools/build_tombox.py d3d12_xs`, geladen mit `ANYXBOXX_D3D12_XS=<Pfad>`); ohne Konsolen-Executable hier nicht testbar | 🟡 in Arbeit |
 | Konsolenbibliotheken von TomBox (Rust, GPL-3.0) für das, was El1xr fehlt: `xg_xs` (Texturlayouts, 23 Exporte) und vollständiges `xmem` (38 Exporte), mit `ANYXBOXX_TOMBOX_DIR=<Ordner>`; gebaut mit `tools/build_tombox.py xg_xs xmem` | 🟡 in Arbeit |
 | `XUser` offline: immer angemeldetes lokales Profil, einstellbarer Gamertag (`ANYXBOXX_GAMERTAG`), Anmeldung von testgdk erfolgreich | ✅ erledigt |
