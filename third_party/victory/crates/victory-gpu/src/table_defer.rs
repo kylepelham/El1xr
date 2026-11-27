@@ -142,6 +142,15 @@ pub(crate) fn wait(
     waits
 }
 
+/// The table's upload of title slot `slot` is recorded now (`None`: no
+/// longer): what was made ready for it is taken as serving that slot, not
+/// kept until the prepare threads' prune.
+pub(crate) fn serving(slot: Option<u32>) {
+    if MAY_WAIT.get() {
+        crate::texture::prepare::serving(slot);
+    }
+}
+
 /// About every five seconds while slots are left null: how many.
 fn line() {
     static NEXT: AtomicU64 = AtomicU64::new(0);

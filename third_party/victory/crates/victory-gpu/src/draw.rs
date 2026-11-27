@@ -4589,7 +4589,7 @@ impl State {
                             }),
                             title_first.map(|t| t + k),
                         ) {
-                            host.make_null(index);
+                            host.make_null_for(index, &view);
                             plain = false;
                             deferred = true;
                             continue;
@@ -4624,7 +4624,9 @@ impl State {
                                     }
                                 }
                             }
+                            crate::table_defer::serving(title_first.map(|t| t + k));
                             readable(list, kind, &view);
+                            crate::table_defer::serving(None);
                         } else {
                             // Another shader sharing this table may read this slot, so do not
                             // mark the table ready for all future shaders without readable().

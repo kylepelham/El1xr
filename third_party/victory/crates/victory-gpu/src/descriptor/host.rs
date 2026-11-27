@@ -2920,6 +2920,13 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` read nothing through a null view shaped like
+    /// `view` (its dimension, or a buffer).
+    pub(crate) fn make_null_for(&self, index: u32, view: &View) {
+        null_for(view, self.cpu(index));
+        self.keep(index, None);
+    }
+
     /// Makes slot `index` a null raw buffer view (reads zeros).
     pub(crate) fn make_null_buffer(&self, index: u32) {
         self.keep(index, None);
