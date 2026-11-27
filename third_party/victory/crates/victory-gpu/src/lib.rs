@@ -73,6 +73,8 @@ mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
+mod round_share;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod land_aside;

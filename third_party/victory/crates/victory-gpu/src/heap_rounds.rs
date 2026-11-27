@@ -55,6 +55,23 @@ impl Rounds {
         }
     }
 
+    /// [`Rounds::start`] for a submission of `runs`; with
+    /// `VICTORY_HEAP_ROUND_SHARE=1` a round already done or asked for that
+    /// began after every list of it was given to its queue (and after the
+    /// last write we made into a heap) is its round ([`crate::round_share`]).
+    pub(crate) fn start_for(runs: &[&crate::host::HostList]) -> Rounds {
+        if !crate::round_share::on() {
+            return Rounds::start();
+        }
+        match crate::round_share::start(runs.iter().map(|l| &l.heap_stamp)) {
+            Some(ticket) => Rounds {
+                ticket: Some(ticket),
+                stale: false,
+            },
+            None => Rounds::start(),
+        }
+    }
+
     pub(crate) fn asked(&self) -> bool {
         self.ticket.is_some()
     }
