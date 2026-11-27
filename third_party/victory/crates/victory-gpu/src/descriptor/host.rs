@@ -1344,6 +1344,9 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 /// heap of 1,507,328, past its end. Unclamped, that index is undefined on
 /// any host.
 pub(crate) fn probe_view_limit() {
+    if crate::host_facts::assumed() {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };

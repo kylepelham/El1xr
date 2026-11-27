@@ -23,6 +23,7 @@ from typing import Iterator
 
 import dev_driver
 import dev_gate
+import dev_prewarm
 import dev_throttle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -259,6 +260,7 @@ def build_launcher_command(
     skip_intro: bool = False,
     data_dir: Path | None = None,
     title_args: list[str] | None = None,
+    extra: list[str] | None = None,
 ) -> list[str]:
     parts = [
         "&",
@@ -281,6 +283,8 @@ def build_launcher_command(
     if overrides:
         entries = "; ".join(f"{_ps_quote(k)} = {_ps_quote(v)}" for k, v in overrides.items())
         parts.extend(["-Override", f"@{{ {entries} }}"])
+    if extra:
+        parts.extend(extra)
     return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", " ".join(parts)]
 
 
@@ -658,6 +662,59 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+@throttled("prewarm")
+def cmd_prewarm(args: argparse.Namespace) -> int:
+    """Translate every shader the title ships into the shader cache for these switch values, without the title
+    (`dev_prewarm`). Holds a build slot (it is a build's worth of CPU); `--pipelines` also takes the gpu lock."""
+    profile = "diag" if args.diag else "release"
+    log_path = DEV_DIR / f"prewarm_{profile}.log"
+    try:
+        game_dir = resolve_game_dir(args.game_dir)
+        missing = [str(p) for p in dev_prewarm.needed_files(game_dir) if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(f"prewarm needs {', '.join(missing)}")
+        overrides = parse_overrides(args.override)
+    except (FileNotFoundError, ValueError) as exc:
+        log_path.write_text(f"error: {exc}\n", encoding="utf-8")
+        print(f"DEV prewarm FAIL profile={profile} secs=0.0 shaders=0 hits=0 translated=0 refused=0 log={log_path}")
+        return 1
+    # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
+    # overrides, mute and skip-intro (not in the key, but kept identical).
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    overrides = dev_prewarm.prewarm_overrides(overrides, args.pipelines, args.host_wave, args.view_limit)
+    cmd = build_launcher_command(
+        game_dir=game_dir,
+        diag=args.diag,
+        overrides=overrides,
+        mute=mute,
+        skip_intro=True,
+        extra=dev_prewarm.launcher_extra(args.pipelines, args.jobs),
+    )
+    gpu = acquire_gpu_lock("prewarm") if args.pipelines else contextlib.nullcontext()
+    t0 = time.monotonic()
+    with gpu:
+        ok, outputs = run_logged_steps([("prewarm", cmd, REPO_ROOT)], log_path)
+    secs = time.monotonic() - t0
+    text = outputs.get("prewarm", "")
+    counts = dev_prewarm.parse_summary(text)
+    device = dev_prewarm.device_made(text)
+    ok = ok and counts["shaders"] > 0 and (args.pipelines or not device)
+    fields = {
+        "profile": profile,
+        "secs": f"{secs:.1f}",
+        "warm_s": str(counts["warm_s"]),
+        "shaders": str(counts["shaders"]),
+        "hits": str(counts["hits"]),
+        "translated": str(counts["translated"]),
+        "refused": str(counts["refused"]),
+        "pipelines": str(counts["pipelines"]),
+        "device": "1" if device else "0",
+        "log": str(log_path),
+    }
+    print(_dev_line("prewarm", ok, fields))
+    return 0 if ok else 1
+
+
 def cmd_scout(args: argparse.Namespace) -> int:
     cmd = [sys.executable, str(SCOUT_PY), *args.scout_args]
     ok, _ = run_logged_steps([("scout_ecosystem", cmd, REPO_ROOT)], DEV_DIR / "scout.log")
@@ -744,6 +801,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
+
+    p_pre = sub.add_parser(
+        "prewarm",
+        help="Translate every shader the title ships into the shader cache for these switch values (no game run).",
+    )
+    p_pre.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override (the arm's).")
+    p_pre.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_pre.add_argument("--diag", action="store_true", help="Warm the diag build's cache (what `capture` runs).")
+    p_pre.add_argument("--unmute", action="store_true", help="As bench/capture --unmute (not in the key).")
+    p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
+    p_pre.add_argument(
+        "--pipelines", action="store_true",
+        help="Also make the compute pipelines (makes a device on the card: takes the gpu lock).",
+    )
+    p_pre.add_argument(
+        "--host-wave", type=int, default=dev_prewarm.DEFAULT_HOST_WAVE,
+        help="The host's most wave lanes, as a run's log states it (default: 32, this RTX 5090).",
+    )
+    p_pre.add_argument(
+        "--view-limit", type=int, default=dev_prewarm.DEFAULT_VIEW_LIMIT,
+        help="The host view heap's null slot: its views minus one (default: 999999, this RTX 5090).",
+    )
+    p_pre.set_defaults(func=cmd_prewarm)
 
     p_scout = sub.add_parser("scout", help="Run tools/scout_ecosystem.py.")
     p_scout.add_argument("scout_args", nargs=argparse.REMAINDER, help="Extra arguments forwarded to scout.")

@@ -43,6 +43,7 @@ pub mod fence;
 pub mod frame;
 pub mod frametime;
 pub mod hitch;
+pub mod host_facts;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]

@@ -17,6 +17,16 @@
   (XboxBvhBuilder.dll, amd_fidelityfx_upscaler_xbox.dll), with the same environment variables as the game.
   Combine with -Warm to cover every archive as well.
 
+.PARAMETER NoGame
+  Optional. Stops after -Warm / -Precompile without starting the title (an offline prewarm: `dev.py prewarm`).
+
+.PARAMETER WarmJobs
+  Optional. Worker threads for -Warm / -Precompile (default: every logical core).
+
+.PARAMETER WarmNoPipelines
+  Optional. -Warm / -Precompile only translate shaders: no compute pipelines, no device on the card when
+  VICTORY_HOST_WAVE and VICTORY_VIEW_LIMIT give the host's facts (as `dev.py prewarm` does).
+
 .PARAMETER AutoA
   Optional. Taps A through the start screens for 150 s (VICTORY_AUTO_A=150), as Neptune's play.ps1 does by default.
 
@@ -96,6 +106,9 @@ param(
     [Parameter(Mandatory = $true)][string]$GameDir,
     [switch]$Warm,
     [switch]$Precompile,
+    [switch]$NoGame,
+    [int]$WarmJobs = 0,
+    [switch]$WarmNoPipelines,
     [switch]$AutoA,
     [switch]$FrametimeDump,
     [switch]$Diag,
@@ -282,6 +295,10 @@ if ($PSBoundParameters.ContainsKey('XgDll') -and $XgDll) {
     $env:VICTORY_XG_MODE = $XgMode
 }
 
+$warmArgs = @()
+if ($WarmJobs -gt 0) { $warmArgs += @('--jobs', [string]$WarmJobs) }
+if ($WarmNoPipelines) { $warmArgs += '--no-pipelines' }
+
 if ($Warm) {
     # Same environment as the game below: the cache key depends on it. Only the game folder's own .rpf files.
     $archives = @(Get-ChildItem -LiteralPath $GameDir -Filter '*.rpf' -File | Sort-Object Name | ForEach-Object { $_.FullName })
@@ -292,7 +309,7 @@ if ($Warm) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm @archives
+        & $exe warm @warmArgs @archives
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }
@@ -311,11 +328,15 @@ if ($Precompile) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm $shaders $gameExe @dlls
+        & $exe warm @warmArgs $shaders $gameExe @dlls
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }
     if ($LASTEXITCODE -ne 0) { throw "victory warm failed (exit code $LASTEXITCODE)." }
+}
+
+if ($NoGame) {
+    exit 0
 }
 
 $prevErrorAction = $ErrorActionPreference
