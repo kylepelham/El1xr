@@ -57,14 +57,45 @@ fn a_stale_wanted_texture_is_taken_again_in_place() {
     // (owner, fresh, generation)
     let mut wanted: Vec<(usize, bool, u32)> = Vec::new();
     let want = |owner: usize, generation: u32, wanted: &mut Vec<(usize, bool, u32)>| {
-        want_in(wanted, |t| t.0 == owner, |t| t.1, || Some((owner, true, generation)));
+        want_in(
+            wanted,
+            |t| t.0 == owner,
+            |t| t.1,
+            || Some((owner, true, generation)),
+        );
     };
     want(7, 1, &mut wanted);
     want(7, 2, &mut wanted);
     assert_eq!(wanted, vec![(7, true, 1)], "a fresh target is kept");
     wanted[0].1 = false;
     want(7, 3, &mut wanted);
-    assert_eq!(wanted, vec![(7, true, 3)], "a stale target is replaced in place");
+    assert_eq!(
+        wanted,
+        vec![(7, true, 3)],
+        "a stale target is replaced in place"
+    );
     want(8, 4, &mut wanted);
     assert_eq!(wanted, vec![(7, true, 3), (8, true, 4)]);
+}
+
+#[test]
+fn async_writer_coalesces_newer_landings_per_address() {
+    let mut pending = PendingMap::new();
+    assert!(pending.is_empty());
+    assert!(!pending.push(0x1000, 1u32));
+    assert!(!pending.push(0x2000, 2u32));
+    // A newer landing for 0x1000 replaces the older unconsumed one.
+    assert!(pending.push(0x1000, 3u32));
+    let mut drained = pending.drain_all();
+    drained.sort_unstable();
+    assert_eq!(drained, vec![2, 3]);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn stale_ticket_rejects_invalidated_async_landing() {
+    let ticket = track(99, 0x8000, 0x9000);
+    assert!(!stale_ticket(&ticket));
+    released(99);
+    assert!(stale_ticket(&ticket));
 }
