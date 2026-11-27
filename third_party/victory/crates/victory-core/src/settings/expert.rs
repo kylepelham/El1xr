@@ -171,6 +171,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_LAZY_TEXTURES", Apply::Restart),
     ("VICTORY_LEAVE_OUT", Apply::Restart),
     ("VICTORY_LEVELS_MIN_KB", Apply::Restart),
+    ("VICTORY_LEVELS_WAIT_SHOWN", Apply::Restart),
     ("VICTORY_LIBRARY_HANDLE", Apply::Restart),
     ("VICTORY_LIBRARY_LOCK", Apply::Restart),
     ("VICTORY_LIBRARY_MAP", Apply::Restart),

@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod flicker;
+mod levels_wait;
 mod list_views;
 mod slot_wait;
 pub(crate) mod view_ages;
@@ -2396,6 +2397,7 @@ impl HostHeap {
         }
         slot_wait::drain();
         self.stale_due();
+        self.levels_due();
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
@@ -3648,6 +3650,9 @@ impl HostHeap {
                     }
                     self.keep(index, None);
                 }
+            } else if !for_draw && self.levels_wait(made, index, key, &view) {
+                // Shows what it showed until the new texture has a level
+                // (`levels_wait`, `VICTORY_LEVELS_WAIT_SHOWN`).
             } else {
                 made[index as usize] = key;
                 match make(&view, self.cpu(index)) {
@@ -3674,6 +3679,8 @@ impl HostHeap {
                 }
                 self.made_too[index as usize].store(key, std::sync::atomic::Ordering::Release);
             }
+        } else if for_draw {
+            self.levels_read(index, key, &view);
         }
         Some((view, resolved))
     }
