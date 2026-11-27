@@ -246,6 +246,13 @@ impl Bools {
     /// `Bools` found out and adds what it finds. The answer is the one
     /// `meet` gives.
     pub fn meet_seen(&self, all: &[(Bool, bool)], seen: &mut Meets) -> bool {
+        if crate::emit::meet::enabled() {
+            return crate::emit::meet::pruned(all, |all| {
+                let mut budget = MAX_MEET;
+                let mut work = all.iter().map(|&(b, holds)| b.0 << 1 | u32::from(holds)).collect();
+                (self.meet_in(0, &mut work, &mut budget, seen), budget)
+            });
+        }
         self.meet_within(all, MAX_MEET, seen)
     }
 
@@ -1033,6 +1040,20 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        // Two loop phis at the same block with identical forward-edge masks
+        // and back-edge values produced as the identical (dst, EXEC) pair of
+        // the same `s_*_wrexec_*` instruction hold the same mask on every
+        // iteration (e.g. `s_andn2_wrexec_b64` in waterfall loops). Sharing
+        // one `Atom::Phi` lets downstream proofs see `saved == EXEC`.
+        if crate::emit::wave_collapse()
+            && let Some((same_id, same_derived)) = self.matching_phi_join(block, &args)
+        {
+            let born = self.index[block];
+            return Some((
+                self.b.atom(Atom::Phi(same_id), born),
+                derived | same_derived,
+            ));
+        }
         if self.phi_join_ids.insert(id) {
             self.phi_joins.push(PhiJoin {
                 block,
@@ -1043,6 +1064,58 @@ impl<'a> Lanes<'a> {
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
+    }
+
+    /// Finds an existing [`PhiJoin`] at `block` that is provably identical to
+    /// `args` on every iteration by induction: same forward-edge masks and
+    /// same back-edge value (either identical SSA keys or the identical
+    /// `(dst, EXEC)` outputs of the same `s_*_wrexec_*` instruction).
+    fn same_wrexec(&self, a: Key, b: Key) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Some(&da0), Some(&da1), Some(&db0), Some(&db1)) = (
+            self.defs.get(&a.0),
+            self.defs.get(&a.1),
+            self.defs.get(&b.0),
+            self.defs.get(&b.1),
+        ) else {
+            return false;
+        };
+        da0 == da1
+            && da0 == db0
+            && da0 == db1
+            && self.p.blocks[da0.0].insts[da0.1]
+                .name()
+                .contains("_wrexec_")
+    }
+
+    fn matching_phi_join(&mut self, block: usize, args: &[Key]) -> Option<(Value, bool)> {
+        let candidates: Vec<(Value, bool, Vec<Key>)> = self
+            .phi_joins
+            .iter()
+            .filter(|pj| pj.block == block && pj.args.len() == args.len())
+            .map(|pj| (pj.id, pj.derived, pj.args.clone()))
+            .collect();
+        for (cid, cderived, cargs) in candidates {
+            let mut equal = true;
+            for (n, (&a, &ca)) in args.iter().zip(cargs.iter()).enumerate() {
+                let (q, _) = self.incoming[block][n];
+                if self.index[q] < self.index[block] {
+                    if self.mask(a).0 != self.mask(ca).0 {
+                        equal = false;
+                        break;
+                    }
+                } else if !self.same_wrexec(a, ca) {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Some((cid, cderived));
+            }
+        }
+        None
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1293,7 +1366,11 @@ impl<'a> Lanes<'a> {
                     let e = exec.unwrap_or(Bool::TRUE);
                     let own = self.b.given(m, e);
                     if self.b.implies(m, e)
-                        && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                        && self
+                            .b
+                            .support(own)
+                            .iter()
+                            .all(|a| matches!(a, Atom::Uniform(_)))
                     {
                         self.scc_lane.insert(scc, own);
                     }
@@ -1503,6 +1580,39 @@ mod tests {
                 .collect();
             meet_anew(b, next, budget)
         })
+    }
+
+    #[test]
+    fn a_search_that_gives_up_finds_no_lane_without_the_large_condition() {
+        // `big`, x0 y0 + x1 y1 + .. over the x's before the y's, has 2^17
+        // ways to be decided; `inner` is `outer` and one more mask. Meeting
+        // `big`, `inner` and not `outer` runs out of case splits and says
+        // yes; `VICTORY_MEET_PRUNE` asks again without `big`: no lane. A
+        // mask asked to hold and not to hold meets no lane unsearched.
+        let mut b = Bools::new();
+        let xs: Vec<Bool> = (0..17).map(|i| b.atom(Atom::Constant(i + 2), 0)).collect();
+        let ys: Vec<Bool> = (0..17).map(|i| b.atom(Atom::Constant(i + 19), 0)).collect();
+        let mut big = Bool::FALSE;
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let both = b.and(x, y);
+            big = b.or(big, both);
+        }
+        let outer = b.atom(Atom::Constant(40), 0);
+        let more = b.atom(Atom::Constant(41), 0);
+        let inner = b.and(outer, more);
+        let all = [(big, true), (inner, true), (outer, false)];
+        let held = [(big, true), (inner, true), (inner, false)];
+        let old = crate::emit::meet::TEST_PRUNE.get();
+        crate::emit::meet::TEST_PRUNE.set(Some(false));
+        assert!(b.meet(&all), "the plain search gives up");
+        assert!(b.meet(&held));
+        assert!(b.meet(&[(big, true), (inner, true)]));
+        crate::emit::meet::TEST_PRUNE.set(Some(true));
+        assert!(!b.meet(&all));
+        assert!(!b.meet(&held));
+        assert!(b.meet(&[(big, true), (inner, true)]));
+        assert!(b.meet(&[(big, true), (inner, false), (outer, true)]));
+        crate::emit::meet::TEST_PRUNE.set(old);
     }
 
     #[test]

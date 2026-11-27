@@ -51,6 +51,7 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        crate::pipeline::samplers::layer(device, &samplers);
         device.CreateRootSignature(0, bytes)
     }
 }

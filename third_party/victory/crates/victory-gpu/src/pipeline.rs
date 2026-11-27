@@ -258,7 +258,7 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        let done = self.translated
             .get_or_init(|| {
                 let _hitch = crate::hitch::span(crate::hitch::Phase::ShaderTranslate);
                 let done = translate(&self.container);
@@ -299,17 +299,34 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        name = program_name(&self.container).unwrap_or("?"),
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
+                    #[cfg(windows)]
+                    Err(e) if translate_ahead::on_ahead_thread() => translate_ahead::refused_ahead(
+                        self,
+                        program_name(&self.container).unwrap_or("?"),
+                        e,
                     ),
+                    Err(e) => self.log_refused(e),
                 }
                 done.ok()
-            })
-            .as_ref()
+            });
+        let done = done.as_ref();
+        // (bootfast) Refused ahead (`VICTORY_TRANSLATE_AHEAD`) and now
+        // needed: reported as a refusal, as it would have been here.
+        #[cfg(windows)]
+        if done.is_none() && !translate_ahead::on_ahead_thread() && translate_ahead::needed(self) {
+            self.log_refused("does not translate (refused ahead)");
+        }
+        done
+    }
+
+    fn log_refused(&self, error: &str) {
+        tracing::warn!(
+            stage = self.stage,
+            hash = %self.hash,
+            name = program_name(&self.container).unwrap_or("?"),
+            error = %error,
+            "shader does not translate; its pipelines' draws are dropped"
+        );
     }
 }
 
@@ -556,6 +573,38 @@ pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
     pipeline(this).pre_pass
 }
 
+/// For a program that walks the ray-tracing structures (`RayOnly::Trace`,
+/// `RayOnly::VBuffer`): whether it is a `CS_RaytraceVBuffer*`, whether it
+/// is the glass one ([`GLASS_TRACE`]), and the buffer views it reads from
+/// tables as (root parameter, dword in the table) (`crate::rt_bind`).
+/// `None` for any other program.
+#[cfg(windows)]
+pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32)>)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let vbuffer = match p.rt_only {
+        RayOnly::VBuffer => true,
+        RayOnly::Trace => false,
+        _ => return None,
+    };
+    let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
+    let views = shader
+        .translated()?
+        .used
+        .iter()
+        .filter(|u| u.kind == victory_shader::ResourceType::Srv && u.root == victory_shader::RootType::Table && u.dwords == 4)
+        .map(|u| (u.slot, u.table_offset_dwords))
+        .collect();
+    Some((vbuffer, shader.hash.starts_with(GLASS_TRACE), views))
+}
+
+/// `CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar`: the trace
+/// the alpha pass (the window glass) runs.
+#[cfg(windows)]
+pub(crate) const GLASS_TRACE: &str = "6d7fe7745ab9c6d8";
+
 /// [`ray_pre_pass`] of a compute program's container.
 #[cfg(windows)]
 fn pre_pass_of(bytes: &[u8]) -> Option<bool> {
@@ -751,8 +800,8 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
 }
 
 /// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// pixel 4567..]` (diagnostics, `crate::drop_why`); "no pipeline" for none.
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".to_owned();
@@ -1017,6 +1066,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    translate_ahead::ahead(&shaders);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -1241,7 +1292,15 @@ mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+pub(crate) mod samplers;
+#[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod recipe;
+#[cfg(windows)]
+pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
+#[cfg(windows)]
+mod translate_ahead;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

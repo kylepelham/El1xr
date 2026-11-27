@@ -24,6 +24,7 @@ use crate::{HleExport, HleModule};
 
 #[cfg(any(windows, test))]
 mod dualsense;
+mod input_trace;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -732,6 +733,7 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    input_trace::current(kind);
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -1155,6 +1157,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            input_trace::pad(state.buttons & A != 0);
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true

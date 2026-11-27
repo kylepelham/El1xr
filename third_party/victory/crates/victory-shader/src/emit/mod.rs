@@ -96,8 +96,11 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+pub mod meet;
+mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
+mod ray_query;
 mod rect;
 mod sampler;
 mod shader;
@@ -120,12 +123,13 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
+pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 
@@ -516,6 +520,28 @@ fn pairs_on() -> bool {
 thread_local! {
     /// A test's choice for [`pairs_on`], for its thread only.
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_COLLAPSE=1` (off by default): two lane-mask loop phis whose
+/// back edges are the same `s_*_wrexec_*` result are one mask (a waterfall
+/// over a narrowed EXEC then collapses to one access), and a guarded
+/// `v_readfirstlane_b32` of a wave64 program in two host waves exchanges its
+/// two words through one pair of barriers. A test can choose for its own
+/// thread.
+pub fn wave_collapse() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COLLAPSE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAVE_COLLAPSE").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_collapse`], for its thread only.
+    pub(crate) static TEST_COLLAPSE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Meet sites the face-relocation compute emitted, or 0 before it is translated.

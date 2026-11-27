@@ -53,6 +53,7 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
+    let interval = crate::load_rate::playing_interval().unwrap_or(interval);
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
@@ -66,6 +67,21 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// Our clock at `interval` from now, after the last tick handed out (as a
+/// title's new interval starts).
+pub(crate) fn restart(interval: Duration) {
+    let first = LAST
+        .iter()
+        .map(|t| t.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    *clock() = Some(Clock {
+        start: Instant::now(),
+        interval,
+        first,
+    });
 }
 
 /// Device method: events are scheduled at every tick.
@@ -149,6 +165,7 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    crate::load_rate::gate(origin);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the

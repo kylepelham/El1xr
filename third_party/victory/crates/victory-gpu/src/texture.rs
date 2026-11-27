@@ -23,9 +23,14 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+pub(crate) mod alias_skip;
+mod gpu_detile;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
+mod reinterpret;
+mod stage_unlocked;
+pub(crate) mod take_by_table;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -37,6 +42,8 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
+    /// The title texture (`crate::readable_once` is told when it is detiled anew).
+    resource: usize,
     buffer: ID3D12Resource,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -75,6 +82,15 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Where in `buffer` `data` begins, and the piece of a block it is
+    /// (`crate::texpool`, `VICTORY_STAGING_BLOCKS=1`; 0 and none for a
+    /// buffer of its own), given back with this.
+    base: u64,
+    piece: Option<crate::texpool::StagingPiece>,
+    /// Detiled on the card (`VICTORY_GPU_DETILE=1`, [`gpu_detile`]): the
+    /// buffer then holds the title's bytes as laid out, and the prelude
+    /// detiles them into this one's buffer, which its copies read.
+    gpu: Option<gpu_detile::Gpu>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -103,9 +119,10 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// of a view the title placed in its memory in another format
 /// ([`alias`]): every level of every layer as each of the two formats lays
 /// it out for a copy (the same bytes: the texels are as wide), the written
-/// texture's layout first.
+/// texture's layout first. No buffer when the formats copy texture to
+/// texture (`reinterpret::direct`).
 struct Through {
-    buffer: ID3D12Resource,
+    buffer: Option<ID3D12Resource>,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -114,6 +131,40 @@ struct Through {
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
+
+/// `VICTORY_ALIAS_AFTER_UPLOAD=1`: an alias copy is due the first time in a
+/// list from each source (off: only at the view's first use, as before).
+fn alias_after_upload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_AFTER_UPLOAD").is_some_and(|v| v == "1"))
+}
+
+/// The list's key for "the copy from `source` into the view `placed` was
+/// recorded": the top bit set, which no address of ours has, so it never
+/// stands for a texture of the list's.
+fn alias_key(placed: usize, source: usize) -> usize {
+    (placed ^ source.rotate_left(29)) | 1 << (usize::BITS - 1)
+}
+
+/// Whether [`alias`] records its copy for the view `placed` in `list` (the
+/// first time it asks; a later use of the source in another way shows as a
+/// change of state). Marks the view used. A CPU upload of the view earlier
+/// in the list (`upload`) also marks it used, and the copy of what the card
+/// wrote into its memory was then left out: the view showed the title
+/// memory's bytes, zeros where the card had drawn. Since
+/// `VICTORY_ALIAS_AFTER_UPLOAD`, the copy is due the first time in the list
+/// from each source. (TaynanGT/Vice-Tay PR #141)
+fn alias_copy_due(list: &HostList, placed: usize, source: usize) -> bool {
+    alias_copy_due_as(list, placed, source, alias_after_upload())
+}
+
+fn alias_copy_due_as(list: &HostList, placed: usize, source: usize, after_upload: bool) -> bool {
+    let first = list.first_use(placed);
+    if !after_upload {
+        return first;
+    }
+    list.first_use(alias_key(placed, source))
+}
 
 // SAFETY: a device-local buffer only lists record copies with.
 unsafe impl Send for Through {}
@@ -134,7 +185,6 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
-    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let (Some(to), Some(from)) = (
@@ -201,15 +251,21 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
+                let direct = reinterpret::on() && reinterpret::direct(of_from.Format, of_to.Format);
+                let buffer = if direct {
+                    None
+                } else {
+                    let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                        return false;
+                    };
+                    crate::host::name(&buffer, || {
+                        format!(
+                            "alias copy {}x{} f{} to f{}",
+                            of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                        )
+                    });
+                    Some(buffer)
                 };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
                 tracing::info!(
                     view = ?placed,
                     texture = ?source,
@@ -218,6 +274,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     parts,
                     written_as = of_from.Format.0,
                     read_as = of_to.Format.0,
+                    direct = buffer.is_none(),
                     "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
                 );
                 let [of_written, of_read] = rows;
@@ -230,7 +287,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let first = alias_copy_due(list, placed as usize, source as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -252,6 +309,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     }
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
+    let predicate = alias_skip::on()
+        .then(|| crate::resource::host_copy(placed).zip(crate::resource::host_copy(source)))
+        .flatten()
+        .and_then(|(p, s)| {
+            let always = crate::resource::host_tiled(placed).is_some()
+                || crate::resource::host_tiled(source).is_some();
+            alias_skip::predicate(list, &p, &s, always)
+        });
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -260,9 +325,19 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             SubresourceIndex: index as u32,
         },
     };
+    #[cfg(windows)]
+    crate::gpucost::mark(&list.list, || "ours: alias copy");
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    let Some(buffer) = &through.buffer else {
+        alias_skip::under(&list.list, predicate.as_ref(), || {
+            reinterpret::record(&list.list, from, to, through.parts.len());
+        });
+        return restore(list, source, before);
+    };
     let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             PlacedFootprint: *row,
@@ -273,30 +348,56 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
-    #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
-    unsafe {
+    alias_skip::under(&list.list, predicate.as_ref(), || unsafe {
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, read, common)]);
+    });
+    list.keep(buffer);
+    if alias_pins() {
+        list.keep(from);
+        list.keep(to);
     }
-    list.keep(&through.buffer);
-    // A draw that also writes the source (a view of it handled before
-    // this one) needs it in that state again; the next read of the alias
-    // then copies once more, as it must after a write.
+    restore(list, source, before)
+}
+
+/// `VICTORY_ALIAS_PINS=1`: an alias copy keeps its source and placed host
+/// textures alive until the list is reset, as it keeps the buffer between
+/// them (off: the buffer only). A texture the title releases while the
+/// list waits to run was freed under the copy: random texels, or a removed
+/// device. (Belobug/VIctory-Belobug-AMD PR #559)
+pub(crate) fn alias_pins() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ALIAS_PINS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_PINS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_ALIAS_PINS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A draw that also writes the source (a view of it handled before an
+/// alias copy) needs it in that state again; the next read of the alias
+/// then copies once more, as it must after a write.
+fn restore(list: &HostList, source: This, before: Option<u32>) -> bool {
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     if let Some(before) = before
         && before & TARGET_OR_UNORDERED != 0
     {
@@ -419,6 +520,9 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.piece.is_some() {
+            return;
+        }
         // (Neptune) Its upload buffer is kept for the next staging buffer of its size class.
         // The last holder is gone: the texture's entry, and every list that recorded an
         // upload from it (a list is reset when the card has run it).
@@ -769,6 +873,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     {
         return;
     }
+    alias_skip::uploaded(list, resource);
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
@@ -842,9 +947,18 @@ fn claim_upload(
 pub(crate) struct PreludeUpload {
     pub(crate) staging: Arc<Staging>,
     pub(crate) copy: Arc<crate::resource::HostTexture>,
-    #[allow(dead_code)]
+    /// The title's texture, for the check at submission that the host has
+    /// not written it since the list was recorded ([`host_wrote`]).
     pub(crate) resource: usize,
     on_demand: Option<crate::resource::OnDemand>,
+}
+
+/// `VICTORY_PRELUDE_RECHECK=1`: a prelude upload is checked again at
+/// submission for a host write made after its list was recorded (off: not
+/// checked, as before).
+fn prelude_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_RECHECK").is_some_and(|v| v == "1"))
 }
 
 impl PreludeUpload {
@@ -859,6 +973,30 @@ impl PreludeUpload {
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
+        // The host wrote the texture (a bake's copy into it) after this list
+        // was recorded, on another recording thread: its title memory holds
+        // what it held before, often another texture's bytes, and copying it
+        // over the host's contents left them there for good (no later list
+        // uploads a host-written texture): a character's baked skin drawn as
+        // coloured specks or a blue face for a whole scene, in about half the
+        // runs (the diner's bartender). (trustno1-coder/VIctory-NVIDIA #33)
+        if prelude_recheck() && host_wrote(self.resource) {
+            static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SKIPPED.fetch_add(1, Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                // SAFETY: a live texture.
+                let desc = unsafe { self.copy.texture.GetDesc() };
+                tracing::warn!(
+                    n,
+                    resource = format_args!("{:#x}", self.resource),
+                    width = desc.Width,
+                    height = desc.Height,
+                    format = desc.Format.0,
+                    "prelude upload left out: the host wrote the texture after the list that samples it was recorded"
+                );
+            }
+            return None;
+        }
         let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
@@ -902,12 +1040,25 @@ impl PreludeUpload {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some((levels, bytes)) = prefill
-            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
-        {
-            crate::descriptor::host::levels_changed(self.staging.memory as u64);
+        if let Some((levels, bytes)) = prefill {
+            match prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes) {
+                Prefilled::Done => crate::descriptor::host::levels_changed(self.staging.memory as u64),
+                Prefilled::NoRoom if prefill_retry() => {
+                    prefill_back(&self.copy.prefill, &self.staging.dirty, (levels, bytes));
+                }
+                Prefilled::NoRoom | Prefilled::Never => {}
+            }
         }
         let texture = &self.copy.texture;
+        // On the card's way: detiled here first, into the buffer the copies read.
+        let gpu = self.staging.gpu.as_ref();
+        if let Some(gpu) = gpu {
+            gpu_detile::record(cmd_list, &self.staging.buffer, self.staging.base, gpu);
+        }
+        let (source, base) = match gpu {
+            Some(gpu) => (gpu_detile::copy_source(gpu), 0),
+            None => (&self.staging.buffer, self.staging.base),
+        };
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
@@ -921,16 +1072,57 @@ impl PreludeUpload {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(source) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: base + footprint.Offset,
+                        ..*footprint
+                    },
                 },
             };
             // SAFETY: an open prelude list; both locations name live resources.
             unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
+        if let Some(gpu) = gpu {
+            gpu_detile::copied(cmd_list, gpu);
+        }
     }
+}
+
+/// What [`prefill_levels`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prefilled {
+    /// The copies are recorded.
+    Done,
+    /// The levels do not fit the texture: they never will.
+    Never,
+    /// No upload memory could be had for them this time.
+    NoRoom,
+}
+
+/// `VICTORY_PREFILL_RETRY=1`: cached levels a prelude had no upload memory
+/// for go back for the next list (off: dropped, as before).
+fn prefill_retry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREFILL_RETRY").is_some_and(|v| v == "1"))
+}
+
+/// Cached levels a prelude took but could not record go back to the host
+/// copy, and the texture is made due again: the next list that samples it
+/// uploads them. Taken and dropped, the texture kept no larger levels than
+/// title memory holds for the rest of the run. (TaynanGT/Vice-Tay
+/// c92d5cfbb0, adapted: our prelude already records them at submission.)
+fn prefill_back(
+    slot: &std::sync::Mutex<Option<(u32, Arc<Vec<u8>>)>>,
+    dirty: &std::sync::atomic::AtomicBool,
+    taken: (u32, Arc<Vec<u8>>),
+) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(taken);
+    }
+    dirty.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Records copies of levels `0..levels` of `copy` (in the copy destination
@@ -942,16 +1134,16 @@ fn prefill_levels(
     copy: &crate::resource::HostTexture,
     levels: u32,
     bytes: &[u8],
-) -> bool {
+) -> Prefilled {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = host() else {
-        return false;
+        return Prefilled::Never;
     };
     let texture = &copy.texture;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if levels == 0 || levels > u32::from(d.MipLevels) || d.DepthOrArraySize != 1 {
-        return false;
+        return Prefilled::Never;
     }
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels as usize];
     let mut total = 0;
@@ -969,10 +1161,10 @@ fn prefill_levels(
         );
     }
     if total as usize > bytes.len() {
-        return false;
+        return Prefilled::Never;
     }
     let Some((buffer, data)) = host.upload_buffer(total) else {
-        return false;
+        return Prefilled::NoRoom;
     };
     // SAFETY: the mapping holds `total` bytes.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
@@ -999,7 +1191,7 @@ fn prefill_levels(
     }
     copy.prefilled.store(levels, Relaxed);
     crate::texstore::PREFILLED.fetch_add(1, Relaxed);
-    true
+    Prefilled::Done
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1558,6 +1750,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        crate::readable_once::bump(self.resource);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1581,6 +1774,13 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        if let Some(gpu) = &self.gpu {
+            // SAFETY: the mapping holds `gpu.raw.bytes`, written only here
+            // (under the staging's `last`), as the PC's way writes it.
+            unsafe { gpu_detile::stage(gpu, self.data, tiled, held) };
+            return;
+        }
+        let started = gpu_detile::on().then(std::time::Instant::now);
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1602,6 +1802,9 @@ impl Staging {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
+        }
+        if let Some(started) = started {
+            gpu_detile::detiled_on_pc(started.elapsed().as_micros() as u64);
         }
     }
 }
@@ -2059,6 +2262,9 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     // (Neptune) A texture made level by level stages every level (zeros for the ones the
     // title does not hold): its upload gives the card's memory by the same answer.
     let first = if on_demand { 0 } else { first };
+    if stage_unlocked::on() {
+        return stage_unlocked::staging(resource, texture, first, on_demand);
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
@@ -2164,17 +2370,42 @@ fn build_staging_untimed(
             Some(&mut total),
         );
     }
-    let (buffer, data) = stage_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    // On the card's way (`VICTORY_GPU_DETILE=1`): its dispatches and buffer,
+    // and the staging buffer holds the bytes as laid out, the mask and tables.
+    let gpu = gpu_detile::plan(
+        &layout,
+        size as u64,
+        &footprints,
+        &rows,
+        |i| {
+            let mips = u32::from(d.MipLevels) - first;
+            (first + i as u32 % mips, i as u32 / mips)
+        },
+        total,
+    );
+    let total = gpu.as_ref().map_or(total, |g| g.raw.bytes);
+    let (piece, buffer, base, data) = match crate::texpool::staging(host, total) {
+        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+        None => {
+            let (buffer, data) = stage_buffer(host, total)?;
+            crate::host::name(&buffer, || {
+                format!(
+                    "staging of {resource:?} {}x{}x{} f{}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                )
+            });
+            (None, buffer, 0, data)
+        }
+    };
+    if let Some(gpu) = &gpu {
+        // SAFETY: a new staging buffer's mapping of `raw.bytes`, ours alone.
+        unsafe { gpu_detile::prepare(gpu, &layout, data) };
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
+        resource: resource as usize,
         buffer,
         data,
         footprints,
@@ -2194,6 +2425,9 @@ fn build_staging_untimed(
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        base,
+        piece,
+        gpu,
     });
     Some(s)
 }
@@ -2748,5 +2982,53 @@ mod prelude_upload_tests {
                 gpu_frame[slot]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod racefix_tests {
+    use super::*;
+
+    /// An alias copy's key is no texture's address and differs by source.
+    #[test]
+    fn alias_keys_stand_apart_from_textures() {
+        let (placed, a, b) = (0x7ff6_1234_5670usize, 0x7ff6_2000_0000usize, 0x7ff6_3000_0000usize);
+        let key = alias_key(placed, a);
+        assert_ne!(key >> (usize::BITS - 1), 0);
+        assert_ne!(key, placed);
+        assert_ne!(key, alias_key(placed, b));
+        assert_eq!(key, alias_key(placed, a));
+    }
+
+    /// A CPU upload of the view earlier in the list no longer keeps the
+    /// alias copy out; a second ask in the list records nothing more.
+    #[test]
+    fn an_upload_earlier_in_the_list_does_not_hide_the_alias_copy() {
+        let Some(host) = host() else { return };
+        let (placed, source) = (0x7ff6_1234_5670usize, 0x7ff6_2000_0000usize);
+        let list = host.new_list().unwrap();
+        // (What `upload_from` asks first.)
+        assert!(list.first_use(placed));
+        assert!(!alias_copy_due_as(&list, placed, source, false), "as before: left out");
+        assert!(alias_copy_due_as(&list, placed, source, true));
+        assert!(!alias_copy_due_as(&list, placed, source, true));
+        // The view stays marked used for the upload after it.
+        assert!(!list.first_use(placed));
+        list.close();
+    }
+
+    /// Levels a prelude could not record go back, and the texture is due.
+    #[test]
+    fn cached_levels_without_room_go_back() {
+        use std::sync::atomic::{AtomicBool, Ordering::Acquire};
+        let slot = Mutex::new(None);
+        let dirty = AtomicBool::new(false);
+        let bytes = Arc::new(vec![7u8; 16]);
+        prefill_back(&slot, &dirty, (2, bytes.clone()));
+        assert!(dirty.load(Acquire));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(l, b)| (*l, b.len())), Some((2, 16)));
+        // Levels put there since are kept.
+        prefill_back(&slot, &dirty, (3, Arc::new(vec![1u8; 4])));
+        assert_eq!(slot.lock().unwrap().as_ref().map(|(l, _)| *l), Some(2));
     }
 }

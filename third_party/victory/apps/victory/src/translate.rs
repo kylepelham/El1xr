@@ -450,7 +450,11 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             });
         }
     }
-    victory_hle::modules::d3d12x::save_pipeline_cache();
+    // Only translated: nothing for the pipeline library (whose opening
+    // would make a device on the card and map its file).
+    if pipelines {
+        victory_hle::modules::d3d12x::save_pipeline_cache();
+    }
     println!(
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
         done.into_inner(),
@@ -459,6 +463,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    let (hits, misses) = victory_gpu::host_facts::shader_cache_counts();
+    println!("warm cache   {hits} from the cache, {misses} translated now");
     Ok(())
 }
 
@@ -975,4 +981,26 @@ mod tests {
         assert_eq!(worker_threads(Some(8), Some(32)), 8);
         assert_eq!(worker_threads(Some(0), Some(32)), 1);
     }
+}
+
+/// (bootfast) `victory warm --recipes`: the host pipeline of every recipe in
+/// the cache's `pipeline-recipes.bin`, made on `jobs` threads (default:
+/// every logical core) into the pipeline library, which is saved after.
+pub fn warm_recipes(jobs: Option<usize>) -> Result<()> {
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let started = std::time::Instant::now();
+    let w = victory_gpu::pipeline::warm_recipes(threads)?;
+    println!(
+        "warm recipes {} recipes: {} host pipelines ({} compiled, {} from the library), {} refused, {} left out, {} unreadable, {} with another key; {:.0} s",
+        w.recipes,
+        w.made,
+        w.compiled,
+        w.loaded,
+        w.refused,
+        w.left_out,
+        w.unreadable,
+        w.other_key,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }

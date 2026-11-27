@@ -166,7 +166,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -748,6 +748,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        crate::timeline::closed(std::ptr::from_ref(host) as usize);
         host.close();
     }
     S_OK
@@ -900,6 +901,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            #[cfg(windows)]
+            crate::gpucost::mark(&list.list, || "title barrier");
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -928,6 +931,11 @@ pub(crate) fn ensure_held_state(
     if let Some((before, state)) = list.transition_held(copy, state) {
         let barrier =
             crate::host::transition(&copy.texture, State(before as i32), State(state as i32));
+        #[cfg(windows)]
+        crate::gpucost::mark(
+            &list.list,
+            || "ours: texture state transitions (and the setup after)",
+        );
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1003,7 +1011,9 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         return false;
     }
     let (from, to) = (from as u64, to as u64);
-    if !crate::host::shader_written(from as usize, len as usize) {
+    let written = crate::host::shader_written(from as usize, len as usize);
+    let order = crate::port_order::order_on();
+    if !written && !crate::port_cbv::copy_order_on() && !order {
         return false;
     }
     let (Some(source), Some(target)) =
@@ -1011,12 +1021,27 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     else {
         return false;
     };
-    if source.left(from) < len || target.left(to) < len || source.unwatched() || target.unwatched()
-    {
+    // (`crate::port_cbv::copy_order_on`) Into a copy draws' constant buffers are viewed in.
+    let for_order = !written && crate::port_cbv::was_viewed(&target);
+    // (`crate::port_order`) Into title memory in place; memory in place is not watched, and
+    // nothing refreshes it over what the card copies there.
+    let in_place = !written && crate::port_order::copy_on_card(&target);
+    if !written && !for_order && !in_place {
         return false;
     }
-    if std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len {
+    let unwatched = |s: &crate::shadow::Shadow| s.unwatched() && !(order && s.in_place());
+    if source.left(from) < len || target.left(to) < len || unwatched(&source) || unwatched(&target)
+        || std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len
+    {
+        crate::port_cbv::ordered(for_order, false);
+        if in_place {
+            crate::port_order::copied(false);
+        }
         return false;
+    }
+    crate::port_cbv::ordered(for_order, true);
+    if in_place {
+        crate::port_order::copied(true);
     }
     // What the title's CPU side wrote of both first, then the copy, then
     // its bytes back into title memory when the list has run.
@@ -1053,6 +1078,9 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         ];
         list.list.ResourceBarrier(&back);
     }
+    list.card_constants.wrote(to as usize, len as usize, &target);
+    // (feedcard) What the CPU makes of it at submission (`VICTORY_CARD_READ_COPY=1`).
+    list.card_copied(to as usize, from as usize, len as usize);
     crate::host::CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
@@ -1112,6 +1140,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::card_writes(list, dst, to, None);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            #[cfg(windows)]
+            crate::gpucost::mark(&list.list, || "title copy resource");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1330,6 +1360,7 @@ extern "system" fn copy_texture_region(
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
+            crate::gpucost::mark(&list.list, || "title copy region");
             match read {
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
@@ -1402,6 +1433,8 @@ fn read_back(
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
     let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(windows)]
+    crate::gpucost::mark(&list.list, || "title copy into a read-back buffer");
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
@@ -1479,6 +1512,8 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        #[cfg(windows)]
+        crate::gpucost::mark(&list.list, || "title resolve");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -1564,6 +1599,8 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            #[cfg(windows)]
+            crate::gpucost::mark(&list.list, || "title clear render target");
             host.output_views(|views| {
                 let rtv = views.rtv(Some(texture), record.desc().as_ref());
                 for batch in clear_batches(rects) {
@@ -1616,6 +1653,8 @@ extern "system" fn clear_dsv(
             let dsv = views.dsv(texture, record.depth_desc().as_ref());
             // SAFETY: an open list, a fresh view of a live texture.
             unsafe {
+                #[cfg(windows)]
+                crate::gpucost::mark(&list.list, || "title clear depth");
                 for batch in clear_batches(rects) {
                     list.list.ClearDepthStencilView(
                         dsv,
@@ -2057,6 +2096,7 @@ extern "system" fn execute_indirect(
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    crate::drop_why::signature(args, stride, max, !count.is_null());
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -2073,6 +2113,7 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        crate::drop_why::set("signature of another shape, or arguments or count outside buffers");
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -2081,9 +2122,11 @@ extern "system" fn execute_indirect(
         ));
     }
     if ran {
+        crate::drop_why::ran();
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::drop_why::count("indirect");
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -2302,7 +2345,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2314,6 +2357,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
+        && !crate::barrier_skip::skip(count, groups)
     {
         #[cfg(feature = "diagnostics")]
         crate::trace_va::list_op("barrier groups", list as *const crate::host::HostList as usize, u64::from(count));
@@ -2321,11 +2365,16 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        #[cfg(windows)]
+        crate::gpucost::mark(
+            &list.list,
+            || "title barrier group (one wait for every shader write)",
+        );
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

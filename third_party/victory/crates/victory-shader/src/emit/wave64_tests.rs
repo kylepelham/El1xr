@@ -2462,3 +2462,52 @@ fn a_first_lane_read_of_a_uniform_scan_carries_across_the_halves() {
         validator.validate(&mut shader.dxil.clone()).unwrap();
     }
 }
+
+/// Guarded `v_readfirstlane_b32` in halves mode exchanges `(has, mine)` in one
+/// pair of barriers (`exchange_halves_two`) instead of two pairs (4 barriers),
+/// while returning the upper half's first active lane when the lower half is
+/// empty and the lower half's when both halves have active lanes.
+#[test]
+fn guarded_readfirstlane_in_halves_mode_runs_correctly_and_halves_barriers() {
+    let mut w = vec![
+        vop2(0x1B, 2, k(63), 0), // v_and_b32 v2, 63, v0 (lane)
+        vop2(0x25, 4, k(10), 2), // v_add_nc_u32 v4, 10, v2 (lane + 10)
+    ];
+    // Force crosses=true so halves mode is chosen (v_readlane_b32 of lane 33).
+    w.extend(vop3(0x360, 5, v(4), k(33)));
+    w.extend([
+        sop1(0x04, 24, EXEC), // s_mov_b64 s[24:25], exec
+        vopc(0xD1, k(39), 2), // v_cmpx_lt_u32 exec, 39, v2: lanes 40-63 only
+        vop1(0x02, 6, v(4)),  // v_readfirstlane_b32 s6, v4 -> 50
+        sop1(0x04, EXEC, 24), // s_mov_b64 exec, s[24:25]
+        vopc(0xD1, k(19), 2), // v_cmpx_lt_u32 exec, 19, v2: lanes 20-63
+        vop1(0x02, 7, v(4)),  // v_readfirstlane_b32 s7, v4 -> 30
+        sop1(0x04, EXEC, 24), // s_mov_b64 exec, s[24:25]
+        vop1(0x01, 6, 6),     // v_mov_b32 v6, s6
+        vop1(0x01, 7, 7),     // v_mov_b32 v7, s7
+        vop1(0x01, 5, 5),     // v_mov_b32 v5, s5
+    ]);
+    w.extend(stores([5, 6, 7, 4]));
+    let native = native_with(&w, true, 64, 0);
+    let old_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let old_pairs = super::TEST_PAIRS.replace(Some(false));
+    let old_collapse = super::TEST_COLLAPSE.replace(Some(true));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let res = lowered(&native, &p, &HashSet::new());
+    super::TEST_COLLAPSE.set(old_collapse);
+    super::TEST_PAIRS.set(old_pairs);
+    lower::TEST_HOST_WAVE.set(old_wave);
+    let shader = res.expect("guarded readfirstlane halves shader should lower");
+    if let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+    }
+    let want: Vec<u32> = (0..64).flat_map(|t| [43, 50, 30, t + 10]).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(got) = run_paired(&shader, [0; 4], 256) {
+        same_as_console(&got, &want);
+    }
+}
