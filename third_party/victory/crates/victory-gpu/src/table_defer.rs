@@ -74,13 +74,43 @@ struct Texture {
     read: bool,
     title_fills: bool,
     host_copy_made: bool,
+    /// Its staging buffer holds the mips the view shows: uploaded before.
+    staged: bool,
     host_refused: bool,
     room: bool,
 }
 
-/// Whether the texture is one to hand out instead of making it now.
+/// Whether the texture is one to hand out instead of uploading it now:
+/// never staged, and a host copy made or room on the card to make one.
 fn candidate(t: Texture) -> bool {
-    t.read && t.title_fills && !t.host_copy_made && !t.host_refused && t.room
+    t.read && t.title_fills && !t.staged && !t.host_refused && (t.host_copy_made || t.room)
+}
+
+/// What a table handed out, by resource and first mip: found again with
+/// nothing held for it, the prepare threads made nothing of it (or it was
+/// taken another way), and the table uploads it itself, as before.
+static HANDED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(usize, u32)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Past this many, what tables handed out is forgotten (textures the title
+/// let go of before a table read them again).
+const HANDED_MOST: usize = 1 << 16;
+
+/// What to do with a texture a table handed out before (`was_handed`), by
+/// what the prepare threads hold for it now: `Some(true)` leave the slot
+/// null (still being made, ahead of the texture pass's queue),
+/// `Some(false)` upload it now (made ready, nothing came of it, or the
+/// texture pass handed it out at the back of its queue), `None` look as for
+/// a new one.
+fn again(was_handed: bool, held: crate::texture::prepare::Held) -> Option<bool> {
+    use crate::texture::prepare::Held;
+    match (was_handed, held) {
+        (true, Held::Pending) => Some(true),
+        (false, Held::Pending) => Some(false),
+        (_, Held::Ready) => Some(false),
+        (true, Held::Nothing) => Some(false),
+        (false, Held::Nothing) => None,
+    }
 }
 
 /// Whether table slot `title_slot` (the title's slot of the table entry),
@@ -110,29 +140,48 @@ pub(crate) fn wait(
         },
         _ => return false,
     };
+    let made = crate::resource::host_copy_made(resource);
     let t = Texture {
         read,
         title_fills: crate::resource::title_fills(resource),
-        host_copy_made: crate::resource::host_copy_made(resource),
+        host_copy_made: made,
+        staged: made && crate::resource::staged_first(resource) <= first,
         host_refused: crate::resource::host_refused(resource),
         room: crate::resource::room_lately(),
     };
     if !candidate(t) {
         return false;
     }
-    use crate::texture::prepare::Look;
-    let waits = match crate::texture::prepare::look_urgent(
-        slot,
-        resource,
-        first,
-        budget(),
-        crate::frame::current(),
-    ) {
-        Look::Go | Look::Full => false,
-        Look::Wait => true,
-        Look::Handed(_) => {
-            STATS[1].fetch_add(1, Relaxed);
-            true
+    let key = (resource as usize, first);
+    let was_handed = HANDED.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+    let waits = match again(was_handed, crate::texture::prepare::held(resource, first)) {
+        Some(waits) => {
+            if !waits {
+                HANDED.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            }
+            waits
+        }
+        None => {
+            use crate::texture::prepare::Look;
+            match crate::texture::prepare::look_urgent(
+                slot,
+                resource,
+                first,
+                budget(),
+                crate::frame::current(),
+            ) {
+                Look::Go | Look::Full => false,
+                Look::Wait => true,
+                Look::Handed(_) => {
+                    let mut handed = HANDED.lock().unwrap_or_else(|e| e.into_inner());
+                    if handed.len() >= HANDED_MOST {
+                        handed.clear();
+                    }
+                    handed.insert(key);
+                    STATS[1].fetch_add(1, Relaxed);
+                    true
+                }
+            }
         }
     };
     if waits {
@@ -192,32 +241,40 @@ mod tests {
         assert!(!may_wait(true, 0, false, false));
     }
 
-    /// Only a read texture the title fills, never given a host copy, not
-    /// refused, while the card has room.
+    /// Only a read texture the title fills, never staged, not refused,
+    /// with a host copy or room on the card for one.
     #[test]
-    fn only_never_made_title_textures_with_room_are_handed_out() {
+    fn only_never_staged_title_textures_are_handed_out() {
         let t = Texture {
             read: true,
             title_fills: true,
             host_copy_made: false,
+            staged: false,
             host_refused: false,
             room: true,
         };
         assert!(candidate(t));
         assert!(!candidate(Texture { read: false, ..t }));
-        assert!(!candidate(Texture {
-            title_fills: false,
-            ..t
-        }));
-        assert!(!candidate(Texture {
-            host_copy_made: true,
-            ..t
-        }));
-        assert!(!candidate(Texture {
-            host_refused: true,
-            ..t
-        }));
+        assert!(!candidate(Texture { title_fills: false, ..t }));
+        assert!(!candidate(Texture { staged: true, ..t }));
+        assert!(!candidate(Texture { host_refused: true, ..t }));
         assert!(!candidate(Texture { room: false, ..t }));
+        let made = Texture { host_copy_made: true, room: false, ..t };
+        assert!(candidate(made));
+        assert!(!candidate(Texture { staged: true, ..made }));
+    }
+
+    /// A slot is never left null for good: once handed out, a texture with
+    /// nothing held for it any more is uploaded by the table itself.
+    #[test]
+    fn a_handed_texture_with_nothing_held_is_uploaded_now() {
+        use crate::texture::prepare::Held;
+        assert_eq!(again(true, Held::Pending), Some(true));
+        assert_eq!(again(false, Held::Pending), Some(false));
+        assert_eq!(again(true, Held::Ready), Some(false));
+        assert_eq!(again(false, Held::Ready), Some(false));
+        assert_eq!(again(true, Held::Nothing), Some(false));
+        assert_eq!(again(false, Held::Nothing), None);
     }
 
     /// Outside a draw's binding nothing waits.

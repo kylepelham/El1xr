@@ -236,6 +236,32 @@ pub(crate) fn look(
     look_in(slot, resource, first, recorded, budget, frame, false)
 }
 
+/// What the prepare threads hold for title texture `resource` from mip
+/// `first` on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Held {
+    /// Handed out, not made ready yet.
+    Pending,
+    /// Made ready, not taken yet.
+    Ready,
+    Nothing,
+}
+
+pub(crate) fn held(resource: This, first: u32) -> Held {
+    let q = queue();
+    if (0..=first).any(|f| q.pending.contains_key(&(resource as usize, f))) {
+        Held::Pending
+    } else if q
+        .ready
+        .get(&(resource as usize))
+        .is_some_and(|all| all.iter().any(|r| r.first <= first))
+    {
+        Held::Ready
+    } else {
+        Held::Nothing
+    }
+}
+
 /// [`look`] for a draw that binds the texture through a table now
 /// (`crate::table_defer`): handed out ahead of the texture pass's queue,
 /// and past the frame's bytes while what is out stays under twice `budget`.
