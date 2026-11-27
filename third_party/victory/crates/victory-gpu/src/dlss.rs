@@ -14,7 +14,13 @@
 //! default), `VICTORY_DLSS_MV_SIGN=-1` (motion vectors the other way),
 //! `VICTORY_DLSS_JITTER_SIGN=-1`, `VICTORY_DLSS_HDR=0|1` (default: by the colour
 //! format), `VICTORY_DLSS_DEPTH_INVERTED=0|1` (default: by near > far),
-//! `VICTORY_DLSS_SHARPNESS=<0..1>`.
+//! `VICTORY_DLSS_SHARPNESS=<0..1>`, `VICTORY_DLSS_PRESET=default|e|f|j|k|l|m`
+//! (the model for every quality mode; k is the transformer, live: a change
+//! makes a new feature) and `VICTORY_DLSS_REACTIVE=1` (the title's reactive
+//! mask as DLSS's current-colour bias mask, live). Preset and reactive mask
+//! after readmet3xt-lab/foxhound `crates/victory-gpu/src/streamline.rs` and
+//! `streamline/plan.rs` (its `VICTORY_DLSS_PRESET`, `VICTORY_DLSS_REACTIVE`),
+//! on the NGX parameters here instead of Streamline's.
 
 use std::ffi::{CString, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -35,6 +41,8 @@ pub(crate) struct Inputs<'a> {
     pub depth: Option<&'a ID3D12Resource>,
     pub motion: Option<&'a ID3D12Resource>,
     pub exposure: Option<&'a ID3D12Resource>,
+    /// The title's reactive mask (`ffxDispatchDescUpscale::reactive`).
+    pub reactive: Option<&'a ID3D12Resource>,
     pub output: &'a ID3D12Resource,
     pub jitter: [f32; 2],
     pub motion_scale: [f32; 2],
@@ -49,8 +57,8 @@ pub(crate) struct Inputs<'a> {
 struct Feature {
     handle: *mut c_void,
     /// render width and height the feature was made for, output size, flags,
-    /// quality mode
-    key: [u32; 6],
+    /// quality mode, preset
+    key: [u32; 7],
 }
 
 struct Dlss {
@@ -60,7 +68,9 @@ struct Dlss {
     /// Features replaced by a live change, released once no list uses them.
     retired: crate::upscale_live::Retired<usize>,
     /// A key a live change asked for that NGX refused: stretched, not retried.
-    failed: Option<[u32; 6]>,
+    failed: Option<[u32; 7]>,
+    /// Whether the last evaluation had a reactive mask (logged on a change).
+    told_reactive: Option<bool>,
 }
 
 // SAFETY: the SDK's objects are used under the mutex only.
@@ -75,6 +85,56 @@ fn env_f(name: &str, default: f32) -> f32 {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
+
+/// `VICTORY_DLSS_PRESET`: the `NVSDK_NGX_DLSS_Hint_Render_Preset` named
+/// (0: the DLL's own choice per mode); `None` for a name it does not have.
+pub(crate) fn preset_value(name: &str) -> Option<u32> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "0" => 0,
+        "e" => 5,
+        "f" => 6,
+        "j" => 10,
+        "k" => 11,
+        "l" => 12,
+        "m" => 13,
+        _ => return None,
+    })
+}
+
+fn preset_bits(value: Option<&str>) -> u64 {
+    let value = value.unwrap_or("");
+    match preset_value(value) {
+        Some(p) => u64::from(p),
+        None => {
+            tracing::warn!(value, "DLSS: VICTORY_DLSS_PRESET is not one of default, e, f, j, k, l, m; the default model");
+            0
+        }
+    }
+}
+
+static PRESET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_DLSS_PRESET", preset_bits);
+static REACTIVE: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_DLSS_REACTIVE");
+
+/// The preset asked for now (`VICTORY_DLSS_PRESET`, live).
+pub(crate) fn preset() -> u32 {
+    PRESET.get() as u32
+}
+
+/// Whether the title's reactive mask goes to DLSS (`VICTORY_DLSS_REACTIVE=1`,
+/// live).
+pub(crate) fn reactive() -> bool {
+    REACTIVE.get_bool()
+}
+
+/// The NGX names of the per-mode preset hints: one preset for every mode.
+const PRESET_HINTS: [*const std::ffi::c_char; 6] = [
+    name!("DLSS.Hint.Render.Preset.DLAA"),
+    name!("DLSS.Hint.Render.Preset.Quality"),
+    name!("DLSS.Hint.Render.Preset.Balanced"),
+    name!("DLSS.Hint.Render.Preset.Performance"),
+    name!("DLSS.Hint.Render.Preset.UltraPerformance"),
+    name!("DLSS.Hint.Render.Preset.UltraQuality"),
+];
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|v| v.trim() == "1")
@@ -207,6 +267,7 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
         feature: None,
         retired: crate::upscale_live::Retired::new(),
         failed: None,
+        told_reactive: None,
     })
 }
 
@@ -250,7 +311,9 @@ pub(crate) fn record(
     );
     let hdr = flags & crate::upscale::DLSS_FLAG_HDR != 0;
     let inverted = flags & crate::upscale::DLSS_FLAG_DEPTH_INVERTED != 0;
-    let live = crate::upscale_live::any();
+    let preset = preset();
+    // A preset changed while running is a live change too.
+    let live = crate::upscale_live::any() || dlss.feature.as_ref().is_some_and(|f| f.key[6] != preset);
     let release = dlss.core.release_feature;
     // SAFETY: handles the core made, no longer used by any list in flight.
     dlss.retired
@@ -264,6 +327,7 @@ pub(crate) fn record(
         out.Height,
         flags as u32,
         quality as u32,
+        preset,
     ];
     if dlss.failed == Some(key) {
         return false;
@@ -291,6 +355,9 @@ pub(crate) fn record(
             p.set_i(name!("PerfQualityValue"), quality);
             p.set_i(name!("DLSS.Feature.Create.Flags"), flags);
             p.set_i(name!("DLSS.Enable.Output.Subrects"), 0);
+            for hint in PRESET_HINTS {
+                p.set_ui(hint, preset);
+            }
             (dlss.core.create_feature)(list.as_raw(), FEATURE_SUPER_SAMPLING, p.0, &mut handle)
         };
         if r != SUCCESS || handle.is_null() {
@@ -313,6 +380,7 @@ pub(crate) fn record(
             depth_inverted = inverted,
             auto_exposure = inputs.exposure.is_none(),
             quality,
+            preset,
             live,
             colour_format = colour.Format.0,
             "DLSS: feature made"
@@ -322,6 +390,20 @@ pub(crate) fn record(
     let Some(feature) = dlss.feature.as_ref() else {
         return false;
     };
+    let reactive = inputs.reactive.filter(|_| reactive());
+    if dlss.told_reactive != Some(reactive.is_some()) {
+        dlss.told_reactive = Some(reactive.is_some());
+        // SAFETY: a live resource.
+        let mask = reactive.map(|r| unsafe { r.GetDesc() });
+        tracing::info!(
+            asked = self::reactive(),
+            title_gave = inputs.reactive.is_some(),
+            mask_size = ?mask.map(|d| (d.Width, d.Height)),
+            mask_format = mask.map_or(0, |d| d.Format.0),
+            "DLSS: reactive mask {}",
+            if reactive.is_some() { "given (DLSS.Input.Bias.Current.Color.Mask)" } else { "not given" }
+        );
+    }
     let mv = env_f("VICTORY_DLSS_MV_SIGN", 1.0);
     let jit = env_f("VICTORY_DLSS_JITTER_SIGN", 1.0);
     let raw = |r: Option<&ID3D12Resource>| r.map_or(std::ptr::null_mut(), |r| r.as_raw());
@@ -333,6 +415,7 @@ pub(crate) fn record(
         p.set_resource(name!("Depth"), raw(inputs.depth));
         p.set_resource(name!("MotionVectors"), raw(inputs.motion));
         p.set_resource(name!("ExposureTexture"), raw(inputs.exposure));
+        p.set_resource(name!("DLSS.Input.Bias.Current.Color.Mask"), raw(reactive));
         p.set_f(name!("Jitter.Offset.X"), jit * inputs.jitter[0]);
         p.set_f(name!("Jitter.Offset.Y"), jit * inputs.jitter[1]);
         p.set_f(name!("MV.Scale.X"), mv * scale(inputs.motion_scale[0]));
@@ -377,7 +460,26 @@ pub(crate) fn record(
 
 #[cfg(test)]
 mod tests {
-    use super::newest_in_store;
+    use super::{newest_in_store, preset, preset_value, reactive};
+
+    #[test]
+    fn preset_names_are_the_ngx_presets() {
+        assert_eq!(preset_value("default"), Some(0));
+        assert_eq!(preset_value(""), Some(0));
+        assert_eq!(preset_value(" K "), Some(11));
+        assert_eq!(preset_value("j"), Some(10));
+        assert_eq!(preset_value("m"), Some(13));
+        assert_eq!(preset_value("e"), Some(5));
+        assert_eq!(preset_value("a"), None);
+        assert_eq!(preset_value("n"), None);
+    }
+
+    #[test]
+    fn preset_and_reactive_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_DLSS_PRESET", "k", preset, 0, 11);
+        check_live("VICTORY_DLSS_REACTIVE", "1", reactive, false, true);
+    }
 
     #[test]
     fn the_newest_store_version_with_a_bin_wins() {
