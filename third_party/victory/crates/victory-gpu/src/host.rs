@@ -7589,6 +7589,7 @@ impl Host {
         }
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        if let Some(made) = crate::texpool::upload_buffer(&self.device, size) { return Some(made); } // VICTORY_UPLOAD_BLOCKS
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -8800,6 +8801,7 @@ impl Host {
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
+        if let Some(made) = crate::texpool::shared_buffer(&self.device, size) { return Some(made); } // VICTORY_SHARED_BUFFER_BLOCKS
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -8927,6 +8929,7 @@ impl Host {
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
+        if let Some(made) = crate::texpool::card_buffer(&self.device, size) { return Some(made); } // VICTORY_CARD_BUFFER_BLOCKS
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
