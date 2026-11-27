@@ -158,6 +158,14 @@ pub(crate) fn list_op(what: &str, list: usize, extra: u64) {
     line(what, list as u64, list as u64, extra);
 }
 
+/// (diagnostics) `VICTORY_DISPATCH_UAV=1`: a UAV barrier on every resource
+/// before each dispatch, to tell a race between dispatches the title left
+/// unordered from other faults.
+pub(crate) fn dispatch_barrier() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_UAV").is_some_and(|v| v == "1"))
+}
+
 /// Whether `[address, address + len)` touches a traced range.
 pub(crate) fn watched(address: u64, len: u64) -> bool {
     on() && overlaps(address, address.saturating_add(len))

@@ -3676,6 +3676,11 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
+        #[cfg(feature = "diagnostics")]
+        if crate::trace_va::dispatch_barrier() {
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        }
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
