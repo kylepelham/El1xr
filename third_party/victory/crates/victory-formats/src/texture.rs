@@ -266,7 +266,7 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block of each element coordinate bit, per
     /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    pattern: std::borrow::Cow<'static, [Vec<u32>; 3]>,
     /// The XOR modes' pattern, by coordinate bit, when the layout was made
     /// by [`Layout::for_gpu`]; `None` otherwise (and `pattern` is empty).
     flips: Option<Flips>,
@@ -343,6 +343,25 @@ fn spread(bits: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// Only tile kind, element size and block size enter the three coordinate
+/// offset tables, so layouts can share the immutable tables instead of
+/// allocating three vectors per texture.
+fn layout_pattern(
+    kind: usize,
+    element_log2: u32,
+    block_log2: u32,
+) -> std::borrow::Cow<'static, [Vec<u32>; 3]> {
+    use std::{borrow::Cow, sync::OnceLock};
+    type Tables = [Vec<u32>; 3];
+    static CACHE: [[[OnceLock<Tables>; 5]; 3]; 3] =
+        [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
+    let block = ((block_log2 - 8) / 4) as usize;
+    Cow::Borrowed(
+        CACHE[kind][block][element_log2 as usize]
+            .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))),
+    )
+}
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -373,6 +392,10 @@ impl Layout {
 
     fn build(desc: &Desc, gpu: Option<(Pipes, u32)>) -> Result<Layout, Error> {
         let d = *desc;
+        // A linear layout reserves storage for a single sample per texel.
+        if d.samples > 1 && d.swizzle == Swizzle::LINEAR {
+            return Err(Error::Invalid);
+        }
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
@@ -463,7 +486,12 @@ impl Layout {
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block),
+            )
+        };
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -617,7 +645,7 @@ impl Layout {
             } else {
                 usize::from(d.swizzle.display())
             };
-            pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            layout_pattern(kind, element_log2, block_log2)
         } else {
             Default::default()
         };
@@ -757,7 +785,12 @@ impl Layout {
             .iter()
             .map(|m| match m.tail {
                 Some(_) => self.alignment,
-                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+                None => {
+                    m.offset
+                        + u64::from(m.pitch)
+                            * u64::from(m.rows)
+                            * u64::from(self.desc.element_bytes)
+                }
             })
             .max()
             .unwrap_or(self.size)
@@ -1259,7 +1292,14 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
+            0 => {
+                32 - desc
+                    .width
+                    .max(desc.height)
+                    .max(depth3d)
+                    .max(1)
+                    .leading_zeros()
+            }
             n => n,
         };
         let plane = |bytes| Desc {
@@ -1732,6 +1772,64 @@ mod tests {
         let s = Layout::for_gpu(&d, Pipes::SERIES_S, 0).unwrap();
         assert_eq!((x.size, x.block), (s.size, s.block));
         assert_ne!(x.offset(0, 77, 91, 0), s.offset(0, 77, 91, 0));
+    }
+
+    #[test]
+    fn shared_swizzle_offsets_are_reused_across_layouts() {
+        for (kind, blocks) in [
+            (0, &[8, 12, 16][..]),
+            (1, &[8, 12, 16][..]),
+            (2, &[12, 16][..]),
+        ] {
+            for &block in blocks {
+                for element in 0..5 {
+                    let shared = super::layout_pattern(kind, element, block);
+                    let again = super::layout_pattern(kind, element, block);
+                    let owned =
+                        super::pattern(kind, element, block).map(|bits| super::spread(&bits));
+                    assert_eq!(shared.as_ref(), &owned);
+                    assert!(std::ptr::eq(shared.as_ref(), again.as_ref()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_multisampling_is_rejected_while_tiled_msaa_succeeds() {
+        let linear = desc(64, 64, 1, 4, Swizzle::LINEAR);
+        assert!(Layout::new(&linear).is_ok());
+        for samples in [2, 4, 8] {
+            let d = Desc { samples, ..linear };
+            assert!(Layout::new(&d).is_err());
+            assert!(
+                Layout::new(&Desc {
+                    swizzle: Swizzle::SW_64KB_R_X,
+                    ..d
+                })
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_volume_slices_are_rejected_without_touching_buffers() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let mut tiled = vec![0x42; layout.size as usize];
+            let mut linear = [0x55; 72];
+            for pitch in [0, 35] {
+                assert!(layout.detile(&tiled, 0, 0, &mut linear, 20, pitch).is_err());
+                assert!(layout.tile(&mut tiled, 0, 0, &linear, 20, pitch).is_err());
+                assert_eq!(linear, [0x55; 72]);
+                assert!(tiled.iter().all(|&v| v == 0x42));
+            }
+            assert!(layout.detile(&tiled, 0, 0, &mut linear, 20, 36).is_ok());
+        }
     }
 
     #[test]

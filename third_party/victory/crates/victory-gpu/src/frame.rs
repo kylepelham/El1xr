@@ -104,8 +104,11 @@ fn last(kind: u32) -> &'static AtomicU64 {
 
 /// The next tick after now and after the last one a wait for `kind` ended
 /// on (an event happens once per tick: a wait woken a little early must not
-/// let the next one end on the same tick), and how long until it.
-fn next_tick(kind: u32) -> (u64, Duration) {
+/// let the next one end on the same tick), and how long until it. When
+/// `reserve` is `Some((limit, late_waits))`, reserves a successful tick under
+/// the clock lock so concurrent waiters for the same event advance to
+/// successive ticks.
+fn next_tick(kind: u32, reserve: Option<(Duration, bool)>) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
@@ -117,10 +120,20 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
-    (
-        tick,
-        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-    )
+    let delay = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    if let Some((limit, late_waits)) = reserve {
+        let (tick, delay) =
+            if !late_waits && limit >= delay && tick > last(kind).load(Ordering::Relaxed) + 1 {
+                (tick - 1, Duration::ZERO)
+            } else {
+                (tick, delay)
+            };
+        if delay <= limit {
+            last(kind).fetch_max(tick, Ordering::Relaxed);
+        }
+        return (tick, delay);
+    }
+    (tick, delay)
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -136,7 +149,6 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the
@@ -145,13 +157,9 @@ pub(crate) extern "system" fn wait(
     // time-out shorter than a tick) answer as before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
-        && limit >= wait
-        && tick > last(kind).load(Ordering::Relaxed) + 1
-    {
-        tick -= 1;
-        wait = Duration::ZERO;
-    }
+    let late_waits =
+        *SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"));
+    let (tick, wait) = next_tick(kind, Some((limit, late_waits)));
     // (Neptune) `VICTORY_PACE=0`: no wait sleeps (a poll whose tick is not due times out at
     // once, a blocking wait ends at once on the next tick): an experiment, to see how much
     // of a slow frame is the title waiting for its own clock.
@@ -283,7 +291,11 @@ mod tests {
             "{flips:?}"
         );
         // Even when a flip wait begins on the tick another just ended on.
-        let (tick, _) = next_tick(FLIP);
+        let (tick, _) = next_tick(FLIP, None);
         assert!(tick > flips[3].0);
+        // Reserving two successive blocking waits under the clock lock yields distinct ticks.
+        let (t1, _) = next_tick(FLIP, Some((Duration::from_secs(1), true)));
+        let (t2, _) = next_tick(FLIP, Some((Duration::from_secs(1), true)));
+        assert!(t2 > t1);
     }
 }

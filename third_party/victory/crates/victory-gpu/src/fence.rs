@@ -9,12 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-pub(crate) const FENCE_IIDS: [Iid; 4] = [
+pub(crate) const FENCE_IIDS: [Iid; 5] = [
     guid(
         0x0a753dcf,
         0xc4d8,
         0x4b91,
         [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
+    ),
+    // ID3D12Fence1 (exposes GetCreationFlags at slot 0x58).
+    guid(
+        0x433685fe,
+        0xe22b,
+        0x4ca0,
+        [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
     ),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
@@ -44,6 +51,30 @@ pub(crate) fn asked_taken() -> [u64; 3] {
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
+}
+
+/// A queued wait or signal can outlive the title's last fence reference.
+/// Keep the fence alive until the command runs or its queue discards it.
+#[cfg(windows)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn retain(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
 }
 
 pub(crate) extern "system" fn create(
@@ -235,6 +266,50 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fence_ref_keeps_fence_alive_after_title_release() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 2, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let retained = FenceRef::retain(f);
+        // Title releases its only reference; retained ref keeps it alive.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 1);
+        set(retained.as_this(), 9);
+        assert_eq!(completed(retained.as_this()), 9);
+        drop(retained);
+    }
+
+    #[test]
+    fn fence1_interface_is_created_and_queried() {
+        const FENCE1_IID: Iid = guid(
+            0x433685fe,
+            0xe22b,
+            0x4ca0,
+            [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
+        );
+        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Flags = extern "system" fn(This) -> u32;
+        type Release = extern "system" fn(This) -> u32;
+
+        let mut f1 = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 3, 0x5, &FENCE1_IID, &mut f1), S_OK);
+        assert!(!f1.is_null());
+        assert_eq!(slot::<Flags>(f1, 0x58)(f1), 0x5);
+        assert_eq!(slot::<Release>(f1, 0x10)(f1), 0);
+
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), 0, 0x2, &FENCE_IIDS[0], &mut f),
+            S_OK
+        );
+        let mut queried = std::ptr::null();
+        assert_eq!(slot::<Query>(f, 0x00)(f, &FENCE1_IID, &mut queried), S_OK);
+        assert_eq!(queried, f);
+        assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
+        assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
+        assert_eq!(slot::<Release>(f, 0x10)(f), 0);
     }
 
     #[cfg(windows)]

@@ -53,6 +53,8 @@ mod pacing;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+mod relay_runs;
+#[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
 mod scratch_spare;
