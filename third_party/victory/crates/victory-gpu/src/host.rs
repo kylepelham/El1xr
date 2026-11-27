@@ -8617,7 +8617,7 @@ impl Host {
                 Flags: crate::pacing::swap_chain_flags(&factory).0 as u32,
                 ..Default::default()
             };
-            let swap_chain = match crate::framegen::create_swap_chain(&factory, &self.queue, hwnd, &desc) {
+            let swap_chain = match crate::framegen::create_swap_chain(&factory, &self.device, &self.queue, hwnd, &desc) {
                 Some(proxy) => proxy,
                 None => factory
                     .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
