@@ -49,6 +49,8 @@ mod bake_inputs;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
+mod bake_why;
+#[cfg(windows)]
 mod draw;
 #[cfg(windows)]
 mod dred;
@@ -127,6 +129,8 @@ pub mod list;
 pub mod native_rt;
 #[cfg(windows)]
 mod rt_bind;
+#[cfg(windows)]
+mod rt_diag;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
