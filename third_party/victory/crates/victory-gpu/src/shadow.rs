@@ -1359,14 +1359,15 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     if !ranges.is_sorted() {
         ranges.sort_unstable();
     }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // In place, no second vector (fxceless/victory-fork #1431).
+    ranges.dedup_by(|next, last| {
+        if next.0 > last.1 {
+            return false;
         }
-    }
-    out
+        last.1 = last.1.max(next.1);
+        true
+    });
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1702,6 +1703,43 @@ mod card_tests {
             [(0, 6), (8, 20), (30, 31)]
         );
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    /// Joined in place (#1431) gives what the join into a second vector
+    /// gave, for ranges in any order, nested, touching or apart.
+    #[test]
+    fn ranges_joined_in_place_equal_the_two_vector_join() {
+        fn two_vectors(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+            ranges.sort_unstable();
+            let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+            for (from, to) in ranges {
+                match out.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => out.push((from, to)),
+                }
+            }
+            out
+        }
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |most: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % most) as usize
+        };
+        for case in 0..2000 {
+            let n = case % 40;
+            let ranges: Vec<(usize, usize)> = (0..n)
+                .map(|_| {
+                    let from = next(4096);
+                    (from, from + next(300))
+                })
+                .collect();
+            assert_eq!(joined(ranges.clone()), two_vectors(ranges.clone()), "{ranges:?}");
+            let mut sorted = ranges.clone();
+            sorted.sort_unstable();
+            assert_eq!(joined(sorted.clone()), two_vectors(sorted), "sorted {ranges:?}");
+        }
     }
 }
 
@@ -3663,6 +3701,28 @@ fn back_piece(
     Some((first, n))
 }
 
+thread_local! {
+    /// [`MergePage`]'s buffer between merges on this thread.
+    static MERGE_PAGE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// The page buffer of [`Shadow::merge_under_writes`], taken from the
+/// thread and given back to it when dropped (on every return).
+struct MergePage(Vec<u8>);
+
+impl MergePage {
+    fn take() -> Self {
+        MergePage(MERGE_PAGE.with(std::cell::Cell::take))
+    }
+}
+
+impl Drop for MergePage {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.0);
+        MERGE_PAGE.with(|cell| cell.set(buf));
+    }
+}
+
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 ///
@@ -4057,6 +4117,28 @@ fn widen_to_words(address: usize, n: usize, runs: Vec<(usize, usize)>) -> Vec<(u
         }
     }
     out
+}
+
+#[cfg(test)]
+mod merge_page_tests {
+    use super::{MergePage, PAGE};
+
+    /// The page buffer goes back to its thread on drop, early returns
+    /// included, and the next merge on the thread takes it as it was.
+    #[test]
+    fn the_page_buffer_is_kept_by_its_thread() {
+        let first = {
+            let mut page = MergePage::take();
+            page.0.resize(PAGE, 7);
+            page.0.as_ptr() as usize
+        };
+        let page = MergePage::take();
+        assert_eq!(page.0.len(), PAGE);
+        assert_eq!(page.0.as_ptr() as usize, first);
+        drop(page);
+        let other = std::thread::spawn(|| MergePage::take().0.len()).join().unwrap();
+        assert_eq!(other, 0, "another thread has a buffer of its own");
+    }
 }
 
 #[cfg(test)]
@@ -5786,7 +5868,9 @@ impl Shadow {
                 }
             }
         }
-        let mut title = Vec::new();
+        // A page's bytes, kept by the thread for its next merge
+        // (fxceless/victory-fork #1437): not 64 KiB made and zeroed a call.
+        let mut page_buf = MergePage::take();
         for (a, e) in busy {
             if watched == 1 {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5820,8 +5904,8 @@ impl Shadow {
             if stale.is_empty() {
                 continue;
             }
-            if title.is_empty() {
-                title.resize(PAGE, 0u8);
+            if page_buf.0.is_empty() {
+                page_buf.0.resize(PAGE, 0u8);
             }
             for (page, prev_at) in stale {
                 let st_before = self.lazy_state[page - base].load(Ordering::Acquire);
@@ -5837,7 +5921,7 @@ impl Shadow {
                 let mut all_read = true;
                 for (lo, hi) in sub_ranges {
                     let n = hi - lo;
-                    let title = &mut title[..n];
+                    let title = &mut page_buf.0[..n];
                     // The lock of the copy's reference (the snapshot, or the
                     // CPU's side of a copy in the card's memory), from before
                     // title memory is read until the title's bytes are in: with

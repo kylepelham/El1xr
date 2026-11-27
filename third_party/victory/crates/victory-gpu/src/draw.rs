@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+mod root_gather;
 mod root_slots;
 mod table_plan;
 #[cfg(windows)]
@@ -1847,15 +1848,8 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
-        for root in self.roots_ref(compute) {
-            match root {
-                Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
-                _ => {}
-            }
-        }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        let (addresses, constants) = root_gather::gather(self.roots_ref(compute));
+        crate::memory::ready(list, heap, addresses.as_slice(), constants.as_slice(), writes)
     }
 
     /// The bound heap holding `handle`.
