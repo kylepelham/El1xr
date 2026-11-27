@@ -205,6 +205,55 @@ def builds_idle(psutil_module=None) -> Iterator[int]:
                 pass
 
 
+def _worktree_tools(psutil) -> list:
+    """Windowless programs run from a worktree's cargo target (offline `victory translate`, test
+    executables started by hand), which `_build_tree` does not see."""
+    found = []
+    for proc in psutil.process_iter(["exe"]):
+        exe = (proc.info.get("exe") or "").lower().replace("/", "\\")
+        if "\\anyxboxx-wt\\" in exe and "\\target\\" in exe:
+            found.append(proc)
+    return found
+
+
+@contextlib.contextmanager
+def builds_suspended(psutil_module=None) -> Iterator[int]:
+    """`--quiet` without the wait: suspends every running build (`_build_tree`) and worktree tool
+    (`_worktree_tools`) for the duration and resumes them after, so a quiet run starts at once
+    instead of waiting for the machine's builds to finish. This dev.py and its parents are spared.
+    Yields how many were suspended. A no-op without psutil."""
+    psutil = psutil_module
+    if psutil is None:
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+    if psutil is None:
+        yield 0
+        return
+    me = {os.getpid()}
+    try:
+        me.update(p.pid for p in psutil.Process().parents())
+    except Exception:
+        pass
+    procs = {p.pid: p for p in _build_tree(psutil) + _worktree_tools(psutil) if p.pid not in me}
+    paused = []
+    for proc in procs.values():
+        try:
+            proc.suspend()
+            paused.append(proc)
+        except Exception:
+            pass
+    try:
+        yield len(paused)
+    finally:
+        for proc in paused:
+            try:
+                proc.resume()
+            except Exception:
+                pass
+
+
 def below_normal_priority() -> None:
     if os.name == "nt":
         import ctypes
