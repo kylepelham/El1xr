@@ -248,16 +248,24 @@ class _SuspendProc:
 class _SuspendPsutil:
     NoSuchProcess = AccessDenied = Exception
 
-    def __init__(self, procs):
+    def __init__(self, procs, children_of_me=()):
         self.procs = procs
+        self.children_of_me = list(children_of_me)
 
     def process_iter(self, _attrs):
         return list(self.procs)
 
     def Process(self):
+        ps = self
+
         class _Me:
+            pid = 1
+
             def parents(self):
                 return []
+
+            def children(self, recursive=False):
+                return list(ps.children_of_me)
         return _Me()
 
 
@@ -266,8 +274,23 @@ def test_quiet_suspends_builds_and_worktree_tools_then_resumes():
     translate = _SuspendProc(202, "victory.exe", r"E:\Gta6\AnyXboxX-wt\shaderperf\third_party\victory\target\release\victory.exe")
     browser = _SuspendProc(203, "chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe")
     ps = _SuspendPsutil([rustc, translate, browser])
-    with dev_throttle.builds_suspended(ps) as paused:
+    with dev_throttle.builds_suspended(ps, rescan_s=0) as paused:
         assert paused == 2
         assert rustc.state == translate.state == "suspended"
         assert browser.state == "running"
     assert rustc.state == translate.state == "running"
+
+
+def test_quiet_suspends_tests_started_during_the_run_but_spares_the_game():
+    game = _SuspendProc(301, "victory.exe", r"E:\Gta6\AnyXboxX-wt\train\third_party\victory\target\release\victory.exe")
+    ps = _SuspendPsutil([], children_of_me=[game])
+    with dev_throttle.builds_suspended(ps, rescan_s=0.05) as paused:
+        assert paused == 0
+        late = _SuspendProc(302, "victory_gpu-1.exe", r"E:\Gta6\AnyXboxX-wt\racefix\third_party\victory\target\debug\deps\victory_gpu-1.exe")
+        ps.procs.extend([game, late])
+        deadline = time.time() + 5
+        while late.state != "suspended" and time.time() < deadline:
+            time.sleep(0.02)
+        assert late.state == "suspended"
+        assert game.state == "running"
+    assert late.state == "running"
