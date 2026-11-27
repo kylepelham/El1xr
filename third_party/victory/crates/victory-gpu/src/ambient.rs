@@ -153,9 +153,34 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// Live, as are the air, the cap, the settling and the shade: each pass
+/// takes them as root constants when it is recorded. (The specular share,
+/// its bound, the holds and the violet drop choose the pipelines the pass
+/// is made with once, and stay read at start.)
 fn set() -> Set {
-    static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT", |v| {
+        match parse(v.unwrap_or_default()) {
+            Set::Off => 0,
+            Set::Estimate(level) => 1 << 32 | u64::from(level.to_bits()),
+            Set::Constant(level) => 2 << 32 | u64::from(level.to_bits()),
+        }
+    });
+    let bits = SET.get();
+    let level = f32::from_bits(bits as u32);
+    match bits >> 32 {
+        1 => Set::Estimate(level),
+        2 => Set::Constant(level),
+        _ => Set::Off,
+    }
+}
+
+/// Two `f32`s in a [`victory_core::settings::Live`] cell's bits, and back.
+fn pack(a: f32, b: f32) -> u64 {
+    u64::from(a.to_bits()) << 32 | u64::from(b.to_bits())
+}
+
+fn unpack(bits: u64) -> [f32; 2] {
+    [f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32)]
 }
 
 /// Whether a stand-in is on (for the diffuse light or for reflections):
@@ -194,18 +219,20 @@ pub(crate) fn specular() -> Option<Specular> {
 /// title's sky. Unset: they take the estimate too (foxhound's default: glass
 /// in a dark room mirrored the bright sky without it).
 pub(crate) fn specular_alpha() -> bool {
-    static SET: OnceLock<bool> = OnceLock::new();
-    *SET.get_or_init(|| !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0"))
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT_SPECULAR_ALPHA", |v| {
+        u64::from(!v.is_some_and(|v| v.trim() == "0"))
+    });
+    SET.get_bool()
 }
 
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT_AIR", |v| {
+        let set = v.unwrap_or_default();
+        u64::from(set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0).to_bits())
+    });
+    f32::from_bits(SET.get() as u32)
 }
 
 /// How many times the estimate the title's own result may keep
@@ -213,11 +240,11 @@ fn air() -> f32 {
 /// probes hold the sky's light indoors too; at 4 times the estimate a room
 /// looked towards a window or the sky goes very bright.
 fn most() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
-    })
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT_MOST", |v| {
+        let set = v.unwrap_or_default();
+        u64::from(set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0).to_bits())
+    });
+    f32::from_bits(SET.get() as u32)
 }
 
 /// How the slow mean of the light around follows the frames
@@ -239,26 +266,28 @@ fn parse_settle(set: &str) -> Option<Settle> {
 }
 
 fn settle() -> Option<Settle> {
-    static SET: OnceLock<Option<Settle>> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
-        parse_settle(&set)
-    })
+    // 0: none (a settling's `ms` is above 0).
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT_SETTLE", |v| {
+        parse_settle(v.unwrap_or("250,3")).map_or(0, |s| pack(s.ms, s.jump))
+    });
+    let bits = SET.get();
+    let [ms, jump] = unpack(bits);
+    (bits != 0).then_some(Settle { ms, jump })
 }
 
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
-    static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
+    static SET: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_AMBIENT_SHADE", |v| {
         let mut shade = [1.0, 0.6];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
+        let set = v.unwrap_or_default();
         for (to, v) in shade.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse() {
                 *to = v;
             }
         }
-        shade
-    })
+        pack(shade[0], shade[1])
+    });
+    unpack(SET.get())
 }
 
 const SOURCE: &str = r#"
@@ -751,6 +780,24 @@ static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 /// stand-in without a depth read of them.
 static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What `crate::skin_fill` fills skin's probe inputs with: the cells' buffer (the room's
+/// slow mean), the share of it, the constant. None while the diffuse stand-in is off or,
+/// for the estimate, before a frame's light has been kept.
+pub(crate) fn skin_light() -> Option<crate::skin_fill::Light<'static>> {
+    if !on() {
+        return None;
+    }
+    let (level, constant) = match set() {
+        Set::Off => return None,
+        Set::Estimate(level) => (level, 0.0),
+        Set::Constant(level) => (0.0, level),
+    };
+    if constant == 0.0 && !KEPT.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(crate::skin_fill::Light { cells: &pass()?.cells, level, constant })
+}
+
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
     /// The image the title's program just wrote.
@@ -946,6 +993,17 @@ pub(crate) fn without_depth(list: &HostList, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_constants_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_AMBIENT", "0.5", set, Set::Off, Set::Estimate(0.5));
+        check_live("VICTORY_AMBIENT_AIR", "2", air, 0.0, 2.0);
+        check_live("VICTORY_AMBIENT_MOST", "1.5", most, 4.0, 1.5);
+        check_live("VICTORY_AMBIENT_SETTLE", "100,2", settle, Some(Settle { ms: 250.0, jump: 3.0 }), Some(Settle { ms: 100.0, jump: 2.0 }));
+        check_live("VICTORY_AMBIENT_SHADE", "0.5", shade, [1.0, 0.6], [0.5, 0.6]);
+        check_live("VICTORY_AMBIENT_SPECULAR_ALPHA", "0", specular_alpha, true, false);
+    }
 
     #[test]
     fn settings() {

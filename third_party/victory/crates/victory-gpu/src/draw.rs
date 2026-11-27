@@ -186,12 +186,16 @@ fn parse_mb_bytes(val: &str) -> Option<u64> {
         .map(|mb| mb.min(u64::MAX >> 20) << 20)
 }
 
+/// `VICTORY_TEXTURE_CATCHUP=0`: a long queue keeps the plain budget. Live.
+static TEXTURE_CATCHUP: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_TEXTURE_CATCHUP", |v| u64::from(v.is_none_or(|v| v != "0")));
+
+/// Live: each pass takes the budgets as they are when it begins.
 fn early_pass_config() -> EarlyPassConfig {
-    static CFG: std::sync::OnceLock<EarlyPassConfig> = std::sync::OnceLock::new();
-    *CFG.get_or_init(|| {
-        let ms = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
+    use victory_core::settings::live_var;
+    static CFG: victory_core::settings::Derived<EarlyPassConfig> = victory_core::settings::Derived::new(|| {
+        let ms = |value: Option<String>, default: u64| {
+            value
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(default)
         };
@@ -204,20 +208,19 @@ fn early_pass_config() -> EarlyPassConfig {
         // so gameplay frames do not stall on `early_textures`. After initial
         // loading passes (`HEAP_BUFFER_PASSES > 60`), default bake uploads are
         // capped to 250 ms unless `VICTORY_BAKE_TEXTURES_MS` is set explicitly.
-        let bake_ms = std::env::var("VICTORY_BAKE_TEXTURES_MS")
-            .ok()
+        let bake_ms = live_var("VICTORY_BAKE_TEXTURES_MS")
             .and_then(|v| v.trim().parse::<u64>().ok());
         EarlyPassConfig {
-            early_ms: ms("VICTORY_EARLY_TEXTURES_MS", 40),
+            early_ms: ms(live_var("VICTORY_EARLY_TEXTURES_MS"), 40),
             bake_ms,
-            gameplay_ms: ms("VICTORY_GAMEPLAY_TEXTURES_MS", 3),
-            pass_bytes_override: std::env::var("VICTORY_TEXTURE_PASS_MB")
-                .ok()
+            gameplay_ms: ms(live_var("VICTORY_GAMEPLAY_TEXTURES_MS"), 3),
+            pass_bytes_override: live_var("VICTORY_TEXTURE_PASS_MB")
                 .as_deref()
                 .and_then(parse_mb_bytes),
-            loading_drain: std::env::var_os("VICTORY_LOADING_DRAIN").is_none_or(|v| v != "0"),
+            loading_drain: live_var("VICTORY_LOADING_DRAIN").is_none_or(|v| v != "0"),
         }
-    })
+    });
+    CFG.get()
 }
 
 /// Computes the `(ms, bytes, now)` `PASS_BUDGET` for `State::early_textures`.
@@ -882,6 +885,20 @@ pub(crate) fn forget_heap_ranges(id: u64) {
         .as_mut()
         .and_then(|heaps| heaps.remove(&id));
     drop(ranges);
+}
+
+#[cfg(test)]
+#[test]
+fn the_texture_budgets_are_live() {
+    use victory_core::settings::check_live;
+    let early = || early_pass_config().early_ms;
+    check_live("VICTORY_EARLY_TEXTURES_MS", "12", early, 40, 12);
+    check_live("VICTORY_GAMEPLAY_TEXTURES_MS", "6", || early_pass_config().gameplay_ms, 3, 6);
+    check_live("VICTORY_BAKE_TEXTURES_MS", "500", || early_pass_config().bake_ms, None, Some(500));
+    check_live("VICTORY_TEXTURE_PASS_MB", "64", || early_pass_config().pass_bytes_override, None, Some(64 << 20));
+    check_live("VICTORY_LOADING_DRAIN", "0", || early_pass_config().loading_drain, true, false);
+    check_live("VICTORY_TEXTURE_LOOK_MS", "500", look_ms, None, Some(500));
+    check_live("VICTORY_TEXTURE_CATCHUP", "0", || TEXTURE_CATCHUP.get_bool(), true, false);
 }
 
 #[cfg(test)]
@@ -1910,6 +1927,10 @@ impl State {
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
+        }
+        // `VICTORY_SKIN_FILL=1`: skin's probe inputs before its first draw of a frame.
+        if crate::skin_fill::on() {
+            self.skin_fill(list, p);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: sync its depth/stencil plane
@@ -3193,13 +3214,10 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(250)
-        }));
+        static SPAN_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_STAGE_MS", |v| {
+            v.and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+        });
+        let span = std::time::Duration::from_millis(SPAN_MS.get());
         // A long queue (the world's first minutes: over 20,000 slots, which
         // at the usual pace took three and a half minutes with the materials
         // black) gets 512 MB and 1.5 s a pass while the run's allowance for
@@ -3210,9 +3228,7 @@ impl State {
         const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
         const LONG: u64 = 2_000;
-        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP
-            .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let catchup = TEXTURE_CATCHUP.get_bool();
         let plain = span;
         let (per_frame, span) =
             if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
@@ -3231,12 +3247,11 @@ impl State {
         // (`VICTORY_HEAP_TEXTURES_MS` overrides; otherwise 4 ms / 10 ms in
         // steady gameplay and 200 ms during initial world-entry loading passes
         // to eliminate main-thread upload spikes while draining streaming fast).
-        static HEAP_TEXTURES_MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let heap_textures_ms = *HEAP_TEXTURES_MS.get_or_init(|| {
-            std::env::var("VICTORY_HEAP_TEXTURES_MS")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
+        // (Plus one: 0 unset.)
+        static HEAP_TEXTURES_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_HEAP_TEXTURES_MS", |v| {
+            v.and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |ms| ms.saturating_add(1))
         });
+        let heap_textures_ms = HEAP_TEXTURES_MS.get().checked_sub(1);
         let smooth_budget = std::time::Duration::from_millis(match heap_textures_ms {
             Some(ms) => ms,
             None => {
@@ -5835,6 +5850,7 @@ mod reflect_views;
 
 mod bake_pass;
 mod material_pass;
+mod skin_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
@@ -6335,21 +6351,20 @@ mod root_binding_tests {
 /// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
 /// four seconds counted in passes, as before). The looks back off 1, 2, 4,
 /// ... frames up to it.
+/// Live; logged when it changes.
 fn look_ms() -> Option<u64> {
-    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|&ms| ms > 0)?;
+    static MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_LOOK_MS", |v| {
+        v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    });
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let ms = MS.get();
+    if ms != 0 && LOGGED.swap(ms, Ordering::Relaxed) != ms {
         tracing::info!(
             ms,
             "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)"
         );
-        Some(ms)
-    })
+    }
+    (ms > 0).then_some(ms)
 }
 
 /// The milliseconds of a frame lately (a mean over the last frames), from

@@ -9,17 +9,17 @@
 use crate::watch::Reading;
 
 /// Whether the switch is on.
+/// Live: each read takes it as it is when it begins.
 pub(super) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SHORT_REMAP_LOCK").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!(
-                "VICTORY_SHORT_REMAP_LOCK=1: texture reads through the copy release the remap lock right after the copy"
-            );
-        }
-        on
-    })
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_SHORT_REMAP_LOCK");
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on = ON.get_bool();
+    if on && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "VICTORY_SHORT_REMAP_LOCK=1: texture reads through the copy release the remap lock right after the copy"
+        );
+    }
+    on
 }
 
 /// [`super::with_title`] for a caller that holds `mapping`: with
@@ -47,6 +47,11 @@ pub(super) fn with_title_snapshot<R>(
 #[cfg(test)]
 mod tests {
     use super::with_title_snapshot;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_SHORT_REMAP_LOCK", "1", super::on, false, true);
+    }
     use crate::watch::{title_memory_reading, title_memory_remapping};
 
     /// The bytes are those of the memory at the copy, partly mapped or not;

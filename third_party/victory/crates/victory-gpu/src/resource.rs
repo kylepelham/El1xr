@@ -1886,15 +1886,16 @@ pub(crate) fn host_made<'a>(
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
+///
+/// Live: each look takes the cap as it is (copies over a lowered cap go as
+/// the budget's usual eviction lets them go).
 fn texture_budget_limit() -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|mb| mb.min(u64::MAX >> 20) << 20)
-    })
+    // Plus one: 0 unset.
+    static LIMIT: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_BUDGET_MB", |v| {
+        v.and_then(|mb| mb.trim().parse::<u64>().ok())
+            .map_or(0, |mb| (mb.min(u64::MAX >> 20) << 20).saturating_add(1))
+    });
+    LIMIT.get().checked_sub(1)
 }
 
 /// Remaining bytes under `VICTORY_TEXTURE_BUDGET_MB`, if that cap is set.
@@ -4167,6 +4168,12 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn the_texture_budget_is_live() {
+        victory_core::settings::check_live("VICTORY_TEXTURE_BUDGET_MB", "1024", super::texture_budget_limit, None, Some(1024 << 20));
+    }
+
     #[test]
     fn a8_unorm_stands_outside_the_r8_family() {
         const R8_TYPELESS: u32 = 60;

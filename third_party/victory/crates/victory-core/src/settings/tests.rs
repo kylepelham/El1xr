@@ -234,6 +234,27 @@ fn saved_files_read_back_the_same() {
     assert!(problems.is_empty());
 }
 
+/// A read-only settings file is not replaced, and no temporary file is left beside it.
+#[test]
+fn a_read_only_file_is_refused_and_left_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, "VICTORY_PRESENT_CAP = \"30\"\n").unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms.clone()).unwrap();
+    let mut values = BTreeMap::new();
+    values.insert("VICTORY_PRESENT_CAP".to_string(), "60".to_string());
+    let err = write_file(&path, &values).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "VICTORY_PRESENT_CAP = \"30\"\n");
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, ["settings.toml"]);
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
 #[test]
 fn changes_merge_over_the_file_and_a_cleared_one_leaves_it() {
     let file: BTreeMap<String, String> = [("VICTORY_A1", "1"), ("VICTORY_B1", "2")]
@@ -463,9 +484,48 @@ fn every_live_setting_is_read_through_a_live_cell_or_a_hook() {
     for i in infos().iter().filter(|i| i.apply == Apply::Live) {
         assert!(
             text.contains(&format!("Live::new(\"{}\"", i.name))
+                || text.contains(&format!("Live::flag(\"{}\"", i.name))
+                || text.contains(&format!("live_var(\"{}\"", i.name))
                 || text.contains(&format!("on_change(\"{}\"", i.name)),
-            "{} is Live but nothing reads it through settings::Live or settings::on_change",
+            "{} is Live but nothing reads it through settings::Live, live_var or settings::on_change",
             i.name
         );
     }
+}
+
+#[test]
+fn a_flag_is_on_only_at_one_and_follows_a_change() {
+    static ON: Live = Live::flag("VICTORY_OVERLAY");
+    if std::env::var_os("VICTORY_OVERLAY").is_some() {
+        return;
+    }
+    assert!(!ON.get_bool(), "unset reads off, as var_os(..) == \"1\" did");
+    assert_eq!(flag_bits(Some("true")), 0);
+    assert_eq!(flag_bits(Some(" 1")), 0);
+    assert_eq!(flag_bits(Some("1")), 1);
+    assert_eq!(set("VICTORY_OVERLAY", "1"), Ok(Applied::Now));
+    assert!(ON.get_bool());
+    set("VICTORY_OVERLAY", "").unwrap();
+    assert!(!ON.get_bool());
+}
+
+#[test]
+fn a_derived_value_is_built_again_after_a_live_change() {
+    static BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CAP: Derived<(u64, bool)> = Derived::new(|| {
+        BUILT.fetch_add(1, Ordering::Relaxed);
+        let cap = live_var("VICTORY_PRESENT_SYNC").and_then(|v| v.parse().ok()).unwrap_or(0);
+        (cap, live_var("VICTORY_PRESENT_SYNC").is_some())
+    });
+    if std::env::var_os("VICTORY_PRESENT_SYNC").is_some() {
+        return;
+    }
+    assert_eq!(CAP.get(), (0, false));
+    let built = BUILT.load(Ordering::Relaxed);
+    assert_eq!(CAP.get(), (0, false));
+    assert!(BUILT.load(Ordering::Relaxed) <= built + 1, "not built at every read");
+    assert_eq!(set("VICTORY_PRESENT_SYNC", "2"), Ok(Applied::Now));
+    assert_eq!(CAP.get(), (2, true));
+    set("VICTORY_PRESENT_SYNC", "").unwrap();
+    assert_eq!(CAP.get(), (0, false));
 }

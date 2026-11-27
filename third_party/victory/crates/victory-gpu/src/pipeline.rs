@@ -66,12 +66,21 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
+    #[cfg(windows)]
+    skin: OnceLock<bool>,
 }
 
 impl Shader {
     /// The program name in its container (`PS_VelocityFill_...`), if any.
     pub(crate) fn program(&self) -> Option<&str> {
         program_name(&self.container)
+    }
+
+    /// Whether it is a skin lighting pixel stage (`crate::skin_fill`).
+    #[cfg(windows)]
+    pub(crate) fn skin(&self) -> bool {
+        *self.skin.get_or_init(|| self.stage == "pixel" && crate::skin_fill::skin_program(&self.container))
     }
 }
 
@@ -171,6 +180,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     .flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                skin: OnceLock::new(),
             })
         })
         .clone()
@@ -192,6 +203,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
             .then(|| crate::ambient::role(container))
             .flatten(),
         translated: OnceLock::new(),
+        skin: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)

@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// `VICTORY_TEXTURE_HASH_EVERY=<frames>` (Neptune; 8): how often a guarded
 /// texture no write was seen to is read and hashed all the same.
 pub(super) fn hash_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| parse_every(std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().as_deref()))
+    static EVERY: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_HASH_EVERY", parse_every);
+    EVERY.get()
 }
 
 fn parse_every(value: Option<&str>) -> u64 {
@@ -32,16 +32,18 @@ fn parse_every(value: Option<&str>) -> u64 {
 /// others hash a sample of it ([`sample`]) and read the whole texture only
 /// when the sample changed. `None` (off) when unset, not a number, or not
 /// above the look's interval.
+///
+/// Live: a kept sample counts only with the whole read it was taken with
+/// ([`kept_sample`]), so one kept under an earlier value is never trusted
+/// for a texture read whole since.
 pub(super) fn full_every() -> Option<u64> {
-    static FULL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *FULL.get_or_init(|| {
-        parse_full(
-            std::env::var("VICTORY_TEXTURE_HASH_SAMPLED")
-                .ok()
-                .as_deref(),
-            hash_every(),
-        )
-    })
+    // Parsed again after any live change, `VICTORY_TEXTURE_HASH_EVERY`'s
+    // too; 0 off (a full interval is above the look's).
+    static FULL: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_HASH_SAMPLED", |v| {
+        parse_full(v, hash_every()).unwrap_or(0)
+    });
+    let full = FULL.get();
+    (full != 0).then_some(full)
 }
 
 fn parse_full(value: Option<&str>, every: u64) -> Option<u64> {
@@ -204,6 +206,14 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switches_are_live() {
+        use victory_core::settings::check_live;
+        if check_live("VICTORY_TEXTURE_HASH_EVERY", "4", hash_every, 8, 4) {
+            check_live("VICTORY_TEXTURE_HASH_SAMPLED", "64", full_every, None, Some(64));
+        }
+    }
 
     #[test]
     fn every_defaults_to_eight_and_is_at_least_one() {

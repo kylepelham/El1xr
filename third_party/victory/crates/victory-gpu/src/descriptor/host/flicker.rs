@@ -26,9 +26,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 /// Frames a stale slot keeps its old view (`VICTORY_FLICKER_KEEP`); 0 off.
+/// Live: slots held under an earlier value keep the frame they were given,
+/// and [`super::HostHeap::stale_due`] lets them go after it is turned off.
 pub(super) fn keep_frames() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| parse_keep(std::env::var("VICTORY_FLICKER_KEEP").ok().as_deref()))
+    static N: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_FLICKER_KEEP", parse_keep);
+    N.get()
 }
 
 fn parse_keep(value: Option<&str>) -> u64 {
@@ -39,8 +41,8 @@ fn parse_keep(value: Option<&str>) -> u64 {
 
 /// `VICTORY_FLICKER_WATCH=1`.
 pub(super) fn watch() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FLICKER_WATCH").is_some_and(|v| v == "1"))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_FLICKER_WATCH");
+    ON.get_bool()
 }
 
 /// What a line counts, in its order.
@@ -150,6 +152,10 @@ struct Held {
 
 static LINE: Mutex<VecDeque<Held>> = Mutex::new(VecDeque::new());
 
+/// Whether a slot was ever held: [`super::HostHeap::stale_due`] then runs
+/// with the switch off too, so none is left showing its old view.
+static EVER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether a held slot may be made null: its frames are over and every
 /// submission begun when it went stale has finished.
 fn over(held: &Held, frame: u64, finished: u64) -> bool {
@@ -202,6 +208,7 @@ impl super::HostHeap {
         if let Some(too) = self.made_too.get(index as usize) {
             too.store(0, Relaxed);
         }
+        EVER_HELD.store(true, Relaxed);
         LINE.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(Held {
@@ -219,7 +226,7 @@ impl super::HostHeap {
     /// Makes null the held slots of this heap whose wait is over, if they
     /// still show what they showed when they went stale.
     pub(super) fn stale_due(&self) {
-        if keep_frames() == 0 {
+        if keep_frames() == 0 && !EVER_HELD.load(Relaxed) {
             return;
         }
         self.release_stale(crate::frame::current(), crate::host::submissions_finished());
@@ -276,6 +283,13 @@ fn raw_of(resource: &ID3D12Resource) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switches_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_FLICKER_KEEP", "8", keep_frames, 0, 8);
+        check_live("VICTORY_FLICKER_WATCH", "1", watch, false, true);
+    }
 
     #[test]
     fn keep_is_off_unless_a_number_of_frames() {
