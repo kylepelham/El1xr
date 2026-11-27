@@ -2719,6 +2719,11 @@ fn lazy_copyback_concurrent_direct_submit_and_copy_readback_stress() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_r = stop.clone();
+    // Reads done so far: the dispatches wait for the first before their last
+    // round, so the reads and the submits overlap however the threads are
+    // scheduled (#52: under load the reader had not started when they ended).
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reads_r = reads.clone();
     let base_addr = block.addr();
     struct StopReader {
         stop: Arc<AtomicBool>,
@@ -2744,6 +2749,7 @@ fn lazy_copyback_concurrent_direct_submit_and_copy_readback_stress() {
                 let w0 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
                 assert!(w0 >= 0x7000_0000, "unexpected torn/zero value {w0:#x}");
                 iters += 1;
+                reads_r.store(iters, Ordering::Release);
             }
             iters
         })),
@@ -2752,6 +2758,11 @@ fn lazy_copyback_concurrent_direct_submit_and_copy_readback_stress() {
     // Hammer 32 `Host::execute` (`DIRECT` UAV) dispatches while reader hammers
     // `COPY` queue readbacks in parallel.
     for round in 0u32..32 {
+        if round == 31 {
+            while reads.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+        }
         pipe.dispatch_on(h, &list, &shadow, 0, LEN, 0x7000_0000 + ((round + 1) << 16), 1);
     }
 
