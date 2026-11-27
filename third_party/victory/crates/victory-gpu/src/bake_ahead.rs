@@ -20,6 +20,15 @@
 //! uploads in the same order. Only the making of host copies moves, which
 //! the prepare threads already do off the recording thread for the other
 //! passes (`crate::texture::prepare`); nothing is staged or recorded here.
+//!
+//! With `VICTORY_BAKE_STAGE_AHEAD=1` as well (and the prepare threads'
+//! table, `VICTORY_TEXTURE_PREPARE_THREADS`) the threads make each texture
+//! ready as a prepare thread does: host copy, staging buffer, the title's
+//! memory detiled into it, filed where the pass's `staging` takes it
+//! (`crate::texture::prepare::make_ready_ahead`). The pass still records
+//! every upload into the list before the draw; the list's submission still
+//! reads the texture again if the title wrote it since (write watch,
+//! guards), so the upload-before-draw guarantee is unchanged.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -80,27 +89,46 @@ fn run_all<T: Sync>(jobs: &[T], threads: usize, deadline: Instant, make: impl Fn
     made.load(Relaxed)
 }
 
+/// (bootfast) Whether the threads also make the textures ready, as the
+/// prepare threads do (staging buffer made, the title's memory detiled into
+/// it), for the pass to record their uploads
+/// (`VICTORY_BAKE_STAGE_AHEAD=1`, with `VICTORY_BAKE_PARALLEL` and
+/// `VICTORY_TEXTURE_PREPARE_THREADS`; off by default).
+fn stage_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_STAGE_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// The most bytes of staging buffers made ready ahead for one pass: what
+/// the pass does not take in its time is let go two seconds later
+/// (`crate::texture::prepare::prune`).
+const STAGE_AHEAD_MOST: u64 = 512 << 20;
+
 /// Before a bake draw's pass over the heap's due slots `due` of `heap`:
 /// the host copies of their title textures not made yet, made on
-/// [`threads`] threads within `budget`.
+/// [`threads`] threads within `budget`; with [`stage_ahead`] the textures
+/// made ready too.
 #[cfg(windows)]
 pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], budget: Duration) {
     let threads = threads();
     if threads == 0 {
         return;
     }
+    let staging = stage_ahead() && crate::texture::prepare::threads() > 0;
     let began = Instant::now();
     let mut seen = HashSet::new();
-    let mut todo: Vec<usize> = Vec::new();
+    let mut todo: Vec<(usize, u32)> = Vec::new();
     for &(index, _) in due {
         let Some(view) = heap.handle(index).and_then(crate::descriptor::view) else {
             continue;
         };
         // A placed texture whose memory is not mapped gets no host copy in
         // the pass either.
+        let mut first = 0;
         if let View::Placed(false, resource, desc) = &view {
+            first = crate::resource::first_mip(desc);
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
+            let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
             if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
                 continue;
             }
@@ -114,26 +142,47 @@ pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], bu
         if resource.is_null()
             || !crate::resource::title_fills(resource)
             || crate::resource::host_refused(resource)
-            || crate::resource::host_copy_made(resource)
-            || !seen.insert(resource as usize)
+            || !seen.insert((resource as usize, first))
         {
             continue;
         }
-        todo.push(resource as usize);
+        let made = crate::resource::host_copy_made(resource);
+        let wanted = if staging {
+            !made || crate::resource::staged_first(resource) > first
+        } else {
+            !made
+        };
+        if wanted {
+            todo.push((resource as usize, first));
+        }
     }
     if todo.len() < AT_LEAST {
         return;
     }
     // Kept alive while the threads make them: the title may release one
     // meanwhile (as for the prepare threads).
-    for &r in &todo {
+    for &(r, _) in &todo {
         crate::resource::keep_alive(r as This);
     }
     let deadline = began + budget;
-    let made = run_all(&todo, threads, deadline, |&r| {
-        crate::resource::room_lately() && crate::resource::host_copy(r as This).is_some()
+    let staged = AtomicU64::new(0);
+    let made = run_all(&todo, threads, deadline, |&(r, first)| {
+        let r = r as This;
+        if staging && staged.load(Relaxed) < STAGE_AHEAD_MOST {
+            match crate::texture::prepare::make_ready_ahead(r, first) {
+                Some(bytes) => {
+                    staged.fetch_add(bytes, Relaxed);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            !crate::resource::host_copy_made(r)
+                && crate::resource::room_lately()
+                && crate::resource::host_copy(r).is_some()
+        }
     });
-    for &r in &todo {
+    for &(r, _) in &todo {
         crate::resource::let_go_kept(r as This);
     }
     let ms = began.elapsed().as_millis() as u64;
@@ -144,13 +193,15 @@ pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], bu
     if passes.is_power_of_two() {
         tracing::info!(
             threads,
+            staging,
             passes,
             looked_for = todo.len(),
             made,
+            staged_mb = staged.load(Relaxed) >> 20,
             ms,
             made_so_far = STATS[1].load(Relaxed),
             ms_so_far = STATS[3].load(Relaxed),
-            "a bake draw's host copies made on threads of their own first (VICTORY_BAKE_PARALLEL)"
+            "a bake draw's host copies (and with VICTORY_BAKE_STAGE_AHEAD its textures made ready) made on threads of their own first (VICTORY_BAKE_PARALLEL)"
         );
     }
 }

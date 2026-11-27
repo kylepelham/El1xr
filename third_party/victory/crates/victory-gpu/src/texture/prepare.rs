@@ -637,6 +637,66 @@ pub(crate) fn census() -> [u64; 3] {
     ]
 }
 
+impl Queue {
+    /// (bootfast) Whether a texture of `resource` from mip `first` on may be
+    /// made ready ahead ([`make_ready_ahead`]): none is handed out for it
+    /// (from that mip or a larger one), and none made ready serves it.
+    fn free_ahead(&self, resource: usize, first: u32) -> bool {
+        !(0..=first).any(|f| self.pending.contains_key(&(resource, f)))
+            && !self
+                .ready
+                .get(&resource)
+                .is_some_and(|all| all.iter().any(|r| r.first <= first))
+    }
+
+    /// (bootfast) Files `ready`, which no slot waits for: the first
+    /// [`take_ready`] of its texture takes it, or [`prune`] lets it go.
+    fn put_ahead(&mut self, resource: usize, ready: Ready) {
+        self.ready.entry(resource).or_default().push(ready);
+    }
+}
+
+/// (bootfast, `VICTORY_BAKE_STAGE_AHEAD=1`) For a bake draw's pass, on one
+/// of `crate::bake_ahead`'s threads: makes title texture `resource` ready
+/// from mip `first` on as a prepare thread does ([`work`]: host copy while
+/// the card has room, staging buffer, the title's memory detiled into it),
+/// and files it for the pass, whose `staging` takes it ([`take_ready`]) and
+/// records its upload in the list before the draw, as before. Nothing is
+/// handed out, so no slot waits for it and the pass never passes a slot
+/// over for it. Needs the prepare threads' table
+/// (`VICTORY_TEXTURE_PREPARE_THREADS`): without it, `false` and nothing
+/// done. The bytes of the staging buffer made ready, if one was.
+pub(crate) fn make_ready_ahead(resource: This, first: u32) -> Option<u64> {
+    if threads() == 0 || !queue().free_ahead(resource as usize, first) {
+        return None;
+    }
+    let job = Job {
+        resource: resource as usize,
+        first,
+        bytes: 0,
+    };
+    let Outcome::Done(Some(staging)) = work(&job) else {
+        return None;
+    };
+    let bytes = staging.bytes;
+    let ready = Ready {
+        first: staging.first,
+        staging: Some(staging),
+        bytes: 0,
+        at: crate::host::moment(),
+        slots: Vec::new(),
+    };
+    let mut q = queue();
+    if !q.free_ahead(job.resource, first) {
+        // A pass handed it out meanwhile: its thread makes it ready.
+        drop(q);
+        drop(ready);
+        return None;
+    }
+    q.put_ahead(job.resource, ready);
+    Some(bytes)
+}
+
 /// Until nothing is handed out and not done, at most `most`: whether that
 /// came (tests).
 #[cfg(test)]
@@ -679,6 +739,35 @@ mod tests {
         assert_eq!(ready_count, 2);
         assert_eq!(skipped, 2);
         assert_eq!(due, [(3, 12), (5, 14), (1, 10)]);
+    }
+
+    /// (bootfast) A texture is made ready ahead only when nothing is handed
+    /// out for it from that mip or a larger one, and nothing made ready
+    /// serves it; what is filed ahead serves the mip it was made from on.
+    #[test]
+    fn ready_ahead_only_when_nothing_serves_it() {
+        let mut q = Queue::default();
+        assert!(q.free_ahead(7, 2));
+        q.pending.insert((7, 1), vec![3]);
+        assert!(!q.free_ahead(7, 2));
+        assert!(q.free_ahead(7, 0));
+        assert!(q.free_ahead(8, 2));
+        q.put_ahead(
+            8,
+            Ready {
+                staging: None,
+                first: 1,
+                bytes: 0,
+                at: 0,
+                slots: Vec::new(),
+            },
+        );
+        assert!(!q.free_ahead(8, 1));
+        assert!(!q.free_ahead(8, 3));
+        assert!(q.free_ahead(8, 0));
+        // Filed ahead, it is no slot's: nothing is hinted to the pass.
+        assert!(q.ready_slots.is_empty());
+        assert_eq!(q.outstanding, 0);
     }
 
     /// The switch is off unless set: the pass makes its textures itself.
