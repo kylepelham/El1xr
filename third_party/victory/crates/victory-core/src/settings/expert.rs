@@ -194,6 +194,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_LOADING_DRAIN", Apply::Live),
     ("VICTORY_LOOKUP_CACHE", Apply::Restart),
     ("VICTORY_MAPPED_BY_PAGE", Apply::Restart),
+    ("VICTORY_MEET_POLLS", Apply::Retranslate),
     ("VICTORY_MEMORY_MAP", Apply::Restart),
     ("VICTORY_MENU_PNG_DIR", Apply::Restart),
     ("VICTORY_MENU_SELFTEST", Apply::Restart),
