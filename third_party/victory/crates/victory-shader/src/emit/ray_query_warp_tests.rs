@@ -1,8 +1,10 @@
 //! The committed-hit ray-query ops (`ray_query.rs`) run on WARP against a
 //! host top level with a known hit: the indices the glass splice will put in
 //! the title's result registers, and the record they make
-//! (`glass_record::pack_hit`). Skipped without WARP ray tracing tier 1.1 or
-//! without the validator (an unsigned program is refused).
+//! (`glass_record::pack_hit`). It traces on the second slot
+//! ([`SLOT_TLAS_NEAR`]), the one the glass trace's `t354` walk gets.
+//! Skipped without WARP ray tracing tier 1.1 or without the validator (an
+//! unsigned program is refused).
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -13,7 +15,7 @@ use windows::core::Interface;
 use super::bitcode::{Attr, Term, V};
 use super::glass_record::{Hit, pack_hit, unpack};
 use super::ray_query::Committed;
-use super::shader::{ROOT_CBV_SPACE, SLOT_TLAS, Shader};
+use super::shader::{ROOT_CBV_SPACE, SLOT_TLAS_NEAR, Shader};
 
 const OUT_DWORDS: u32 = 9;
 /// `RAY_FLAG_CULL_NON_OPAQUE` (0x40 is `CULL_OPAQUE`).
@@ -64,6 +66,7 @@ fn tracer() -> Vec<u8> {
     s.trace_ray_inline(
         b,
         rq,
+        SLOT_TLAS_NEAR,
         flags,
         mask,
         [half, zero, minus_one],
@@ -340,7 +343,7 @@ fn trace_known_scene(gpu: &Gpu, dxil: &[u8]) -> Vec<u32> {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR {
-                        ShaderRegister: u32::from(SLOT_TLAS),
+                        ShaderRegister: u32::from(SLOT_TLAS_NEAR),
                         RegisterSpace: ROOT_CBV_SPACE,
                     },
                 },

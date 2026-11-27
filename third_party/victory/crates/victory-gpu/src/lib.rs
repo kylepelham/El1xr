@@ -73,6 +73,8 @@ mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
+mod round_share;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod land_aside;
@@ -163,6 +165,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod tex_check;
+mod tex_early;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

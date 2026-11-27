@@ -1,7 +1,8 @@
 //! Inline ray queries on a host top level (`VICTORY_NATIVE_BVH`):
 //! `AllocateRayQuery`, `RayQuery_TraceRayInline`, `RayQuery_Proceed` and the
-//! committed status and distance, on the `RTAccelerationStructure` bound as
-//! root SRV [`SLOT_TLAS`] in [`ROOT_CBV_SPACE`] (ray tracing tier 1.1).
+//! committed hit, on an `RTAccelerationStructure` bound as root SRV
+//! [`SLOT_TLAS`] or [`SLOT_TLAS_NEAR`] in [`ROOT_CBV_SPACE`] (ray tracing
+//! tier 1.1).
 //!
 //! Groundwork only: no lowering calls these yet. The title walks its own
 //! console-format structures in its own compute programs and asks the
@@ -12,7 +13,7 @@
 #![allow(dead_code)] // groundwork: no lowering emits ray queries yet
 
 use super::bitcode::{Attr, Md, V};
-use super::shader::{ROOT_CBV_SPACE, SLOT_TLAS, Shader, flags};
+use super::shader::{ROOT_CBV_SPACE, SLOT_TLAS, SLOT_TLAS_NEAR, Shader, flags};
 
 /// DXIL resource kind of a ray-tracing acceleration structure.
 const KIND_RTAS: u32 = 16;
@@ -22,7 +23,7 @@ const KIND_RAW: u32 = 11;
 /// The metadata of root SRV `slot`: its variable (`raw` for a raw buffer),
 /// shape, and extra properties (a ray-tracing structure's element type).
 pub(super) fn srv_md(s: &mut Shader, slot: u8, raw: V) -> (V, u32, Option<Md>) {
-    if slot != SLOT_TLAS {
+    if slot != SLOT_TLAS && slot != SLOT_TLAS_NEAR {
         return (raw, KIND_RAW, None);
     }
     let i32t = s.t.i32;
@@ -40,12 +41,14 @@ pub(super) fn srv_md(s: &mut Shader, slot: u8, raw: V) -> (V, u32, Option<Md>) {
 }
 
 impl Shader {
-    /// The handle of the host ray-tracing structure ([`SLOT_TLAS`]).
-    pub fn tlas_handle(&mut self) -> V {
-        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == SLOT_TLAS) {
+    /// The handle of the host ray-tracing structure at root SRV `slot`
+    /// ([`SLOT_TLAS`] or [`SLOT_TLAS_NEAR`]).
+    pub fn tlas_handle(&mut self, slot: u8) -> V {
+        debug_assert!(slot == SLOT_TLAS || slot == SLOT_TLAS_NEAR);
+        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
             return h;
         }
-        let r = self.m.i32(u32::from(SLOT_TLAS));
+        let r = self.m.i32(u32::from(slot));
         let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
@@ -60,7 +63,7 @@ impl Shader {
         );
         let h = self.annotate(block, h, KIND_RTAS, 0);
         self.flags |= flags::RAYTRACING_1_1;
-        self.root_srvs.push((SLOT_TLAS, h));
+        self.root_srvs.push((slot, h));
         h
     }
 
@@ -71,12 +74,14 @@ impl Shader {
         self.op(block, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[f])
     }
 
-    /// `RayQuery_TraceRayInline`: starts `rq` on the host structure.
+    /// `RayQuery_TraceRayInline`: starts `rq` on the host structure at root
+    /// SRV `slot` ([`Shader::tlas_handle`]).
     #[allow(clippy::too_many_arguments)]
     pub fn trace_ray_inline(
         &mut self,
         block: usize,
         rq: V,
+        slot: u8,
         flags: V,
         mask: V,
         origin: [V; 3],
@@ -84,7 +89,7 @@ impl Shader {
         dir: [V; 3],
         tmax: V,
     ) {
-        let h = self.tlas_handle();
+        let h = self.tlas_handle(slot);
         let args = [
             rq, h, flags, mask, origin[0], origin[1], origin[2], tmin, dir[0], dir[1], dir[2], tmax,
         ];
@@ -201,6 +206,7 @@ mod tests {
         s.trace_ray_inline(
             b,
             rq,
+            SLOT_TLAS,
             ray_flags,
             mask,
             [zero, zero, zero],

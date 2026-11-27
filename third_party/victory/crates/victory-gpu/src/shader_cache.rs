@@ -103,6 +103,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     if wave_pairs_vt {
         h.update(b"VICTORY_WAVE_PAIRS_VT=1");
     }
+    if victory_shader::emit::native_glass() {
+        h.update(b"VICTORY_NATIVE_GLASS=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }

@@ -452,6 +452,59 @@ pub(crate) fn sync_heaps_wait(ticket: u64) {
     }
 }
 
+/// The ticket the next [`sync_heaps_start`] would get: a round for it, or
+/// any later one, begins after this call (`VICTORY_HEAP_ROUND_SHARE`'s
+/// stamps, `crate::heap_rounds`). `0` when there is no worker.
+#[cfg(windows)]
+pub(crate) fn heap_sync_next() -> u64 {
+    let (worker, spawned) = heap_sync_worker();
+    if !spawned {
+        return 0;
+    }
+    worker.state.lock().unwrap_or_else(|e| e.into_inner()).0 + 1
+}
+
+/// A round for ticket `need` or later: the ticket to wait for, and how it
+/// was had ([`crate::round_share::decide`]: done already, asked already by
+/// someone else, or asked now).
+#[cfg(windows)]
+pub(crate) fn sync_heaps_share(need: u64) -> (u64, crate::round_share::Decision) {
+    use crate::round_share::Decision;
+    let (worker, spawned) = heap_sync_worker();
+    if !spawned {
+        sync_heaps();
+        return (0, Decision::Ask);
+    }
+    let (ticket, decision) = {
+        let mut state = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = crate::round_share::decide(state.0, state.1, need);
+        if decision == Decision::Ask {
+            state.0 += 1;
+            (state.0, decision)
+        } else {
+            (need, decision)
+        }
+    };
+    if decision == Decision::Ask {
+        worker.cv.notify_one();
+    }
+    (ticket, decision)
+}
+
+/// Whether any of `ranges` (`[from, to)`) overlaps a registered
+/// shader-visible descriptor heap (one look at the heaps for all).
+#[cfg(windows)]
+pub(crate) fn any_in_shader_heap(ranges: impl IntoIterator<Item = (usize, usize)>) -> bool {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return false;
+    }
+    ranges.into_iter().any(|(from, to)| {
+        let (from, to) = (from as u64, to as u64);
+        from < to && heaps.iter().any(|&(hs, he, _)| from < he && hs < to)
+    })
+}
+
 /// Whether `[start, start + len)` overlaps any registered shader-visible
 /// descriptor heap.
 #[cfg(windows)]

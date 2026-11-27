@@ -605,6 +605,7 @@ pub(crate) fn relay_hand_back_for_test(
 pub(super) fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::heap_rounds::line(frames);
+    crate::round_share::line(frames);
     if !late() {
         return;
     }
@@ -916,6 +917,9 @@ pub(super) fn read_backs(list: &HostList) {
             *source,
             Some(*recorded),
         );
+        if landed {
+            crate::round_share::touched([(*at, *at + pitch * (rows - 1) + row)]);
+        }
     }
 }
 
@@ -1063,6 +1067,28 @@ impl Landings {
         self.unchanged = 0;
         Some(line)
     }
+}
+
+/// `VICTORY_HEAP_ROUND_SHARE`: the ranges the flights of `items` wrote back
+/// into title memory ([`crate::round_share::touched`]).
+pub(super) fn heap_landed(items: &[Late]) {
+    if !crate::round_share::on() {
+        return;
+    }
+    crate::round_share::touched(
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Late::Run(f) => Some(f),
+                _ => None,
+            })
+            .flat_map(|f| {
+                f.back
+                    .iter()
+                    .flat_map(|(_, r)| r.iter().copied())
+                    .chain(f.tex_back.iter().copied())
+            }),
+    );
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
