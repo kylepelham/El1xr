@@ -3692,6 +3692,7 @@ impl State {
         if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
             self.alpha_rays = alpha;
         }
+        crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
         if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
                 "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS, VICTORY_RT_TRACE =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
@@ -5060,6 +5061,7 @@ impl State {
         if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
             self.alpha_rays = alpha;
         }
+        crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
         if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
                 "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"

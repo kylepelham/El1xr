@@ -75,6 +75,9 @@ struct Structure {
     sig: u64,
     /// The last frame it was built or named by a top level.
     used: u64,
+    /// A top level whose build was recorded into this buffer: what
+    /// [`top_level`] hands to rays (a buffer made but not built is not).
+    top_built: bool,
 }
 
 /// Structures neither built nor named by a top level for this many frames
@@ -215,6 +218,7 @@ pub fn copy(dest: u64, source: u64, mode: u32) {
         size: 0,
         sig: src.sig,
         used: crate::queue::presented(),
+        top_built: src.top_built,
     };
     store.by_title.insert(dest, alias);
     ALIASED.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +515,7 @@ fn build_one(
             size: result_size,
             sig,
             used: frame,
+            top_built: false,
         };
         if let Some(old) = store.by_title.insert(dest, fresh) {
             // The list may still read the old one: it holds it until done.
@@ -534,6 +539,7 @@ fn build_one(
             size: scratch_size,
             sig: 0,
             used: frame,
+            top_built: false,
         };
         if let Some(old) = store.scratch.replace(fresh) {
             host.keep(&old.buffer);
@@ -564,8 +570,39 @@ fn build_one(
     }
     match b {
         Build::Bottom { .. } => BUILT_BOTTOM.fetch_add(1, Ordering::Relaxed),
-        Build::Top { .. } => BUILT_TOP.fetch_add(1, Ordering::Relaxed),
+        Build::Top { .. } => {
+            if let Some(st) = store.by_title.get_mut(&dest) {
+                st.top_built = true;
+            }
+            BUILT_TOP.fetch_add(1, Ordering::Relaxed)
+        }
     };
+}
+
+/// The host GPU address of the top level built for title address
+/// `address`, if one was built and is kept (`crate::rt_bind`). Asking keeps
+/// it from being let go.
+pub(crate) fn top_level(address: u64) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let st = store.as_mut()?.by_title.get_mut(&address)?;
+    if !st.top_built {
+        return None;
+    }
+    st.used = crate::queue::presented();
+    // SAFETY: a live buffer.
+    Some(unsafe { st.buffer.GetGPUVirtualAddress() })
+}
+
+/// How many top levels are kept, for `crate::rt_bind`'s summary.
+pub(crate) fn tops_kept() -> usize {
+    STORE
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|s| s.by_title.values().filter(|st| st.top_built).count()))
+        .unwrap_or(0)
 }
 
 fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
