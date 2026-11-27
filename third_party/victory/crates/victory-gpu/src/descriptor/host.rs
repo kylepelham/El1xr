@@ -850,9 +850,10 @@ const TABLED_BLOCK: u32 = 64;
 
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
-/// them through a table.
-pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// them through a table; of the latter, those a draw read again in the
+/// frame of their first read ([`tabled_reread`]).
+pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether slots draws read through tables leave the queue of textures
 /// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
@@ -860,6 +861,23 @@ pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
 fn tabled_out() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
+}
+
+/// (Androtim `8625c3a`) Whether a table read of a slot the queue holds
+/// takes it out also when the slot was read through a table before in the
+/// same frame (`VICTORY_TABLED_REREAD=1`; off: once a frame, as before).
+///
+/// A slot leaves the queue at its first table read of a frame only. The
+/// title rewrites tables' slots while it records (a table per draw), so a
+/// slot written after that read waits in the queue [`TABLED_GRACE`] frames
+/// for a draw, and the draws that read it again in the same frame (which
+/// make it and upload its texture) do not take it out: the texture pass
+/// takes it 8 frames later. Asked by the slot's mark
+/// ([`SLOT_IN_TEXTURES`]) first, so a read of a slot not queued takes no
+/// lock. A candidate of the flicker at scene loads.
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_some_and(|v| v == "1"))
 }
 
 /// What the queue of textures picked by index knows of a title slot.
@@ -2563,6 +2581,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in_as(index, read, frame, tabled_reread());
+    }
+
+    /// [`HostHeap::tabled_in`], with [`tabled_reread`] as `reread` says.
+    fn tabled_in_as(&self, index: u32, read: bool, frame: u64, reread: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
             return;
@@ -2588,6 +2611,18 @@ impl HostHeap {
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
+            }
+        } else if reread && tabled_out() && self.slot_may(index, SLOT_IN_TEXTURES) {
+            // Read again in the frame of its first read, and maybe queued
+            // since (the title wrote it again, due `TABLED_GRACE` frames
+            // on): this draw brought it up to date too.
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.slots.remove(&index).is_some() {
+                TABLED_WRITES[1].fetch_add(1, Relaxed);
+                TABLED_WRITES[2].fetch_add(1, Relaxed);
+            }
+            if !textures.rechecks.contains_key(&index) {
+                self.note_slot(index, SLOT_IN_TEXTURES, false);
             }
         }
     }
@@ -6428,6 +6463,44 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A slot written after its first table read of a frame waits for its
+    /// grace frames; a later read in that frame takes it out only with
+    /// `VICTORY_TABLED_REREAD=1` (`tabled_in_as`'s `reread`).
+    #[test]
+    fn a_slot_written_after_its_read_leaves_at_the_next_read_when_asked() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !tabled_out() {
+            return;
+        }
+        let frame = 200;
+        let slots = |at: u64| -> Vec<u32> {
+            heap.texture_slots_due(at, 8)
+                .0
+                .into_iter()
+                .map(|d| d.0)
+                .collect()
+        };
+        heap.tabled_in_as(4, true, frame, true);
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame + TABLED_GRACE - 1), []);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // Read again in that frame, as before: it stays.
+        heap.tabled_in_as(4, true, frame, false);
+        assert_eq!(slots(frame + TABLED_GRACE), [4]);
+        // With the re-read: out, counted, and its mark cleared.
+        let before = TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed);
+        heap.tabled_in_as(4, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
+        assert!(TABLED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(!heap.slot_may(4, SLOT_IN_TEXTURES));
+        // A slot not queued: nothing to take out.
+        heap.tabled_in_as(5, true, frame, true);
+        heap.tabled_in_as(5, true, frame, true);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     #[test]

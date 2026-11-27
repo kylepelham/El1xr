@@ -287,6 +287,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
     // a flip would compare against stale state and miss changed records (wrong descriptors).
     ("VICTORY_SYNC_IN_PLACE", Apply::Restart),
+    ("VICTORY_TABLED_REREAD", Apply::Restart),
     ("VICTORY_TABLED_TEXTURES", Apply::Restart),
     ("VICTORY_TABLES_BY_CONTENT", Apply::Restart),
     ("VICTORY_TABLE_DEFER", Apply::Restart),
