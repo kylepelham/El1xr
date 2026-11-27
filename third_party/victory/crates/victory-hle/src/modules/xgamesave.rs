@@ -213,7 +213,12 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes: an unfinished version is never read, and a file another
+            // program holds (a virus scanner, a backup) must not make the container
+            // unreadable. What is left goes at a later look.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -230,8 +235,14 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let Some((name, display, blobs)) = load(&version)? else {
             continue;
         };
+        // Older versions go as far as they can: the newest readable one is the container
+        // whatever is left below it. Returning the removal's error made every save of the
+        // container fail for as long as another program held one of its files.
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let path = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::info!(dir = %path.display(), %e, "an older save version stays for now; it goes at a later save");
+            }
         }
         return Ok(Some(Version {
             dir: version,
@@ -1015,6 +1026,42 @@ mod tests {
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
+    }
+
+    /// A file of an older version held by another program (a virus scanner, a backup copy
+    /// in progress) keeps that version from being removed. The saves after it must not fail
+    /// for that, and what is left goes once the file is free.
+    ///
+    /// Source: trustno1-coder/VIctory-NVIDIA PR #253 (`0438a1b`, fxceless).
+    #[cfg(windows)]
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries
+                .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+                .count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(first.blob(0))
+            .unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("two".into(), vec![("a".into(), "second a".into())])));
+        assert_eq!(update(root.path(), "three", &[("a", Some("third a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("three".into(), vec![("a".into(), "third a".into())])));
+        assert!(first.blob(0).exists(), "the held file is still there");
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("four".into(), vec![("a".into(), "fourth a".into())])));
+        assert_eq!(versions(), 1);
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
