@@ -64,6 +64,8 @@ mod scratch_spare;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 mod cores;
 #[cfg(windows)]
 mod inplace;

@@ -96,6 +96,7 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
 mod rect;
@@ -120,6 +121,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
+pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
