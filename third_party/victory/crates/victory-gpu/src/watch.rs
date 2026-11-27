@@ -54,6 +54,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+mod holes;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
 
@@ -926,6 +927,68 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64])
     true
 }
 
+/// [`nothing_new`] with `VICTORY_COLD_SKIP`: skips 2 MiB chunks whose
+/// lock-free chunk mark has not moved since the copy last verified them.
+pub(crate) fn nothing_new_cold(
+    start: usize,
+    end: usize,
+    base: usize,
+    copied: &[u64],
+    verified: &[u64],
+) -> bool {
+    if !light() || start >= end {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(off) = first.checked_sub(base) else {
+        return false;
+    };
+    let len = last - first;
+    let Some(taken) = copied.get(off..off + len) else {
+        return false;
+    };
+    let (fb, lb) = (start / BLOCK, end.div_ceil(BLOCK));
+    if !published_all(fb, lb) {
+        let ahead = {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            reservation::covered(&j, first, last)
+        };
+        if !ahead {
+            return false;
+        }
+    }
+    let base_chunk = base / crate::cold_skip::CHUNK_PAGES;
+    let (mut walked, mut passed) = (0u64, 0u64);
+    for span in crate::cold_skip::spans(first, last - 1) {
+        let chunk = span.start / crate::cold_skip::CHUNK_PAGES;
+        let at = chunk - base_chunk;
+        if verified
+            .get(at)
+            .copied()
+            .is_some_and(|v| v != 0 && crate::cold_skip::chunk_mark(chunk) < v)
+        {
+            passed += span.len() as u64;
+            continue;
+        }
+        walked += span.len() as u64;
+        let part = part_of(&PARTS, span.start, false);
+        for p in span {
+            let t = taken[p - first];
+            if t == 0 {
+                return false;
+            }
+            let stamp = part.map_or(0, |part| {
+                part.0[p % PART].load(std::sync::atomic::Ordering::Acquire)
+            });
+            if stamp > t {
+                return false;
+            }
+        }
+    }
+    crate::cold_skip::count(walked, passed);
+    true
+}
+
 /// (Neptune) `VICTORY_GUARD_HOT=<frames>` (0 or unset: off): a block of view memory that was
 /// found written at three checks running, frame after frame, is left without its guard for
 /// that many frames, and counts as written at every check meanwhile.
@@ -1360,10 +1423,17 @@ fn written_set(page: usize, now: u64) -> u64 {
 
 /// The page's stamp alone: what it held before.
 fn stamp_set(page: usize, now: u64) -> u64 {
-    match part(page, true) {
+    let before = match part(page, true) {
         Some(part) => part.0[page % PART].fetch_max(now, std::sync::atomic::Ordering::AcqRel),
         None => 0,
+    };
+    // With `VICTORY_COLD_SKIP`: advance the 2 MiB chunk's mark after the
+    // page stamp (`Release`), so any reader that loads the mark (`Acquire`)
+    // before walking `PARTS` never pairs a newer mark with an older stamp.
+    if crate::cold_skip::kept() {
+        crate::cold_skip::note_chunk(page);
     }
+    before
 }
 
 /// Notes a batch of 4 KiB pages found written by the kernel at asking `now`.
@@ -1557,16 +1627,21 @@ pub(crate) fn ask_once_active() -> bool {
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`. Check before allocating/scanning/sorting.
+    // hold is left to `writes`. Check before consuming/filtering/sorting
+    // (ZigZagBoi1/ScarlettPort 23870346; XaviFortes/VIctory-RDNA 56638976).
     if ask_once_active() {
         return;
     }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1 && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .into_iter()
+        .filter(|r| {
+            r.0 < r.1
+                && !(light() && published_all(r.0 / BLOCK, r.1.div_ceil(BLOCK)))
+                && !refused_as_view(r.0, r.1)
+        })
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -2528,9 +2603,37 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with(start, end, guarded, None)
+}
+
+/// [`writes`], with the marks of the range's 2 MiB chunks put into `marks`,
+/// read (`Acquire`) before the pages in `PARTS` (`VICTORY_COLD_SKIP`,
+/// `crate::cold_skip`).
+pub(crate) fn writes_marked(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: &mut Vec<(usize, u64)>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with(start, end, guarded, Some(marks))
+}
+
+/// [`writes`]; `marks`: filled as [`writes_marked`] says, if given.
+fn writes_with(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    mut marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let read_pages = |marks: Option<&mut Vec<(usize, u64)>>| -> Vec<(usize, u64)> {
+        if let Some(marks) = marks {
+            crate::cold_skip::read_marks(first, last, marks);
+        }
+        written_in(first, last)
+    };
     // Asked ahead with the submission's other ranges: the journal has it. (Neptune) The lock
     // is held for the look alone, and the kernel is asked without it: the pages are
     // noted in a table of their own (`written_set`).
@@ -2539,11 +2642,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         reservation::covered(&j, first, last).then_some(j.ahead_asked)
     };
     if let Some(asked) = standing {
-        return Some((asked, written_in(first, last)));
+        return Some((asked, read_pages(marks.as_deref_mut())));
     }
     let (first_b, last_b) = (start / BLOCK, end.div_ceil(BLOCK));
     if guarded && light() && start < end && published_all(first_b, last_b) {
-        return Some((next_asking(), written_in(first, last)));
+        return Some((next_asking(), read_pages(marks.as_deref_mut())));
     }
     // View memory the kernel would refuse, and the caller does not ask the
     // guards (textures, which then fall back to guarded/hash tracking): no
@@ -2644,7 +2747,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if failed {
             publish(&epochs);
         }
-        Some((now, written_in(first, last)))
+        Some((now, read_pages(marks.as_deref_mut())))
     })
 }
 
@@ -3191,7 +3294,7 @@ fn guard_with_epochs_flags(
                     // Ordinary reservations (or when placeholder skip is disabled):
                     // reuse one VirtualQuery across the contiguous uncommitted region.
                     if block >= uncommitted_until {
-                        uncommitted_until = uncommitted_end(block);
+                        uncommitted_until = holes::uncommitted_end_cached(block);
                     }
                     if block < uncommitted_until {
                         continue;
@@ -3357,7 +3460,7 @@ fn guard_locked(
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if cursor >= uncommitted_until {
-                uncommitted_until = uncommitted_end(cursor);
+                uncommitted_until = holes::uncommitted_end_cached(cursor);
             }
             if cursor < uncommitted_until {
                 if let Some((rf, rt)) = run.take() {
@@ -3514,7 +3617,7 @@ fn guard_shared(
                 continue;
             }
             if cursor >= uncommitted_until {
-                uncommitted_until = uncommitted_end(cursor);
+                uncommitted_until = holes::uncommitted_end_cached(cursor);
             }
             if cursor < uncommitted_until {
                 if let Some((rf, rt)) = run.take() {
@@ -4952,6 +5055,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    holes::forget(at, len);
     crate::texback::remapped(at, len);
     if reservation::enabled() {
         ask_once_end();
@@ -7565,5 +7669,28 @@ mod mapping_tests {
         });
         assert_eq!(answer.recv().unwrap(), (false, true));
         drop(changing);
+    }
+
+    /// While a submission-wide asking stands (`ask_once`), `ask_ahead` returns
+    /// before consuming its range iterator.
+    #[test]
+    fn ask_ahead_does_not_consume_ranges_when_asking_stands() {
+        use super::{JOURNAL, KEPT, ask_ahead, ask_once_end};
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ask_once_end();
+            }
+        }
+        let _reset = Reset;
+        {
+            let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+            j.kept = true;
+            KEPT.store(true, Ordering::Release);
+        }
+        ask_ahead(std::iter::from_fn(|| {
+            panic!("a kept asking must not consume another range plan")
+        }));
     }
 }

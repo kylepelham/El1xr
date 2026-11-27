@@ -1792,19 +1792,35 @@ pub(crate) fn host_made<'a>(
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
+fn texture_budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|mb| mb.min(u64::MAX >> 20) << 20)
+    })
+}
+
+/// Remaining bytes under `VICTORY_TEXTURE_BUDGET_MB`, if that cap is set.
+#[cfg(windows)]
+pub(crate) fn texture_budget_remaining() -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let limit = texture_budget_limit()?;
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    Some(limit.saturating_sub(filled))
+}
+
+#[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    if let Some(limit) = texture_budget_limit() {
         return filled < limit;
     }
     if filled < FLOOR {
@@ -5337,15 +5353,6 @@ float4 lit() : SV_Target { return 1.0; }
         };
         let state = host_copy(depth).unwrap().state.load(Relaxed);
         let state = D3D12_RESOURCE_STATES(state as i32);
-        let colour = host.rtv(Some(&target), None);
-        let depth_view = host.dsv(
-            host_depth,
-            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
-                Format: DXGI_FORMAT(45),
-                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            }),
-        );
         let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources and views.
         unsafe {
@@ -5353,10 +5360,21 @@ float4 lit() : SV_Target { return 1.0; }
             if state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
-            l.ClearRenderTargetView(colour, &[0.0; 4], None);
-            l.SetGraphicsRootSignature(&signature);
-            l.SetPipelineState(&pipeline);
-            l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            host.output_views(|views| {
+                let colour = views.rtv(Some(&target), None);
+                let depth_view = views.dsv(
+                    host_depth,
+                    Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                        Format: DXGI_FORMAT(45),
+                        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    }),
+                );
+                l.ClearRenderTargetView(colour, &[0.0; 4], None);
+                l.SetGraphicsRootSignature(&signature);
+                l.SetPipelineState(&pipeline);
+                l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            });
             l.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,

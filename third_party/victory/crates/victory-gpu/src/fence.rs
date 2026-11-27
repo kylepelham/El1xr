@@ -105,10 +105,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         if crate::host::late() {
             drop(waiters);
             crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
+            if wait_until(&fence.value, value, std::time::Duration::from_millis(250)) {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
@@ -133,6 +133,40 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    // SAFETY: wake any guest thread blocking via WaitOnAddress on the fence's value.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
+}
+
+/// Blocks until `target` reaches `value` or `timeout` elapses, waking via
+/// `WaitOnAddress` and releasing held queues while waiting.
+#[cfg(windows)]
+fn wait_until(target: &AtomicU64, value: u64, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let current = target.load(Ordering::Acquire);
+        if current >= value {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let ms = (deadline - now).as_millis().min(10) as u32;
+        // SAFETY: waits on the fence's own u64 until woken or timeout.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                (&raw const *target).cast(),
+                (&raw const current).cast(),
+                size_of::<u64>(),
+                ms.max(1),
+            );
+        }
+        crate::queue::release_held(false);
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -200,6 +234,30 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocking_wait_wakes_on_signal_and_times_out_when_unreached() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let addr = f as usize;
+        assert!(!wait_until(
+            &fence(f).value,
+            10,
+            std::time::Duration::from_millis(15)
+        ));
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            set(addr as This, 10);
+        });
+        assert!(wait_until(
+            &fence(f).value,
+            10,
+            std::time::Duration::from_millis(500)
+        ));
+        signaller.join().unwrap();
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }

@@ -17,9 +17,13 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(feature = "mimalloc")]
+pub mod heap;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -40,6 +44,10 @@ pub mod frametime;
 mod heap_rounds;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod land_aside;
+#[cfg(windows)]
+mod output_views;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -71,6 +79,11 @@ pub mod queue;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod stretch;
+#[cfg(all(windows, feature = "dlss"))]
+mod dlss;
+pub mod upscale;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -101,6 +114,8 @@ pub mod titlemem;
 #[cfg(windows)]
 mod defrag;
 mod watch;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod wc_skip;
 
 #[cfg(windows)]
 pub use defrag::log_defrag_counters;
@@ -108,6 +123,8 @@ pub use defrag::log_defrag_counters;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use wc_skip::title_memory_reserved;
 #[cfg(windows)]
 pub use shadow::LazyAccessHold;
 #[cfg(windows)]
