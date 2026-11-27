@@ -578,9 +578,10 @@ def apply_snaps(overrides: dict[str, str], every_s: float, snap_dir: Path) -> di
 
 
 def run_bench(
-    args: argparse.Namespace, overrides: dict[str, str], log_path: Path, snap_dir: Path
+    args: argparse.Namespace, overrides: dict[str, str], log_path: Path, snap_dir: Path, what: str = "bench"
 ) -> tuple[dict[str, object], int | None, int | None, int]:
-    """One timed release run under gpu.lock: (stats, driver resets before and after, snaps written).
+    """One timed release run under gpu.lock and `_quiet(args, what)`: (stats, driver resets before
+    and after, snaps written).
     Raises FileNotFoundError or ValueError (before anything runs) for a bad game folder or save."""
     game_dir = resolve_game_dir(args.game_dir)
     overrides = apply_fast_boot(args, overrides)
@@ -599,7 +600,7 @@ def run_bench(
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock("bench"), _quiet(args, "bench"):
+        with acquire_gpu_lock(what), _quiet(args, what):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
@@ -799,7 +800,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         unmute=plan.unmute, diag=False, seconds=plan.seconds, quiet=plan.quiet, snap_every=plan.snap_every,
     )
     try:
-        stats, before, after, snaps = run_bench(bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps")
+        stats, before, after, snaps = run_bench(
+            bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps", what="train"
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}")
         print(f"DEV train FAIL run={rid} reason=setup")
