@@ -361,7 +361,7 @@ pub(crate) fn commit_show(heap: usize, index: u32, handle: u64, expected_key: u6
 }
 
 /// [`commit_show`] now: true if it wrote the slot.
-fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key: u64) -> bool {
+pub(crate) fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key: u64) -> bool {
     let heaps = super::SHADER_HEAPS
         .read()
         .unwrap_or_else(|e| e.into_inner());
