@@ -1241,6 +1241,8 @@ mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+pub(crate) mod samplers;
+#[cfg(windows)]
 mod make;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline

@@ -1197,6 +1197,7 @@ fn overlay_pass() -> Option<&'static OverlayPass> {
             let ps = compile(OVERLAY, s!("over"), s!("ps_5_1"))?;
             // SAFETY: plain creation; the root signature is inside the pixel shader.
             unsafe {
+                crate::pipeline::samplers::layer(&host.device, &[crate::pipeline::samplers::overlay()]);
                 let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &ps[..])?;
                 let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
