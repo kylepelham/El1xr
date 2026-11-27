@@ -749,9 +749,11 @@ impl Lower<'_> {
                         need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
+                    let (c1, turn) = self.exchange_turn(self.cur);
                     let cl = self.console_lane();
-                    let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
+                    let is = self.s.m.cmp(c1, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    let k = self.exchange_set(c1, k, turn);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -760,7 +762,7 @@ impl Lower<'_> {
                     let c2 = self.order_waves(self.cur, self.reached_by_group());
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    let _c2 = self.order_waves(c2, self.reached_by_group());
+                    let _c2 = self.exchange_done(c2, turn);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);

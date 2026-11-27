@@ -523,6 +523,12 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_EXCHANGE_PAIRS=1` (off by default): the exchanges of the two host waves of a
+/// console wave64 take turns between two sets of dwords, one group barrier each instead of two.
+pub fn exchange_pairs() -> bool {
+    lower::exchange_pairs::enabled()
+}
+
 /// `VICTORY_WAVE_COLLAPSE=1` (off by default): two lane-mask loop phis whose
 /// back edges are the same `s_*_wrexec_*` result are one mask (a waterfall
 /// over a narrowed EXEC then collapses to one access), and a guarded
