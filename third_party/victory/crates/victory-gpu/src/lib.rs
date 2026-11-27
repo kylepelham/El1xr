@@ -28,6 +28,7 @@ pub mod console;
 mod copystat;
 #[cfg(windows)]
 mod gpucost;
+mod gpucost_slow;
 #[cfg(feature = "mimalloc")]
 pub mod heap;
 pub mod descriptor;

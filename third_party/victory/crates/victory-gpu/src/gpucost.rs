@@ -89,6 +89,8 @@ struct Stamps {
     labels: Vec<Label>,
     /// Resolved at the list's close since its last reset.
     closed: bool,
+    /// Our list number (`victory list #N`), 0 for lists of ours without one.
+    id: u64,
 }
 
 // SAFETY: free-threaded D3D12 objects behind a lock.
@@ -166,6 +168,7 @@ fn make() -> Option<Stamps> {
         back,
         labels: Vec::new(),
         closed: false,
+        id: 0,
     })
 }
 
@@ -239,6 +242,9 @@ fn collect(s: &mut Stamps) {
         read
     };
     let ordered = stamps.windows(2).all(|w| w[0] <= w[1]);
+    if ordered && !stamps.contains(&UNWRITTEN) {
+        crate::gpucost_slow::note(s.id, &labels, &stamps, frequency());
+    }
     let span = stamps[n - 1].wrapping_sub(stamps[0]);
     let why = if stamps.contains(&UNWRITTEN) {
         Some(if stamps.iter().all(|&t| t == UNWRITTEN) {
@@ -283,6 +289,12 @@ fn collect(s: &mut Stamps) {
 /// `list` was just reset: its last run's stamps are counted, and its first
 /// stamp, under `label`, is written.
 pub(crate) fn begin(list: &ID3D12GraphicsCommandList, label: impl Into<Label>) {
+    begin_as(list, label, 0);
+}
+
+/// [`begin`] for our list number `id` (`victory list #N`), which slow runs
+/// are said under (`crate::gpucost_slow`).
+pub(crate) fn begin_as(list: &ID3D12GraphicsCommandList, label: impl Into<Label>, id: u64) {
     if !on() {
         return;
     }
@@ -296,6 +308,7 @@ pub(crate) fn begin(list: &ID3D12GraphicsCommandList, label: impl Into<Label>) {
         },
     };
     collect(s);
+    s.id = id;
     // SAFETY: an open list and its own heap.
     unsafe { list.EndQuery(&s.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0) };
     s.labels.push(label.into());
