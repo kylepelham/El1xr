@@ -57,23 +57,14 @@ fn a_stale_wanted_texture_is_taken_again_in_place() {
     // (owner, fresh, generation)
     let mut wanted: Vec<(usize, bool, u32)> = Vec::new();
     let want = |owner: usize, generation: u32, wanted: &mut Vec<(usize, bool, u32)>| {
-        want_in(
-            wanted,
-            |t| t.0 == owner,
-            |t| t.1,
-            || Some((owner, true, generation)),
-        );
+        want_in(wanted, |t| t.0 == owner, |t| t.1, || Some((owner, true, generation)));
     };
     want(7, 1, &mut wanted);
     want(7, 2, &mut wanted);
     assert_eq!(wanted, vec![(7, true, 1)], "a fresh target is kept");
     wanted[0].1 = false;
     want(7, 3, &mut wanted);
-    assert_eq!(
-        wanted,
-        vec![(7, true, 3)],
-        "a stale target is replaced in place"
-    );
+    assert_eq!(wanted, vec![(7, true, 3)], "a stale target is replaced in place");
     want(8, 4, &mut wanted);
     assert_eq!(wanted, vec![(7, true, 3), (8, true, 4)]);
 }

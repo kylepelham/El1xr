@@ -114,18 +114,15 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|weak| {
-            let Some(ticket) = weak.upgrade() else {
-                return false;
-            };
-            if matches(&ticket) {
-                ticket.valid.store(false, Ordering::Release);
-            }
-            true
-        });
+    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+        let Some(ticket) = weak.upgrade() else {
+            return false;
+        };
+        if matches(&ticket) {
+            ticket.valid.store(false, Ordering::Release);
+        }
+        true
+    });
 }
 
 /// Title texture `owner` is being freed.
