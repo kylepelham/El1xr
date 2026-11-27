@@ -30,6 +30,7 @@ pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+mod short_remap;
 mod stage_unlocked;
 mod stale_audit;
 pub(crate) mod take_by_table;
@@ -1673,7 +1674,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1703,8 +1704,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1724,7 +1724,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1743,7 +1743,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let sample = sampling.then(|| blind_hash::sample(tiled));
         let kept = blind_hash::kept_sample(last.sample, last.hash);

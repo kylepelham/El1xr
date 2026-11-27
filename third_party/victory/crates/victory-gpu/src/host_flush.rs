@@ -348,6 +348,7 @@ pub(super) fn last<R>(flush: impl FnOnce() -> R) -> R {
 pub(super) fn log(frames: f64) {
     super::one_pass::line(frames);
     crate::refresh_prof::log(frames);
+    crate::shadow::refresh_stamp::line(frames);
     if !crate::refresh_prof::on() {
         for arr in &STATS_BY {
             for a in arr {

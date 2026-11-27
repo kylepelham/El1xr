@@ -17,6 +17,9 @@ pub(crate) enum Note {
     /// Left as the title had it: no frame's light kept yet, or its image or
     /// depth not found.
     NotReady,
+    /// Its image found and no depth: the light around without a direction
+    /// (`VICTORY_AMBIENT_SPECULAR_BOUND=1`); the rays' layer.
+    Bound(u32),
 }
 
 /// Dispatches followed, frames they were in, left as they were (water,
@@ -26,6 +29,7 @@ static RAN: AtomicU64 = AtomicU64::new(0);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static WATER: AtomicU64 = AtomicU64::new(0);
 static NOT_READY: AtomicU64 = AtomicU64::new(0);
+static BOUND: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAYERS: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +61,10 @@ pub(crate) fn note(note: Note) {
         Note::NotReady => {
             NOT_READY.fetch_add(1, Relaxed);
         }
+        Note::Bound(layer) => {
+            BOUND.fetch_add(1, Relaxed);
+            LAYERS.fetch_or(1 << layer.min(3), Relaxed);
+        }
     }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,7 +83,8 @@ pub(crate) fn note(note: Note) {
         "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={},{}) in the last {seconds:.0} s: {} frames, \
          {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along the reflected direction \
          put in right after it; {} of water (or the alpha layer with VICTORY_AMBIENT_SPECULAR_ALPHA=0) and {} \
-         before a frame's light was kept or without its views left as the title had them",
+         before a frame's light was kept or without its views left as the title had them; {} without a depth \
+         given the light around instead (VICTORY_AMBIENT_SPECULAR_BOUND={})",
         set.share,
         set.sky,
         FRAMES.swap(0, Relaxed),
@@ -83,6 +92,8 @@ pub(crate) fn note(note: Note) {
         named(layers),
         WATER.swap(0, Relaxed),
         NOT_READY.swap(0, Relaxed),
+        BOUND.swap(0, Relaxed),
+        u8::from(crate::ambient_reflect::bound()),
     );
 }
 

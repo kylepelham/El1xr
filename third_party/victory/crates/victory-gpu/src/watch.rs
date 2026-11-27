@@ -55,6 +55,11 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 mod guard4k;
+
+/// (feedcard, #88) `VICTORY_GUARD_4K_JOIN`, for the flush profile's line.
+pub(crate) fn guard_4k_join() -> bool {
+    guard4k::join()
+}
 mod holes;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
