@@ -12,6 +12,12 @@
 //! kind and the six longest waits, each with the new view and the old one
 //! (resource size, mips and format; view format, dimension, channel mapping
 //! and mips; address).
+//!
+//! Null views the title writes on purpose (`CreateShaderResourceView` with
+//! no resource, [`title_null`]) are not waits: the slot shows what the
+//! title asked for. Batch 5 counted 61,002 of them as failed (all
+//! `shader 0x0`: R32_UINT buffers, R32_UINT 2D, 3D and 1D views, and
+//! acceleration structures). They are counted as `title_null` writes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,6 +55,7 @@ pub(crate) enum Kind {
 struct Wait {
     kind: Kind,
     since: u64,
+    view: View,
     new: String,
     old: String,
 }
@@ -57,24 +64,64 @@ struct Wait {
 static WAITS: Mutex<Option<HashMap<(usize, u32), Wait>>> = Mutex::new(None);
 /// When the last summary was logged.
 static LAST_SUMMARY: AtomicU64 = AtomicU64::new(0);
+/// Title null views written since the last summary.
+static TITLE_NULLS: AtomicU64 = AtomicU64::new(0);
 /// Logged at least so long a wait.
 const LONG_MS: u64 = 1000;
 const SUMMARY_MS: u64 = 5000;
 
 /// Slot `index` of heap `heap` waits for `new`, showing `kind` meanwhile
-/// (`old`: what it showed). Counted from the first time only.
+/// (`old`: what it showed). Counted from the first time for that view; a
+/// slot written with another view meanwhile waits for that one from then.
 pub(crate) fn waiting(heap: usize, index: u32, kind: Kind, new: &View, old: Option<&View>) {
     let now = crate::host::now_ms();
     {
         let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = waits.get_or_insert_with(HashMap::new).entry((heap, index));
-        let wait = entry.or_insert_with(|| Wait {
-            kind,
-            since: now,
-            new: text(Some(new)),
-            old: text(old),
-        });
-        wait.kind = kind;
+        note(waits.get_or_insert_with(HashMap::new), (heap, index), kind, new, old, now);
+    }
+    summary(now);
+}
+
+fn note(
+    waits: &mut HashMap<(usize, u32), Wait>,
+    key: (usize, u32),
+    kind: Kind,
+    new: &View,
+    old: Option<&View>,
+    now: u64,
+) {
+    match waits.get_mut(&key) {
+        Some(wait) if wait.view == *new => wait.kind = kind,
+        _ => {
+            let wait = Wait {
+                kind,
+                since: now,
+                view: new.clone(),
+                new: text(Some(new)),
+                old: text(old),
+            };
+            waits.insert(key, wait);
+        }
+    }
+}
+
+/// Whether the title wrote a null view on purpose: a shader view of no
+/// resource (D3D12's null descriptor, with the description saying its
+/// kind). Made, it reads zeros, as the title meant.
+pub(crate) fn title_null(view: &View) -> bool {
+    matches!(view, View::Shader(0, _))
+}
+
+/// Slot `index` of heap `heap` shows the null view the title wrote: it
+/// waits for nothing.
+pub(crate) fn title_nulled(heap: usize, index: u32) {
+    let now = crate::host::now_ms();
+    TITLE_NULLS.fetch_add(1, Relaxed);
+    {
+        let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = waits.as_mut() {
+            w.remove(&(heap, index));
+        }
     }
     summary(now);
 }
@@ -113,6 +160,7 @@ fn summary(now: u64) {
     {
         return;
     }
+    let title_null = TITLE_NULLS.swap(0, Relaxed);
     let waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(waits) = waits.as_ref() else { return };
     let (counts, longest) = tally(waits.iter().map(|(k, w)| (*k, w.kind, w.since)), now);
@@ -121,6 +169,7 @@ fn summary(now: u64) {
         kept_same = counts[1],
         kept_other = counts[2],
         failed = counts[3],
+        title_null,
         "view ages: waiting"
     );
     for ((heap, index), kind, ms) in longest {
@@ -214,6 +263,32 @@ mod tests {
         let order: Vec<u32> = longest.iter().map(|(k, ..)| k.1).collect();
         assert_eq!(order, vec![9, 8, 7, 6, 5, 4]);
         assert_eq!(longest[0].2, 9000);
+    }
+
+    #[test]
+    fn a_view_of_no_resource_is_a_title_null() {
+        let mut d = [0u32; 10];
+        d[0] = 42;
+        d[1] = 1;
+        assert!(title_null(&View::Shader(0, Some(d))));
+        assert!(title_null(&View::Shader(0, None)));
+        assert!(!title_null(&View::Shader(0x1234, Some(d))));
+        assert!(!title_null(&View::Placed(false, [0; 14], [0; 16])));
+    }
+
+    #[test]
+    fn a_slot_written_with_another_view_waits_from_then() {
+        let mut waits = HashMap::new();
+        let a = View::Shader(0x10, None);
+        let b = View::Shader(0x20, None);
+        note(&mut waits, (1, 7), Kind::Failed, &a, None, 1000);
+        note(&mut waits, (1, 7), Kind::Null, &a, None, 2000);
+        assert_eq!((waits[&(1, 7)].kind, waits[&(1, 7)].since), (Kind::Null, 1000));
+        note(&mut waits, (1, 7), Kind::Null, &b, Some(&a), 3000);
+        let w = &waits[&(1, 7)];
+        assert_eq!((w.kind, w.since), (Kind::Null, 3000));
+        assert_eq!(w.new, text(Some(&b)));
+        assert_eq!(w.old, text(Some(&a)));
     }
 
     #[test]
