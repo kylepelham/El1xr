@@ -8,6 +8,8 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+#[cfg(windows)]
+mod mesh_launch;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2049,13 +2051,15 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        // (`VICTORY_MESH_LAUNCH`) The pipeline with the launch stage for a launched record.
+        let pso = crate::launch::pso(p);
+        if self.host_pipeline != pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            unsafe { l.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
             // Kept and named once per list even when alternating pipelines.
-            list.bind_pipeline(&p.pso, &p.root, &p.name);
+            list.bind_pipeline(pso, &p.root, &p.name);
         }
         let mut made = std::mem::take(&mut self.scratch_made);
         crate::table_defer::begin(p.is_bake, compute);
@@ -5155,6 +5159,12 @@ impl State {
             crate::drop_why::set("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        if kind == MESH
+            && crate::launch::on()
+            && let Some(drawn) = self.launch_mesh(list, p, max, count.is_some(), &args, arguments, len)
+        {
+            return drawn;
         }
         if raw_indirect() && kind == MESH && max == 1 && count.is_none() {
             self.window = None;
