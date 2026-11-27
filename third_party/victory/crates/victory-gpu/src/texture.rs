@@ -75,6 +75,11 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Where in `buffer` `data` begins, and the piece of a block it is
+    /// (`crate::texpool`, `VICTORY_STAGING_BLOCKS=1`; 0 and none for a
+    /// buffer of its own), given back with this.
+    base: u64,
+    piece: Option<crate::texpool::StagingPiece>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -421,6 +426,9 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.piece.is_some() {
+            return;
+        }
         // (Neptune) Its upload buffer is kept for the next staging buffer of its size class.
         // The last holder is gone: the texture's entry, and every list that recorded an
         // upload from it (a list is reset when the card has run it).
@@ -926,7 +934,10 @@ impl PreludeUpload {
                 pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: self.staging.base + footprint.Offset,
+                        ..*footprint
+                    },
                 },
             };
             // SAFETY: an open prelude list; both locations name live resources.
@@ -2166,13 +2177,19 @@ fn build_staging_untimed(
             Some(&mut total),
         );
     }
-    let (buffer, data) = stage_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (piece, buffer, base, data) = match crate::texpool::staging(host, total) {
+        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+        None => {
+            let (buffer, data) = stage_buffer(host, total)?;
+            crate::host::name(&buffer, || {
+                format!(
+                    "staging of {resource:?} {}x{}x{} f{}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                )
+            });
+            (None, buffer, 0, data)
+        }
+    };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -2196,6 +2213,8 @@ fn build_staging_untimed(
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        base,
+        piece,
     });
     Some(s)
 }

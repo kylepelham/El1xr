@@ -11390,7 +11390,7 @@ impl Host {
         }
         Some([
             own.Budget,
-            own.CurrentUsage,
+            own.CurrentUsage.saturating_sub(crate::texpool::free_texture_bytes()), // empty block bytes are room
             shared.Budget,
             shared.CurrentUsage,
         ])

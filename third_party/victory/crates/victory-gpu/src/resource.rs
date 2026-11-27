@@ -1598,7 +1598,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                         .is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly {
-                host_texture_as(&r.desc, r.host.state, clear, true).ok()
+                host_texture_as(&r.desc, r.host.state, clear, true, false).ok()
             } else {
                 None
             };
@@ -1617,7 +1617,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => host_texture(&r.desc, r.host.state, clear, blockable(r)),
         };
         let texture = match texture {
             Ok(texture) => texture,
@@ -2984,15 +2984,28 @@ fn no_texture(code: HRESULT) -> NoTexture {
     }
 }
 
+/// Whether the host copy of `r` may lie in a block (`crate::texpool`): a
+/// texture the title places and fills from a layout the upload reads, so it
+/// is uploaded before it is read and a piece's old bytes are never seen.
+/// Source: uiliannn/VItoriaBr 5668b8bbdc.
+#[cfg(windows)]
+fn blockable(r: &Resource) -> bool {
+    crate::texpool::texture_heaps()
+        && r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        && fills(&r.desc)
+        && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags; `blockable`: see [`blockable`].
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    blockable: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
-    host_texture_as(desc, state, clear, false)
+    host_texture_as(desc, state, clear, false, blockable)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -3003,6 +3016,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
+    blockable: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -3053,6 +3067,25 @@ fn host_texture_as(
         }
         value
     });
+    // In a piece of a block (`VICTORY_TEXTURE_HEAPS=1`).
+    if blockable
+        && !reserved
+        && clear_value.is_none()
+        && d.sample_count <= 1
+        // SAFETY: the description has the host layout (as below).
+        && let Some(t) = unsafe {
+            crate::texpool::texture(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+            )
+        }
+    {
+        crate::host::name(&t, || {
+            format!("texture {}x{} f{} flags {:#x} in a block", d.width, d.height, d.format, d.flags)
+        });
+        return Ok(t);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()

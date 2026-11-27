@@ -110,6 +110,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
+mod texpool;
+#[cfg(windows)]
 mod texstore;
 #[cfg(windows)]
 mod texture;
