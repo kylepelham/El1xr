@@ -4626,6 +4626,7 @@ impl Host {
                         }
                     }
                     firsts.push(lists.len());
+                    let _laps = run_split::prelude();
                     if let Some(prelude) = list.prelude(&uploads) {
                         lists.push(Some(prelude));
                     }
@@ -6386,7 +6387,9 @@ impl HostList {
         use crate::copystat::{C, add};
         let mut wrote_heap = false;
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        let mut laps = run_split::Laps::start();
         for step in &self.deferred().copies {
+            laps.step(step);
             let (started, copied) = match step {
                 Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => continue,
                 Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
@@ -6481,6 +6484,7 @@ impl HostList {
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        laps.end();
         (wrote_heap, textures)
     }
 }
@@ -7984,6 +7988,7 @@ impl Meter {
             crate::card_constants::line(frames);
             step_reads::line(frames);
             crate::port_order::line(frames);
+            run_split::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
@@ -9202,6 +9207,8 @@ mod sweep_aside;
 mod flush;
 #[path = "host_step_reads.rs"]
 mod step_reads;
+#[path = "host_run_split.rs"]
+mod run_split;
 use step_reads::blocked_by;
 
 #[cfg(test)]

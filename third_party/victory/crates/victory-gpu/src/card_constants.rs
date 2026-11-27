@@ -40,7 +40,7 @@ const MOST_NOTED: usize = 256;
 /// Whether the switch is on (`VICTORY_CARD_COPY_CONSTANTS=1`).
 pub(crate) fn on() -> bool {
     #[cfg(test)]
-    if tests::FORCED.load(Ordering::Relaxed) {
+    if tests::FORCED.get() {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -224,8 +224,10 @@ pub(crate) fn line(frames: f64) {
 mod tests {
     use super::*;
 
-    /// The switch, on for the test that needs it.
-    pub(super) static FORCED: AtomicBool = AtomicBool::new(false);
+    // The switch, on for the test that needs it. Per thread: tests run side by side, and only this test's own calls may see it.
+    thread_local! {
+        pub(super) static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// A private allocation standing for a title buffer, registered as one.
     struct Title(usize, usize);
@@ -267,7 +269,7 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return;
         };
-        FORCED.store(true, Ordering::Relaxed);
+        FORCED.set(true);
         const LEN: usize = 64 << 10;
         let (from, to) = (Title::new(LEN, 0x5eed_0001), Title::new(LEN, 0x5eed_0002));
         let (src, dst) = (from.0 + 4096, to.0 + 8192);
@@ -336,7 +338,7 @@ mod tests {
         assert!(snapshot(&list, dst as u64, 256).is_none());
         list.close();
         list.reset();
-        FORCED.store(false, Ordering::Relaxed);
+        FORCED.set(false);
         drop((list, source, target));
     }
 

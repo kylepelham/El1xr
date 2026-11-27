@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Whether the steps are noted and [`blocked_by`] uses the notes.
 pub(super) fn on() -> bool {
     #[cfg(test)]
-    if tests::FORCED.load(Ordering::Relaxed) {
+    if tests::FORCED.get() {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -154,7 +154,9 @@ pub(super) fn line(frames: f64) {
 }
 
 fn answer(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
-    if !on() {
+    // The card copies' steps (`VICTORY_CARD_READ_COPY=1`) block or not as `readcopy::decide`
+    // sets them at submission: not noted here, so the walk answers.
+    if !on() || super::readcopy::card_read_copy() {
         return super::blocked_by_walk(written, runs, count);
     }
     if written.is_empty() {
@@ -179,9 +181,10 @@ fn answer(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option
 mod tests {
     use super::*;
 
-    /// The notes, on for the test that records real lists.
-    pub(super) static FORCED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    // The notes, on for the test that records real lists. Per thread: tests run side by side, and only this test's own calls may see it.
+    thread_local! {
+        pub(super) static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// Lists recorded with the host's own calls (copies, joined copies, fills
     /// of both kinds, steps of ours) answer as the walk does.
@@ -190,7 +193,7 @@ mod tests {
         let Some(host) = super::super::host() else {
             return;
         };
-        FORCED.store(true, Ordering::Relaxed);
+        FORCED.set(true);
         let memory = vec![0u8; 1 << 16];
         let base = memory.as_ptr() as usize;
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -241,7 +244,7 @@ mod tests {
                 super::super::blocked_by_walk(&written, &runs, false)
             );
         }
-        FORCED.store(false, Ordering::Relaxed);
+        FORCED.set(false);
         drop(memory);
     }
 
