@@ -75,6 +75,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// The first copy numbered by [`premap`] since the last [`ready`]
+    /// (`usize::MAX`: none): the next draw brings it up to date.
+    premapped: usize,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,6 +114,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            premapped: usize::MAX,
         })
     }
 
@@ -237,6 +241,29 @@ impl Memory {
     }
 }
 
+/// `VICTORY_BVH_PREMAP` (`crate::bvh_premap`): the copies around the
+/// structure builder's ranges (`addresses`: destinations, sources, scratch,
+/// instances, vertices and indices of the builds the title asks for), made
+/// before the builder's first dispatch rather than from its faults a frame
+/// later. Brought up to date (and declared written) by the next draw that
+/// reads title memory by address.
+pub(crate) fn premap(addresses: &[u64]) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let Some(m) = guard.as_mut() else {
+        return;
+    };
+    let before = m.copies.len();
+    for &address in addresses.iter().filter(|&&a| a != 0) {
+        m.name(address);
+    }
+    if m.copies.len() > before {
+        m.premapped = m.premapped.min(before);
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -261,7 +288,7 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
+    let numbered = m.copies.len().min(std::mem::replace(&mut m.premapped, usize::MAX));
     for &address in addresses {
         m.name(address);
     }
