@@ -659,6 +659,21 @@ fn is_scene_kernel(io: &crate::native::StageIo, digest: [u8; 16]) -> bool {
         )
 }
 
+/// `VICTORY_WAVE_LOOP_SKIPS=1` ([`crate::loop_skips`]): the form the wave-wide branches try
+/// first, every skip left out but those around loops that go round on a scalar test (the
+/// program itself where those are the only skips the deep form leaves out); `None` when off.
+fn loop_skips_kept<F>(
+    p: &ir::Program,
+    deep: bool,
+    form: &impl Fn(Option<ir::Program>) -> Option<F>,
+) -> Option<F> {
+    if !crate::loop_skips::on() || std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let kept = crate::loop_skips::with_kept(|| ir::without_skips(p, true));
+    form(kept.or_else(|| deep.then(|| p.clone())))
+}
+
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
 /// host; where an approximate form translates the program, the paired form instead if it
 /// does.
@@ -839,7 +854,9 @@ fn emit_forms(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    let kept = if wide_on && !defrag { loop_skips_kept(p, deep.is_some(), &form) } else { None };
+                    let before = bases.into_iter().flatten().next();
+                    for base in [kept.as_ref().map(|f| &f.0), before].into_iter().flatten() {
                         let again = if defrag {
                             lower::with_half_meets(|| widen(c, native, base, why, false))
                         } else {
@@ -934,7 +951,9 @@ fn emit_forms(
                 forms[0].1.as_ref().map(|f| &f.0),
                 Some(p),
             ];
-            if let Some(base) = bases.into_iter().flatten().next() {
+            let kept = loop_skips_kept(p, deep.is_some(), &form);
+            let before = bases.into_iter().flatten().next();
+            for base in [kept.as_ref().map(|f| &f.0), before].into_iter().flatten() {
                 let again = widen(c, native, base, why, false);
                 report("wave-wide branches (last)", &again);
                 if done(&again) {

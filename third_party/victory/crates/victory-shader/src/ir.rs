@@ -1071,6 +1071,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 return None;
             }
         }
+        // a loop that goes round on a scalar test, inside `loop_skips::with_kept`
+        if crate::loop_skips::keeps(p, &inside) {
+            return None;
+        }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
         let empty = if deep && p.blocks[first].exit == Exit::Jump(target) {
