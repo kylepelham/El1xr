@@ -68,6 +68,15 @@ impl SmallRuns {
     }
 
     fn push(&mut self, from: usize, to: usize) {
+        if let Some(last) = self.spill.last_mut() {
+            if last.1 == from {
+                last.1 = to;
+                return;
+            }
+        } else if self.inline_len > 0 && self.inline[self.inline_len - 1].1 == from {
+            self.inline[self.inline_len - 1].1 = to;
+            return;
+        }
         if self.inline_len < self.inline.len() {
             self.inline[self.inline_len] = (from, to);
             self.inline_len += 1;
@@ -84,6 +93,59 @@ impl SmallRuns {
     }
 }
 
+/// Inserts a disjoint byte span `(lo, hi, stamp)` into `spans` (kept sorted
+/// and non-overlapping), merging with an adjacent span that shares `stamp`.
+fn insert_partial_span(spans: &mut Vec<(u32, u32, u64)>, lo: u32, hi: u32, stamp: u64) {
+    if lo >= hi {
+        return;
+    }
+    let pos = spans.partition_point(|&(a, _, _)| a < lo);
+    spans.insert(pos, (lo, hi, stamp));
+    if pos + 1 < spans.len()
+        && spans[pos].1 == spans[pos + 1].0
+        && spans[pos].2 == spans[pos + 1].2
+    {
+        spans[pos].1 = spans[pos + 1].1;
+        spans.remove(pos + 1);
+    }
+    if pos > 0 && spans[pos - 1].1 == spans[pos].0 && spans[pos - 1].2 == spans[pos].2 {
+        spans[pos - 1].1 = spans[pos].1;
+        spans.remove(pos);
+    }
+}
+
+/// Prunes partial spans invalidated by `write` (`stamp < write`) and returns
+/// the sorted gaps inside `[req_lo, req_hi)` not covered by remaining spans.
+fn stale_gaps_in_page(
+    spans: &mut Vec<(u32, u32, u64)>,
+    write: u64,
+    req_lo: u32,
+    req_hi: u32,
+) -> Vec<(u32, u32)> {
+    spans.retain(|&(_, _, stamp)| write <= stamp);
+    let mut gaps = Vec::new();
+    let mut cursor = req_lo;
+    for &(a, b, _) in spans.iter() {
+        if b <= cursor {
+            continue;
+        }
+        if a >= req_hi {
+            break;
+        }
+        if a > cursor {
+            gaps.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+        if cursor >= req_hi {
+            break;
+        }
+    }
+    if cursor < req_hi {
+        gaps.push((cursor, req_hi));
+    }
+    gaps
+}
+
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
 /// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
@@ -94,10 +156,25 @@ struct CopiedPages {
     /// Unused high bits in the final word are always 0.
     uncopied_bits: Vec<u64>,
     uncopied: usize,
+    /// Per page index (`page - base`) that has only been copied in part:
+    /// sorted, non-overlapping byte spans `(lo, hi, stamp)` within the 64 KiB
+    /// page that are current as of `stamp`.
+    partial: std::collections::HashMap<usize, Vec<(u32, u32, u64)>>,
+    /// First 64 KiB page of the shadow (`start / PAGE`), for chunk indexing.
+    base: usize,
+    /// With `VICTORY_COLD_SKIP`: per 2 MiB chunk, the journal's mark when a
+    /// walk last left every page of it fresh (`crate::cold_skip::Chunks`);
+    /// empty until the first cold-skip walk.
+    verified: Vec<u64>,
 }
 
 impl CopiedPages {
+    #[cfg(test)]
     fn new(pages: usize) -> Self {
+        Self::with_base(pages, 0)
+    }
+
+    fn with_base(pages: usize, base: usize) -> Self {
         let words = pages.div_ceil(64);
         let mut uncopied_bits = vec![u64::MAX; words];
         let rem = pages % 64;
@@ -108,6 +185,9 @@ impl CopiedPages {
             at: vec![0; pages],
             uncopied_bits,
             uncopied: pages,
+            partial: std::collections::HashMap::new(),
+            base,
+            verified: Vec::new(),
         }
     }
 
@@ -115,21 +195,55 @@ impl CopiedPages {
         self.at.get(index).copied()
     }
 
+    fn forget_page(&mut self, page: usize) {
+        if !self.verified.is_empty() {
+            crate::cold_skip::forget(&mut self.verified, self.base, page);
+        }
+    }
+
     fn set(&mut self, index: usize, now: u64) {
         if let Some(slot) = self.at.get_mut(index) {
-            if *slot == 0 && now != 0 {
+            let old = *slot;
+            if old == 0 && now != 0 {
                 self.uncopied -= 1;
                 self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
-            } else if *slot != 0 && now == 0 {
+            } else if old != 0 && now == 0 {
                 self.uncopied += 1;
                 self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
             }
             *slot = now;
+            self.partial.remove(&index);
+            if !self.verified.is_empty() && (now == 0 || now < old) {
+                crate::cold_skip::forget(&mut self.verified, self.base, self.base + index);
+            }
+        }
+    }
+
+    fn advance_partial(&mut self, index: usize, before: u64, now: u64) {
+        if let Some(spans) = self.partial.get_mut(&index) {
+            for (_, _, stamp) in spans.iter_mut() {
+                if *stamp >= before {
+                    *stamp = (*stamp).max(now);
+                }
+            }
+        }
+    }
+
+    fn stale_gaps(&mut self, idx: usize, write: u64, r_lo: u32, r_hi: u32) -> Vec<(u32, u32)> {
+        match self.partial.get_mut(&idx) {
+            Some(spans) => {
+                let g = stale_gaps_in_page(spans, write, r_lo, r_hi);
+                if spans.is_empty() {
+                    self.partial.remove(&idx);
+                }
+                g
+            }
+            None => vec![(r_lo, r_hi)],
         }
     }
 
     fn all_uncopied(&self) -> bool {
-        self.uncopied == self.at.len()
+        self.uncopied == self.at.len() && self.partial.is_empty()
     }
 
     #[cfg(test)]
@@ -210,6 +324,75 @@ impl CopiedPages {
     /// returns `true` (used by lazy GPU-resident write-back so `DEFERRED`
     /// pages are neither copied from title memory nor coalesced across).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_page(
+        &mut self,
+        runs: &mut SmallRuns,
+        run: &mut Option<(usize, usize)>,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        page: usize,
+        write: u64,
+    ) {
+        let idx = page - base;
+        let page_base = page * PAGE;
+        let page_lo = page_base.max(start);
+        let page_hi = (page_base + PAGE).min(end);
+        let req_lo = page_lo.max(from);
+        let req_hi = page_hi.min(to);
+        let r_lo = (req_lo - page_base) as u32;
+        let r_hi = (req_hi - page_base) as u32;
+        let full_page = req_lo == page_lo && req_hi == page_hi;
+
+        let gaps = if self.partial.is_empty() {
+            vec![(r_lo, r_hi)]
+        } else {
+            self.stale_gaps(idx, write, r_lo, r_hi)
+        };
+        if gaps.is_empty() {
+            if let Some((run_start, run_end)) = run.take() {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            if full_page {
+                self.set(idx, now);
+            }
+            return;
+        }
+        if full_page {
+            self.set(idx, now);
+        }
+        if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+            match *run {
+                Some((_, run_end)) if page < run_end => {}
+                Some((run_start, run_end)) if page == run_end => {
+                    *run = Some((run_start, page + 1));
+                }
+                Some((run_start, run_end)) => {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    *run = Some((page, page + 1));
+                }
+                None => *run = Some((page, page + 1)),
+            }
+        } else {
+            if let Some((run_start, run_end)) = run.take() {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            for &(g_lo, g_hi) in &gaps {
+                runs.push(page_base + g_lo as usize, page_base + g_hi as usize);
+            }
+        }
+        if !full_page {
+            let spans = self.partial.entry(idx).or_default();
+            for (g_lo, g_hi) in gaps {
+                insert_partial_span(spans, g_lo, g_hi, now);
+            }
+        }
+    }
+
     fn plan_stale_filtered(
         &mut self,
         base: usize,
@@ -222,6 +405,8 @@ impl CopiedPages {
         skip_idx: impl Fn(usize) -> bool,
     ) -> SmallRuns {
         let mut runs = SmallRuns::new();
+        let from = from.max(start);
+        let to = to.min(end);
         if from >= to {
             return runs;
         }
@@ -229,19 +414,6 @@ impl CopiedPages {
         let last = (to - 1) / PAGE;
         let lo = first_page - base;
         let hi = last - base;
-
-        let push_page =
-            |runs: &mut SmallRuns, run: &mut Option<(usize, usize)>, page: usize| match *run {
-                Some((_, run_end)) if page < run_end => {}
-                Some((run_start, run_end)) if page == run_end => {
-                    *run = Some((run_start, page + 1));
-                }
-                Some((run_start, run_end)) => {
-                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-                    *run = Some((page, page + 1));
-                }
-                None => *run = Some((page, page + 1)),
-            };
 
         let mut run: Option<(usize, usize)> = None;
         let w_start = if written.len() > 8 {
@@ -267,10 +439,7 @@ impl CopiedPages {
                 if skip_idx(idx) || write <= self.at[idx] {
                     continue;
                 }
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    self.set(idx, now);
-                }
-                push_page(&mut runs, &mut run, page);
+                self.plan_page(&mut runs, &mut run, base, start, end, from, to, now, page, write);
             }
             if let Some((run_start, run_end)) = run {
                 runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
@@ -296,27 +465,30 @@ impl CopiedPages {
             }
             let next_w =
                 (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
-            let idx = match (next_u, next_w) {
+            let (idx, write) = match (next_u, next_w) {
                 (Some(u), Some(w)) if u < w => {
                     next_u = self.next_uncopied(u + 1, hi);
-                    u
+                    (u, 0)
                 }
                 (Some(u), Some(w)) if w < u => {
+                    let wr = written[wi].1;
                     wi += 1;
-                    w
+                    (w, wr)
                 }
                 (Some(u), Some(_)) => {
+                    let wr = written[wi].1;
                     next_u = self.next_uncopied(u + 1, hi);
                     wi += 1;
-                    u
+                    (u, wr)
                 }
                 (Some(u), None) => {
                     next_u = self.next_uncopied(u + 1, hi);
-                    u
+                    (u, 0)
                 }
                 (None, Some(w)) => {
+                    let wr = written[wi].1;
                     wi += 1;
-                    w
+                    (w, wr)
                 }
                 (None, None) => break,
             };
@@ -324,15 +496,227 @@ impl CopiedPages {
                 continue;
             }
             let page = base + idx;
-            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                self.set(idx, now);
-            }
-            push_page(&mut runs, &mut run, page);
+            self.plan_page(&mut runs, &mut run, base, start, end, from, to, now, page, write);
         }
         if let Some((run_start, run_end)) = run {
             runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
         }
         runs
+    }
+
+    /// [`Self::plan_stale_filtered`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// `marks` are the 2 MiB chunk marks read before `written`. Chunks with no
+    /// write note since a walk left every page of them fresh are passed over.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_cold(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        marks: &[(usize, u64)],
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> SmallRuns {
+        let mut runs = SmallRuns::new();
+        let from = from.max(start);
+        let to = to.min(end);
+        if from >= to {
+            return runs;
+        }
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let pages = base..base + self.at.len();
+        let mut verified = std::mem::take(&mut self.verified);
+        let mut chunks = crate::cold_skip::Chunks::new(&mut verified, pages, marks);
+        let mut wi = if written.len() > 8 {
+            written.partition_point(|&(p, _)| p < first_page)
+        } else {
+            0
+        };
+        let mut run: Option<(usize, usize)> = None;
+        let (mut walked, mut passed) = (0u64, 0u64);
+        for span in crate::cold_skip::spans(first_page, last) {
+            if chunks.unchanged(&span) {
+                if let Some((run_start, run_end)) = run.take() {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                }
+                passed += span.len() as u64;
+                continue;
+            }
+            walked += span.len() as u64;
+            let mut all_fresh = true;
+            for page in span.clone() {
+                while wi < written.len() && written[wi].0 < page {
+                    wi += 1;
+                }
+                let write = if wi < written.len() && written[wi].0 == page {
+                    let w = written[wi].1;
+                    wi += 1;
+                    w
+                } else {
+                    0
+                };
+                let idx = page - base;
+                if skip_idx(idx) {
+                    if let Some((run_start, run_end)) = run.take() {
+                        runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    }
+                    all_fresh = false;
+                    continue;
+                }
+                let taken = self.at[idx];
+                if taken == 0 || write > taken {
+                    self.plan_page(
+                        &mut runs, &mut run, base, start, end, from, to, now, page, write,
+                    );
+                } else if let Some((run_start, run_end)) = run.take() {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                }
+                all_fresh &= crate::cold_skip::fresh(self.at[idx], write);
+            }
+            chunks.walked(&span, all_fresh);
+        }
+        if let Some((run_start, run_end)) = run {
+            runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+        }
+        self.verified = verified;
+        crate::cold_skip::count(walked, passed);
+        runs
+    }
+
+    /// Sub-page planner (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) with
+    /// per-span partial-page stamps and lazy-deferred page skipping.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_subpages(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+        mut page_mask: impl FnMut(usize, u64, Option<(u64, u16)>) -> Option<u16>,
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, usize)> {
+        const KERNEL_PAGE: usize = 4096;
+        let from = from.max(start);
+        let to = to.min(end);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut writes = written.iter().peekable();
+        let mut subs = subs.iter().peekable();
+        let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
+        let last = (to - 1) / PAGE;
+        for page in from / PAGE..=last {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
+                }
+                _ => 0,
+            };
+            while subs.peek().is_some_and(|s| s.0 < page) {
+                subs.next();
+            }
+            let sub = subs
+                .peek()
+                .filter(|s| s.0 == page && s.1 == write && write != 0)
+                .map(|s| (s.2, s.3));
+            let idx = page - base;
+            if skip_idx(idx) {
+                continue;
+            }
+            let prev = self.get(idx).unwrap_or(0);
+            if prev == 0 || write > prev {
+                let page_base = page * PAGE;
+                let page_lo = page_base.max(start);
+                let page_hi = (page_base + PAGE).min(end);
+                let req_lo = page_lo.max(from);
+                let req_hi = page_hi.min(to);
+                let r_lo = (req_lo - page_base) as u32;
+                let r_hi = (req_hi - page_base) as u32;
+                let full_page = req_lo == page_lo && req_hi == page_hi;
+
+                let gaps = if self.partial.is_empty() {
+                    vec![(r_lo, r_hi)]
+                } else {
+                    self.stale_gaps(idx, write, r_lo, r_hi)
+                };
+                if gaps.is_empty() {
+                    bytes_runs.extend(run.take());
+                    if full_page {
+                        self.set(idx, now);
+                    }
+                    continue;
+                }
+                let mask = page_mask(page, prev, sub);
+                if full_page {
+                    self.set(idx, now);
+                }
+                if let Some(bits) = mask {
+                    bytes_runs.extend(run.take());
+                    let mut k = 0;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let a = k;
+                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                            k += 1;
+                        }
+                        let sub_lo = (a * KERNEL_PAGE) as u32;
+                        let sub_hi = (k * KERNEL_PAGE) as u32;
+                        for &(g_lo, g_hi) in &gaps {
+                            let lo = g_lo.max(sub_lo);
+                            let hi = g_hi.min(sub_hi);
+                            if lo < hi {
+                                bytes_runs.push((page_base + lo as usize, page_base + hi as usize));
+                                if !full_page {
+                                    insert_partial_span(
+                                        self.partial.entry(idx).or_default(),
+                                        lo,
+                                        hi,
+                                        now,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if gaps.len() == 1 && gaps[0] == (r_lo, r_hi) {
+                        extend_runs(&mut run, &mut bytes_runs, page, u16::MAX);
+                    } else {
+                        bytes_runs.extend(run.take());
+                        for &(g_lo, g_hi) in &gaps {
+                            bytes_runs.push((page_base + g_lo as usize, page_base + g_hi as usize));
+                        }
+                    }
+                    if !full_page {
+                        let spans = self.partial.entry(idx).or_default();
+                        for (g_lo, g_hi) in gaps {
+                            insert_partial_span(spans, g_lo, g_hi, now);
+                        }
+                    }
+                }
+            } else {
+                bytes_runs.extend(run.take());
+            }
+        }
+        bytes_runs.extend(run);
+        bytes_runs
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let (a, b) = (a.max(from), b.min(to));
+                (a < b).then_some((a, b))
+            })
+            .collect()
     }
 }
 
@@ -633,6 +1017,11 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Title buffers big enough for a copy in the card's memory turned down
+/// because the copies made already hold the most [`card_limits`] allows,
+/// since the start, and their bytes (counted only).
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -747,6 +1136,19 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        let n = CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB                  (VICTORY_CARD_BUFFERS_MB); {} buffers turned down so far for it ({} MB), frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -3040,6 +3442,9 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "mimalloc")]
+    crate::heap::log_once();
+    crate::cold_skip::line(frames);
     let c: Vec<f64> = BACK_CLASS
         .iter()
         .map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames)
@@ -4094,6 +4499,211 @@ mod stale_tests {
             vec![(base, base + PAGE)]
         );
     }
+
+    #[test]
+    fn partial_page_refresh_skips_unchanged_and_reuploads_written_spans() {
+        let base = 0x100usize;
+        let start = base * PAGE;
+        let len = 3 * PAGE;
+        let end = start + len;
+        let mut title = vec![0xAAu8; len];
+        let mut shadow = vec![0u8; len];
+        let mut copied = CopiedPages::new(3);
+
+        // Unaligned span crossing both a 4 KiB subpage boundary and the
+        // 64 KiB boundary between page 0x100 and page 0x101.
+        let from = start + 0xF500;
+        let to = start + PAGE + 0x1300;
+        let do_refresh = |copied: &mut CopiedPages,
+                          title: &[u8],
+                          shadow: &mut [u8],
+                          now: u64,
+                          written: &[(usize, u64)]| {
+            let runs = copied.plan_stale(base, start, end, from, to, now, written);
+            let mut bytes = 0;
+            for (lo, hi) in runs.iter() {
+                shadow[lo - start..hi - start].copy_from_slice(&title[lo - start..hi - start]);
+                bytes += hi - lo;
+            }
+            bytes
+        };
+
+        // 1st refresh: copies the entire unaligned span across the boundary.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 10, &[]), to - from);
+        assert_eq!(copied.at, [0, 0, 0]);
+        assert!(!copied.all_uncopied());
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 2nd refresh with no CPU writes: skips every already-covered byte.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 11, &[]), 0);
+
+        // CPU writes to the second page only; 3rd refresh uploads only that page's covered span.
+        title[PAGE + 0x200..PAGE + 0x400].fill(0x55);
+        assert_eq!(
+            do_refresh(&mut copied, &title, &mut shadow, 13, &[(base + 1, 12)]),
+            0x1300
+        );
+        assert_eq!(&shadow[from - start..to - start], &title[from - start..to - start]);
+
+        // 4th refresh with no new write: skips again.
+        assert_eq!(do_refresh(&mut copied, &title, &mut shadow, 14, &[(base + 1, 12)]), 0);
+    }
+
+    #[test]
+    fn partial_page_refresh_handles_overlapping_extension_and_whole_promotion() {
+        let base = 0x200usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = CopiedPages::new(1);
+
+        // First partial refresh [0x100, 0x500).
+        let r1: Vec<_> = copied
+            .plan_stale(base, start, end, start + 0x100, start + 0x500, 10, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r1, vec![(0x100, 0x500)]);
+
+        // Extended refresh [0x100, 0x800): copies only [0x500, 0x800).
+        let r2: Vec<_> = copied
+            .plan_stale(base, start, end, start + 0x100, start + 0x800, 11, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r2, vec![(0x500, 0x800)]);
+
+        // Full-page refresh promotes to whole-page stamp and clears partial entry.
+        let r3: Vec<_> = copied
+            .plan_stale(base, start, end, start, end, 12, &[])
+            .iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r3, vec![(0, 0x100), (0x800, PAGE)]);
+        assert_eq!(copied.at[0], 12);
+        assert!(copied.partial.is_empty());
+    }
+
+    #[test]
+    fn partial_page_refresh_with_dirty4k_skips_clean_and_already_copied_subpages() {
+        let base = 0x300usize;
+        let start = base * PAGE;
+        let end = start + PAGE;
+        let mut copied = CopiedPages::new(1);
+        copied.set(0, 5);
+
+        // Whole page was copied at 5, then written at 12 (before=4 <= 5),
+        // with only 4 KiB page 1 (0x1000..0x2000) dirty.
+        let subs = [(base, 12u64, 4u64, 1u16 << 1)];
+        let r1: Vec<_> = copied
+            .plan_stale_subpages(
+                base,
+                start,
+                end,
+                start + 0x0800,
+                start + 0x2400,
+                13,
+                &[(base, 12)],
+                &subs,
+                |_, prev, sub| sub.filter(|&(before, _)| prev != 0 && before <= prev).map(|(_, b)| b),
+                |_| false,
+            )
+            .into_iter()
+            .map(|(lo, hi)| (lo - start, hi - start))
+            .collect();
+        assert_eq!(r1, vec![(0x1000, 0x2000)]);
+
+        // Second partial refresh of the same range with no new write skips it completely.
+        let r2 = copied.plan_stale_subpages(
+            base,
+            start,
+            end,
+            start + 0x0800,
+            start + 0x2400,
+            14,
+            &[(base, 12)],
+            &subs,
+            |_, prev, sub| sub.filter(|&(before, _)| prev != 0 && before <= prev).map(|(_, b)| b),
+            |_| false,
+        );
+        assert!(r2.is_empty());
+    }
+
+    #[test]
+    fn plan_stale_cold_matches_plan_stale_and_respects_forget_and_lazy_skip() {
+        let base = 40usize;
+        let pages = 96usize;
+        let start = base * PAGE;
+        let end = start + pages * PAGE;
+        let mut cold = CopiedPages::with_base(pages, base);
+        let mut plain = CopiedPages::with_base(pages, base);
+
+        // Initial full refresh marks all 3 chunks verified (marks empty -> 0).
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 1, &[], &[], |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 1, &[])
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(start, end)]);
+
+        // Unchanged chunks produce empty runs.
+        assert!(
+            cold.plan_stale_cold(base, start, end, start, end, 2, &[], &[], |_| false)
+                .iter()
+                .next()
+                .is_none()
+        );
+
+        // Write page 70 (chunk 2) -> only chunk 2 walked and copied.
+        let marks = [(70 / crate::cold_skip::CHUNK_PAGES, 1u64)];
+        let written = [(70usize, 3u64)];
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 3, &written, &marks, |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 3, &written)
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(70 * PAGE, 71 * PAGE)]);
+
+        // Invalidating page 45 via `set(..., 0)` automatically forgets its chunk.
+        cold.set(45 - base, 0);
+        plain.set(45 - base, 0);
+        let r_cold: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 4, &written, &marks, |_| false)
+            .iter()
+            .collect();
+        let r_plain: Vec<_> = plain
+            .plan_stale(base, start, end, start, end, 4, &written)
+            .iter()
+            .collect();
+        assert_eq!(r_cold, r_plain);
+        assert_eq!(r_cold, vec![(45 * PAGE, 46 * PAGE)]);
+
+        // Lazy-deferred page 70 keeps chunk 2 unverified so it is re-walked once cleared.
+        let marks2 = [(70 / crate::cold_skip::CHUNK_PAGES, 2u64)];
+        let written2 = [(70usize, 5u64)];
+        assert!(
+            cold.plan_stale_cold(base, start, end, start, end, 5, &written2, &marks2, |i| {
+                i == 70 - base
+            })
+            .iter()
+            .next()
+            .is_none()
+        );
+        let r_after: Vec<_> = cold
+            .plan_stale_cold(base, start, end, start, end, 6, &written2, &marks2, |_| {
+                false
+            })
+            .iter()
+            .collect();
+        assert_eq!(r_after, vec![(70 * PAGE, 71 * PAGE)]);
+    }
 }
 
 /// Copies of windows outside buffers let go since the start, and their
@@ -4351,7 +4961,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(CopiedPages::new(pages)),
+            copied: Mutex::new(CopiedPages::with_base(pages, (start / PAGE as u64) as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
@@ -5322,6 +5932,7 @@ impl Shadow {
                 if all_read && (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     copied.set(page - base, now);
+                    copied.forget_page(page);
                 }
             }
         }
@@ -5407,10 +6018,20 @@ impl Shadow {
         }
         let w = self.watched.load(Ordering::Relaxed);
         if w != NOT_WATCHED {
+            let skip = crate::cold_skip::on();
             if w == 1 {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                let clean =
-                    crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at);
+                let clean = if skip {
+                    crate::watch::nothing_new_cold(
+                        from,
+                        to,
+                        self.start as usize / PAGE,
+                        &copied.at,
+                        &copied.verified,
+                    )
+                } else {
+                    crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.at)
+                };
                 drop(copied);
                 if clean {
                     self.refresh_check(from, to);
@@ -5423,11 +6044,21 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let mut marks = Vec::new();
+            let answer = if skip {
+                crate::watch::writes_marked(from, to, true, &mut marks)
+            } else {
+                crate::watch::writes(from, to, true)
+            };
+            if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
                 // With `VICTORY_DIRTY_4K`: the 4 KiB pages the kernel found, read before the copy's lock.
                 let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, &subs);
+                let copied = if skip {
+                    self.copy_stale_cold(from, to, now, &written, &subs, &marks)
+                } else {
+                    self.copy_stale(from, to, now, &written, &subs)
+                };
                 // Keep pages still deferred in another shadow marked `0` so
                 // future GPU writes on that owning shadow remain visible to
                 // this overlapping shadow on subsequent refreshes.
@@ -5634,35 +6265,20 @@ impl Shadow {
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
-        // with CopiedPages bitset consistency and lazy-deferred page skipping.
+        // with CopiedPages bitset consistency, partial-page stamps, and lazy-deferred skipping.
         let bytes_runs = {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let mut writes = written.iter().peekable();
-            let mut subs = subs.iter().peekable();
-            let (mut run, mut bytes_runs) = (None::<(usize, usize)>, Vec::new());
-            let last = (to - 1) / PAGE;
-            for page in from / PAGE..=last {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
-                while subs.peek().is_some_and(|s| s.0 < page) {
-                    subs.next();
-                }
-                let sub = subs
-                    .peek()
-                    .filter(|s| s.0 == page && s.1 == write && write != 0)
-                    .map(|s| (s.2, s.3));
-                let idx = page - base;
-                if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
-                    continue;
-                }
-                let prev = copied.get(idx).unwrap_or(0);
-                if prev == 0 || write > prev {
-                    let mask = if four_k {
+            copied.plan_stale_subpages(
+                base,
+                start,
+                end,
+                from,
+                to,
+                now,
+                written,
+                subs,
+                |page, prev, sub| {
+                    if four_k {
                         let m = crate::watch::stale_mask(page, prev);
                         crate::watch::note_4k(m);
                         m
@@ -5672,23 +6288,11 @@ impl Shadow {
                             .map(|(_, bits)| bits);
                         crate::watch::dirty4k_count(found, narrow && found.is_some());
                         if narrow { found } else { None }
-                    };
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        copied.set(idx, now);
                     }
-                    extend_runs(&mut run, &mut bytes_runs, page, mask.unwrap_or(u16::MAX));
-                }
-            }
-            bytes_runs.extend(run);
-            bytes_runs
+                },
+                |idx| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
+            )
         };
-        let bytes_runs: Vec<(usize, usize)> = bytes_runs
-            .into_iter()
-            .filter_map(|(a, b)| {
-                let (a, b) = (a.max(from), b.min(to));
-                (a < b).then_some((a, b))
-            })
-            .collect();
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(bytes_runs.into_iter());
@@ -5696,6 +6300,46 @@ impl Shadow {
         let mut bytes = 0;
         for (a, b) in bytes_runs {
             bytes += self.copy(a, b);
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] with `VICTORY_COLD_SKIP` (`crate::cold_skip`):
+    /// skips 2 MiB chunks whose mark has not moved since a walk left every page
+    /// of them fresh; delegates to [`Shadow::copy_stale`] when sub-page
+    /// tracking (`VICTORY_WATCH_4K` / `VICTORY_DIRTY_4K`) is active.
+    fn copy_stale_cold(
+        self: &Arc<Self>,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+        marks: &[(usize, u64)],
+    ) -> usize {
+        if crate::watch::watch_4k() || crate::watch::dirty4k_kept() {
+            return self.copy_stale(from, to, now, written, subs);
+        }
+        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        let runs = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if has_deferred {
+                copied.plan_stale_cold(base, start, end, from, to, now, written, marks, |idx| {
+                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+                })
+            } else {
+                copied.plan_stale_cold(base, start, end, from, to, now, written, marks, |_| false)
+            }
+        };
+        let total: usize = runs.iter().map(|(a, b)| b - a).sum();
+        if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
+            return self.copy_runs_wide(runs.iter());
+        }
+        let mut bytes = 0;
+        for (run_from, run_to) in runs.iter() {
+            bytes += self.copy(run_from, run_to);
         }
         bytes
     }
@@ -6216,13 +6860,15 @@ impl Shadow {
             if theirs.contains(&page) {
                 continue;
             }
-            if let Some(i) = page.checked_sub(base)
-                && let Some(held) = copied.get(i)
-                && held != 0
-                && before <= held
-            {
-                copied.set(i, now);
-                QUIET_BACK.fetch_add(1, Ordering::Relaxed);
+            if let Some(i) = page.checked_sub(base) {
+                copied.advance_partial(i, before, now);
+                if let Some(held) = copied.get(i)
+                    && held != 0
+                    && before <= held
+                {
+                    copied.set(i, now);
+                    QUIET_BACK.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -6586,22 +7232,29 @@ pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 /// the title's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// A window nothing names any more is let go ([`let_go_idle`]).
-/// shortcut: a window is 4 MiB however little of it is read (the memory
-/// line says how much was ever asked for, and how much was ever copied);
-/// [`window`] cuts the windows of asks that give a length on a finer grid.
+/// shortcut: a window is a whole cell of this however little of it is
+/// read (the memory line says how much was ever asked for, and how much was
+/// ever copied); [`window`] cuts the windows of asks that give a length on
+/// a finer grid, and [`tails`] those of asks without one.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: 1 MiB
+/// ([`GRID`]) unless `VICTORY_WINDOW_KB` names another power of two from 64
+/// to 4096 (4096: whole 4 MiB windows, as before).
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
 /// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
 /// window ends nearer to what is read. An ask without a length keeps the
 /// 4 MiB grid whatever is set: a root view reads from its address to its
 /// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// The default since three pairs of runs (RTX 3060 12 GB, 32 GB of RAM, the
+/// prison yard; 1 MiB with tails against 4 MiB, measured over the first
+/// 120 s in the world): windows 2.5-3.1 GB -> 1.6-1.8 GB, the process's
+/// private bytes 25.5-27.1 GB -> 23.4-24.8 GB, page faults in frames over
+/// a second 4.4-7.2 -> 1.4-3.6 million, and those frames 41-75 s -> 28-52
+/// s; the usual frame was no slower (103-152 ms -> 82-131 ms).
+/// shortcut: the same memory asked for with different ranges then lies in
+/// more than one window.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
@@ -6613,13 +7266,16 @@ fn window() -> u64 {
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
-/// 64 KiB to 4 MiB, 4 MiB for anything else.
+/// 64 KiB to 4 MiB, [`GRID`] for anything else.
 fn grid(kb: Option<u64>) -> u64 {
     match kb {
         Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
+        _ => GRID,
     }
 }
+
+/// The window grid unless said otherwise ([`window`]).
+const GRID: u64 = 1 << 20;
 
 /// The window (start, bytes) of title memory for an ask of `[address,
 /// end)` on a grid of `grid` bytes.
@@ -6637,16 +7293,21 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
+/// On by default with the 1 MiB grid ([`window`]);
+/// `VICTORY_WINDOW_TAILS=0` turns it off. A longer tail is another
 /// host buffer than the shorter one: what was bound to the shorter stays
 /// right only because every list brings up to date the copy it bound
 /// (`draw.rs` keeps a root view's copy with its slot). It pays only
 /// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
 /// with a length in the same cell makes the whole cell's window, and the
 /// tail is that.
+fn tails_enabled(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| tails_enabled(std::env::var_os("VICTORY_WINDOW_TAILS").as_deref()))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -6900,8 +7561,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> =
     Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made with a
+/// new buffer, and copies given a spare one ([`exact_reuse`]).
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -6928,49 +7590,304 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
+    let width = len.next_multiple_of(256);
+    let reuse = exact_reuse();
+    let gone = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1
-                || crate::host::references(&shadow.buffer) > 1
-                || *used + LATELY > now
-        });
+        // slot shows it), and not asked for lately. With [`exact_reuse`]
+        // looked for once every [`SWEEP_EVERY`] new copies, not at every new
+        // one (all under the lock every thread recording lists takes), and
+        // the cheap tests first (`references` is two calls into the buffer).
+        let mut gone = Vec::new();
+        let due = !reuse || EXACT_SWEEP.fetch_add(1, Ordering::Relaxed).is_multiple_of(SWEEP_EVERY);
+        if map.len() >= MANY && due {
+            map.retain(|_, (shadow, used)| {
+                let keep = Arc::strong_count(shadow) > 1
+                    || *used + LATELY > now
+                    || crate::host::references(&shadow.buffer) > 1;
+                if !keep {
+                    gone.push(shadow.clone());
+                }
+                keep
+            });
+        }
+        gone
+    };
+    // Outside the lock: the buffers of copies let go of are kept to be used
+    // again, and a new copy's buffer is made or taken from them.
+    if reuse {
+        for shadow in gone {
+            spare_exact(shadow);
+        }
+    } else {
+        drop(gone);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = match if reuse { take_spare(width) } else { None } {
+        Some(spare) => {
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            spare
+        }
+        None => {
+            let made = host()?.shared_buffer(width)?;
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            made
+        }
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    let now = *tick;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        // Another thread made it meanwhile: that one, and this buffer to the
+        // spares (nothing has seen it).
+        *used = now;
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        let shadow = shadow.clone();
+        drop(guard);
+        if reuse {
+            give_spare(buffer, data, width, (0, 0));
+        }
+        return Some(shadow);
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Whether the buffers of copies of views' own bytes ([`exact`]) are used
+/// again once nothing names them and the card is done with them
+/// (`VICTORY_EXACT_REUSE`, on unless `0`).
+fn exact_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_REUSE").is_none_or(|v| v != "0"))
+}
+
+/// Submissions past those begun when a spare was let go of that must have
+/// finished before it is used again (`VICTORY_EXACT_REUSE_LAG`, 64).
+fn exact_reuse_lag() -> u64 {
+    static LAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LAG.get_or_init(|| {
+        std::env::var("VICTORY_EXACT_REUSE_LAG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// Frames a spare waits at least before it is used again
+/// (`VICTORY_EXACT_REUSE_FRAMES`, 3).
+fn exact_reuse_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_EXACT_REUSE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3)
+    })
+}
+
+/// The submission after whose end, and the frame from which, a spare let go
+/// of now (`started`, `frame`) may be used again.
+pub(crate) fn spare_gate(started: u64, frame: u64, lag: u64, frames: u64) -> (u64, u64) {
+    (started + lag, frame + frames)
+}
+
+/// New copies between two looks for idle ones (with [`exact_reuse`]).
+const SWEEP_EVERY: u64 = 32;
+static EXACT_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// A buffer of a copy let go of, mapped, kept for another copy.
+struct Spare {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: D3D12 resources are free-threaded; `data` is the buffer's CPU
+// mapping, used by whoever takes the spare alone.
+unsafe impl Send for Spare {}
+
+/// Buffers kept to be used again, by width; at most 256 MB of them.
+static SPARES: Mutex<Spares<Spare>> = Mutex::new(Spares::new(256 << 20));
+
+/// A copy of [`exact`] let go of: its buffer to the spares, if nothing but
+/// the copy names it.
+fn spare_exact(shadow: Arc<Shadow>) {
+    let Ok(shadow) = Arc::try_unwrap(shadow) else {
+        return;
+    };
+    if shadow.place.is_some() || shadow.card.is_some() || shadow.rebar || shadow.data.is_null() {
+        return;
+    }
+    let (buffer, data, width) = (
+        shadow.buffer.clone(),
+        shadow.data,
+        shadow.len.next_multiple_of(256),
+    );
+    drop(shadow);
+    // Ours alone now (a slot's or a list's hold would show).
+    if crate::host::references(&buffer) != 1 {
+        return;
+    }
+    let gate = spare_gate(
+        crate::host::submissions_started(),
+        crate::frame::current(),
+        exact_reuse_lag(),
+        exact_reuse_frames(),
+    );
+    give_spare(buffer, data, width, gate);
+}
+
+fn give_spare(buffer: ID3D12Resource, data: *mut u8, width: u64, gate: (u64, u64)) {
+    let dropped = SPARES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(width, gate, Spare { buffer, data: data as usize });
+    for spare in dropped {
+        crate::host::retire(spare.buffer);
+    }
+}
+
+/// A spare buffer of `width` bytes the card is done with, zeroed.
+fn take_spare(width: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let now = (crate::host::submissions_finished(), crate::frame::current());
+    let spare = SPARES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(width, now)?;
+    let data = spare.data as *mut u8;
+    // SAFETY: the buffer's CPU mapping of `width` bytes (it was made so),
+    // which neither a copy nor the card uses any more.
+    unsafe { std::ptr::write_bytes(data, 0, width as usize) };
+    Some((spare.buffer, data))
+}
+
+/// Things kept by width, each with the (submission, frame) gate after which
+/// it may be used again; at most `most` bytes, the oldest given up first.
+pub(crate) struct Spares<T> {
+    items: std::collections::VecDeque<(u64, (u64, u64), T)>,
+    bytes: u64,
+    most: u64,
+}
+
+impl<T> Spares<T> {
+    pub(crate) const fn new(most: u64) -> Self {
+        Spares {
+            items: std::collections::VecDeque::new(),
+            bytes: 0,
+            most,
+        }
+    }
+
+    /// Keeps `item` of `width` bytes until `gate`; gives back what had to go
+    /// for room (`item` itself if it is over an eighth of the most).
+    pub(crate) fn give(&mut self, width: u64, gate: (u64, u64), item: T) -> Vec<T> {
+        let mut out = Vec::new();
+        if width > self.most / 8 {
+            out.push(item);
+            return out;
+        }
+        while self.bytes + width > self.most {
+            let Some((w, _, old)) = self.items.pop_front() else {
+                break;
+            };
+            self.bytes -= w;
+            out.push(old);
+        }
+        self.bytes += width;
+        self.items.push_back((width, gate, item));
+        out
+    }
+
+    /// The oldest kept of `width` whose gate (submission finished, frame
+    /// reached) `now` has passed.
+    pub(crate) fn take(&mut self, width: u64, now: (u64, u64)) -> Option<T> {
+        let at = self
+            .items
+            .iter()
+            .position(|&(w, (after, frame), _)| w == width && after <= now.0 && frame <= now.1)?;
+        let (w, _, item) = self.items.remove(at)?;
+        self.bytes -= w;
+        Some(item)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
 }
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let (spares, spare_mb) = {
+        let s = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        (s.items.len(), s.bytes >> 20)
+    };
     tracing::info!(
-        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again):          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {:.1} given a spare buffer          (VICTORY_EXACT_REUSE=0: none), {kept} kept, {spares} spare buffers ({spare_mb} MB)",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod spare_tests {
+    use super::{Spares, spare_gate};
+
+    #[test]
+    fn a_spare_is_taken_only_of_its_width_and_after_its_gate() {
+        let mut s = Spares::new(1 << 20);
+        assert!(s.give(256, (5, 2), 'a').is_empty());
+        assert!(s.give(512, (1, 0), 'b').is_empty());
+        assert_eq!(s.take(256, (4, 9)), None, "the card may still read it");
+        assert_eq!(s.take(256, (9, 1)), None, "too few frames since");
+        assert_eq!(s.take(1024, (9, 9)), None, "no other width");
+        assert_eq!(s.take(256, (5, 2)), Some('a'));
+        assert_eq!(s.take(256, (9, 9)), None);
+        assert_eq!(s.take(512, (1, 0)), Some('b'));
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn spares_keep_to_their_bytes_oldest_first_and_refuse_big_ones() {
+        let mut s = Spares::new(64 << 10);
+        assert!(s.give(4 << 10, (0, 0), 1).is_empty());
+        assert!(s.give(4 << 10, (0, 0), 2).is_empty());
+        assert_eq!(s.give(16 << 10, (0, 0), 3), vec![3], "over an eighth of the most");
+        for i in 0..14 {
+            assert!(s.give(4 << 10, (0, 0), 10 + i).is_empty());
+        }
+        assert_eq!(s.give(4 << 10, (0, 0), 99), vec![1], "the oldest goes first");
+        assert_eq!(s.len(), 16);
+    }
+
+    #[test]
+    fn a_spare_waits_past_the_lag_and_some_frames() {
+        assert_eq!(spare_gate(100, 10, 64, 3), (164, 13));
+        let mut s = Spares::new(1 << 20);
+        assert!(s.give(256, spare_gate(100, 10, 64, 3), 'x').is_empty());
+        assert_eq!(s.take(256, (101, 20)), None, "lists not yet sent may still name it");
+        assert_eq!(s.take(256, (200, 12)), None);
+        assert_eq!(s.take(256, (164, 13)), Some('x'));
+    }
 }
 
 #[cfg(test)]
@@ -7065,17 +7982,25 @@ mod window_tests {
     }
 
     /// The setting takes powers of two from 64 KiB to 4 MiB; anything else
-    /// leaves the grid as it was.
+    /// leaves the grid at its default, 1 MiB.
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
+        assert_eq!(grid(None), 1 << 20);
         assert_eq!(grid(Some(4096)), WINDOW);
         assert_eq!(grid(Some(1024)), 1 << 20);
         assert_eq!(grid(Some(256)), 256 << 10);
         assert_eq!(grid(Some(64)), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(grid(Some(bad)), 1 << 20, "{bad}");
         }
+    }
+
+    #[test]
+    fn window_tails_default_on_and_zero_turns_them_off() {
+        use std::ffi::OsStr;
+        assert!(super::tails_enabled(None));
+        assert!(super::tails_enabled(Some(OsStr::new("1"))));
+        assert!(!super::tails_enabled(Some(OsStr::new("0"))));
     }
 
     /// A window holds its ask and is cut on the grid; on the default grid
