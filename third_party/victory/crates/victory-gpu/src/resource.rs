@@ -3322,6 +3322,14 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// (readmet3xt-lab `36c4c37`) Whether resource `this` lies in memory the
+/// title mapped itself (made at an address): the only resource memory that
+/// can be unmapped while the resource lives. A committed resource's memory
+/// and a heap's are ours, allocated whole when they were made.
+pub(crate) fn at_title_address(this: This) -> bool {
+    !this.is_null() && matches!(resource(this).backing, Backing::Address(_))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
