@@ -5173,6 +5173,11 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() || self.transient_written(address as usize) {
+            // (`crate::port_order::account_on`) In place: in the flights' account all the same.
+            if self.place.is_some() && crate::port_order::account_on() {
+                crate::port_order::accounted();
+                list.defer_gpu_write(self, address as usize, len.min(self.left(address)) as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));

@@ -5207,6 +5207,11 @@ impl State {
         {
             return drawn;
         }
+        // (`crate::port_order`) Arguments or count in place: never clamped ahead of their place.
+        let at_place = crate::port_order::indirect_at_place(
+            args.in_place(),
+            counter.as_ref().is_some_and(|(s, _)| s.in_place()),
+        );
         if raw_indirect() && kind == MESH && max == 1 && count.is_none() {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5366,6 +5371,7 @@ impl State {
             .flatten()
             .filter(|_| crate::indirect::split_ahead());
         if clamp_ahead()
+            && !at_place
             && !windows()
             && (kind != DISPATCH || split_parts.is_some())
             && max == 1
@@ -5451,6 +5457,7 @@ impl State {
             None
         };
         let windowed = windows()
+            && !at_place
             && kind != DISPATCH
             && max == 1
             && count.is_none()

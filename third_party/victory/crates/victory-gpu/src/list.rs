@@ -1010,7 +1010,8 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     }
     let (from, to) = (from as u64, to as u64);
     let written = crate::host::shader_written(from as usize, len as usize);
-    if !written && !crate::port_cbv::copy_order_on() {
+    let order = crate::port_order::order_on();
+    if !written && !crate::port_cbv::copy_order_on() && !order {
         return false;
     }
     let (Some(source), Some(target)) =
@@ -1020,16 +1021,26 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     };
     // (`crate::port_cbv::copy_order_on`) Into a copy draws' constant buffers are viewed in.
     let for_order = !written && crate::port_cbv::was_viewed(&target);
-    if !written && !for_order {
+    // (`crate::port_order`) Into title memory in place; memory in place is not watched, and
+    // nothing refreshes it over what the card copies there.
+    let in_place = !written && crate::port_order::copy_on_card(&target);
+    if !written && !for_order && !in_place {
         return false;
     }
-    if source.left(from) < len || target.left(to) < len || source.unwatched() || target.unwatched()
+    let unwatched = |s: &crate::shadow::Shadow| s.unwatched() && !(order && s.in_place());
+    if source.left(from) < len || target.left(to) < len || unwatched(&source) || unwatched(&target)
         || std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len
     {
         crate::port_cbv::ordered(for_order, false);
+        if in_place {
+            crate::port_order::copied(false);
+        }
         return false;
     }
     crate::port_cbv::ordered(for_order, true);
+    if in_place {
+        crate::port_order::copied(true);
+    }
     // What the title's CPU side wrote of both first, then the copy, then
     // its bytes back into title memory when the list has run.
     source.refresh(list, from, len);

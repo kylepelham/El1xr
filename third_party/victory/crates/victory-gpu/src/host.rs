@@ -3978,7 +3978,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4570,7 +4570,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -4609,8 +4609,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or nothing to do (in place).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -10637,6 +10637,7 @@ impl Meter {
         {
             crate::card_constants::line(frames);
             step_reads::line(frames);
+            crate::port_order::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
