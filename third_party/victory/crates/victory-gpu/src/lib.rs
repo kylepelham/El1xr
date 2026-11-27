@@ -110,6 +110,8 @@ pub mod titlemem;
 #[cfg(windows)]
 mod defrag;
 mod watch;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod wc_skip;
 
 #[cfg(windows)]
 pub use defrag::log_defrag_counters;
@@ -117,6 +119,8 @@ pub use defrag::log_defrag_counters;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use wc_skip::title_memory_reserved;
 #[cfg(windows)]
 pub use shadow::LazyAccessHold;
 #[cfg(windows)]

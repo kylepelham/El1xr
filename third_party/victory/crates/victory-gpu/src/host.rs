@@ -6051,7 +6051,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         // Where the piece's last compare kept these bytes,
@@ -6398,7 +6401,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        if lo >= hi
+                            || crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                            || !seen.insert((copy, lo, hi))
+                        {
                             continue;
                         }
                         let from = inflight_piece_from(&r.span, p);
@@ -6634,7 +6640,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
