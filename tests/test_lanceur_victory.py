@@ -58,6 +58,7 @@ REGLAGES = {
     "VICTORY_SHARED_BUFFER_BLOCKS": "1",
     "VICTORY_UPLOAD_BLOCKS": "1",
     "VICTORY_GUARD_4K": "1",
+    "VICTORY_BAKE_INPUTS": "1",
     "VICTORY_ASYNC_SUBMIT": "1",
 }
 # -Quality, par-dessus la table (lu dans le bloc `if ($Quality)` du lanceur).
