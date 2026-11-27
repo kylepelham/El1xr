@@ -75,15 +75,46 @@ enum Tally {
 }
 
 fn tally(what: Tally) {
-    let before = COUNTS[what as usize].fetch_add(1, Relaxed);
-    if matches!(what, Tally::Kept) && (before + 1).is_multiple_of(1024) {
-        let [kept, read, landed, over, rewritten] = COUNTS.each_ref().map(|c| c.load(Relaxed));
-        tracing::info!(
-            "levels wait shown, since the start: {kept} slots kept the texture they showed while the new one had no level; \
-             made from the new one by a draw or a show {read}, by a pass that found its level {landed}, at their last frame {over}; \
-             {rewritten} written again meanwhile (VICTORY_LEVELS_WAIT_SHOWN)"
-        );
+    let kept = COUNTS[what as usize].fetch_add(1, Relaxed) + 1;
+    // At the first slot kept, at powers of two, then every 1024: the line
+    // says the switch acted. (It came only at every 1024th before, and
+    // never in a run with fewer.)
+    if matches!(what, Tally::Kept) && logged_at(kept) {
+        summary();
     }
+}
+
+fn logged_at(kept: u64) -> bool {
+    kept.is_power_of_two() || kept.is_multiple_of(1024)
+}
+
+/// Frames between the lines [`report`] logs while the switch is on.
+const REPORT_FRAMES: u64 = 600;
+
+static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// While the switch is on, the counts every [`REPORT_FRAMES`] frames, zeros
+/// too: a run with the switch on says whether it acted at all.
+fn report(frame: u64) {
+    let last = REPORTED.load(Relaxed);
+    if frame >= last + REPORT_FRAMES
+        && REPORTED
+            .compare_exchange(last, frame, Relaxed, Relaxed)
+            .is_ok()
+    {
+        summary();
+    }
+}
+
+fn summary() {
+    let [kept, read, landed, over, rewritten] = COUNTS.each_ref().map(|c| c.load(Relaxed));
+    tracing::info!(
+        frames = frames(),
+        "levels wait shown, since the start: {kept} slots kept the texture they showed while the new one had no level; \
+         made from the new one by a draw or a show {read}, by a pass that found its level {landed}, at their last frame {over}; \
+         {rewritten} written again meanwhile (VICTORY_LEVELS_WAIT_SHOWN; acts only on a title write of a view of a \
+         texture with no level uploaded, `flicker watch` empty_views)"
+    );
 }
 
 /// Whether `old`, which a slot shows, can stand for `new`: both views placed
@@ -216,6 +247,9 @@ impl super::HostHeap {
     /// their view; those the title wrote again since are let go. How many
     /// were made.
     pub(super) fn levels_due(&self) -> usize {
+        if frames() != 0 {
+            report(crate::frame::current());
+        }
         if !looking() || self.sampler {
             return 0;
         }
@@ -279,6 +313,26 @@ mod tests {
     #[test]
     fn the_switch_is_live() {
         victory_core::settings::check_live("VICTORY_LEVELS_WAIT_SHOWN", "1", frames, 0, 60);
+    }
+
+    /// The summary comes at the first slot kept and at powers of two (it
+    /// came at every 1024th only, so a run with fewer never showed it).
+    #[test]
+    fn the_summary_is_logged_from_the_first_slot_kept() {
+        let at: Vec<u64> = (1..=5000).filter(|&k| logged_at(k)).collect();
+        assert_eq!(&at[..5], &[1, 2, 4, 8, 16]);
+        assert!(at.contains(&3072) && !at.contains(&3));
+    }
+
+    #[test]
+    fn a_report_comes_once_per_report_frames() {
+        let base = REPORTED.load(Relaxed) + 10 * REPORT_FRAMES;
+        report(base);
+        assert_eq!(REPORTED.load(Relaxed), base);
+        report(base + REPORT_FRAMES - 1);
+        assert_eq!(REPORTED.load(Relaxed), base, "too soon");
+        report(base + REPORT_FRAMES);
+        assert_eq!(REPORTED.load(Relaxed), base + REPORT_FRAMES);
     }
 
     #[test]
