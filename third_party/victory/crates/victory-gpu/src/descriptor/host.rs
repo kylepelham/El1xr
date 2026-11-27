@@ -3741,16 +3741,22 @@ impl HostHeap {
                         }
                     }
                     None => {
+                        // A null view the title wrote on purpose is shown as asked, not failed.
+                        let title_null = view_ages::title_null(&view);
                         if !self.sampler {
                             null_for(&view, self.cpu(index));
-                            if shows_texture(&view) {
+                            if shows_texture(&view) && !title_null {
                                 flicker::count(flicker::Count::Unmade);
                             }
                         }
                         self.keep(index, None);
                         if view_ages::on() && !self.sampler && shows_texture(&view) {
-                            let kind = view_ages::Kind::Failed;
-                            view_ages::waiting(self.ages_key(), index, kind, &view, None);
+                            if title_null {
+                                view_ages::title_nulled(self.ages_key(), index);
+                            } else {
+                                let kind = view_ages::Kind::Failed;
+                                view_ages::waiting(self.ages_key(), index, kind, &view, None);
+                            }
                         }
                     }
                 }
@@ -5319,8 +5325,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => {
-            if magenta_for(desc, at) {
+        View::Shader(r, Some(desc)) => {
+            if *r != 0 && magenta_for(desc, at) {
                 return;
             }
             return null_like(desc, at);
