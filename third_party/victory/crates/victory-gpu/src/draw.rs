@@ -2812,6 +2812,10 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
+        if !compute && crate::material_demand::on() {
+            self.material_textures(p);
+        }
         // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
         if p.is_bake && !compute && crate::bake_inputs::on() {
             return self.bake_draw_textures(list, p);
@@ -3136,6 +3140,15 @@ impl State {
             }
             None => 0,
         };
+        // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
+        if !only && crate::material_demand::on() {
+            let wanted = host.texture_slots_pick(&crate::material_demand::take());
+            if !wanted.is_empty() {
+                due.retain(|d| !wanted.iter().any(|w| w.0 == d.0));
+                crate::material_demand::add(crate::material_demand::C::Promoted, wanted.len() as u64);
+                due.splice(pinned..pinned, wanted);
+            }
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -5818,6 +5831,7 @@ mod miss_views;
 mod reflect_views;
 
 mod bake_pass;
+mod material_pass;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
