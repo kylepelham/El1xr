@@ -690,6 +690,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 fn card_clock_line(frames: f64, ms: f64) {
     crate::timeline::line(frames);
     crate::merge_runs::line(frames);
+    readcopy::frame_line(frames);
     let [idle, behind, stood] =
         [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -2793,6 +2794,9 @@ enum Step {
     /// list's prelude when changed: once per submission, whichever lists
     /// sample it, until a `Copy` or `Run` intervenes.
     Texture(crate::texture::PreludeUpload),
+    /// (feedcard) A title buffer copy done on the card (`crate::list` `card_copy`): also by the
+    /// CPU at submission as a `Copy` while the flag is set ([`readcopy`]).
+    CardCopy(usize, usize, usize, std::sync::atomic::AtomicBool),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3458,7 +3462,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
+                Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => {}
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
@@ -7171,6 +7177,9 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        if late {
+            readcopy::decide(runs);
+        }
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
@@ -9052,7 +9061,9 @@ impl HostList {
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
         for step in &self.deferred().copies {
             let (started, copied) = match step {
-                &Step::Copy(dst, src, len) => {
+                Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => continue,
+                Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -11848,6 +11859,9 @@ fn pump() {
         }
     }
 }
+
+#[path = "host_readcopy.rs"]
+mod readcopy;
 
 #[path = "host_flush.rs"]
 mod flush;
