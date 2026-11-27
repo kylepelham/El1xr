@@ -28,6 +28,7 @@ use crate::watch::PAGE;
 pub(crate) mod lazy;
 #[path = "shadow_build.rs"]
 mod build;
+mod placement;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -952,13 +953,7 @@ pub(crate) fn cards() -> bool {
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-                << 20
-        };
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
@@ -966,13 +961,13 @@ fn card_limits() -> (u64, u64) {
         // (Neptune) `VICTORY_CARD_BUFFERS_MIN_KB` sets the least size below a megabyte (64 KiB at
         // the least, a piece of the card's compare): an experiment on whether the shader writes
         // of the small buffers, found on the CPU otherwise, are what the first room's walls miss.
-        let least = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), |kb| {
-                (kb << 10).max(64 << 10)
-            });
-        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        // `VICTORY_CARD_SIDE=1`: sizes no switch says by the card's budget.
+        placement::buffer_limits(
+            number("VICTORY_CARD_BUFFERS_MIN_KB"),
+            number("VICTORY_CARD_BUFFERS_MIN_MB"),
+            number("VICTORY_CARD_BUFFERS_MB"),
+            placement::set(),
+        )
     })
 }
 
@@ -1031,8 +1026,11 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(
+    // (`VICTORY_CARD_SIDE=1`: the windows' room too.)
+    placement::kept_room(
+        card_limits().1,
         CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed),
+        placement::set().map(|_| (window_card_most(), WINDOW_CARD_BYTES.load(Ordering::Relaxed))),
     )
 }
 
@@ -1189,11 +1187,9 @@ fn window_card_most() -> u64 {
             Some([budget, ..]) if budget >= 14 << 30 => 4096,
             _ => 0,
         };
-        std::env::var("VICTORY_CARD_WINDOWS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or_else(unset)
-            << 20
+        // (`VICTORY_CARD_SIDE=1`: never under the placement's total.)
+        let switch = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        placement::windows_most(switch, if switch.is_none() { unset() << 20 } else { 0 }, placement::set())
     })
 }
 
@@ -1212,7 +1208,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > placement::window_line(budget, card_room_kept_on())
     {
         return None;
     }
@@ -1254,7 +1250,7 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let room = most != 0
         && host
             .video_memory()
-            .is_none_or(|[budget, used, ..]| used + size <= budget / 10 * 8);
+            .is_none_or(|[budget, used, ..]| used + size <= placement::window_line(budget, card_room_kept_on()));
     if !room || WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         if room {
             WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
