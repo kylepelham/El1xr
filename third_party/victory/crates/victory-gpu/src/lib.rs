@@ -44,6 +44,8 @@ pub mod frame;
 pub mod frametime;
 pub mod hitch;
 #[cfg(windows)]
+mod card_constants;
+#[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
 mod host;

@@ -1119,6 +1119,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if let Some((_, gpu)) = crate::card_constants::snapshot(list, address, len) {
+        return Some(gpu);
+    }
     static REUSE_ROOT_CBV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let reuse = *REUSE_ROOT_CBV
         .get_or_init(|| std::env::var_os("VICTORY_REUSE_ROOT_CBV").is_some_and(|v| v == "1"));
@@ -4580,8 +4583,16 @@ impl State {
                                 _ => crate::port_cbv::copied(true),
                             }
                         }
+                        if let Some((buffer, gpu)) =
+                            crate::card_constants::snapshot(list, address, u64::from(size))
+                            && host.constant_raw_at(index, &buffer, gpu, size)
+                        {
+                            // (Never reused: a later card copy may write it again.)
+                            scratch_epoch = Some(u64::MAX);
+                            continue;
+                        }
                         if crate::port_cbv::on() {
-                            scratch_epoch = Some(cbv_epoch);
+                            scratch_epoch = scratch_epoch.or(Some(cbv_epoch));
                             let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                                 host.make_null_buffer(index);
                                 continue;
@@ -4592,7 +4603,7 @@ impl State {
                             }
                             continue;
                         }
-                        scratch_epoch = Some(cbv_epoch);
+                        scratch_epoch = scratch_epoch.or(Some(cbv_epoch));
                         let Some(gpu) = list.constant_scratch(address, size) else {
                             host.make_null(index);
                             continue;
