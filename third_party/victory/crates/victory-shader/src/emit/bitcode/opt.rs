@@ -1123,9 +1123,16 @@ impl Module {
 
     /// A constant table no remaining load reads leaves the module (the
     /// validator refuses an internal declaration nothing uses). Shared
-    /// memory stays declared whether it is read or not.
+    /// memory stays declared whether it is read or not, but for an exchange's
+    /// own dwords (`VICTORY_EXCHANGE_SITES=1`) whose code went.
     fn drop_unused_tables(&mut self) {
-        let mut used: Vec<bool> = self.globals.iter().map(|g| g.init.is_none()).collect();
+        let mut used: Vec<bool> = self
+            .globals
+            .iter()
+            .map(|g| {
+                g.init.is_none() && !g.name.starts_with(crate::emit::lower::exchange_sites::PREFIX)
+            })
+            .collect();
         if used.iter().all(|&u| u) {
             return;
         }
@@ -1258,6 +1265,32 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
+    }
+
+    /// An exchange's own array (`VICTORY_EXCHANGE_SITES=1`) whose code went leaves the module,
+    /// the uses of the one after it renumbered; the program's LDS stays unread or not.
+    #[test]
+    fn an_exchange_array_nothing_reads_leaves_and_shared_memory_stays() {
+        let Kit { mut m, b, .. } = kit();
+        let i32t = m.int(32);
+        let pair = m.array(2, i32t);
+        let lds = m.global("lds", pair, 3);
+        let dead = m.global("wave_exchange_0", pair, 3);
+        let live = m.global("wave_exchange_2", pair, 3);
+        let zero = m.i32(0);
+        let gone = m.new_block();
+        for (block, array) in [(b, live), (gone, dead)] {
+            let ptr = m.element(block, array, zero);
+            m.store(block, ptr, zero);
+            m.terminate(block, Term::Ret);
+        }
+        let _ = lds;
+        m.optimise(DEAD);
+        let names: Vec<&str> = m.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["lds", "wave_exchange_2"]);
+        let ptr = m.blocks[b].body[0];
+        assert!(matches!(m.insts[ptr as usize].op, Op::Gep(_, V::Global(1), _)));
+        m.write();
     }
 
     #[test]

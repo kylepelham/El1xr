@@ -114,6 +114,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_EXACT_REUSE_FRAMES", Apply::Restart),
     ("VICTORY_EXACT_REUSE_LAG", Apply::Restart),
     ("VICTORY_EXCHANGE_PAIRS", Apply::Retranslate),
+    ("VICTORY_EXCHANGE_SITES", Apply::Retranslate),
     ("VICTORY_EXIT_CHILD", Apply::Restart),
     ("VICTORY_EXTRA_STATIC_SAMPLER", Apply::Restart),
     ("VICTORY_F16_NEAREST", Apply::Retranslate),
