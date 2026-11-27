@@ -11,6 +11,28 @@ use super::{Attr, Bin, Lower, Rmw, Shader, Structured, Term, V, flags, need, pre
 thread_local! {
     /// See [`with_half_meets`].
     static HALF_MEETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's choice for [`meet_poll_cap`], for its thread only.
+    #[cfg(test)]
+    static TEST_POLL_CAP: std::cell::Cell<Option<Option<u32>>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_MEET_POLLS=<n>`: a half that has polled its partner's dword `n` times goes on
+/// without it (a partner cut out of a loop at the loop limit then costs wrong values, not a
+/// hung card), and its first lane counts the give-up in a fourth tally dword the host logs.
+/// Unset or 0: the wait has no cap, as before. Part of the translation (the shader cache
+/// keys on it). After trustno1-coder/VIctory-NVIDIA `4f49709` (`MEETING_POLLS`, 4096).
+fn meet_poll_cap() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(cap) = TEST_POLL_CAP.get() {
+        return cap;
+    }
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| parse_poll_cap(std::env::var("VICTORY_MEET_POLLS").ok().as_deref()))
+}
+
+/// [`meet_poll_cap`]'s reading of the switch. Pure, for testing.
+fn parse_poll_cap(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse::<u32>().ok().filter(|&n| n > 0)
 }
 
 /// The host's group-shared memory, in dwords (32 KiB).
@@ -55,8 +77,13 @@ pub(super) struct HalfMeet {
     pub base: u32,
     pub cap: u32,
     pub waves: u32,
-    /// First of three LDS dwords: meetings, wait polls, wait atomics.
+    /// First of three LDS dwords: meetings, wait polls, wait atomics; a fourth, waits that
+    /// gave up, with [`meet_poll_cap`].
     pub tally: u32,
+    /// Tally dwords: 3, or 4 with a poll cap.
+    pub tallies: u32,
+    /// [`meet_poll_cap`], read once per shader.
+    pub poll_cap: Option<u32>,
     pub meets: u32,
     /// Half-meet sites that order a shader LDS read, and those that order a write.
     pub lds_reads: u32,
@@ -87,19 +114,22 @@ impl HalfMeet {
     /// refused rather than declared past the host's 32 KiB.
     pub(super) fn new(s: &mut Shader, st: &Structured) -> Self {
         let enabled = HALF_MEETS.get() && s.wave_size == Some(32);
+        let poll_cap = if enabled { meet_poll_cap() } else { None };
+        let tallies = 3 + u32::from(poll_cap.is_some());
         let (base, cap, waves, tally, wave_all, group_all) = if enabled {
             let group = s.threads.map(|t| t.into_iter().product::<u32>()).unwrap_or(0);
             let waves = group.div_ceil(64).max(1);
-            // Three dwords past the table count meetings, wait polls and wait atomics.
+            // Three dwords past the table count meetings, wait polls and wait atomics
+            // (a fourth the waits that gave up, with a poll cap).
             let spare = HOST_LDS_DWORDS
                 .saturating_sub(s.lds_dwords)
-                .saturating_sub(3);
+                .saturating_sub(tallies);
             let per = 2 * waves;
             let cap = if per == 0 { 0 } else { spare / per };
             let base = s.lds_dwords;
             s.lds_dwords += cap * per;
             let tally = s.lds_dwords;
-            s.lds_dwords += 3;
+            s.lds_dwords += tallies;
             (
                 base,
                 cap,
@@ -117,6 +147,8 @@ impl HalfMeet {
             cap,
             waves,
             tally,
+            tallies,
+            poll_cap,
             meets: 0,
             lds_reads: 0,
             lds_writes: 0,
@@ -316,7 +348,15 @@ impl<'a> Lower<'a> {
         );
         let ready = self.s.m.cmp(ljoin, pred::IUGE, seen, generation);
         let polled = self.s.m.bin(ljoin, Bin::Add, polls, one);
-        self.s.m.terminate(ljoin, Term::CondBr(ready, done, wait));
+        let leave = match self.meet.poll_cap {
+            Some(cap) => {
+                let cap = self.s.m.i32(cap);
+                let spent = self.s.m.cmp(ljoin, pred::IUGE, polled, cap);
+                self.s.m.bin(ljoin, Bin::Or, ready, spent)
+            }
+            None => ready,
+        };
+        self.s.m.terminate(ljoin, Term::CondBr(leave, done, wait));
         let start = self.s.m.i32(0);
         self.s.m.set_phi(polls, vec![(start, join), (polled, ljoin)]);
         self.cur = done;
@@ -326,6 +366,16 @@ impl<'a> Lower<'a> {
         self.lds_tally(here, 0, one);
         self.lds_tally(here, 1, polled);
         self.end_guarded(guarded, &[]);
+        if self.meet.poll_cap.is_some() {
+            // The half went on without its partner: its first lane counts it.
+            let here = self.cur;
+            let short = self.s.m.cmp(here, pred::IULT, seen, generation);
+            let gave_up = self.s.m.bin(here, Bin::And, first, short);
+            let guarded = self.begin_guarded(Some(gave_up));
+            let here = self.cur;
+            self.lds_tally(here, 3, one);
+            self.end_guarded(guarded, &[]);
+        }
         let after = self.cur;
         // The rest of this instruction was aimed at the block the meet closed.
         self.s.m.continues(block, after);
@@ -339,7 +389,8 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(block, pred::EQ, thread, zero)
     }
 
-    /// Thread 0 adds `value` into tally dword `slot` (0 meetings, 1 polls, 2 wait atomics).
+    /// Adds `value` into tally dword `slot` (0 meetings, 1 polls, 2 wait atomics, 3 waits that
+    /// gave up).
     fn lds_tally(&mut self, block: usize, slot: u32, value: V) {
         let lds = self.s.lds();
         let idx = self.s.m.i32(self.meet.tally + slot);
@@ -361,7 +412,7 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(i32t);
         let add = self.s.m.i32(0);
         let zero = self.s.m.i32(0);
-        for slot in 0..3u32 {
+        for slot in 0..self.meet.tallies {
             let idx = self.s.m.i32(self.meet.tally + slot);
             let ptr = self.s.m.element(block, lds, idx);
             let value = self.s.m.load(block, ptr);
@@ -385,7 +436,7 @@ impl<'a> Lower<'a> {
         if self.meet.cap == 0 {
             return;
         }
-        let n = self.meet.cap * 2 * self.meet.waves.max(1) + 3;
+        let n = self.meet.cap * 2 * self.meet.waves.max(1) + self.meet.tallies;
         let entry = self.s.entry;
         let (head, done) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(entry, Term::Br(head));
@@ -411,7 +462,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::{Lowered, Parts, TEST_HOST_WAVE, lower};
-    use super::with_half_meets;
+    use super::{TEST_POLL_CAP, parse_poll_cap, with_half_meets};
     use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
@@ -559,6 +610,47 @@ mod tests {
                         || what.ends_with("where not every lane runs"),
                     "unexpected refusal: {what}"
                 );
+            }
+        }
+    }
+
+    /// `VICTORY_MEET_POLLS`: unset, 0 or unreadable is no cap; a number is the cap.
+    #[test]
+    fn meet_poll_cap_reads_the_switch() {
+        assert_eq!(parse_poll_cap(None), None);
+        assert_eq!(parse_poll_cap(Some("0")), None);
+        assert_eq!(parse_poll_cap(Some("lots")), None);
+        assert_eq!(parse_poll_cap(Some(" 4096 ")), Some(4096));
+    }
+
+    /// With a poll cap the wait has a second way out and the program a fourth tally dword;
+    /// it still validates. Without one the translation is the uncapped one, byte for byte.
+    #[test]
+    fn meet_poll_cap_bounds_the_wait() {
+        let native = make_128_lds_program(&[
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 1,
+            0x36 << 26 | 0x36 << 18, // ds_read_b32
+            2 << 24 | 1,
+        ]);
+        let with = |cap: Option<u32>| {
+            let was = TEST_POLL_CAP.replace(Some(cap));
+            let (l, _) = lower_wide_half_meet(&native);
+            TEST_POLL_CAP.set(was);
+            l
+        };
+        let open = with(None);
+        let again = with(None);
+        let capped = with(Some(4096));
+        assert_eq!(open.dxil, again.dxil, "the uncapped translation is not stable");
+        assert_ne!(open.dxil, capped.dxil, "the cap left the translation as it was");
+        assert_eq!(open.half_meets, capped.half_meets);
+        #[cfg(windows)]
+        {
+            use super::super::super::validator::Validator;
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut capped.dxil.clone())
+                    .expect("capped half-meet DXIL failed validation");
             }
         }
     }

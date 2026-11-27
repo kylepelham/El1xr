@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod buffer_format;
 mod flicker;
 pub(crate) mod host_textures;
 mod keep_shown;
@@ -4495,7 +4496,9 @@ fn buffer_srv(
         buffer.StructureByteStride,
     );
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width)
+        || buffer_format::refused(desc.Format, stride, raw, false)
+    {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let why = if raw {
             "raw, refused by the host"
@@ -4671,7 +4674,9 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width)
+        || buffer_format::refused(desc.Format, stride, raw, true)
+    {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let why = if raw {
             "raw, refused by the host"
