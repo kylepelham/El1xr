@@ -246,7 +246,8 @@ def test_train_runs_one_step_per_call_and_reports(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
     calls = []
 
-    def fake_bench(args, overrides, log_path, snap_dir):
+    def fake_bench(args, overrides, log_path, snap_dir, what):
+        assert what == "train"
         calls.append((overrides, log_path.name, snap_dir.name, args.seconds, args.snap_every, args.quiet))
         fps = 26.0 if overrides.get("VICTORY_FOO") == "1" else 24.0
         s = dev.parse_victory_log("")
@@ -373,3 +374,42 @@ def test_train_compare_writes_one_side_by_side_png_per_snap_of_run_a(tmp_path, m
     assert image.rows[1] == gradient(4, 3, 31)[1] + b"\xff\x00\xff" * 8 + gradient(4, 3, 33)[1]
     assert dev.main(["train", "--plan", str(plan), "--compare", "1", "9"]) == 1
     assert "DEV train-compare FAIL reason=run" in capsys.readouterr().out
+
+
+def test_a_train_run_holds_the_gpu_lock_and_quiets_builds_as_train(tmp_path, monkeypatch, capsys):
+    """`train` goes through the same `_quiet` as `bench` (all slots with `quiet = true`, else the
+    free slots and idle builds), tagged `train`, inside the gpu.lock."""
+    import contextlib
+
+    dev = load_dev()
+    monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
+    game = tmp_path / "game"
+    game.mkdir()
+    events = []
+
+    @contextlib.contextmanager
+    def fake_quiet(args, what):
+        events.append(("quiet", what, args.quiet))
+        yield
+        events.append(("quiet done", what))
+
+    @contextlib.contextmanager
+    def fake_gpu_lock(tag, timeout_s=0.0):
+        events.append(("gpu", tag))
+        yield
+
+    def fake_run(cmd, log_path, seconds):
+        events.append(("run", seconds))
+        log_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(dev, "_quiet", fake_quiet)
+    monkeypatch.setattr(dev, "acquire_gpu_lock", fake_gpu_lock)
+    monkeypatch.setattr(dev, "run_timed_victory", fake_run)
+    monkeypatch.setattr(dev, "resolve_game_dir", lambda explicit: game)
+    monkeypatch.setattr(dev, "build_launcher_command", lambda **kw: ["victory"])
+    monkeypatch.setattr(dev, "resolve_save_dir", lambda *a, **kw: tmp_path)
+    monkeypatch.setattr(dev, "isolated_save_data_dir", lambda save, what: contextlib.nullcontext(tmp_path))
+    monkeypatch.setattr(dev.dev_driver, "resets_since_boot", lambda: 0)
+    dev.main(["train", "--plan", str(plan_file(tmp_path))])
+    assert events == [("gpu", "train"), ("quiet", "train", True), ("run", 60), ("quiet done", "train")]
+    assert "DEV train FAIL run=01_on" in capsys.readouterr().out, "an empty log has no world"
