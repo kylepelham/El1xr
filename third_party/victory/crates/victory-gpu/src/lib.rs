@@ -38,6 +38,7 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod frametime;
+pub mod hitch;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
