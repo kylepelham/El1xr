@@ -32,6 +32,8 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod side_by_side;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -1333,6 +1335,12 @@ fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -
         SCATTER[1].fetch_add(1, Relaxed);
         let (start, len) = (base + lo * PAGE, (hi - lo) * PAGE);
         let _changing = changing(physical, start, len);
+        if side_by_side::threads() > 1 {
+            if !side_by_side::change(physical, start, &want[lo..hi]) {
+                return false;
+            }
+            continue;
+        }
         unmap(physical, start, len);
         let mut k = lo;
         while k < hi {
@@ -1911,10 +1919,25 @@ fn map_view(
         }
         slice.section.mark_committed(slice.index, n);
     }
-    let _made = Made(made);
-    slice.section.mark_touched(slice.index, n);
     #[cfg(feature = "diagnostics")]
     remap_time(3, began);
+    noted(physical, base, len, slice, fresh, made);
+    Ok(())
+}
+
+/// What [`map_view`] notes of a view the host has just mapped (and
+/// committed) at `[base, base + len)`, begun at `made`.
+fn noted(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    fresh: bool,
+    made: std::time::Instant,
+) {
+    let _made = Made(made);
+    let n = len / PAGE;
+    slice.section.mark_touched(slice.index, n);
     #[cfg(feature = "diagnostics")]
     let books = std::time::Instant::now();
     // New contents, read-write: the GPU side's copies no longer guard it
@@ -1937,7 +1960,6 @@ fn map_view(
     physical.views.insert(base, (len, slice));
     #[cfg(feature = "diagnostics")]
     remap_time(4, books);
-    Ok(())
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -2214,6 +2236,87 @@ mod tests {
         /// This thread's [`lean`] and [`remap_keep`], when set.
         pub(super) static FORCE: std::cell::Cell<[Option<bool>; 2]> =
             const { std::cell::Cell::new([None; 2]) };
+        /// This thread's `side_by_side::threads`, when set.
+        pub(super) static THREADS: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Scatters of many pages with `VICTORY_MAP_THREADS=8` (lean too, then
+    /// not): mapped, moved over each other's addresses, unmapped, given
+    /// twice in one list, across a view of several pages, and with a page
+    /// that is not the title's; every page shows what it held.
+    #[test]
+    fn a_scatter_side_by_side_is_what_one_after_the_other_is() {
+        THREADS.with(|t| t.set(Some(8)));
+        for lean in [true, false] {
+            FORCE.with(|f| f.set([Some(lean), None]));
+            const N: usize = 200;
+            let pages = allocate(N);
+            let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+            assert_ne!(a, 0);
+            let at = |k: usize| (a + k * PAGE) as *mut c_void;
+            let first = |k: usize| at(k).cast::<u64>();
+            for round in 0..4_usize {
+                // Every address shows another page each round.
+                let to: Vec<*mut c_void> = (0..N).map(|i| at((i + 7 * round) % N)).collect();
+                assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), N, pages.as_ptr()), 1);
+                for i in 0..N {
+                    // SAFETY: mapped read-write.
+                    unsafe {
+                        if round > 0 {
+                            assert_eq!(first((i + 7 * round) % N).read(), (1000 * (round - 1) + i) as u64);
+                        }
+                        first((i + 7 * round) % N).write((1000 * round + i) as u64);
+                    }
+                }
+            }
+            // Half of them unmapped by one scatter (null pages), then mapped
+            // again by another.
+            let to: Vec<*mut c_void> = (0..N / 2).map(at).collect();
+            assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), N / 2, [0usize; N / 2].as_ptr()), 1);
+            assert!((0..N / 2).all(|k| query(at(k)).host.State == MEM_RESERVE));
+            assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), N / 2, pages.as_ptr()), 1);
+            // SAFETY (below): mapped read-write.
+            // Pages keep what they held: page k is at k now (and elsewhere).
+            assert!((0..N / 2).all(|k| unsafe { first(k).read() } == (3000 + k) as u64));
+            // An address twice: the last one counts; page 0 unmaps.
+            let to = [at(0), at(1), at(0), at(2), at(3), at(0)];
+            let what = [pages[5], pages[6], 0, 0, pages[7], pages[8]];
+            assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 6, what.as_ptr()), 1);
+            assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+            // SAFETY: mapped read-write; the same page at three addresses.
+            unsafe {
+                first(0).write(77);
+                let to = [at(10), at(11), at(12)];
+                assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 3, [pages[8]; 3].as_ptr()), 1);
+                assert_eq!((first(10).read(), first(11).read(), first(12).read()), (77, 77, 77));
+            }
+            // A view of several pages, a run of a scatter over its middle:
+            // both ends stay.
+            let b = at(N + 8);
+            assert_eq!(XMemMapPhysicalPages(b, 6, pages[20..26].as_ptr()), b);
+            // SAFETY: mapped read-write.
+            unsafe { first(N + 8 + 5).write(55) };
+            let to: Vec<*mut c_void> = (N + 9..N + 13).map(at).collect();
+            assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 4, pages[30..34].as_ptr()), 1);
+            // SAFETY: mapped read-write.
+            unsafe {
+                assert_eq!(first(N + 8 + 5).read(), 55);
+                first(N + 9).write(9);
+                assert_eq!(first(30).read(), 9);
+            }
+            assert_eq!(query(at(N + 8)).host.State, MEM_COMMIT);
+            // A page the title does not own fails the call.
+            assert_eq!(XMemMapPhysicalPagesScatter([at(40), at(41)].as_ptr(), 2, [pages[0], 1].as_ptr()), 0);
+            // All gone.
+            let to: Vec<*mut c_void> = (0..2 * N).map(at).collect();
+            assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 2 * N, std::ptr::null()), 1);
+            assert!((0..2 * N).all(|k| query(at(k)).host.State == MEM_RESERVE));
+            assert!(physical().views.range(a..a + 2 * N * PAGE).next().is_none());
+            assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+        }
+        FORCE.with(|f| f.set([None; 2]));
+        THREADS.with(|t| t.set(None));
     }
 
     /// Pages keep what they hold however often they are mapped, moved and
