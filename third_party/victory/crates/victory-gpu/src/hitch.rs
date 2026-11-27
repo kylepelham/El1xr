@@ -21,6 +21,8 @@
 //! the present, and all others ([`frame_line`]).
 
 #[cfg(windows)]
+mod cpu;
+#[cfg(windows)]
 pub(crate) mod stacks;
 
 use std::cell::Cell;
@@ -144,6 +146,28 @@ fn bank() -> usize {
 /// The title calls a present on this thread.
 pub fn title_presents() {
     TITLE.store(thread_id(), Ordering::Relaxed);
+    #[cfg(windows)]
+    if every_frame() {
+        TITLE_CPU_US.store(cpu::lap().unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// The CPU time of the title's presenting thread between its last two
+/// presents (`u64::MAX`: not known).
+static TITLE_CPU_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// CPU microseconds of a frame: our presenting thread, the title's, the
+/// whole process (`None`: not known).
+type Cpu = [Option<u64>; 3];
+
+fn cpu_now() -> Cpu {
+    #[cfg(windows)]
+    {
+        let title = TITLE_CPU_US.load(Ordering::Relaxed);
+        [cpu::lap(), (title != u64::MAX).then_some(title), cpu::process_lap()]
+    }
+    #[cfg(not(windows))]
+    [None; 3]
 }
 
 /// Whether every frame's phases are written (`VICTORY_FRAME_PHASES=1`).
@@ -246,7 +270,7 @@ pub(crate) fn presented(frame: u64) {
     #[cfg(windows)]
     stacks::frame_ended(frame, frame_us, me);
     if every_frame() {
-        tracing::info!("{}", frame_line(frame, frame_us, &taken));
+        tracing::info!("{}", frame_line(frame, frame_us, &taken, cpu_now()));
     }
     let threshold = threshold_ms();
     if threshold == 0 || frame_us < threshold * 1000 {
@@ -337,15 +361,20 @@ fn all(bank: &[(u64, u64); PHASES], frame_us: Option<u64>) -> String {
 }
 
 /// The line of every frame (`VICTORY_FRAME_PHASES=1`): each bank's phases
-/// as microseconds/calls.
-pub(crate) fn frame_line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; BANKS]) -> String {
+/// as microseconds/calls, and the CPU time of our presenting thread, the
+/// title's and the process.
+pub(crate) fn frame_line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; BANKS], cpu: Cpu) -> String {
     let title = TITLE.load(Ordering::Relaxed);
     let own = title != 0 && title != PRESENTER.load(Ordering::Relaxed);
+    let cpu = cpu.map(|us| us.map_or("?".to_owned(), |us| us.to_string()));
     format!(
-        "frame phases: frame {frame} took {frame_us} us; ours: {}; title: {}; others: {}",
+        "frame phases: frame {frame} took {frame_us} us; ours: {}; title: {}; others: {}; cpu us: ours {}, title {}, process {}",
         all(&taken[0], Some(frame_us)),
         all(&taken[1], own.then_some(frame_us)),
-        all(&taken[2], None)
+        all(&taken[2], None),
+        cpu[0],
+        cpu[1],
+        cpu[2]
     )
 }
 
@@ -407,7 +436,9 @@ mod tests {
         assert_eq!(ours, "submit 20000/24, present 500/1, waiting for work 9000/30, outside 10500");
         assert_eq!(all(&taken[1], None), "present turn 2000/1, binding 6000/4000");
         assert_eq!(all(&taken[2], None), "memory remap 300/7");
-        assert!(frame_line(3, 40_000, &taken).starts_with("frame phases: frame 3 took 40000 us; ours: submit 20000/24"));
+        let line = frame_line(3, 40_000, &taken, [Some(30_000), None, Some(200_000)]);
+        assert!(line.starts_with("frame phases: frame 3 took 40000 us; ours: submit 20000/24"));
+        assert!(line.ends_with("cpu us: ours 30000, title ?, process 200000"), "{line}");
     }
 
     #[test]
