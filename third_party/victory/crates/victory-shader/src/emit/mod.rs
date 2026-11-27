@@ -86,6 +86,7 @@
 mod bitcode;
 mod container;
 pub mod glass_record;
+mod glass_splice;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
@@ -130,9 +131,10 @@ pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
+pub use glass_splice::{GLASS_TRACE, native_glass};
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 

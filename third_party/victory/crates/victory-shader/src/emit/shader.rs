@@ -53,6 +53,9 @@ pub const SLOT_MEET: u8 = 252;
 /// Root SRV `t<SLOT_TLAS>`: a top level built with the host's DXR
 /// (`VICTORY_NATIVE_BVH`) for inline ray queries ([`super::ray_query`]).
 pub const SLOT_TLAS: u8 = 251;
+/// Root SRV `t<SLOT_TLAS_NEAR>`: a second host top level, for the glass
+/// trace's near walk (the title's `t354`; [`SLOT_TLAS`] holds its `t355`).
+pub const SLOT_TLAS_NEAR: u8 = 250;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
