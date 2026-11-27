@@ -289,6 +289,81 @@ def builds_suspended(psutil_module=None, rescan_s: float = 1.0, builds: bool = T
                 pass
 
 
+# The 9950X3D's second CCD (logical CPUs 16-31, 32 MB L3): builds and worktree tests go there while
+# the game runs, so the V-cache CCD (0-15, 96 MB L3) and its cache stay the game's.
+ASIDE_CPUS = tuple(range(16, 32))
+
+
+@contextlib.contextmanager
+def builds_aside(psutil_module=None, rescan_s: float = 2.0, cpus: tuple[int, ...] = ASIDE_CPUS) -> Iterator[int]:
+    """Loud runs: pins every build (`_build_tree`) and worktree tool or test (`_worktree_tools`) to
+    `cpus` at the idle priority class for the duration, rescanning every `rescan_s` seconds for new
+    ones, and gives each back all CPUs after. Nothing is paused, so writers' tests and gates keep
+    going. This dev.py, its parents and everything it starts (the game) are spared. Yields how many
+    were moved at the start. A no-op without psutil or with fewer CPUs than `cpus` names."""
+    psutil = psutil_module
+    if psutil is None:
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+    if psutil is None or (psutil.cpu_count() or 0) <= max(cpus, default=0):
+        yield 0
+        return
+    every = list(range(psutil.cpu_count()))
+    idle = getattr(psutil, "IDLE_PRIORITY_CLASS", None)
+    me = psutil.Process()
+    spared: set[int] = {me.pid}
+    try:
+        spared.update(p.pid for p in me.parents())
+    except Exception:
+        pass
+    moved: dict[int, object] = {}
+    lock = threading.Lock()
+
+    def sweep() -> None:
+        try:
+            spared.update(c.pid for c in me.children(recursive=True))
+        except Exception:
+            pass
+        for proc in _build_tree(psutil) + _worktree_tools(psutil):
+            if proc.pid in spared or proc.pid in moved:
+                continue
+            try:
+                proc.cpu_affinity(list(cpus))
+                if idle is not None:
+                    proc.nice(idle)
+            except Exception:
+                continue
+            with lock:
+                moved[proc.pid] = proc
+
+    sweep()
+    first = len(moved)
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.wait(rescan_s):
+            sweep()
+
+    watcher = threading.Thread(target=loop, name="builds-aside", daemon=True)
+    if rescan_s > 0:
+        watcher.start()
+    try:
+        yield first
+    finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join(timeout=10)
+        with lock:
+            procs = list(moved.values())
+        for proc in procs:
+            try:
+                proc.cpu_affinity(every)
+            except Exception:
+                pass
+
+
 def below_normal_priority() -> None:
     if os.name == "nt":
         import ctypes
