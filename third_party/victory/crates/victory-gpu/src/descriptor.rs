@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod tabled_all;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -67,6 +69,10 @@ pub(crate) struct Heap {
     /// dirty-slot scans do not consume `sync_heaps`'s `written` cursor.
     #[cfg(windows)]
     buffer_written: Option<crate::watch::Tracked>,
+    /// Pages to read again when what `VICTORY_TABLED_ALL` left on them is
+    /// left no longer ([`tabled_all`]; none without the switch).
+    #[cfg(windows)]
+    table_retries: Option<std::sync::Mutex<tabled_all::Retries>>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -228,7 +234,15 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let mut ranges = written.take(start as usize, end as usize);
+        let mut retries = heap
+            .table_retries
+            .as_ref()
+            .map(|r| r.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(retries) = &mut retries {
+            retries.include_due(crate::frame::current(), start as usize, end as usize, &mut ranges);
+        }
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -240,7 +254,11 @@ pub(crate) fn sync_heaps() {
                 // of per-draw tables alone is not read at all.
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 looked += slots.end - slots.start;
-                host.not_left_to_draws(slots, &mut asked);
+                let mut retry_at = u64::MAX;
+                host.not_left_to_draws(slots, &mut asked, retries.is_some().then_some(&mut retry_at));
+                if let Some(retries) = &mut retries {
+                    retries.after_read(page, retry_at);
+                }
                 pages += 1;
                 if asked.is_empty() {
                     mirrored += flush_sync_batch(
@@ -1729,6 +1747,9 @@ pub(crate) extern "system" fn create_heap(
         buffer_written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        table_retries: (placed && visible && desc.kind == VIEWS_KIND && tabled_all::on())
+            .then(std::sync::Mutex::default),
     });
     #[cfg(windows)]
     if visible {

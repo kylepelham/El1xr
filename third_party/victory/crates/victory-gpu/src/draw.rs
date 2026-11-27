@@ -4236,12 +4236,17 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+        match host.mirror(index, handle, true) {
+            Some(view) => {
+                readable(list, u.kind, &view);
+                // Up to date by this draw: not the texture pass's to make.
+                if crate::descriptor::host::is_texture_view(&view) {
+                    host.texture_slot_tabled(index, true);
+                } else {
+                    host.table_slot(index);
+                }
             }
+            None => host.table_slot(index),
         }
     }
 
@@ -4539,6 +4544,11 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let entry = group.entry(k);
+                // The title's own slot is a table's, whatever it holds
+                // (`VICTORY_TABLED_ALL`).
+                if let Some(title) = title_first {
+                    host.table_slot(title + k);
+                }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let in_place = crate::port_cbv::in_place_on();
