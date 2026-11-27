@@ -7,6 +7,8 @@
 //! on another thread too, the first time and whenever the size changes: that snap waits for the
 //! first present after it is ready. One snap at a time; a present while one is being written
 //! takes none. The picture is the title's game plane, without a second (UI) plane over it.
+//! `VICTORY_SNAP_FULL=1` writes it at full size instead: halving keeps every other row, so a
+//! fault on alternate rows (scanlines) cannot show in a half-size snap.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -24,6 +26,8 @@ const LAND_POLL: Duration = Duration::from_millis(5);
 pub(crate) struct Config {
     every: Duration,
     folder: PathBuf,
+    /// `VICTORY_SNAP_FULL=1`: full-size pictures.
+    full: bool,
 }
 
 fn config() -> Option<&'static Config> {
@@ -32,8 +36,9 @@ fn config() -> Option<&'static Config> {
         .get_or_init(|| {
             let every = parse_every(&std::env::var("VICTORY_SNAP_EVERY_S").ok()?)?;
             let folder = std::env::var_os("VICTORY_SNAP_DIR").map_or_else(|| PathBuf::from("snaps"), PathBuf::from);
-            tracing::info!(every_s = every.as_secs_f64(), folder = %folder.display(), "timed snaps on (VICTORY_SNAP_EVERY_S)");
-            Some(Config { every, folder })
+            let full = std::env::var("VICTORY_SNAP_FULL").is_ok_and(|v| v.trim() == "1");
+            tracing::info!(every_s = every.as_secs_f64(), folder = %folder.display(), full, "timed snaps on (VICTORY_SNAP_EVERY_S)");
+            Some(Config { every, folder, full })
         })
         .as_ref()
 }
@@ -231,17 +236,17 @@ fn make_buffer(state: &'static Mutex<State>, device: Device, size: u64) {
 /// for already). The snap is written on a thread of its own.
 pub(crate) fn finish(pending: Option<Pending>, flight: u64) {
     if let (Some(pending), Some(config)) = (pending, config()) {
-        finish_in(&STATE, pending, flight, config.folder.clone());
+        finish_in(&STATE, pending, flight, config.folder.clone(), config.full);
     }
 }
 
-fn finish_in(state: &'static Mutex<State>, pending: Pending, flight: u64, folder: PathBuf) {
+fn finish_in(state: &'static Mutex<State>, pending: Pending, flight: u64, folder: PathBuf, full: bool) {
     let spawned = std::thread::Builder::new()
         .name("victory-snap".into())
         .spawn(move || {
             let pending = pending;
             if landed(flight) {
-                write(&pending, &folder);
+                write(&pending, &folder, full);
             } else {
                 tracing::warn!(
                     frame = pending.frame,
@@ -267,7 +272,7 @@ fn landed(flight: u64) -> bool {
     true
 }
 
-fn write(pending: &Pending, folder: &Path) {
+fn write(pending: &Pending, folder: &Path, full: bool) {
     let f = pending.footprint.Footprint;
     let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
     let mut data = std::ptr::null_mut();
@@ -282,8 +287,8 @@ fn write(pending: &Pending, folder: &Path) {
         rgb
     };
     let Some(rgb) = rgb else { return };
-    let (half, hw, hh) = halve(&rgb, w, h);
-    let png = crate::screenshot::encode_png(hw as u32, hh as u32, &half);
+    let (rgb, w, h) = sized(rgb, w, h, full);
+    let png = crate::screenshot::encode_png(w as u32, h as u32, &rgb);
     let path = folder.join(name(pending.since_start, pending.frame));
     match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), frame = pending.frame, "snap saved"),
@@ -293,6 +298,11 @@ fn write(pending: &Pending, folder: &Path) {
 
 fn name(since_start: Duration, frame: u64) -> String {
     format!("snap-{:04}s-f{frame}.png", since_start.as_secs())
+}
+
+/// The picture as saved: as it is when `full`, else [`halve`]d.
+fn sized(rgb: Vec<u8>, w: usize, h: usize, full: bool) -> (Vec<u8>, usize, usize) {
+    if full { (rgb, w, h) } else { halve(&rgb, w, h) }
 }
 
 /// 8-bit RGB rows at half size (every other pixel of every other row), as `crate::capture` saves.
@@ -356,6 +366,17 @@ mod tests {
         assert_eq!(halve(&[7, 8, 9], 1, 1), (vec![7, 8, 9], 1, 1));
     }
 
+    /// Dark odd rows (scanlines) vanish from a half-size snap and stay in a full-size one.
+    #[test]
+    fn a_full_size_snap_keeps_the_rows_halving_drops() {
+        // 2x4 pixels: rows 0 and 2 white, rows 1 and 3 black.
+        let rgb: Vec<u8> = (0..4).flat_map(|y| [if y % 2 == 0 { 255 } else { 0 }; 6]).collect();
+        let (half, w, h) = sized(rgb.clone(), 2, 4, false);
+        assert_eq!((w, h), (1, 2));
+        assert!(half.iter().all(|&b| b == 255), "halving keeps only the white rows");
+        assert_eq!(sized(rgb.clone(), 2, 4, true), (rgb, 2, 4));
+    }
+
     /// The whole path on the host GPU: the first due present asks for the buffer and takes no
     /// snap, the next records the copy into a list that runs, and the writer thread saves a PNG
     /// of half the texture's size. A present while that snap is being written takes none.
@@ -395,7 +416,7 @@ mod tests {
         );
         list.close();
         host.execute(&[&list]);
-        finish_in(&STATE, pending, 0, folder.path().to_path_buf());
+        finish_in(&STATE, pending, 0, folder.path().to_path_buf(), false);
         while lock(&STATE).busy {
             assert!(Instant::now() < deadline, "the snap was not written");
             std::thread::sleep(Duration::from_millis(5));
