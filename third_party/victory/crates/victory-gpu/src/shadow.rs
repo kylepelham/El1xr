@@ -7214,63 +7214,80 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || {
-                    format!("title buffer {:#x}+{len:#x} on the card", key.0)
-                });
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: Some(buffer),
-                    chunks: Mutex::default(),
-                    flagged: std::sync::atomic::AtomicBool::new(false),
-                    me: std::sync::OnceLock::new(),
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    has_dirty: AtomicBool::new(false),
-                    sent: Mutex::default(),
-                    has_sent: AtomicBool::new(false),
-                    side: [const { Mutex::new(()) }; 64],
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+        // `VICTORY_BUFFER_AHEAD`: the host buffers are made with the tables
+        // let go, so that threads making copies of different buffers make
+        // them side by side (`crate::buffer_ahead`); the first to be done
+        // gives the buffer its copy, and a copy made for nothing goes.
+        if crate::buffer_ahead::on() {
+            drop(map);
+            let made = new_copy(key.0, len, size)?;
+            let mut map = buffers();
+            let entry = map.get_mut(&key)?;
+            return Some(entry.shadow.get_or_insert(made).clone());
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if let Some(card) = &shadow.card {
-            let weak = Arc::downgrade(&shadow);
-            let _ = card.me.set(weak.clone());
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
-        }
-        entry.shadow = Some(shadow);
+        entry.shadow = Some(new_copy(key.0, len, size)?);
     }
     entry.shadow.clone()
+}
+
+/// A new host copy of `len` bytes of title buffer at `start`, `size` bytes
+/// of host buffer, in the card's memory if [`card_for`] gives room.
+fn new_copy(start: u64, len: u64, size: u64) -> Option<Arc<Shadow>> {
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || {
+                format!("title buffer {:#x}+{len:#x} on the card", start)
+            });
+            tracing::info!(
+                start = format_args!("{:#x}", start),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+            let card = Card {
+                staging: Some(buffer),
+                chunks: Mutex::default(),
+                flagged: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                has_dirty: AtomicBool::new(false),
+                sent: Mutex::default(),
+                has_sent: AtomicBool::new(false),
+                side: [const { Mutex::new(()) }; 64],
+                size,
+            };
+            (on_card, Some(card))
+        }
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", start),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", start),
+            len,
+            "buffer copied to the host"
+        );
+    }
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if let Some(card) = &shadow.card {
+        let weak = Arc::downgrade(&shadow);
+        let _ = card.me.set(weak.clone());
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+    Some(shadow)
 }
 
 /// Whether small title buffers inside one window cell share the cell's

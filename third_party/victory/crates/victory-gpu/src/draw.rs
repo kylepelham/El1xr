@@ -2614,6 +2614,14 @@ impl State {
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        if slots.len() >= crate::buffer_ahead::LEAST && crate::buffer_ahead::on() {
+            crate::buffer_ahead::make(
+                slots
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?))
+                    .collect(),
+            );
+        }
         for (n, &index) in slots.iter().enumerate() {
             let Some(handle) = heap.handle(index) else {
                 ranges.forget(index);
