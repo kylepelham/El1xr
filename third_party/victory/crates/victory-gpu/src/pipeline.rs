@@ -1296,6 +1296,8 @@ pub(crate) mod samplers;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+mod eager;
+#[cfg(windows)]
 mod recipe;
 #[cfg(windows)]
 pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
