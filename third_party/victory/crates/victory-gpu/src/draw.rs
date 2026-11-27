@@ -730,6 +730,7 @@ impl State {
         self.dynamic.clear();
         self.fresh_tables.clear();
         self.recording = 0;
+        crate::readable_once::forget();
         self.ready_tables.clear();
         self.seen_tables.clear();
         self.root_srv_slots.clear();
@@ -1279,6 +1280,7 @@ impl State {
             fresh_tables.shrink_to(1024);
         }
         *recording = 0;
+        crate::readable_once::forget();
         ready_tables.clear();
         if ready_tables.capacity() > 4096 {
             ready_tables.shrink_to(1024);
@@ -5700,6 +5702,13 @@ fn ready_tables_on() -> bool {
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    // (`VICTORY_LIST_READABLE_ONCE`) Made ready earlier in this list, nothing changed since.
+    if kind == ResourceType::Srv
+        && let View::Shader(resource, _) = view
+        && crate::readable_once::ready(list, *resource, TESTED_DEPTH.get().0)
+    {
+        return;
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -5722,6 +5731,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            let marks = crate::readable_once::marks(*resource);
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
@@ -5755,6 +5765,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_held_state(list, &copy, state);
+            if let Some(marks) = marks
+                && placed.is_none()
+                && !aliased
+                && twin.is_none()
+                && state == SHADER_RESOURCE
+                && (!copy.title_written() || crate::resource::staged_first(*resource as This) == 0)
+            {
+                crate::readable_once::made_ready(list, *resource, marks);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.

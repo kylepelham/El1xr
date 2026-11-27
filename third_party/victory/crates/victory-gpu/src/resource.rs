@@ -1345,6 +1345,21 @@ fn target_changes(address: u64) -> &'static std::sync::atomic::AtomicU32 {
     &TARGET_CHANGES[(address >> 16) as usize % TARGET_BUCKETS]
 }
 
+/// (`VICTORY_LIST_READABLE_ONCE`, `crate::readable_once`) What [`alias_of`]
+/// goes by for title texture `this`: the count of targets that entered the
+/// table near its memory (0 for one it cannot alias, not placed).
+#[cfg(windows)]
+pub(crate) fn alias_stamp(this: This) -> u32 {
+    let r = resource(this);
+    if r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+        target_changes(r.data() as u64)
+            .load(std::sync::atomic::Ordering::Acquire)
+            .wrapping_add(1)
+    } else {
+        0
+    }
+}
+
 /// The host GPU wrote title texture `this` by a copy or resolve.
 #[cfg(windows)]
 pub(crate) fn mark_host_written(this: This) {
@@ -1370,6 +1385,7 @@ pub(crate) fn host_written_mark(this: This) -> bool {
 /// has none). Called under the staging table's lock.
 #[cfg(windows)]
 pub(crate) fn set_staged_first(this: This, first: u32) {
+    crate::readable_once::bump(this as usize);
     if !this.is_null() {
         resource(this)
             .host
@@ -1668,6 +1684,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        crate::readable_once::bump(this as usize);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -3264,6 +3281,8 @@ fn hand_out_resource(
             no_target: std::sync::atomic::AtomicU32::new(0),
         },
     });
+    #[cfg(windows)]
+    crate::readable_once::bump(std::ptr::from_ref::<Resource>(&resource) as usize);
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -3291,6 +3310,7 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::readable_once::bump(std::ptr::from_ref::<Resource>(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {

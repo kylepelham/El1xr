@@ -85,6 +85,8 @@ pub mod root;
 mod stretch;
 #[cfg(windows)]
 mod table_defer;
+#[cfg(windows)]
+mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
