@@ -993,6 +993,7 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    pub(crate) alias_log: Mutex<crate::texture::alias_skip::Log>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -4830,6 +4831,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                alias_log: Mutex::default(),
                 twins: Mutex::default(),
                 plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 uses_heaps: std::sync::atomic::AtomicBool::new(false),
@@ -7334,6 +7336,7 @@ impl Host {
             lists.push(Some(check));
         }
         PREP_PARTS[8].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::texture::alias_skip::submitted(runs);
         let t_heaps = std::time::Instant::now();
         if heap_rounds.wait() {
             PREP_PARTS[0].fetch_add(t_heaps.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -7863,6 +7866,7 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::texture::alias_skip::reset(&self.alias_log);
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
         self.pipelines
@@ -7921,6 +7925,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<(u32, u32)> {
+        crate::texture::alias_skip::used(&self.alias_log, copy, wanted);
         let wanted = copy.legal(wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -7943,6 +7948,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        crate::texture::alias_skip::used(&self.alias_log, copy, wanted);
         let wanted = copy.legal(wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
