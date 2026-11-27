@@ -20,6 +20,7 @@ pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
 mod list_views;
+pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 mod slot_wait;
@@ -1995,7 +1996,7 @@ impl HostHeap {
         let live_on = live_textures();
         let began = std::time::Instant::now();
         let mut found = [0, 0, waiting];
-        let mut results: Vec<(u32, Recheck, bool, Option<u64>)> = Vec::with_capacity(due.len());
+        let mut results: Vec<(u32, Recheck, bool, Option<u64>, bool)> = Vec::with_capacity(due.len());
         for (index, seen) in due {
             if began.elapsed() > span {
                 break;
@@ -2008,7 +2009,12 @@ impl HostHeap {
                 None
             };
             found[usize::from(changed)] += 1;
+            // (#115) `VICTORY_LIVE_TEXTURES_SKIP_GPU_WRITTEN` / `_DIAG`.
+            let card = if changed { live_watch::card_if_asked(seen.at) } else { None };
+            let left = changed
+                && live_watch::on_change(live_watch::skip(), card) == live_watch::Changed::Leave;
             if changed {
+                live_watch::changed(index, &seen, frame, card, left);
                 recheck_tail::changed(index, &seen, frame);
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2025,11 +2031,16 @@ impl HostHeap {
                     );
                 }
             }
-            results.push((index, seen, changed, plain_print));
+            results.push((index, seen, changed, plain_print, left));
         }
         if !results.is_empty() {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for (index, seen, changed, plain_print) in results {
+            live_watch::summary(frame, textures.live.len(), textures.rechecks.len());
+            for (index, seen, changed, plain_print, left) in results {
+                if left {
+                    textures.card_written(index, &seen);
+                    continue;
+                }
                 textures.rechecked(index, &seen, changed, frame, live_on, plain_print);
                 if changed {
                     self.note_slot(index, SLOT_IN_TEXTURES, true);

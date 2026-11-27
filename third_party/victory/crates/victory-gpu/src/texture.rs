@@ -801,7 +801,7 @@ pub(crate) fn host_written(resource: This) {
 /// (`VICTORY_BAKE_WATCH`) The texture the host wrote, other than `except`,
 /// whose memory holds part of `[address, address + len)`: its address
 /// and resource.
-fn in_host_written(address: u64, len: u64, except: usize) -> Option<(u64, usize)> {
+pub(crate) fn in_host_written(address: u64, len: u64, except: usize) -> Option<(u64, usize)> {
     let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
     let end = address.saturating_add(len);
     let before = map.range(..=address).next_back();
