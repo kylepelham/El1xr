@@ -47,7 +47,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build(wave_wide: bool, wave_pairs: bool) -> [u8; 32] {
+fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -100,6 +100,9 @@ fn build(wave_wide: bool, wave_pairs: bool) -> [u8; 32] {
     if wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0") {
         h.update(b"VICTORY_WAVE_PAIRS_ONLY=1");
     }
+    if wave_pairs_vt {
+        h.update(b"VICTORY_WAVE_PAIRS_VT=1");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -135,6 +138,61 @@ const WAVE_WIDE_DEFAULT: [&str; 7] = [
 /// allows none.
 static WAVE_PAIRS: OnceLock<Vec<String>> = OnceLock::new();
 const WAVE_PAIRS_DEFAULT: [&str; 2] = ["02384a60fda6f2d0", "6b82bc7d22016cb5"];
+
+/// `VICTORY_WAVE_PAIRS_VT=1` (off by default): the compute programs TaynanGT/Vice-Tay #208
+/// pairs by default take the paired wave64 form with that pull request's rules first
+/// (`victory_shader::emit::with_wave_pairs_vt`; the other forms if it refuses one). On a host
+/// of 32-lane waves their wave-wide sums, first-lane reads and LDS shared within a console wave
+/// are exact only in that form; the others left (RTX 4090) whole 16x16 tiles black or lit in
+/// the tiled shadow mask, dark blocks on open water and a halo around dark silhouettes against
+/// the sky. Only these containers' cache keys change with the switch.
+const WAVE_PAIRS_VT: [&str; 29] = [
+    // shadow mask, `CS_ShadowRenderTiled*`
+    "191ecaed66eea3b1", "1d44a723bdebbf27", "20b78ee12ecdb57d", "240cb516c1af0bc3",
+    "31d703207b51549a", "466ec41d3f9d24c0", "56f3bf2d9388e5a7", "65de113e23fa4fdd",
+    "804b342cb4b9d1e9", "922e1d0ee1e19a85", "ab5455fc6abb804f", "abd7a22106898c66",
+    "b4b0427232707598", "be6ce5d849d51127", "ce79e9eba7ae0348", "d7db57731ada919b",
+    "f133e35efed2a48a", "fa0bd10a35bfef3c",
+    // water, `CS_TransmissionVolumetrics_Tiled`, `_Tiled_LocalLights`, `_GenerateTiles`,
+    // `_Submerged`
+    "5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6", "1aa247ed3653b616",
+    // atmospheric diffusion and its depth scan, `CS_GatherDiffusion`, `CS_ScanMip0..3`,
+    // `CS_DeferredFallbacksAlpha_SkyProbe`, `CS_TemporalResolve2_Opaque_FrameStatistics`
+    "ce2378e5e8711aad", "b7953a05b189dfc1", "71883e40620a567a",
+    "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
+];
+
+fn wave_pairs_vt_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAVE_PAIRS_VT").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn allow_wave_pairs_vt(container: &[u8]) -> bool {
+    wave_pairs_vt_on() && WAVE_PAIRS_VT.contains(&&blake3::hash(container).to_hex()[..16])
+}
+
+/// Whether `VICTORY_WAVE_PAIRS_VT=1` names this container (its 16-digit log hash): for the
+/// offline translation (`victory translate`), which calls the translator without this cache.
+pub fn wave_pairs_vt_listed(container: &[u8]) -> bool {
+    allow_wave_pairs_vt(container)
+}
+
+/// [`translate_container`], for a container [`allow_wave_pairs_vt`] names inside
+/// `with_wave_pairs_vt`, with one log line saying what the paired form made of it.
+fn translate_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
+    if !vt {
+        return translate_container(container, wide, pairs);
+    }
+    let r = victory_shader::emit::with_wave_pairs_vt(true, || translate_container(container, wide, pairs));
+    let hex = blake3::hash(container).to_hex();
+    let shader = &hex[..16];
+    match victory_shader::emit::take_wave_pairs_vt() {
+        Some(Ok(())) => tracing::info!(shader, "wave pairs vt: paired Wave64"),
+        Some(Err(why)) => tracing::warn!(shader, why, "wave pairs vt: refused, other forms"),
+        None => tracing::warn!(shader, "wave pairs vt: not tried (not wave64 compute on 32-lane waves)"),
+    }
+    r
+}
 
 /// Serializes temporary `VICTORY_WAVE_WIDE=last` and `VICTORY_WAVE_PAIRS=1`
 /// overrides for allowlisted containers so concurrent translations and
@@ -252,12 +310,13 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
+    let vt = allow_wave_pairs_vt(container);
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        translate_container(c, wide, pairs)
+        translate_vt(c, wide, pairs, vt)
     };
-    cached(cache, &build(wide, pairs), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(wide, pairs, vt), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
@@ -265,9 +324,10 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
-    let translate = |c: &[u8]| translate_container(c, wide, pairs);
+    let vt = allow_wave_pairs_vt(container);
+    let translate = |c: &[u8]| translate_vt(c, wide, pairs, vt);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(wide, pairs), container, translate),
+        Some(cache) => cached(cache, &build(wide, pairs, vt), container, translate),
         None => translate(container),
     }
 }

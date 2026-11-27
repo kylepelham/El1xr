@@ -478,6 +478,26 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // A program `with_wave_pairs_vt` names: the paired form with Vice-Tay #208's rules first,
+    // the other forms as before if it refuses the program.
+    if WAVE_PAIRS_VT_HERE.get()
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
+        lower::take_needs();
+        let tried = paired_vt(c, native, p, io, res);
+        lower::take_needs();
+        match tried {
+            Ok((shader, Some(32))) => {
+                WAVE_PAIRS_VT_TOOK.set(Some(Ok(())));
+                return Ok(shader);
+            }
+            Ok(_) => WAVE_PAIRS_VT_TOOK.set(Some(Err("a wave size other than 32"))),
+            Err(ShaderError::Unsupported { what, .. }) => WAVE_PAIRS_VT_TOOK.set(Some(Err(what))),
+            Err(_) => WAVE_PAIRS_VT_TOOK.set(Some(Err("not translated"))),
+        }
+    }
     let r = emit_forms(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that no form above gives
     // the host (it still asks for 64-lane waves, or does not translate): once more in the
@@ -515,6 +535,38 @@ fn pairs_on() -> bool {
         return on;
     }
     std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+}
+
+thread_local! {
+    /// [`with_wave_pairs_vt`]'s choice, for this thread's translations.
+    static WAVE_PAIRS_VT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the last translation on this thread inside [`with_wave_pairs_vt`] made of the paired
+    /// form: taken, or why it was refused ([`take_wave_pairs_vt`]).
+    static WAVE_PAIRS_VT_TOOK: std::cell::Cell<Option<Result<(), &'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Translations inside `f` on this thread take the paired wave64 form with Vice-Tay #208's
+/// rules first when `on` (TaynanGT/Vice-Tay #208; `victory-gpu`'s shader cache names the
+/// programs, by that pull request's list, with `VICTORY_WAVE_PAIRS_VT=1`). A program that form
+/// refuses takes the other forms as before.
+pub fn with_wave_pairs_vt<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAVE_PAIRS_VT_HERE.set(self.0);
+        }
+    }
+    WAVE_PAIRS_VT_TOOK.set(None);
+    let _restore = Restore(WAVE_PAIRS_VT_HERE.replace(on));
+    f()
+}
+
+/// What the last translation inside [`with_wave_pairs_vt`] on this thread made of the paired
+/// form: `None` if it did not try it (not a wave64 compute program on a 32-lane host), else
+/// taken or why it was refused.
+pub fn take_wave_pairs_vt() -> Option<Result<(), &'static str>> {
+    WAVE_PAIRS_VT_TOOK.take()
 }
 
 #[cfg(test)]
@@ -1074,9 +1126,15 @@ fn paired(
             what: "paired lanes in a thread group that does not fill its console waves",
         });
     }
-    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let st = paired_structure(p)?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
+}
+
+/// `p` structured for the paired form: every per-lane branch the wave's; again while that
+/// leaves another branch per lane.
+fn paired_structure(p: &ir::Program) -> Result<structure::Structured, ShaderError> {
     let mut wide = std::collections::HashSet::new();
-    let st = loop {
+    loop {
         let st = structure::structure_wide(p, &wide)?;
         let lanes: Vec<usize> = (0..st.exits.len())
             .filter(|b| !wide.contains(b))
@@ -1086,11 +1144,60 @@ fn paired(
             })
             .collect();
         if lanes.is_empty() {
-            break st;
+            return Ok(st);
         }
         wide.extend(lanes);
+    }
+}
+
+/// [`paired`] with Vice-Tay #208's checks and rules (TaynanGT/Vice-Tay, from fxceless/victory-fork
+/// #1397 by ByFxbian, after PiloteCode #854 and darkworldhm 840243e2; `lower::with_paired_lanes_vt`):
+/// refused for a spilled program, a group that does not fill its console waves or holds more
+/// than 1024 threads, an entry block with predecessors, LDS past what a group may have, an LDS
+/// operation the form does not take, and a group of several waves that would have to meet
+/// after their ways part.
+fn paired_vt(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let refuse = |what| Err(ShaderError::Unsupported { offset: 0, what });
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return refuse("paired lanes outside compute");
     };
-    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
+    if crate::spill::is_spilled(native) {
+        return refuse("paired Wave64 for spilled DispatchX programs is not validated");
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+        return refuse("paired lanes in a thread group that does not fill its console waves");
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return refuse("paired Wave64 requires a single-entry wave prologue");
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return refuse("paired Wave64 exceeds the compute group shared-memory limit");
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0
+            || insts()
+                .filter(|i| lower::accesses_lds(i))
+                .any(|i| !lower::supports_paired_lds(i.name())))
+    {
+        return refuse("an LDS operation not supported by paired Wave64");
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits) || (group_sync() == 0 && (threads > 64 || waits)) {
+        return refuse("paired Wave64 would require an unavailable group rendezvous");
+    }
+    let st = paired_structure(p)?;
+    lower::with_paired_lanes_vt(|| emit_program(c, native, p, &st, io, res))
 }
 
 /// The translated program, and the wave size it requires of the host.

@@ -542,7 +542,13 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    // (`VICTORY_WAVE_PAIRS_VT=1`: the programs the run's shader cache gives Vice-Tay #208's
+    // paired form)
+    let vt = victory_gpu::shader_cache::wave_pairs_vt_listed(&bytes);
+    emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks));
+    if vt {
+        eprintln!("WAVE64-PAIRS-VT {}: {:?}", example(), emit::take_wave_pairs_vt());
+    }
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
