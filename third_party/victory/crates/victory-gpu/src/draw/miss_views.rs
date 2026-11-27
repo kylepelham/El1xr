@@ -160,12 +160,30 @@ impl State {
                 })
             })
             .or_else(|| self.frame_depth(half?, &heap, start_of(0)));
+        // (trustno1-coder/VIctory-NVIDIA#124) The rays' image without a
+        // depth that fits: the light around, without a direction, if asked.
+        let without_depth = |of: &D3D12_RESOURCE_DESC, image| {
+            let ran = crate::ambient_reflect::bound()
+                && of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && of.Format.0 == 26
+                && crate::ambient::without_depth(
+                    list,
+                    &Views {
+                        image,
+                        depth: None,
+                        size: [of.Width as u32, of.Height],
+                        slices: 1,
+                        depth_size: [of.Width as u32, of.Height],
+                    },
+                );
+            note(if ran { Note::Bound(layer) } else { Note::NotReady });
+            ran
+        };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(
                 "no stand-in for reflections: the miss program's image or depth not found (counted in the 10 s line)"
             );
-            note(Note::NotReady);
-            return false;
+            return image.is_some_and(|(of, image)| without_depth(&of, image));
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != 26 || volume || !sizes_fit(&seen, &of) {
@@ -173,8 +191,7 @@ impl State {
                 format = of.Format.0,
                 "no stand-in for reflections: another image"
             );
-            note(Note::NotReady);
-            return false;
+            return without_depth(&of, image);
         }
         let ran = crate::ambient::after(
             list,
