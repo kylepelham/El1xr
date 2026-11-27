@@ -24,6 +24,7 @@ from typing import Iterator
 
 import dev_driver
 import dev_gate
+import dev_png
 import dev_stats
 import dev_throttle
 import dev_train
@@ -691,6 +692,30 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def train_compare(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, a: str, b: str) -> int:
+    """Side-by-side PNGs of two runs' snaps: each of run A's (left) with run B's nearest in time."""
+    try:
+        sa, sb = dev_train.find_run(plan, done, a), dev_train.find_run(plan, done, b)
+    except dev_train.PlanError as exc:
+        print(f"error: {exc}")
+        print("DEV train-compare FAIL reason=run")
+        return 1
+    ida, idb = (dev_train.run_id(s, str(done[s]["set"])) for s in (sa, sb))
+    pairs = dev_train.pair_snaps(
+        dev_train.snaps(train_dir / f"{ida}_snaps"), dev_train.snaps(train_dir / f"{idb}_snaps")
+    )
+    out_dir = train_dir / f"compare_{ida}_vs_{idb}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("cmp-*.png"):
+        old.unlink()
+    for t, left, u, right in pairs:
+        image = dev_png.side_by_side(dev_png.read_png(left), dev_png.read_png(right))
+        dev_png.write_png(out_dir / f"cmp-{t:04d}s-{u:04d}s.png", image)
+    ok = bool(pairs)
+    print(f"DEV train-compare {'PASS' if ok else 'FAIL'} left={ida} right={idb} pairs={len(pairs)} dir={out_dir}")
+    return 0 if ok else 1
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     """One run of a batch plan (`--run`), or the report across its runs (`--report`, `--list`)."""
     try:
@@ -705,6 +730,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         print(dev_train.listing(plan, done), end="")
         print(f"DEV train-list PASS runs={len(done)} next={dev_train.next_pending(plan, done)} dir={train_dir}")
         return 0
+    if args.compare:
+        return train_compare(plan, done, train_dir, *args.compare)
     if args.report:
         text, figures = dev_train.report(plan, done)
         train_dir.mkdir(parents=True, exist_ok=True)
@@ -850,6 +877,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument("--report", action="store_true", help="Table of every run, medians by set and deltas.")
     mode.add_argument("--list", action="store_true", help="The steps, done or pending, with their overrides.")
+    mode.add_argument(
+        "--compare", nargs=2, metavar=("A", "B"),
+        help="Side-by-side PNGs: each snap of run A (left) with run B's nearest in time (A, B: step, run id or set).",
+    )
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_train.set_defaults(func=cmd_train)
 

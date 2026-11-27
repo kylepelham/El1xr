@@ -3,7 +3,9 @@ tools/dev_stats.py that `dev.py bench` and `dev.py train` print."""
 
 import importlib.util
 import json
+import struct
 import sys
+import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +15,7 @@ TOOLS = Path(__file__).resolve().parents[1] / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+import dev_png
 import dev_stats
 import dev_train
 
@@ -69,7 +72,7 @@ def test_a_json_plan_with_its_own_order_and_default_bench_options(tmp_path):
     plan = dev_train.load_plan(plan_file(tmp_path, json.dumps(data), "p.json"))
     assert plan.order == ["a", "b"]
     assert plan.baseline == "a", "no set named off: the first of the order"
-    assert (plan.seconds, plan.snap_every, plan.fast_boot, plan.quiet) == (75, 15.0, True, False)
+    assert (plan.seconds, plan.snap_every, plan.fast_boot, plan.quiet) == (200, 15.0, True, False)
     assert plan.sets == {"a": {"VICTORY_X": "2"}, "b": {}}
 
 
@@ -283,3 +286,90 @@ def test_train_refuses_a_bad_plan_without_running(tmp_path, monkeypatch, capsys)
     assert "DEV train FAIL reason=plan" in capsys.readouterr().out
     assert dev.main(["train", "--plan", str(plan_file(tmp_path)), "--run", "nope"]) == 1
     assert "DEV train FAIL reason=run" in capsys.readouterr().out
+
+
+def png_with_every_filter(path, width, height, rgb_rows):
+    """A PNG whose rows cycle through all five filters (as screenshot.rs's adaptive encoder may)."""
+    def paeth(a, b, c):
+        p = a + b - c
+        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        return a if pa <= pb and pa <= pc else b if pb <= pc else c
+
+    raw, prev = b"", bytes(width * 3)
+    for y, row in enumerate(rgb_rows):
+        kind = y % 5
+        out = bytearray()
+        for i, x in enumerate(row):
+            a = row[i - 3] if i >= 3 else 0
+            c = prev[i - 3] if i >= 3 else 0
+            pred = [0, a, prev[i], (a + prev[i]) >> 1, paeth(a, prev[i], c)][kind]
+            out.append((x - pred) & 255)
+        raw += bytes([kind]) + bytes(out)
+        prev = row
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(dev_png.SIGNATURE + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def gradient(width, height, seed):
+    return [bytes((seed * 31 + x * 7 + y * 13 + (x * y) % 251) & 255 for x in range(width * 3)) for y in range(height)]
+
+
+def test_pngs_of_every_row_filter_read_back_and_side_by_side_pads_the_shorter(tmp_path):
+    rows = gradient(6, 10, 1)
+    png_with_every_filter(tmp_path / "a.png", 6, 10, rows)
+    a = dev_png.read_png(tmp_path / "a.png")
+    assert (a.width, a.height, a.rows) == (6, 10, rows)
+    b = dev_png.Image(2, 3, [b"\x01" * 6] * 3)
+    both = dev_png.side_by_side(a, b, gap=1)
+    assert (both.width, both.height) == (9, 10)
+    assert both.rows[0] == rows[0] + b"\xff\x00\xff" + b"\x01" * 6
+    assert both.rows[9] == rows[9] + b"\xff\x00\xff" + bytes(6), "the shorter one padded with black"
+    dev_png.write_png(tmp_path / "both.png", both)
+    again = dev_png.read_png(tmp_path / "both.png")
+    assert (again.width, again.height, again.rows) == (9, 10, both.rows)
+
+
+def test_snaps_pair_with_the_nearest_in_time_and_runs_are_found_by_step_id_or_set(tmp_path):
+    for name in ["snap-0015s-f400.png", "snap-0030s-f800.png", "snap-0002s-f9.png", "other.png"]:
+        (tmp_path / name).write_bytes(b"")
+    found = dev_train.snaps(tmp_path)
+    assert [t for t, _ in found] == [2, 15, 30]
+    right = [(14, "r14"), (16, "r16"), (45, "r45")]
+    assert [(t, u) for t, _, u, _ in dev_train.pair_snaps(found, right)] == [(2, 14), (15, 14), (30, 16)]
+    assert dev_train.pair_snaps(found, []) == []
+    plan = dev_train.parse_plan("p", {"sets": {"on": {}, "off": {}}})
+    done = {1: record(1, "on", 26.0, 60.0, 2), 2: record(2, "off", 24.0, 70.0, 5),
+            4: record(4, "on", 20.0, 60.0, 2, ok=False)}
+    assert dev_train.find_run(plan, done, "2") == 2
+    assert dev_train.find_run(plan, done, "04_on") == 4
+    assert dev_train.find_run(plan, done, "on") == 1, "the latest run of the set that passed"
+    with pytest.raises(dev_train.PlanError, match="no finished run '3'"):
+        dev_train.find_run(plan, done, "3")
+
+
+def test_train_compare_writes_one_side_by_side_png_per_snap_of_run_a(tmp_path, monkeypatch, capsys):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
+    plan = plan_file(tmp_path)
+    train_dir = tmp_path / "dev" / "train_batch7"
+    train_dir.mkdir(parents=True)
+    dev_train.save_result(train_dir, 1, record(1, "on", 26.0, 60.0, 2))
+    dev_train.save_result(train_dir, 2, record(2, "off", 24.0, 70.0, 5))
+    for rid, times, seed in [("01_on", [15, 30], 1), ("02_off", [16, 31, 46], 2)]:
+        folder = train_dir / f"{rid}_snaps"
+        folder.mkdir()
+        for t in times:
+            png_with_every_filter(folder / f"snap-{t:04d}s-f{t * 30}.png", 4, 3, gradient(4, 3, seed + t))
+    assert dev.main(["train", "--plan", str(plan), "--compare", "on", "off"]) == 0
+    out_dir = train_dir / "compare_01_on_vs_02_off"
+    assert "DEV train-compare PASS left=01_on right=02_off pairs=2" in capsys.readouterr().out
+    assert sorted(p.name for p in out_dir.iterdir()) == ["cmp-0015s-0016s.png", "cmp-0030s-0031s.png"]
+    image = dev_png.read_png(out_dir / "cmp-0030s-0031s.png")
+    assert (image.width, image.height) == (16, 3)
+    assert image.rows[1] == gradient(4, 3, 31)[1] + b"\xff\x00\xff" * 8 + gradient(4, 3, 33)[1]
+    assert dev.main(["train", "--plan", str(plan), "--compare", "1", "9"]) == 1
+    assert "DEV train-compare FAIL reason=run" in capsys.readouterr().out

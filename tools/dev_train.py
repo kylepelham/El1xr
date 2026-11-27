@@ -5,7 +5,7 @@ of its own beyond the gpu.lock file every bench takes.
 
 Plan (TOML or JSON; every key optional but `sets`):
 
-    seconds = 75                        # bench options for every run
+    seconds = 200                       # bench options for every run (fast boot settles at ~100 s)
     quiet = true                        # hold every build slot during each run
     snap_every = 15                     # a PNG every 15 s (0: none)
     save = "default_checkpoint"
@@ -30,6 +30,8 @@ Plan (TOML or JSON; every key optional but `sets`):
 
 Values are strings, numbers or booleans (true is "1", false "0"). Results go to
 `<dev dir>/train_<plan file stem>/`: `NN_<set>.log`, `NN_<set>.json` and `NN_<set>_snaps/`.
+`--compare A B` writes `compare_<A>_vs_<B>/cmp-<A s>s-<B s>s.png`: each snap of run A (left)
+next to the snap of run B (right) nearest in time.
 """
 
 from __future__ import annotations
@@ -44,8 +46,9 @@ from pathlib import Path
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 RESULT_RE = re.compile(r"^(\d+)_(.+)\.json$")
+SNAP_RE = re.compile(r"^snap-(\d+)s-f(\d+)\.png$")
 DEFAULT_ORDER = ("on", "off", "off", "on")
-DEFAULT_SECONDS = 75
+DEFAULT_SECONDS = 200
 DEFAULT_SNAP_EVERY = 15.0
 PLAN_KEYS = {"seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets"}
 
@@ -216,6 +219,41 @@ def pick(plan: Plan, done: dict[int, dict[str, object]], run: str) -> tuple[int,
         if name == run and step not in done:
             return step, name
     return max([len(plan.order), *done], default=0) + 1, run
+
+
+def find_run(plan: Plan, done: dict[int, dict[str, object]], which: str) -> int:
+    """The step a `--compare` argument names: a step number, a run id (`03_off`), or a set (its
+    latest run that passed, else its latest run)."""
+    m = re.match(r"^(\d+)(?:_.*)?$", which)
+    if m and int(m.group(1)) in done:
+        return int(m.group(1))
+    runs = [s for s in sorted(done) if done[s]["set"] == which]
+    passed = [s for s in runs if done[s].get("ok")]
+    if passed or runs:
+        return (passed or runs)[-1]
+    raise PlanError(f"no finished run '{which}' (runs: {', '.join(run_id(s, str(done[s]['set'])) for s in sorted(done))})")
+
+
+def snaps(folder: Path) -> list[tuple[int, Path]]:
+    """A run's snaps as (seconds since its first present, path), in time order."""
+    found = []
+    if folder.is_dir():
+        for path in folder.iterdir():
+            m = SNAP_RE.match(path.name)
+            if m:
+                found.append((int(m.group(1)), path))
+    return sorted(found)
+
+
+def pair_snaps(left: list[tuple[int, Path]], right: list[tuple[int, Path]]) -> list[tuple[int, Path, int, Path]]:
+    """Each snap of `left` with the snap of `right` nearest in time (the earlier on a tie)."""
+    if not right:
+        return []
+    out = []
+    for t, path in left:
+        u, other = min(right, key=lambda r: (abs(r[0] - t), r[0]))
+        out.append((t, path, u, other))
+    return out
 
 
 def next_pending(plan: Plan, done: dict[int, dict[str, object]]) -> str:
