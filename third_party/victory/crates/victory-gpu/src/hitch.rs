@@ -147,6 +147,8 @@ fn bank() -> usize {
 pub fn title_presents() {
     TITLE.store(thread_id(), Ordering::Relaxed);
     #[cfg(windows)]
+    stacks::title_presents(thread_id());
+    #[cfg(windows)]
     if every_frame() {
         TITLE_CPU_US.store(cpu::lap().unwrap_or(u64::MAX), Ordering::Relaxed);
     }
