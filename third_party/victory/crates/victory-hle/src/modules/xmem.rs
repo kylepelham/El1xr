@@ -529,6 +529,12 @@ impl Slice {
     }
 }
 
+/// The first page number given out; 0 stays unused.
+const FIRST_PAGE: usize = 0x10_0000;
+/// Numbers from here on do not survive the title's 21-bit `number >> 4`
+/// ([`FRAMES`]).
+const PAGE_LIMIT: usize = 1 << 25;
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -539,10 +545,46 @@ struct Physical {
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
+impl Physical {
+    /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
+    /// last given while they fit the title's 21 bits (as before), then the
+    /// lowest run of `n` freed ones. `None` if there is no such run.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let len = n.checked_mul(FRAMES)?;
+        let end = self.next_page.checked_add(len);
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+            let first = self.next_page;
+            self.next_page = end;
+            return Some(first);
+        }
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        REUSING.call_once(|| {
+            tracing::info!("page numbers reach the title's 21 bits: freed ones given again");
+        });
+        let mut used: Vec<usize> = self.pages.keys().copied().collect();
+        used.sort_unstable();
+        free_run(used, len)
+    }
+}
+
+/// The lowest `start` from [`FIRST_PAGE`] where `len` (a multiple of
+/// [`FRAMES`]) numbers up to [`PAGE_LIMIT`] are all outside `used`
+/// (sorted).
+fn free_run(used: impl IntoIterator<Item = usize>, len: usize) -> Option<usize> {
+    let mut start = FIRST_PAGE;
+    for at in used.into_iter().chain([PAGE_LIMIT]) {
+        if at.checked_sub(start).is_some_and(|gap| gap >= len) {
+            return Some(start);
+        }
+        start = start.max(at.checked_add(FRAMES)?);
+    }
+    None
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        // Page numbers are opaque to titles.
+        next_page: FIRST_PAGE,
         ..Default::default()
     })
 });
@@ -600,8 +642,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, n));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let Some(first) = physical.take(n) else {
+        drop(physical);
+        // The title keeps 21 bits of a number (`FRAMES`).
+        tracing::warn!(n, "XMemAllocatePhysicalPages: out of page numbers");
+        // SAFETY: checked non-null. The section goes with `section`.
+        unsafe { count.write(0) };
+        return 0;
+    };
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -2501,6 +2549,28 @@ mod tests {
             weak.upgrade().is_none(),
             "Section dropped and unmapped host_view cleanly once last view dropped"
         );
+    }
+
+    #[test]
+    fn page_numbers_freed_are_given_again_past_the_title_s_21_bits() {
+        let mut table = Physical {
+            next_page: PAGE_LIMIT - 2 * FRAMES,
+            ..Default::default()
+        };
+        // The last numbers that fit, as before.
+        assert_eq!(table.take(2), Some(PAGE_LIMIT - 2 * FRAMES));
+        assert_eq!(table.next_page, PAGE_LIMIT);
+        // Then the lowest free run, still packed into 21 bits.
+        assert_eq!(table.take(3), Some(FIRST_PAGE));
+        assert_eq!(table.take(usize::MAX), None);
+        let f = |k: usize| FIRST_PAGE + k * FRAMES;
+        assert_eq!(free_run([f(0), f(1), f(3)], FRAMES), Some(f(2)));
+        assert_eq!(free_run([f(0), f(1), f(3)], 2 * FRAMES), Some(f(4)));
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE), Some(FIRST_PAGE));
+        assert_eq!(free_run([f(0)], PAGE_LIMIT - FIRST_PAGE), None);
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
+        let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
+        assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
     }
 }
 

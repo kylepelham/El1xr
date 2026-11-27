@@ -902,4 +902,70 @@ mod first_diff_tests {
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
+
+    #[test]
+    fn compare_hash_eight_way_unroll_matches_scalar_loop() {
+        const SEED: [u32; 4] = [0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+        const STEP: [u32; 4] = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
+        let step = |h: [u32; 4], v: [u32; 4]| -> [u32; 4] {
+            let m = [
+                (h[0] ^ v[0]).wrapping_mul(STEP[0]),
+                (h[1] ^ v[1]).wrapping_mul(STEP[1]),
+                (h[2] ^ v[2]).wrapping_mul(STEP[2]),
+                (h[3] ^ v[3]).wrapping_mul(STEP[3]),
+            ];
+            [
+                m[1] ^ (m[0] >> 15),
+                m[2] ^ (m[1] >> 15),
+                m[3] ^ (m[2] >> 15),
+                m[0] ^ (m[3] >> 15),
+            ]
+        };
+        let load4 = |buf: &[u8], at: u32| -> [u32; 4] {
+            let s = &buf[at as usize..at as usize + 16];
+            [
+                u32::from_le_bytes(s[0..4].try_into().unwrap()),
+                u32::from_le_bytes(s[4..8].try_into().unwrap()),
+                u32::from_le_bytes(s[8..12].try_into().unwrap()),
+                u32::from_le_bytes(s[12..16].try_into().unwrap()),
+            ]
+        };
+        let buf: Vec<u8> = (0..65568usize)
+            .map(|i| ((i.wrapping_mul(131) ^ (i >> 3)) & 0xff) as u8)
+            .collect();
+        for &(lo, hi) in &[
+            (0u32, 0u32),
+            (0, 16),
+            (0, 1024),
+            (0, 7168),
+            (0, 8192),
+            (0, 8208),
+            (0, 65536),
+            (0, 65568),
+            (32, 16400),
+        ] {
+            for thread in [0u32, 1, 31, 63] {
+                let init = SEED.map(|x| x.wrapping_add(thread));
+                let mut ref_h = init;
+                let mut at = lo + thread * 16;
+                while at < hi {
+                    ref_h = step(ref_h, load4(&buf, at));
+                    at += 1024;
+                }
+                let mut unrolled_h = init;
+                let mut at = lo + thread * 16;
+                while at + 7168 < hi {
+                    for k in 0..8u32 {
+                        unrolled_h = step(unrolled_h, load4(&buf, at + k * 1024));
+                    }
+                    at += 8192;
+                }
+                while at < hi {
+                    unrolled_h = step(unrolled_h, load4(&buf, at));
+                    at += 1024;
+                }
+                assert_eq!(unrolled_h, ref_h, "lo={lo} hi={hi} thread={thread}");
+            }
+        }
+    }
 }

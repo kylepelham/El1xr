@@ -41,6 +41,10 @@ mod heap_rounds;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod land_aside;
+#[cfg(windows)]
+mod output_views;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod pacing;
@@ -89,6 +93,8 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod texstore;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

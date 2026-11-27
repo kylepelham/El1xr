@@ -1351,16 +1351,29 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
+        // Sampler heaps always back the full 2,048 hardware limit and reserve
+        // slot 2,047 as a permanent null point sampler so `umin(index, 2047)`
+        // in `victory-shader` never reads past smaller title sampler heaps.
+        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            SAMPLERS - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
         let extra = if sampler { 0 } else { dynamic_slots(null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            let fitted = count.min(SAMPLERS - 1);
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -4489,7 +4502,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -4547,6 +4561,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                         first,
                         u32::from(own.MipLevels),
                     );
+                }
+                // Made whole from the store (`crate::texstore`): all its levels.
+                let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
+                if prefilled > 0
+                    && let Some(desc) = &mut desc
+                {
+                    show_prefilled(desc, prefilled);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4665,6 +4686,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
             }
         }
     }
+}
+
+/// The view `desc` of a host copy whose levels below `levels` the store
+/// filled (`crate::texstore`): from level 0, if it showed from one of them.
+fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return;
+    }
+    // SAFETY: the member its dimension says.
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    if t.MostDetailedMip == 0 || t.MostDetailedMip > levels {
+        return;
+    }
+    if t.MipLevels != u32::MAX {
+        t.MipLevels += t.MostDetailedMip;
+    }
+    t.MostDetailedMip = 0;
+    t.ResourceMinLODClamp = 0.0;
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -6234,6 +6273,70 @@ mod dynamic_bits_tests {
         assert_eq!(got, Some(fill_b));
         heap.release(heap.id(), fill_a, heap.dynamic - 17);
         heap.release(heap.id(), fill_b, 16);
+    }
+
+    /// Every host sampler heap backs all 2,048 hardware descriptors and
+    /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
+    /// `victory-shader` never reads past smaller title sampler heaps.
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        let Some(small) = super::HostHeap::new(true, 16) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(small.count, 16);
+        let Some(full) = super::HostHeap::new(true, 2048) else {
+            return;
+        };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(full.count, 2047);
+    }
+
+    #[test]
+    fn show_prefilled_widens_texture2d_view_to_level_zero() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+            D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV,
+        };
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 3,
+                    MipLevels: 6,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.0,
+                },
+            },
+            ..Default::default()
+        };
+        super::show_prefilled(&mut desc, 3);
+        // SAFETY: Texture2D variant set above.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!(t.MostDetailedMip, 0);
+        assert_eq!(t.MipLevels, 9);
+        assert_eq!(t.ResourceMinLODClamp, 0.0);
+
+        // A view starting past the prefilled range is left unchanged.
+        let mut untouched = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 4,
+                    MipLevels: 5,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 4.0,
+                },
+            },
+            ..Default::default()
+        };
+        super::show_prefilled(&mut untouched, 3);
+        // SAFETY: Texture2D variant set above.
+        let t2 = unsafe { untouched.Anonymous.Texture2D };
+        assert_eq!(t2.MostDetailedMip, 4);
+        assert_eq!(t2.MipLevels, 5);
     }
 
     /// Placed unordered texture views (2D and 3D) mirror onto host unordered

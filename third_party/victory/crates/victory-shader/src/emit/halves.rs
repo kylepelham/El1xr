@@ -285,7 +285,15 @@ impl<'a> Lower<'a> {
     /// compare (whose result would depend on the host's denormal mode).
     pub(super) fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        let zero_factor = self.s.m.const_f32_bits(a).is_some_and(|bits| bits & 0x7F80_0000 == 0)
+            || self.s.m.const_f32_bits(b).is_some_and(|bits| bits & 0x7F80_0000 == 0);
+        if zero_factor {
+            return self.s.m.f32(0);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if a == b {
+            return m;
+        }
         let exp = self.s.m.i32(0x7F80_0000);
         let izero = self.s.m.i32(0);
         let is_zero = |l: &mut Self, v: V| {
@@ -321,10 +329,20 @@ impl<'a> Lower<'a> {
     /// the legacy rule that a zero factor makes the product +0 whatever the
     /// other factor is (an infinity or no number too).
     pub(super) fn legacy_fmad(&mut self, a: V, b: V, acc: V) -> V {
-        let (a, b, acc) = (self.ftz(a), self.ftz(b), self.ftz(acc));
+        let zero_factor = self.s.m.const_f32_bits(a).is_some_and(|bits| bits & 0x7F80_0000 == 0)
+            || self.s.m.const_f32_bits(b).is_some_and(|bits| bits & 0x7F80_0000 == 0);
+        let acc = self.ftz(acc);
         let c = self.cur;
-        let fused = self.fmad(a, b, acc);
         let zero = self.s.m.f32(0);
+        if zero_factor {
+            return self.s.m.bin(c, Bin::Add, zero, acc);
+        }
+        if a == b {
+            let a = self.ftz(a);
+            return self.fmad(a, a, acc);
+        }
+        let (a, b) = (self.ftz(a), self.ftz(b));
+        let fused = self.fmad(a, b, acc);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
