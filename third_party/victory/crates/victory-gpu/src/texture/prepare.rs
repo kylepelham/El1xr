@@ -233,6 +233,25 @@ pub(crate) fn look(
     budget: u64,
     frame: u64,
 ) -> Look {
+    look_in(slot, resource, first, recorded, budget, frame, false)
+}
+
+/// [`look`] for a draw that binds the texture through a table now
+/// (`crate::table_defer`): handed out ahead of the texture pass's queue,
+/// and past the frame's bytes while what is out stays under twice `budget`.
+pub(crate) fn look_urgent(slot: u32, resource: This, first: u32, budget: u64, frame: u64) -> Look {
+    look_in(slot, resource, first, &HashSet::new(), budget, frame, true)
+}
+
+fn look_in(
+    slot: u32,
+    resource: This,
+    first: u32,
+    recorded: &HashSet<(usize, u32)>,
+    budget: u64,
+    frame: u64,
+    urgent: bool,
+) -> Look {
     if threads() == 0
         || !crate::resource::title_fills(resource)
         || crate::resource::host_refused(resource)
@@ -274,7 +293,7 @@ pub(crate) fn look(
         q.frame = frame;
         q.handed = 0;
     }
-    if q.handed >= budget || q.outstanding >= budget {
+    if over_budget(q.handed, q.outstanding, budget, urgent) {
         return Look::Full;
     }
     crate::resource::keep_alive(resource);
@@ -282,11 +301,16 @@ pub(crate) fn look(
     q.outstanding += bytes;
     q.pending.insert((resource as usize, first), vec![slot]);
     q.wait(slot);
-    q.jobs.push_back(Job {
+    let job = Job {
         resource: resource as usize,
         first,
         bytes,
-    });
+    };
+    if urgent {
+        q.jobs.push_front(job);
+    } else {
+        q.jobs.push_back(job);
+    }
     let start = threads().saturating_sub(q.started);
     q.started += start;
     drop(q);
@@ -295,6 +319,16 @@ pub(crate) fn look(
     }
     WORK.notify_one();
     Look::Handed(bytes)
+}
+
+/// Whether nothing more may be handed out: the frame's bytes or what is out
+/// reached `budget`; for an urgent look only what is out, against twice it.
+fn over_budget(handed: u64, outstanding: u64, budget: u64, urgent: bool) -> bool {
+    if urgent {
+        outstanding >= budget.saturating_mul(2)
+    } else {
+        handed >= budget || outstanding >= budget
+    }
 }
 
 fn start_thread() {
@@ -679,6 +713,17 @@ mod tests {
         assert_eq!(ready_count, 2);
         assert_eq!(skipped, 2);
         assert_eq!(due, [(3, 12), (5, 14), (1, 10)]);
+    }
+
+    /// An urgent look (a table's texture) ignores the frame's bytes and is
+    /// held only by what is out, at twice the budget.
+    #[test]
+    fn urgent_looks_pass_the_frame_budget_but_not_twice_the_outstanding() {
+        assert!(over_budget(100, 0, 100, false));
+        assert!(over_budget(0, 100, 100, false));
+        assert!(!over_budget(99, 99, 100, false));
+        assert!(!over_budget(500, 199, 100, true));
+        assert!(over_budget(0, 200, 100, true));
     }
 
     /// The switch is off unless set: the pass makes its textures itself.
