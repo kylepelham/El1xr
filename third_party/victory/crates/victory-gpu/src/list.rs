@@ -1008,7 +1008,8 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         return false;
     }
     let (from, to) = (from as u64, to as u64);
-    if !crate::host::shader_written(from as usize, len as usize) {
+    let written = crate::host::shader_written(from as usize, len as usize);
+    if !written && !crate::port_cbv::copy_order_on() {
         return false;
     }
     let (Some(source), Some(target)) =
@@ -1016,13 +1017,18 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     else {
         return false;
     };
+    // (`crate::port_cbv::copy_order_on`) Into a copy draws' constant buffers are viewed in.
+    let for_order = !written && crate::port_cbv::was_viewed(&target);
+    if !written && !for_order {
+        return false;
+    }
     if source.left(from) < len || target.left(to) < len || source.unwatched() || target.unwatched()
+        || std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len
     {
+        crate::port_cbv::ordered(for_order, false);
         return false;
     }
-    if std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len {
-        return false;
-    }
+    crate::port_cbv::ordered(for_order, true);
     // What the title's CPU side wrote of both first, then the copy, then
     // its bytes back into title memory when the list has run.
     source.refresh(list, from, len);

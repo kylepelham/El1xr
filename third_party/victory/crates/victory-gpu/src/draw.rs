@@ -4574,6 +4574,7 @@ impl State {
                                     ) {
                                         shadow.refresh(list, address, u64::from(size));
                                         crate::port_cbv::in_copy(size);
+                                        crate::port_cbv::viewed(&shadow);
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
