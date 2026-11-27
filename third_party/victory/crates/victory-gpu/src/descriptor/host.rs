@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod flicker;
+mod keep_shown;
 mod levels_wait;
 mod list_views;
 mod slot_wait;
@@ -3612,6 +3613,7 @@ impl HostHeap {
                     && keep_other_views()
                     && shows_texture(&view)
                     && shows_texture(&old)
+                    && keep_shown::may_stand_in(&old, &view)
                     && self
                         .kept
                         .get(index as usize)

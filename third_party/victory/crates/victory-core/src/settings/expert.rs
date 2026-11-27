@@ -155,6 +155,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_INPUT_TRACE", Apply::Restart),
     ("VICTORY_KBM_GTA", Apply::Restart),
     ("VICTORY_KEEP_OTHER_VIEWS", Apply::Restart),
+    ("VICTORY_KEEP_SHOWN", Apply::Restart),
     ("VICTORY_KEEP_SNAPSHOTS", Apply::Restart),
     ("VICTORY_KEEP_SNAPSHOTS_MB", Apply::Restart),
     ("VICTORY_KEEP_VIEWS", Apply::Restart),
