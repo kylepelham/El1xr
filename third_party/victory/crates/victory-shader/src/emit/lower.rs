@@ -108,6 +108,10 @@ mod lds_loop;
 #[path = "lds_first.rs"]
 mod lds_first;
 
+/// Where the program's code table starts (`VICTORY_CONST_TABLE_TRIM=1`).
+#[path = "code_table.rs"]
+mod code_table;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1453,22 +1457,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = if code_table::const_table_trim() {
+                    code_table::code_table_start(self.x.p, &addresses, lowest)
+                } else {
+                    lowest
+                };
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
