@@ -32,6 +32,9 @@ pub(crate) const MIN_PREFIX: u64 = 32 << 10;
 /// Bytes of levels kept in memory at most (the rest is read from the folder
 /// when asked).
 const KEPT: u64 = 4 << 30;
+/// Maximum whole textures queued for background indexing/writing so concurrent
+/// prepare threads cannot bloat RAM if disk I/O lags behind.
+const MAX_QUEUED_JOBS: usize = 64;
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -56,7 +59,7 @@ struct Store {
     index: Mutex<HashMap<Key, Entry>>,
     kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
     kept_bytes: AtomicU64,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    jobs: Mutex<mpsc::SyncSender<Job>>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<HashSet<u128>>,
 }
@@ -166,7 +169,7 @@ fn store() -> Option<&'static Store> {
                 keys = index.len(),
                 "texture store: larger levels kept from earlier runs (VICTORY_TEXTURE_STORE)"
             );
-            let (send, receive) = mpsc::channel::<Job>();
+            let (send, receive) = mpsc::sync_channel::<Job>(MAX_QUEUED_JOBS);
             let to = folder.clone();
             std::thread::Builder::new()
                 .name("texture store".into())
@@ -251,11 +254,40 @@ pub(crate) fn keep(
         parts,
         blob,
     };
-    let _ = store
+    enqueue_job(store, job);
+}
+
+fn enqueue_job(store: &Store, job: Job) -> bool {
+    let blob = job.blob;
+    let sent = store
         .jobs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .send(job);
+        .try_send(job)
+        .is_ok();
+    if !sent {
+        // Queue is full (or worker exited): allow a later upload to retry.
+        store
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&blob);
+    }
+    sent
+}
+
+/// Inserts `bytes` under `blob` into `store.kept` at most once while staying
+/// within [`KEPT`], avoiding double-counting `kept_bytes` when several
+/// prepare threads miss the cache for the same blob concurrently.
+fn cache_kept(store: &Store, blob: u128, bytes: &Arc<Vec<u8>>) -> bool {
+    let len = bytes.len() as u64;
+    let mut kept = store.kept.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.contains_key(&blob) || store.kept_bytes.load(Relaxed) + len > KEPT {
+        return false;
+    }
+    kept.insert(blob, bytes.clone());
+    store.kept_bytes.fetch_add(len, Relaxed);
+    true
 }
 
 /// A texture to keep ([`keep`]).
@@ -326,14 +358,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-        store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-        store
-            .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(blob, bytes.clone());
-    }
+    cache_kept(store, blob, &bytes);
     STATS[1].fetch_add(1, Relaxed);
     Some((blob, bytes, entries))
 }
@@ -372,14 +397,7 @@ fn find_in(store: &Store, shape: Shape, level: u32, smaller: &[u8]) -> Option<Ar
             let bytes =
                 Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-                store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-                store
-                    .kept
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(entry.blob, bytes.clone());
-            }
+            cache_kept(store, entry.blob, &bytes);
             bytes
         }
     };
@@ -469,7 +487,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_JOBS);
         let st = Store {
             folder: dir.clone(),
             index: Mutex::new(HashMap::new()),
@@ -504,7 +522,7 @@ mod tests {
         drop(index_file);
 
         // Reload a fresh store from disk (empty RAM cache) and find by prefix.
-        let (tx2, _rx2) = mpsc::channel();
+        let (tx2, _rx2) = mpsc::sync_channel(MAX_QUEUED_JOBS);
         let reloaded = Store {
             folder: dir.clone(),
             index: Mutex::new(load_index(&dir)),
@@ -524,5 +542,54 @@ mod tests {
         assert!(find_in(&reloaded, shape, level, &altered).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_kept_deduplicates_bytes_and_full_queue_releases_seen() {
+        let desc = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth_or_array: 1,
+            mips: 1,
+            format: 71,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        };
+        let layout = Texture::new(&desc).unwrap().planes[0].layout.clone();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let st = Store {
+            folder: PathBuf::new(),
+            index: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
+            kept_bytes: AtomicU64::new(0),
+            jobs: Mutex::new(tx),
+            seen: Mutex::new(HashSet::new()),
+        };
+
+        // Inserting the same blob twice only counts its bytes once.
+        let bytes = Arc::new(vec![7u8; 4096]);
+        assert!(cache_kept(&st, 42, &bytes));
+        assert!(!cache_kept(&st, 42, &bytes));
+        assert_eq!(st.kept_bytes.load(Relaxed), 4096);
+
+        // Filling the bounded channel rejects overflow without blocking and clears `seen`.
+        let make_job = |blob| Job {
+            shape: [64, 64, 71, 1],
+            layout: layout.clone(),
+            tiled: Vec::new(),
+            parts: Vec::new(),
+            blob,
+        };
+        st.seen.lock().unwrap().insert(1);
+        assert!(enqueue_job(&st, make_job(1)));
+        assert!(st.seen.lock().unwrap().contains(&1));
+
+        st.seen.lock().unwrap().insert(2);
+        assert!(!enqueue_job(&st, make_job(2)));
+        assert!(
+            !st.seen.lock().unwrap().contains(&2),
+            "rejected job must clear seen so a later upload can store it"
+        );
     }
 }
