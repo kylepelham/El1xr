@@ -32,6 +32,8 @@ pub mod device;
 mod alloc_backoff;
 #[cfg(windows)]
 mod ambient;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod bake_ahead;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
