@@ -240,6 +240,9 @@ class _SuspendProc:
     def children(self, recursive=False):
         return []
 
+    def parents(self):
+        return list(getattr(self, "ancestors", []))
+
     def suspend(self):
         self.state = "suspended"
 
@@ -329,3 +332,19 @@ def test_loud_runs_move_builds_and_tests_to_the_second_ccd_then_give_cpus_back()
         assert game.cpus == list(range(32)) and game.prio == "normal"
         assert test_exe.state == "running"
     assert rustc.cpus == test_exe.cpus == list(range(32))
+
+
+def test_quiet_never_suspends_a_process_this_run_started_even_between_scans():
+    class _Me:
+        pid = 1
+    launcher = _SuspendProc(501, "powershell.exe")
+    launcher.ancestors = [_Me()]
+    game = _SuspendProc(502, "victory.exe", r"E:\Gta6\AnyXboxX-wt\train\third_party\victory\target\release\victory.exe")
+    game.ancestors = [launcher, _Me()]
+    cargo = _SuspendProc(503, "cargo.exe")
+    cargo.ancestors = [launcher, _Me()]
+    # Neither shows up in the run's children list (started after it was read), only in the scan.
+    ps = _SuspendPsutil([game, cargo], children_of_me=[])
+    with dev_throttle.builds_suspended(ps, rescan_s=0) as paused:
+        assert paused == 0
+        assert game.state == cargo.state == "running"

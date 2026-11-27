@@ -217,6 +217,16 @@ def _worktree_tools(psutil) -> list:
     return found
 
 
+def _started_by(proc, pid: int) -> bool:
+    """Whether `pid` is among `proc`'s ancestors, read from the candidate itself so a process this
+    dev.py starts between two scans (the launcher's cargo, the game) is never taken for a writer's.
+    Unknown counts as ours: better to leave a writer's test running than to pause the game."""
+    try:
+        return any(parent.pid == pid for parent in proc.parents())
+    except Exception:
+        return True
+
+
 @contextlib.contextmanager
 def builds_suspended(psutil_module=None, rescan_s: float = 1.0, builds: bool = True) -> Iterator[int]:
     """`--quiet` without the wait: suspends every build (`_build_tree`) and worktree tool or test
@@ -255,6 +265,9 @@ def builds_suspended(psutil_module=None, rescan_s: float = 1.0, builds: bool = T
             pass
         for proc in (_build_tree(psutil) if builds else []) + _worktree_tools(psutil):
             if proc.pid in spared or proc.pid in paused:
+                continue
+            if _started_by(proc, me.pid):
+                spared.add(proc.pid)
                 continue
             try:
                 proc.suspend()
@@ -328,6 +341,9 @@ def builds_aside(psutil_module=None, rescan_s: float = 2.0, cpus: tuple[int, ...
             pass
         for proc in _build_tree(psutil) + _worktree_tools(psutil):
             if proc.pid in spared or proc.pid in moved:
+                continue
+            if _started_by(proc, me.pid):
+                spared.add(proc.pid)
                 continue
             try:
                 proc.cpu_affinity(list(cpus))
