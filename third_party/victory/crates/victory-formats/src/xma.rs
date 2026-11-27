@@ -1074,6 +1074,15 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn decode_bounds_declared_bits_to_real_payload() {
+        let mut dec = Decoder::new(1, 48000);
+        let mut out = Vec::new();
+        // Declared length far past the 4-byte payload must not loop or panic.
+        let _ = dec.decode(&[0u8; 4], 100_000, &mut out);
+        assert_eq!(out.len(), FRAME_SAMPLES);
+    }
+
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
         for i in 0..n as usize {
