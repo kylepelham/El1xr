@@ -2,15 +2,19 @@
 
 The build compiles every VIctory workspace test binary and `xtask` in one cargo call (cargo
 builds in parallel and holds its directory lock). Then the test binaries run directly, without
-cargo, side by side with `cargo xtask policy` and pytest. Binaries in `SERIAL_BINARIES` share
-process-wide state between their tests (the write-watch tables, guarded pages, the lazy
-copy-back switch) and run with one test thread; the other binaries use the default.
+cargo, side by side with `cargo xtask policy` and pytest (with `PYTEST_WORKERS` pytest-xdist
+workers when the test interpreter has the plugin: 33-41 s in one process, 15-21 s with 4).
 
 Binaries in `SHARDED_BINARIES` run as several processes of one test thread each, every test in
-exactly one of them. `victory_shader`'s GPU tests take one process-wide lock and create a D3D12
-device each; with libtest's default 32 threads in one process the binary took 497-850 s here
-(and timed out at 900 s in one gate), against 60 s on one thread and 24-28 s as 6-8 processes of
-one thread (measured 2026-11-27 with other jobs building).
+exactly one of them; the other binaries use libtest's default. `victory_shader`'s GPU tests take
+one process-wide lock and create a D3D12 device each; with libtest's default 32 threads in one
+process the binary took 497-850 s here (and timed out at 900 s in one gate), against 60 s on one
+thread and 24-28 s as 6-8 processes of one thread (measured 2026-11-27 with other jobs building;
+on a busier machine later that day 6 shards took 47-51 s and 8 took 30-35 s).
+`victory_gpu`'s tests share process-wide state (the write-watch tables, guarded pages, the lazy
+copy-back switch) and need one test thread in their process; each shard is its own process with
+its own state, so sharding keeps that (18 s on one thread, every test also passed alone in a
+process of its own).
 """
 
 from __future__ import annotations
@@ -27,8 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, ContextManager
 
-SERIAL_BINARIES = frozenset({"victory_gpu"})
-SHARDED_BINARIES = {"victory_shader": 6}
+SHARDED_BINARIES = {"victory_shader": 8, "victory_gpu": 4}
+PYTEST_WORKERS = 4
 MAX_SHARD_ARGS_CHARS = 24_000  # Windows command lines end at 32,767 characters
 STEP_TIMEOUT_S = 900.0
 CARGO_RESULT_RE = re.compile(r"test result: (?:ok|FAILED)\.\s*(\d+) passed;\s*(\d+) failed;")
@@ -171,22 +175,32 @@ def shards(names: list[str], count: int) -> list[list[str]]:
 
 
 def cargo_steps(label: str, exe: str, victory_dir: Path) -> list[Step]:
-    if label in SERIAL_BINARIES:
+    """A sharded binary as its shards, or as one process of one thread when it cannot list its tests."""
+    if label not in SHARDED_BINARIES:
+        return [Step(label, [exe], victory_dir, "cargo")]
+    names = list_tests(exe, victory_dir)
+    if not names:
         return [Step(label, [exe, "--test-threads=1"], victory_dir, "cargo")]
-    if label in SHARDED_BINARIES:
-        names = list_tests(exe, victory_dir)
-        if names:
-            return [
-                Step(f"{label}#{i + 1}", [exe, "--test-threads=1", "--exact", *group], victory_dir, "cargo")
-                for i, group in enumerate(shards(names, SHARDED_BINARIES[label]))
-            ]
-    return [Step(label, [exe], victory_dir, "cargo")]
+    return [
+        Step(f"{label}#{i + 1}", [exe, "--test-threads=1", "--exact", *group], victory_dir, "cargo")
+        for i, group in enumerate(shards(names, SHARDED_BINARIES[label]))
+    ]
+
+
+def pytest_command(python: str) -> list[str]:
+    """pytest with `PYTEST_WORKERS` pytest-xdist workers, or in one process when `python` lacks xdist."""
+    cmd = [python, "-m", "pytest", "-q"]
+    try:
+        probe = subprocess.run([python, "-c", "import xdist"], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return cmd
+    return cmd + ["-n", str(PYTEST_WORKERS)] if probe.returncode == 0 else cmd
 
 
 def plan(b: Build, victory_dir: Path, repo_root: Path, python: str) -> list[Step]:
     steps = [step for label, exe in b.binaries for step in cargo_steps(label, exe, victory_dir)]
     steps.append(Step("policy", ["cargo", "xtask", "policy"], victory_dir, "policy"))
-    steps.append(Step("pytest", [python, "-m", "pytest", "-q"], repo_root, "pytest"))
+    steps.append(Step("pytest", pytest_command(python), repo_root, "pytest"))
     return steps
 
 

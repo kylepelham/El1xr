@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import dev_gate  # noqa: E402
 
@@ -73,14 +75,36 @@ def test_a_crashed_binary_counts_as_a_failure(tmp_path):
     assert not step.ok and step.failed == 1
 
 
-def test_victory_gpu_runs_on_one_thread_and_others_on_the_default(tmp_path):
-    build = dev_gate.Build(True, 1.0, [("victory_gpu", "g.exe"), ("victory_shader", "s.exe")])
+def test_unsharded_binaries_run_on_the_default_and_pytest_on_xdist_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(dev_gate, "pytest_command", lambda python: [python, "-m", "pytest", "-q", "-n", "4"])
+    build = dev_gate.Build(True, 1.0, [("victory_formats", "f.exe")])
     steps = dev_gate.plan(build, tmp_path, tmp_path, "python")
     commands = {s.label: s.cmd for s in steps}
-    assert commands["victory_gpu"] == ["g.exe", "--test-threads=1"]
-    assert commands["victory_shader"] == ["s.exe"]
+    assert commands["victory_formats"] == ["f.exe"]
     assert commands["policy"] == ["cargo", "xtask", "policy"]
-    assert commands["pytest"][1:] == ["-m", "pytest", "-q"]
+    assert commands["pytest"] == ["python", "-m", "pytest", "-q", "-n", "4"]
+
+
+def test_pytest_uses_xdist_workers_only_when_the_interpreter_has_the_plugin(monkeypatch):
+    seen = []
+
+    def probe(returncode):
+        def fake_run(cmd, **_kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, returncode, b"", b"")
+        return fake_run
+
+    monkeypatch.setattr(dev_gate.subprocess, "run", probe(0))
+    assert dev_gate.pytest_command("py") == ["py", "-m", "pytest", "-q", "-n", str(dev_gate.PYTEST_WORKERS)]
+    assert seen == [["py", "-c", "import xdist"]]
+    monkeypatch.setattr(dev_gate.subprocess, "run", probe(1))
+    assert dev_gate.pytest_command("py") == ["py", "-m", "pytest", "-q"]
+
+    def missing(cmd, **_kw):
+        raise OSError("no such interpreter")
+
+    monkeypatch.setattr(dev_gate.subprocess, "run", missing)
+    assert dev_gate.pytest_command("py") == ["py", "-m", "pytest", "-q"]
 
 
 def test_shards_hold_every_test_once_and_spread_neighbours():
@@ -100,24 +124,27 @@ def test_shards_grow_in_number_before_a_command_line_grows_too_long():
     assert sorted(n for g in groups for n in g) == sorted(names)
 
 
-def test_victory_shader_runs_as_one_thread_shards_covering_every_test(tmp_path, monkeypatch):
+@pytest.mark.parametrize("label", ["victory_shader", "victory_gpu"])
+def test_sharded_binaries_run_as_one_thread_shards_covering_every_test(tmp_path, monkeypatch, label):
     names = [f"emit::valu_tests::t{i}" for i in range(13)]
     monkeypatch.setattr(dev_gate, "list_tests", lambda exe, cwd: names)
-    build = dev_gate.Build(True, 1.0, [("victory_shader", "s.exe"), ("victory_formats", "f.exe")])
+    build = dev_gate.Build(True, 1.0, [(label, "s.exe"), ("victory_formats", "f.exe")])
     steps = dev_gate.plan(build, tmp_path, tmp_path, "python")
-    shard_steps = [s for s in steps if s.label.startswith("victory_shader#")]
-    assert len(shard_steps) == dev_gate.SHARDED_BINARIES["victory_shader"]
+    shard_steps = [s for s in steps if s.label.startswith(f"{label}#")]
+    assert len(shard_steps) == dev_gate.SHARDED_BINARIES[label]
     for s in shard_steps:
         assert s.cmd[:3] == ["s.exe", "--test-threads=1", "--exact"]
     assert sorted(n for s in shard_steps for n in s.cmd[3:]) == sorted(names)
     assert {s.label: s.cmd for s in steps}["victory_formats"] == ["f.exe"]
 
 
-def test_a_binary_that_cannot_list_its_tests_runs_whole(tmp_path, monkeypatch):
+@pytest.mark.parametrize("label", ["victory_shader", "victory_gpu"])
+def test_a_sharded_binary_that_cannot_list_its_tests_runs_whole_on_one_thread(tmp_path, monkeypatch, label):
+    # victory_gpu's tests share process-wide state: never libtest's default threads.
     monkeypatch.setattr(dev_gate, "list_tests", lambda exe, cwd: None)
-    build = dev_gate.Build(True, 1.0, [("victory_shader", "s.exe")])
+    build = dev_gate.Build(True, 1.0, [(label, "s.exe")])
     steps = dev_gate.plan(build, tmp_path, tmp_path, "python")
-    assert [s.cmd for s in steps if s.kind == "cargo"] == [["s.exe"]]
+    assert [s.cmd for s in steps if s.kind == "cargo"] == [["s.exe", "--test-threads=1"]]
 
 
 def test_list_tests_reads_libtest_list_output(tmp_path, monkeypatch):
