@@ -534,6 +534,7 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -949,6 +950,14 @@ fn system_timestamp() -> u64 {
 
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+static PRESENT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Title `present()` calls so far: increments synchronously when the title
+/// ends a frame (unlike `FRAMES` which increments on `victory-submit` under
+/// `VICTORY_ASYNC_PRESENT=1`, or `frame::current` which ticks on origin waits).
+pub(crate) fn present_calls() -> u64 {
+    PRESENT_CALLS.load(Ordering::Relaxed)
+}
 
 /// Frames presented so far (also in release builds).
 pub(crate) fn frame_count() -> u64 {
@@ -969,6 +978,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
     // (Neptune) What the title names, read now: the first plane's first resource, and a
     // second plane's if it is another one.
     #[cfg(windows)]
@@ -1044,7 +1054,6 @@ fn present_now(named: Named) {
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::hitch::presented(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -1113,6 +1122,7 @@ fn present_now(named: Named) {
     }
     #[cfg(not(windows))]
     let _ = named;
+    crate::hitch::presented(frame);
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.

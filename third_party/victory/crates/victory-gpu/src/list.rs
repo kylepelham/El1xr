@@ -351,10 +351,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
-        drop(_uploads);
+        if !_uploads.is_empty() {
+            crate::host::reap_now(_uploads);
+        }
         if !ran.contains(&i)
             || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most().0
         {
+            crate::host::reap_now(host);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -373,8 +376,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
                 idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
                 TRIMMED_LISTS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 drop(idle);
-                drop(gone);
+                if !gone.is_empty() {
+                    crate::host::reap_now(gone);
+                }
             }
+        } else {
+            drop(idle);
+            crate::host::reap_now(host);
         }
     }
 }

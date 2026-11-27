@@ -43,10 +43,7 @@ const THREADS: usize = 128;
 /// Whether the sampler runs.
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_HITCH_STACKS") {
-        Ok(v) => v == "1",
-        Err(_) => cfg!(feature = "diagnostics"),
-    })
+    *ON.get_or_init(|| std::env::var("VICTORY_HITCH_STACKS").is_ok_and(|v| v == "1"))
 }
 
 /// A thread that opened spans: its id, its stack's bounds, the

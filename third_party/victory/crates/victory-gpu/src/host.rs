@@ -420,6 +420,36 @@ fn reap_one(object: Retired) {
     REAP.1.notify_one();
 }
 
+/// Drops `object` on the reaper thread when [`reaper_on`] (caller guarantees
+/// the card is done with it, so D3D12 `Release()` does not stall a hot thread).
+pub(crate) fn reap_now<T: 'static>(object: T) {
+    if !reaper_on() {
+        drop(object);
+        return;
+    }
+    reap_one(Retired(Box::new(object)));
+}
+
+#[cfg(test)]
+pub(crate) fn flush_reaper() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let taken = std::mem::take(&mut *REAP.0.lock().unwrap_or_else(|e| e.into_inner()));
+        if taken.is_empty() {
+            // Give the reaper thread a beat if it already took a batch.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if REAP.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                break;
+            }
+        } else {
+            drop(taken);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
 /// Drops `objects`: here, or with [`reaper_on`] on the thread of that name.
 fn reap(objects: Vec<Retired>) {
     if objects.is_empty() {
@@ -7843,12 +7873,13 @@ impl HostList {
             .readable = false;
         self.kept_pipeline.store(0, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
-        *self.deferred() = Deferred::default();
-        self.states
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut old_deferred = std::mem::take(&mut *self.deferred());
+        // Drop `Step::Host` synchronously so any un-run `Claimed` unclaims before reuse.
+        if !old_deferred.copies.is_empty() {
+            old_deferred.copies.retain(|s| !matches!(s, Step::Host(_)));
+        }
+        let old_states = std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
+        let old_twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
         self.pipelines
@@ -7857,14 +7888,30 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
+        let old_scratch = {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
+                Vec::new()
+            } else {
+                std::mem::take(&mut scratch.chunks)
             }
+        };
+        if !old_deferred.uploads.is_empty()
+            || !old_deferred.kept.is_empty()
+            || !old_deferred.copies.is_empty()
+            || !old_deferred.backs.is_empty()
+            || !old_deferred.texture_backs.is_empty()
+            || !old_deferred.refresh_spans.is_empty()
+            || !old_deferred.gpu_writes.is_empty()
+            || !old_states.is_empty()
+            || !old_twins.is_empty()
+            || !old_scratch.is_empty()
+        {
+            reap_now((old_deferred, old_states, old_twins, old_scratch));
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {

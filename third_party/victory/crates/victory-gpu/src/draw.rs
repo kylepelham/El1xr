@@ -2056,13 +2056,23 @@ impl State {
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
         let (early_ms, bake_ms, gameplay_ms) = early_budgets();
-        let bake_ms = bake_ms.unwrap_or_else(|| {
-            if HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed) > 60 {
-                250
-            } else {
-                10_000
-            }
-        });
+        let world_running = HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed) > 60;
+        let bake_ms = bake_ms.unwrap_or(if world_running { 32 } else { 10_000 });
+        // Once gameplay is running, cap bake draws (`VICTORY_BAKE_GAMEPLAY_MS`,
+        // default 32 ms) so a launcher-level `VICTORY_BAKE_TEXTURES_MS=500`
+        // still gives fast loading bakes without 500 ms gameplay hitches.
+        let bake_ms = if world_running {
+            static GAMEPLAY_BAKE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let cap = *GAMEPLAY_BAKE_MS.get_or_init(|| {
+                std::env::var("VICTORY_BAKE_GAMEPLAY_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(32)
+            });
+            bake_ms.min(cap)
+        } else {
+            bake_ms
+        };
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
@@ -2076,7 +2086,7 @@ impl State {
         // budget less what the others had finished, and a frame took up to
         // 2.7 s on a 500 ms budget).
         let left = if bake {
-            bake_left(frame, bake_ms, crate::host::now_ms())
+            bake_left(crate::queue::present_calls(), bake_ms, crate::host::now_ms())
         } else {
             0
         };
@@ -2387,7 +2397,7 @@ impl State {
                 if HEAP_BUFFER_PASSES_TOTAL.load(Ordering::Relaxed) > 60 {
                     if due.len() < 4000 { 4 } else { 10 }
                 } else {
-                    200
+                    40
                 }
             }
         });
@@ -2441,8 +2451,7 @@ impl State {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
-                    && began.elapsed() >= budget)
+                || ((uploaded_this_pass > 0 || checked > 0) && entered.elapsed() >= budget)
             {
                 break;
             }
