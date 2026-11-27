@@ -25,12 +25,15 @@ from typing import Iterator
 import dev_driver
 import dev_gate
 import dev_greps
+import dev_live
 import dev_png
 import dev_prewarm
 import dev_stats
 import dev_throttle
 import dev_train
+import dev_verdict
 import dev_visual
+import dev_warm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -474,13 +477,19 @@ def parse_victory_log(text: str) -> dict[str, object]:
     }
 
 
+def release_build_cmd(env: dict[str, str] | None = None) -> list[str]:
+    """The release build; `--features dlss` when VICTORY_DLSS_SDK names the NVIDIA DLSS SDK
+    (kept outside the repository), so VICTORY_UPSCALE=dlss runs DLSS instead of a stretch."""
+    env = os.environ if env is None else env
+    cmd = ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)]
+    if env.get("VICTORY_DLSS_SDK", "").strip():
+        cmd += ["--features", "dlss"]
+    return cmd
+
+
 @throttled("build")
 def cmd_build(args: argparse.Namespace) -> int:
-    rel_step = (
-        "cargo build release",
-        ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)],
-        REPO_ROOT,
-    )
+    rel_step = ("cargo build release", release_build_cmd(), REPO_ROOT)
     diag_step = (
         "cargo build diag",
         [
@@ -642,13 +651,19 @@ def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
     quiet = getattr(args, "quiet", False)
     tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
     if quiet:
-        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+        # Take the free slots at once (none left to writers) and suspend running builds and worktree
+        # tools for the run: no wait for the machine's builds to finish, none competing with the game.
+        with dev_throttle.free_build_slots(LOCKS_DIR, tag, leave=0) as held, \
+                dev_throttle.builds_suspended() as paused:
+            print(f"DEV {what}: quiet: holding {len(held)} of {dev_throttle.build_slots()} build slots, "
+                  f"{paused} build/tool processes suspended for the run", flush=True)
             yield
         return
-    with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:
+    with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled, \
+            dev_throttle.builds_suspended(builds=False) as tools:
         print(
             f"DEV {what}: holding {len(held)} of {dev_throttle.build_slots()} build slots for the run; "
-            f"{idled} build processes at idle priority",
+            f"{idled} build processes at idle priority, {tools} worktree tests/tools suspended",
             flush=True,
         )
         yield
@@ -745,6 +760,8 @@ def train_compare(plan: dev_train.Plan, done: dict[int, dict[str, object]], trai
 def train_greps_from(plan_path: Path, plan: dev_train.Plan, sources: list[str]) -> int:
     """Adds the log-line phrases of writers' ready.md batch items to the plan's [greps]."""
     found = []
+    if sources == ["all"]:
+        sources = [str(p) for p in sorted(COORD_DIR.glob("*/ready.md"))]
     for source in sources:
         path = Path(source)
         if not path.is_file():
@@ -799,10 +816,147 @@ def train_region(done: dict[int, dict[str, object]], train_dir: Path, spec: list
     return 0 if ok else 1
 
 
-def cmd_train(args: argparse.Namespace) -> int:
-    """One run of a batch plan (`--run`), or the report across its runs (`--report`, `--list`)."""
+def train_scans(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> dict[int, dev_greps.LogScan]:
+    return {
+        step: dev_greps.scan_log(read_log_text(log), plan.greps)
+        for step, rec in done.items()
+        if (log := train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log").exists()
+    }
+
+
+def train_lives(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> dict[int, dict[str, object]]:
+    """Every live run's segments and per-set figures, read again from its log."""
+    out = {}
+    for step, rec in done.items():
+        arm = plan.live.get(str(rec["set"]))
+        log = train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log"
+        if arm is not None and log.exists():
+            out[step] = dev_live.analyse(arm, read_log_text(log))
+    return out
+
+
+def train_verdict(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path) -> int:
+    scans = train_scans(plan, done, train_dir)
+    base = dev_greps.baseline_warns([scans[s] for s in sorted(scans) if done[s]["set"] == plan.baseline])
+    flagged: dict[str, list[str]] = {}
+    for s, scan in sorted(scans.items()):
+        found = dev_greps.flags(scan, base, done[s]["set"] == plan.baseline)
+        if found:
+            rid = dev_train.run_id(s, str(done[s]["set"]))
+            flagged.setdefault(str(done[s]["set"]), []).append(f"{rid}: " + "; ".join(f.split(':')[0] for f in found))
+    rows, floor, sources = dev_verdict.set_verdicts(plan.sets, plan.baseline, done, flagged)
+    rows += [dev_verdict.live_verdict(r) for _, r in sorted(train_lives(plan, done, train_dir).items())]
+    text = "\n".join(dev_verdict.verdict_lines(rows, floor, sources, plan.name, plan.baseline)) + "\n"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    (train_dir / "verdict.md").write_text(text, encoding="utf-8")
+    (train_dir / "verdict.json").write_text(json.dumps({"floor": floor, "rows": rows}, indent=2), encoding="utf-8")
+    print(text, end="")
+    counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in ("KEEP", "DROP", "INCONCLUSIVE")}
+    print(f"DEV train-verdict PASS rows={len(rows)} keep={counts['KEEP']} drop={counts['DROP']} "
+          f"inconclusive={counts['INCONCLUSIVE']} floors={'repeats' if sources else 'defaults'} "
+          f"verdict={train_dir / 'verdict.md'} (suggestions)")
+    return 0
+
+
+def run_prewarm(
+    game_dir: Path, overrides: dict[str, str], mute: bool, pipelines: bool, jobs: int, log_path: Path
+) -> tuple[bool, dict[str, int]]:
+    """One prewarm in this process (no build slot: it runs inside a train call's gpu lock window)."""
+    cmd = prewarm_command(game_dir, overrides, mute, False, pipelines, jobs)
+    with acquire_gpu_lock("prewarm") if pipelines else contextlib.nullcontext():
+        ok, outputs = run_logged_steps([("prewarm", cmd, REPO_ROOT)], log_path)
+    text = outputs.get("prewarm", "")
+    counts = dev_prewarm.parse_summary(text)
+    ok = ok and counts["shaders"] > 0 and (counts["recipes"] > 0 if pipelines else not dev_prewarm.device_made(text))
+    return ok, counts
+
+
+def train_warm(plan: dev_train.Plan, name: str, game_dir_arg: str | None, train_dir: Path) -> tuple[bool, str]:
+    """Makes a step's shader variant warm as the plan's `prewarm` says, unless a stamp says it is.
+    Raises FileNotFoundError for a missing game folder."""
+    if plan.prewarm == "none":
+        return True, "off"
+    overrides, mute = apply_mute_default(dev_train.step_overrides(plan, name), plan.unmute)
+    pipelines = plan.prewarm == "pipelines"
+    if is_warm(overrides, pipelines):
+        return True, "warm"
+    game_dir = resolve_game_dir(game_dir_arg)
+    print(f"DEV train: prewarm ({plan.prewarm}) of {name}", flush=True)
+    ok, counts = run_prewarm(game_dir, overrides, mute, pipelines, 0, train_dir / f"prewarm_{name}.log")
+    if not ok:
+        return False, "failed"
+    dev_warm.write_stamp(warm_dir(), warm_signature(overrides), pipelines, counts, overrides, "train")
+    return True, f"made:{counts['translated']}"
+
+
+AHEAD_TIMEOUT_S = 1800.0
+
+
+def start_ahead(plan: dev_train.Plan, name: str, game_dir: Path, train_dir: Path) -> tuple | None:
+    """Translates `name`'s shader variant (translation only: no device, no gpu lock, no build slot) at idle priority
+    while this arm runs, into the cache that arm will use. None when it is already stamped warm."""
+    overrides, mute = apply_mute_default(dev_train.step_overrides(plan, name), plan.unmute)
+    if is_warm(overrides, False):
+        return None
+    cmd = prewarm_command(game_dir, overrides, mute, False, False, plan.ahead_jobs)
+    log = train_dir / f"ahead_{name}.log"
+    flags = subprocess.IDLE_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    with log.open("wb") as out:
+        proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), stdout=out, stderr=subprocess.STDOUT, creationflags=flags)
+    print(f"DEV train: translating {name}'s shaders ahead at idle priority ({plan.ahead_jobs} jobs) log={log}", flush=True)
+    return name, proc, log, overrides, time.monotonic()
+
+
+def finish_ahead(ahead: tuple, kill: bool = False) -> dict[str, object]:
+    """Waits for the prewarm ahead (it must end inside this call: Drift ends what a command started) and stamps it."""
+    name, proc, log, overrides, t0 = ahead
+    if kill:
+        kill_process_tree(proc.pid)
+    elif proc.poll() is None:
+        print(f"DEV train: waiting for the prewarm ahead of {name}", flush=True)
     try:
-        plan = dev_train.load_plan(Path(args.plan))
+        proc.wait(timeout=AHEAD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc.pid)
+        proc.wait(timeout=10)
+    text = read_log_text(log)
+    counts = dev_prewarm.parse_summary(text)
+    ok = proc.returncode == 0 and counts["shaders"] > 0 and not dev_prewarm.device_made(text)
+    if ok:
+        dev_warm.write_stamp(warm_dir(), warm_signature(overrides), False, counts, overrides, "ahead")
+    return {"set": name, "ok": ok, "translated": counts["translated"], "hits": counts["hits"],
+            "secs": round(time.monotonic() - t0, 1), "log": str(log)}
+
+
+def train_warm_only(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, args: argparse.Namespace) -> int:
+    """`--warm [next|N|SET]`: the prewarm check `--run` makes, alone."""
+    try:
+        step, name = dev_train.pick(plan, done, args.warm)
+        train_dir.mkdir(parents=True, exist_ok=True)
+        ok, status = train_warm(plan, name, args.game_dir, train_dir)
+    except (dev_train.PlanError, FileNotFoundError) as exc:
+        print(f"error: {exc}")
+        print("DEV train-warm FAIL reason=run")
+        return 1
+    print(f"DEV train-warm {'PASS' if ok else 'FAIL'} run={dev_train.run_id(step, name)} prewarm={status}")
+    return 0 if ok else 1
+
+
+def _live_line(rid: str, result: dict[str, object]) -> str:
+    sets, delta = result["sets"], result["delta"]
+    parts = [f"{label}={result['a' if label == 'A' else 'b']} fps={sets[label]['fps']:.1f} prep={sets[label]['prep_ms']:.1f}"
+             for label in ("A", "B") if label in sets]
+    if delta:
+        parts.append(f"delta_fps={delta['fps']:+.1f} delta_p99={delta['p99_ms']:+.1f}")
+    parts.append(f"noisy={','.join(result['noisy']) or '-'} problems={len(result['problems'])}")
+    return f"DEV train-live run={rid} " + " ".join(parts)
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """One run of a batch plan (`--run`, with its prewarm), or the report across its runs (`--report`, `--list`,
+    `--verdict`)."""
+    try:
+        plan = dev_train.load_plan(Path(args.plan), dev_warm.apply_kinds(REPO_ROOT))
     except (OSError, dev_train.PlanError) as exc:
         print(f"error: {exc}")
         print("DEV train FAIL reason=plan")
@@ -821,13 +975,12 @@ def cmd_train(args: argparse.Namespace) -> int:
         return train_visual(plan, done, train_dir, args.visual)
     if args.region:
         return train_region(done, train_dir, args.region, args.at)
+    if args.verdict:
+        return train_verdict(plan, done, train_dir)
+    if args.warm:
+        return train_warm_only(plan, done, train_dir, args)
     if args.report:
-        scans = {
-            step: dev_greps.scan_log(read_log_text(log), plan.greps)
-            for step, rec in done.items()
-            if (log := train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log").exists()
-        }
-        text, figures = dev_train.report(plan, done, scans)
+        text, figures = dev_train.report(plan, done, train_scans(plan, done, train_dir), train_lives(plan, done, train_dir))
         visual = dev_visual.report_section(train_dir)
         if visual:
             text += "\n".join(visual) + "\n"
@@ -847,36 +1000,111 @@ def cmd_train(args: argparse.Namespace) -> int:
     rid = dev_train.run_id(step, name)
     train_dir.mkdir(parents=True, exist_ok=True)
     log_path = train_dir / f"{rid}.log"
+    overrides = dev_train.step_overrides(plan, name)
+    arm = plan.live.get(name)
+    if arm is not None:
+        schedule = train_dir / f"{rid}.schedule.txt"
+        schedule.write_text(dev_live.schedule_text(arm), encoding="utf-8")
+        overrides["VICTORY_SETTINGS_SCHEDULE"] = str(schedule)
+    quiet = args.quiet if args.quiet is not None else dev_train.step_quiet(plan, name)
     bench_args = argparse.Namespace(
         game_dir=args.game_dir, fast_boot=plan.fast_boot, save=plan.save, skip_intro=False, title_args=[],
-        unmute=plan.unmute, diag=False, seconds=plan.seconds, quiet=plan.quiet, snap_every=plan.snap_every,
+        unmute=plan.unmute, diag=False, seconds=dev_train.step_seconds(plan, name), quiet=quiet,
+        snap_every=plan.snap_every,
     )
+    ahead = None
     try:
-        stats, before, after, snaps = run_bench(
-            bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps", what="train"
-        )
+        warm_ok, warm = train_warm(plan, name, args.game_dir, train_dir)
+        if not warm_ok:
+            print(f"DEV train FAIL run={rid} reason=prewarm log={train_dir / f'prewarm_{name}.log'}")
+            return 1
+        nxt = dev_train.next_after(plan, done, step)
+        # Not during a quiet run: those are the final before/after numbers and must have the machine to themselves.
+        if plan.prewarm_ahead and plan.prewarm != "none" and not quiet and nxt is not None:
+            ahead = start_ahead(plan, nxt[1], resolve_game_dir(args.game_dir), train_dir)
+        stats, before, after, snaps = run_bench(bench_args, overrides, log_path, train_dir / f"{rid}_snaps", what="train")
     except (FileNotFoundError, ValueError) as exc:
+        if ahead is not None:
+            finish_ahead(ahead, kill=True)
         print(f"error: {exc}")
         print(f"DEV train FAIL run={rid} reason=setup")
         return 1
+    ahead_info = finish_ahead(ahead) if ahead is not None else None
     ok = bench_ok(stats)
     done[step] = {
-        "step": step, "set": name, "overrides": plan.sets[name], "ok": ok, "stats": stats,
-        "resets_before": before, "resets_after": after, "snaps": snaps, "log": str(log_path),
+        "step": step, "set": name, "kind": "live" if arm is not None else "set", "overrides": overrides, "ok": ok,
+        "stats": stats, "resets_before": before, "resets_after": after, "snaps": snaps, "log": str(log_path),
+        "quiet": quiet, "prewarm": warm, "ahead": ahead_info,
         "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if arm is not None:
+        done[step]["live"] = dev_live.analyse(arm, read_log_text(log_path))
     dev_train.save_result(train_dir, step, done[step])
+    nxt_id = dev_train.next_pending(plan, done)
+    nxt_after = dev_train.next_after(plan, done, 0)
+    ttl = f" next_ttl_min={dev_train.ttl_minutes(plan, nxt_after[1])}" if nxt_after else ""
+    ahead_field = f"{ahead_info['set']}:{ahead_info['translated'] if ahead_info['ok'] else 'failed'}" if ahead_info else "none"
     print(
         f"{_dev_line('train', ok, {'run': rid})} {bench_fields(stats)} driver_resets={_count(after)} "
-        f"snaps={snaps} next={dev_train.next_pending(plan, done)} log={log_path}"
+        f"snaps={snaps} next={nxt_id}{ttl} prewarm={warm} ahead={ahead_field} log={log_path}"
     )
+    if arm is not None:
+        print(_live_line(rid, done[step]["live"]))
     _print_driver_warning(before, after)
     _print_hang_lines(log_path)
     return 0 if ok else 1
 
 
-@throttled("prewarm")
+def warm_dir() -> Path:
+    return DEV_DIR / "warm"
+
+
+def warm_signature(overrides: dict[str, str], diag: bool = False) -> str:
+    """The stamp signature of a prewarm with these launch overrides (mute applied), the current victory.exe and
+    launcher."""
+    exe = dev_warm.exe_identity(dev_warm.victory_exe(REPO_ROOT, diag), REPO_ROOT / "tools" / "lancer_victory.ps1")
+    return dev_warm.signature(overrides, exe, diag)
+
+
+def is_warm(overrides: dict[str, str], pipelines: bool, diag: bool = False) -> bool:
+    return dev_warm.is_warm(warm_dir(), warm_signature(overrides, diag), pipelines, dev_warm.shader_cache_dir(overrides))
+
+
+def prewarm_command(
+    game_dir: Path, overrides: dict[str, str], mute: bool, diag: bool, pipelines: bool, jobs: int,
+    host_wave: int = dev_prewarm.DEFAULT_HOST_WAVE, view_limit: int = dev_prewarm.DEFAULT_VIEW_LIMIT,
+) -> list[str]:
+    # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
+    # overrides, mute and skip-intro (not in the key, but kept identical).
+    return build_launcher_command(
+        game_dir=game_dir,
+        diag=diag,
+        overrides=dev_prewarm.prewarm_overrides(overrides, pipelines, host_wave, view_limit),
+        mute=mute,
+        skip_intro=True,
+        extra=dev_prewarm.launcher_extra(pipelines, jobs),
+    )
+
+
 def cmd_prewarm(args: argparse.Namespace) -> int:
+    """A no-op when a stamp says this variant is warm (`dev_warm`; `--force` runs it anyway), else `prewarm_work`."""
+    if not args.force:
+        try:
+            overrides, _ = apply_mute_default(parse_overrides(args.override), args.unmute)
+        except ValueError:
+            return prewarm_work(args)
+        sig = warm_signature(overrides, args.diag)
+        if is_warm(overrides, args.pipelines, args.diag):
+            profile = "diag" if args.diag else "release"
+            print(_dev_line("prewarm", True, {
+                "profile": profile, "skipped": "warm", "stamp": str(dev_warm.stamp_path(warm_dir(), sig)),
+            }))
+            return 0
+    return prewarm_work(args)
+
+
+@throttled("prewarm")
+def prewarm_work(args: argparse.Namespace) -> int:
     """Translate every shader the title ships into the shader cache for these switch values, without the title
     (`dev_prewarm`). Holds a build slot (it is a build's worth of CPU); `--pipelines` also takes the gpu lock."""
     profile = "diag" if args.diag else "release"
@@ -891,18 +1119,8 @@ def cmd_prewarm(args: argparse.Namespace) -> int:
         log_path.write_text(f"error: {exc}\n", encoding="utf-8")
         print(f"DEV prewarm FAIL profile={profile} secs=0.0 shaders=0 hits=0 translated=0 refused=0 log={log_path}")
         return 1
-    # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
-    # overrides, mute and skip-intro (not in the key, but kept identical).
     overrides, mute = apply_mute_default(overrides, args.unmute)
-    overrides = dev_prewarm.prewarm_overrides(overrides, args.pipelines, args.host_wave, args.view_limit)
-    cmd = build_launcher_command(
-        game_dir=game_dir,
-        diag=args.diag,
-        overrides=overrides,
-        mute=mute,
-        skip_intro=True,
-        extra=dev_prewarm.launcher_extra(args.pipelines, args.jobs),
-    )
+    cmd = prewarm_command(game_dir, overrides, mute, args.diag, args.pipelines, args.jobs, args.host_wave, args.view_limit)
     gpu = acquire_gpu_lock("prewarm") if args.pipelines else contextlib.nullcontext()
     t0 = time.monotonic()
     with gpu:
@@ -912,6 +1130,8 @@ def cmd_prewarm(args: argparse.Namespace) -> int:
     counts = dev_prewarm.parse_summary(text)
     device = dev_prewarm.device_made(text)
     ok = ok and counts["shaders"] > 0 and (counts["recipes"] > 0 if args.pipelines else not device)
+    if ok:
+        dev_warm.write_stamp(warm_dir(), warm_signature(overrides, args.diag), args.pipelines, counts, overrides, "prewarm")
     fields = {
         "profile": profile,
         "secs": f"{secs:.1f}",
@@ -1040,7 +1260,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--greps-from", nargs="+", metavar="READY_MD",
-        help="Add the backticked log lines of these ready.md files' batch items to the plan's [greps].",
+        help="Add the backticked log lines of these ready.md files' batch items to the plan's [greps] "
+        "(`all`: every AnyXboxX-coord/*/ready.md).",
     )
     mode.add_argument(
         "--visual", nargs="*", metavar="RUN",
@@ -1049,6 +1270,18 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--region", nargs=5, metavar=("REF", "X0", "Y0", "X1", "Y1"),
         help="Mean colour of this rectangle of REF.png in every run's snap nearest each --at time.",
+    )
+    mode.add_argument(
+        "--verdict", action="store_true",
+        help="KEEP/DROP/INCONCLUSIVE per set (and live arm) against the baseline, with noise floors from same-set repeats.",
+    )
+    mode.add_argument(
+        "--warm", nargs="?", const="next", metavar="next|N|SET",
+        help="Prewarm check: make the step's shader variant warm as `--run` would before its run (no-op when stamped).",
+    )
+    p_train.add_argument(
+        "--quiet", action=argparse.BooleanOptionalAction, default=None,
+        help="This run only: hold every build slot (--quiet) or not (--no-quiet), whatever the plan says.",
     )
     p_train.add_argument("--at", nargs="+", type=float, metavar="T", help="Seconds for --region.")
     p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
@@ -1063,6 +1296,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--diag", action="store_true", help="Warm the diag build's cache (what `capture` runs).")
     p_pre.add_argument("--unmute", action="store_true", help="As bench/capture --unmute (not in the key).")
     p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
+    p_pre.add_argument("--force", action="store_true", help="Run it even when a stamp says this variant is warm.")
     p_pre.add_argument(
         "--pipelines", action="store_true",
         help="Then make the host pipelines of the recipes runs wrote down (VICTORY_PIPELINE_RECIPES=1) into the "

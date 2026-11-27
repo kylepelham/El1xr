@@ -542,6 +542,43 @@ mod batch {
     }
 
     #[test]
+    fn checks_started_early_are_joined_where_pending_checks_ran() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let done = Arc::new(AtomicUsize::new(0));
+        let start = |batch: &mut Batch, n: usize| {
+            for i in 0..n {
+                let done = done.clone();
+                batch.early.start(move || {
+                    if i % 2 == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        };
+        let mut batch = Batch::default();
+        // Before a step that writes title memory.
+        start(&mut batch, 4);
+        assert!(batch.early.started());
+        batch.title_written();
+        assert_eq!(done.load(Ordering::SeqCst), 4);
+        assert!(!batch.early.started());
+        // Before a host callback or the preludes of the lists so far.
+        start(&mut batch, 3);
+        batch.flush_textures();
+        assert_eq!(done.load(Ordering::SeqCst), 7);
+        // At the end of the submission's last flush.
+        start(&mut batch, 5);
+        batch.flush();
+        assert_eq!(done.load(Ordering::SeqCst), 12);
+        assert!(!batch.early.started());
+        // A batch let go with checks started waits for them.
+        start(&mut batch, 2);
+        drop(batch);
+        assert_eq!(done.load(Ordering::SeqCst), 14);
+    }
+
+    #[test]
     fn refreshes_merge_up_to_the_next_step_between_them() {
         use super::super::{ShadowStep, push_refresh_step};
         let (mut span, mut steps) = (None, Vec::new());

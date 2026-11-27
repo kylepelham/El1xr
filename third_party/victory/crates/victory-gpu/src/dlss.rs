@@ -111,13 +111,18 @@ pub(crate) struct Inputs<'a> {
 
 struct Feature {
     handle: *mut c_void,
-    /// render width and height the feature was made for, output size, flags
-    key: [u32; 5],
+    /// render width and height the feature was made for, output size, flags,
+    /// quality mode
+    key: [u32; 6],
 }
 
 struct Dlss {
     params: *mut c_void,
     feature: Option<Feature>,
+    /// Features replaced by a live change, released once no list uses them.
+    retired: crate::upscale_live::Retired<usize>,
+    /// A key a live change asked for that NGX refused: stretched, not retried.
+    failed: Option<[u32; 6]>,
 }
 
 // SAFETY: the SDK's objects are used under the mutex only.
@@ -217,6 +222,8 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
     Some(Dlss {
         params,
         feature: None,
+        retired: crate::upscale_live::Retired::new(),
+        failed: None,
     })
 }
 
@@ -260,14 +267,34 @@ pub(crate) fn record(
     );
     let hdr = flags & crate::upscale::DLSS_FLAG_HDR != 0;
     let inverted = flags & crate::upscale::DLSS_FLAG_DEPTH_INVERTED != 0;
-    let key = [in_w, in_h, out.Width as u32, out.Height, flags as u32];
+    let live = crate::upscale_live::any();
+    // SAFETY: handles the SDK made, no longer used by any list in flight.
+    dlss.retired
+        .tick(|h| unsafe { _ = NVSDK_NGX_D3D12_ReleaseFeature(h as *mut c_void) });
+    let quality = crate::upscale_live::quality()
+        .unwrap_or_else(|| env_f("VICTORY_DLSS_QUALITY", 2.0) as c_int);
+    let key = [
+        in_w,
+        in_h,
+        out.Width as u32,
+        out.Height,
+        flags as u32,
+        quality as u32,
+    ];
+    if dlss.failed == Some(key) {
+        return false;
+    }
     let p = dlss.params;
     if dlss.feature.as_ref().is_none_or(|f| f.key != key) {
         if let Some(old) = dlss.feature.take() {
-            // SAFETY: a handle the SDK made.
-            unsafe { NVSDK_NGX_D3D12_ReleaseFeature(old.handle) };
+            if live {
+                // A live change: lists in flight may still evaluate it.
+                dlss.retired.retire(old.handle as usize);
+            } else {
+                // SAFETY: a handle the SDK made.
+                unsafe { NVSDK_NGX_D3D12_ReleaseFeature(old.handle) };
+            }
         }
-        let quality = env_f("VICTORY_DLSS_QUALITY", 2.0) as c_int;
         let mut handle = std::ptr::null_mut();
         // SAFETY: live parameters and an open list.
         let r = unsafe {
@@ -288,7 +315,11 @@ pub(crate) fn record(
                 ?key,
                 "DLSS: no feature for these sizes; the upscale stays a stretch"
             );
-            *guard = Some(None);
+            if live {
+                dlss.failed = Some(key);
+            } else {
+                *guard = Some(None);
+            }
             return false;
         }
         tracing::info!(
@@ -298,6 +329,7 @@ pub(crate) fn record(
             depth_inverted = inverted,
             auto_exposure = inputs.exposure.is_none(),
             quality,
+            live,
             colour_format = colour.Format.0,
             "DLSS: feature made"
         );
@@ -322,7 +354,12 @@ pub(crate) fn record(
         NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.X"), mv * scale(inputs.motion_scale[0]));
         NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.Y"), mv * scale(inputs.motion_scale[1]));
         NVSDK_NGX_Parameter_SetI(p, name!("Reset"), inputs.reset as c_int);
-        NVSDK_NGX_Parameter_SetF(p, name!("Sharpness"), env_f("VICTORY_DLSS_SHARPNESS", 0.0));
+        NVSDK_NGX_Parameter_SetF(
+            p,
+            name!("Sharpness"),
+            crate::upscale_live::sharpness()
+                .unwrap_or_else(|| env_f("VICTORY_DLSS_SHARPNESS", 0.0)),
+        );
         NVSDK_NGX_Parameter_SetF(
             p,
             name!("DLSS.Pre.Exposure"),

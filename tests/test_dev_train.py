@@ -55,6 +55,24 @@ def plan_file(tmp_path, text=PLAN_TOML, name="batch7.toml"):
     return path
 
 
+def no_game(dev, monkeypatch, warm=None):
+    """Keeps `train --run` off the game folder: its prewarm and the prewarm ahead are recorded, never run."""
+    warm = [] if warm is None else warm
+
+    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path):
+        warm.append(("prewarm", dict(overrides), pipelines))
+        return True, {"translated": 5, "hits": 0, "shaders": 5, "recipes": 1}
+
+    def fake_ahead(plan, name, game_dir, train_dir):
+        warm.append(("ahead", name))
+        return None
+
+    monkeypatch.setattr(dev, "run_prewarm", fake_prewarm)
+    monkeypatch.setattr(dev, "start_ahead", fake_ahead)
+    monkeypatch.setattr(dev, "resolve_game_dir", lambda arg: Path("game"))
+    return warm
+
+
 def test_a_toml_plan_resolves_sets_through_common_and_from(tmp_path):
     plan = dev_train.load_plan(plan_file(tmp_path))
     assert plan.name == "batch7"
@@ -255,6 +273,7 @@ def test_train_runs_one_step_per_call_and_reports(tmp_path, monkeypatch, capsys)
         return s, 3, 3, 4
 
     monkeypatch.setattr(dev, "run_bench", fake_bench)
+    no_game(dev, monkeypatch)
     plan = plan_file(tmp_path)
     assert dev.main(["train", "--plan", str(plan)]) == 0
     assert dev.main(["train", "--plan", str(plan), "--run", "next"]) == 0
@@ -282,6 +301,7 @@ def test_train_refuses_a_bad_plan_without_running(tmp_path, monkeypatch, capsys)
     dev = load_dev()
     monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
     monkeypatch.setattr(dev, "run_bench", lambda *a: pytest.fail("ran"))
+    no_game(dev, monkeypatch)
     bad = plan_file(tmp_path, '[sets.on]\nFOO = 1\n[sets.off]\n', "bad.toml")
     assert dev.main(["train", "--plan", str(bad)]) == 1
     assert "DEV train FAIL reason=plan" in capsys.readouterr().out
@@ -402,6 +422,7 @@ def test_a_train_run_holds_the_gpu_lock_and_quiets_builds_as_train(tmp_path, mon
         events.append(("run", seconds))
         log_path.write_text("", encoding="utf-8")
 
+    no_game(dev, monkeypatch)
     monkeypatch.setattr(dev, "_quiet", fake_quiet)
     monkeypatch.setattr(dev, "acquire_gpu_lock", fake_gpu_lock)
     monkeypatch.setattr(dev, "run_timed_victory", fake_run)

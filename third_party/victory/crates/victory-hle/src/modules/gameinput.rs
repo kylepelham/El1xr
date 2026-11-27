@@ -523,11 +523,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (mut pads, mut keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
+        let first = pads.iter().flatten().next().copied().unwrap_or_default();
+        let blocked = victory_gpu::menu::feed_pad(first.buttons, first.left_x, first.left_y);
+        shield(&mut pads, &mut keys, blocked);
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
@@ -564,6 +567,22 @@ impl Hub {
 
     fn index(&self, device: *const Device) -> Option<usize> {
         self.devices.iter().position(|d| std::ptr::eq(d, device))
+    }
+}
+
+/// (El1xr) While the in-game menu (`VICTORY_MENU=1`) has the input, the title sees its pads
+/// connected but at rest and no keys (the mouse readers stand down on their own); otherwise the
+/// menu's View + Menu chord is hidden from it.
+fn shield(pads: &mut [Option<PadState>; PADS], keys: &mut Vec<KeyState>, blocked: bool) {
+    for pad in pads.iter_mut().flatten() {
+        if blocked {
+            *pad = PadState::default();
+        } else {
+            pad.buttons = victory_gpu::menu::chord_mask(pad.buttons);
+        }
+    }
+    if blocked {
+        keys.clear();
     }
 }
 
@@ -1478,7 +1497,7 @@ mod host {
             std::env::var("VICTORY_MOUSE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1.0)
         });
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if !focused() {
+        if !focused() || victory_gpu::menu::blocked() {
             (held.taken, held.fresh, held.x, held.y) = (false, true, 0.0, 0.0);
             (held.left, held.click) = (false, false);
             TAKEN.store(false, Relaxed);
@@ -1487,7 +1506,7 @@ mod host {
         // SAFETY: plain queries, a pointer move inside our own window, and our
         // procedure set before that window's own, which it calls.
         unsafe {
-            let f9 = GetAsyncKeyState(0x78) < 0;
+            let f9 = GetAsyncKeyState(0x78) < 0 && !victory_gpu::menu::owns_key(0x78);
             if f9 && !held.f9 {
                 (held.taken, held.fresh, held.x, held.y) = (!held.taken, true, 0.0, 0.0);
             }
@@ -1650,7 +1669,7 @@ mod host {
             ClipCursor, GetCursorPos, GetWindowInfo, SetCursorPos, WINDOWINFO,
         };
         let mut st = lock(&GTA_MOUSE);
-        if !focused() {
+        if !focused() || victory_gpu::menu::blocked() {
             st.toggle_held = false;
             st.click_held = false;
             release_gta_mouse_look(&mut st);
@@ -1861,6 +1880,20 @@ mod tests {
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
         }
+    }
+
+    #[test]
+    fn menu_shield_rests_pads_and_drops_keys_only_while_blocked() {
+        let pad = PadState { buttons: A | MENU, left_x: 0.7, right_trigger: 1.0, ..PadState::default() };
+        let key = KeyState { virtual_key: b'W', ..KeyState::default() };
+        let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|_| None);
+        pads[1] = Some(pad);
+        let mut keys = vec![key];
+        shield(&mut pads, &mut keys, false);
+        assert_eq!((pads[1], keys.len()), (Some(pad), 1), "open input passes untouched");
+        shield(&mut pads, &mut keys, true);
+        assert_eq!(pads[1], Some(PadState::default()), "still connected, at rest");
+        assert!(pads[0].is_none() && keys.is_empty());
     }
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {

@@ -267,6 +267,11 @@ impl Lower<'_> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, bb);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),
@@ -781,11 +786,16 @@ impl Lower<'_> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
+                // (the paired form: a wave64 lane select takes the low six bits;
+                // `VICTORY_WRITELANE_MASK=1`: every form takes S1 masked to the wave)
                 let lane = match self.twin {
                     Some(_) => {
                         let k63 = self.s.m.i32(63);
                         self.s.m.bin(c, Bin::And, lane, k63)
+                    }
+                    None if super::isa_fixes::Fix::WritelaneMask.on() => {
+                        let k = self.s.m.i32(self.wave() - 1);
+                        self.s.m.bin(c, Bin::And, lane, k)
                     }
                     None => lane,
                 };

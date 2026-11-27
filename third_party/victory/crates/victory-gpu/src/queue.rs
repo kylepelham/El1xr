@@ -573,8 +573,9 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => {}
+                    Held::Wait(..) => raise_behind(q, &held),
                     Held::Value(wait) => {
+                        raise_behind(q, &held);
                         // Passed at a present without being met: what the
                         // queue stood at.
                         if all && !value_met(&wait) {
@@ -614,7 +615,7 @@ pub(crate) fn release_held(all: bool) {
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
-                            let (lists, order) = take_along(&mut held, lists, order);
+                            let (lists, order) = take_along(q, &mut held, lists, order);
                             // Not waited for: the host keeps the lists
                             // until they are settled.
                             if async_submit() {
@@ -677,11 +678,34 @@ pub(crate) fn release_held(all: bool) {
     }
 }
 
+/// (entryhitch) `VICTORY_HEAP_ROUND_SHARE=1`: a wait of queue `q` was just
+/// passed, so the parts it holds behind it (`held`) and those kept aside
+/// for it behind a present may read records the title wrote until then:
+/// they need a heap-sync round from now on (`crate::round_share`).
+#[cfg(windows)]
+fn raise_behind(q: usize, held: &[Held]) {
+    if !crate::round_share::on() {
+        return;
+    }
+    let now = crate::round_share::stamp_now();
+    let raise = |h: &Held| {
+        if let Held::Run(lists, _) = h {
+            crate::round_share::raise_lists(lists.iter().map(|l| l.host()), now);
+        }
+    };
+    held.iter().for_each(raise);
+    if async_present() {
+        let later = lock(&LATER.0);
+        later.next.iter().filter(|(of, _)| *of == q).for_each(|(_, h)| raise(h));
+    }
+}
+
 /// (feedcard) `VICTORY_MERGE_SUBMISSIONS=1`: the submissions right behind this one in its
 /// queue's line that may go to the card with it, taken out of `held` and put behind it
 /// ([`crate::merge_runs`]).
 #[cfg(windows)]
 fn take_along(
+    q: usize,
     held: &mut Vec<Held>,
     mut lists: Vec<crate::list::Detached>,
     mut order: Vec<usize>,
@@ -712,6 +736,10 @@ fn take_along(
             }),
         )
     };
+    // Waits met among those taken: what is behind them, these and the rest.
+    if held[..taken].iter().any(|h| matches!(h, Held::Wait(..) | Held::Value(_))) {
+        raise_behind(q, held);
+    }
     let mut along = 0;
     for h in held.drain(..taken) {
         if let Held::Run(more, more_order) = h {
@@ -824,6 +852,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::round_share::stamp_lists(lists);
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1227,6 +1256,7 @@ fn present_now(named: Named) {
                     .map_or(SHADER_RESOURCE, |(_, before)| before);
                 (other, t, before)
             });
+        crate::present_audit::presenting(resource as usize);
         let shown = host.present(texture, state, frame, over.map(|(_, t, before)| (t, before)));
         if let Some((other, _, before)) = over {
             crate::resource::host_transition(other, before);

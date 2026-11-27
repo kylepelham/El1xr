@@ -617,6 +617,9 @@ pub(crate) struct State {
     /// The last `CS_RayPrePass*` this list dispatched was the alpha one: its
     /// `CS_RaytraceVBuffer*` serves the glass (`crate::pipeline::skips_rt_skin`).
     alpha_rays: bool,
+    /// The host top levels of the glass dispatch being made
+    /// (`crate::rt_bind::dispatch`), for its root SRVs.
+    glass_tlas: Option<[u64; 2]>,
 }
 
 impl Drop for State {
@@ -1233,6 +1236,7 @@ impl State {
             pending_shows,
             tables_gone,
             alpha_rays,
+            glass_tlas,
             root_bindings,
         } = self;
         *pipeline = new_pipeline as usize;
@@ -1305,6 +1309,7 @@ impl State {
         pending_shows.clear();
         *tables_gone = false;
         *alpha_rays = false;
+        *glass_tlas = None;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1546,6 +1551,7 @@ impl State {
                     continue;
                 };
                 self.targets.push(record.resource as usize);
+                crate::present_audit::target_bound(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
                 let desc = record.desc();
@@ -2201,6 +2207,18 @@ impl State {
                                 once!("a shader picks buffers from a view heap that is not set")
                             }
                         }
+                        continue;
+                    }
+                    if srv
+                        && (slot == victory_shader::emit::SLOT_TLAS
+                            || slot == victory_shader::emit::SLOT_TLAS_NEAR)
+                    {
+                        // Ours: the host top levels the glass dispatch was
+                        // matched to (`crate::rt_bind`), null when it was
+                        // not, and then the shader takes the title's walk.
+                        let near = usize::from(slot == victory_shader::emit::SLOT_TLAS_NEAR);
+                        let at = self.glass_tlas.map_or(0, |m| m[near]);
+                        self.bind_resource(list, compute, param, RootResource::Srv(at));
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
@@ -3737,7 +3755,7 @@ impl State {
         if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
             self.alpha_rays = alpha;
         }
-        crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
+        self.glass_tlas = crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
         if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
                 "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS, VICTORY_RT_TRACE =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
@@ -5145,7 +5163,7 @@ impl State {
         if let Some(alpha) = crate::pipeline::ray_pre_pass(self.pipeline as This) {
             self.alpha_rays = alpha;
         }
-        crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
+        self.glass_tlas = crate::rt_bind::dispatch(self.pipeline as This, self.alpha_rays, |slot| match self.compute.get(usize::from(slot)) { Some(&Root::Table(t)) => Some(t), _ => None });
         if crate::pipeline::skips_rt_skin(self.pipeline as This, self.alpha_rays) {
             once!(
                 "passes that only serve rays are left out (VICTORY_BVH_NO_HIT=1, builder off; VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them; VICTORY_SKIP_RT_SKIN=1 skips skinning; the alpha CS_RaytraceVBuffer runs unless VICTORY_SKIP_RT_VBUFFER=1)"
