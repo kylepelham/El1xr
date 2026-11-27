@@ -3684,6 +3684,10 @@ impl State {
         if role == Role::Miss {
             return self.ambient_miss(list, p);
         }
+        // `crate::ambient_reflect`'s holds (`reflect_views`).
+        if role.holds_image() {
+            return self.ambient_hold(list, p, role);
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3724,6 +3728,8 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Miss => crate::ambient::MISS_LIGHT,
+            Role::Reflect => crate::ambient_reflect::REFLECTIONS[0],
+            Role::Knee => crate::ambient_reflect::KNEE_IMAGE,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(
@@ -3750,7 +3756,7 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air | Role::Miss => None,
+            Role::Radiance | Role::Air | Role::Miss | Role::Reflect | Role::Knee => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
@@ -3889,6 +3895,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
+            && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -5117,12 +5124,16 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
-        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too.
+        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
+        // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
             && kind == 2
-            && crate::ambient::specular().is_some()
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && match role {
+                crate::ambient::Role::Miss => crate::ambient::specular().is_some(),
+                role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
+            }
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
@@ -5803,6 +5814,8 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 mod indirect_signature_tests;
 
 mod miss_views;
+
+mod reflect_views;
 
 mod bake_pass;
 
