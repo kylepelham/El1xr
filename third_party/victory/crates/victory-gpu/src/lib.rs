@@ -62,6 +62,8 @@ mod draw;
 mod dred;
 #[cfg(windows)]
 mod hang_watch;
+#[cfg(windows)]
+mod raw_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
 pub mod dxgi;

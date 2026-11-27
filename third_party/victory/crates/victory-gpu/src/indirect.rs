@@ -387,6 +387,8 @@ pub(crate) mod budget;
 
 pub(crate) mod rest;
 
+pub(crate) mod raw_check;
+
 /// What a list knows of its records: the writes it declared (range, with the order number of
 /// its latest declaration), the order number of each copy's last pass (by [`Shadow::id`]), and
 /// the records that pass covered (kind and order number). A record is clean when no write

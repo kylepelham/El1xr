@@ -5473,9 +5473,23 @@ impl State {
         }
         // (El1xr) `VICTORY_SPLIT_RAW=1`: and a dispatch split into parts, in one piece.
         let split_raw = split && crate::indirect::split_raw();
+        let raw = raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split;
+        // (El1xr) `VICTORY_RAW_CHECK`: a raw record is read first (`crate::indirect::raw_check`).
+        let checked = if raw && !after_writer && !split_raw {
+            crate::indirect::raw_check::check(list, (kind, stride, max), arguments, count, || {
+                crate::pipeline::shaders_of(self.pipeline as This)
+            })
+        } else {
+            crate::indirect::raw_check::Check::Run
+        };
+        if checked == crate::indirect::raw_check::Check::Drop {
+            crate::drop_why::set("raw record over the limits (VICTORY_RAW_CHECK)");
+            why("raw record over the limits (VICTORY_RAW_CHECK)");
+            return false;
+        }
         if after_writer
             || split_raw
-            || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
+            || (raw && checked == crate::indirect::raw_check::Check::Run)
         {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5510,6 +5524,19 @@ impl State {
             });
             if kind == MESH {
                 self.mesh_scissor(list, true);
+            }
+            // (El1xr) `VICTORY_RAW_ARGS_WATCH`: what the card reads, for the hang watch
+            // (not a record our pass made safe: its buffer is in the argument state).
+            if !after_writer {
+                crate::raw_watch::note(
+                    list,
+                    (kind, stride, max),
+                    (&args.buffer, args.offset(arguments)),
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+                    arguments,
+                    if split_raw { "split" } else { "raw" },
+                    || crate::pipeline::shaders_of(self.pipeline as This),
+                );
             }
             // SAFETY: an open list with everything set; the list keeps the host copies
             // alive, and the signature is cached.

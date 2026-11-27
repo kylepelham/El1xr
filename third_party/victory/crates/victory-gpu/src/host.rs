@@ -7859,6 +7859,7 @@ impl Meter {
         );
         crate::indirect::budget::line(frames);
         crate::indirect::rest::line(frames);
+        crate::indirect::raw_check::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
