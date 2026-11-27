@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod list_views;
+mod slot_wait;
 pub(crate) use list_views::on as list_views;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
@@ -339,7 +340,23 @@ pub(crate) fn show_after() -> bool {
 /// [`show_after`] until the submission with its upload finished. Only writes
 /// the descriptor if the heap is still live and title slot `handle` still
 /// carries `expected_key`.
+/// With `VICTORY_SLOT_WAIT_ALL=1` the write also waits for the submissions
+/// sent after that one ([`slot_wait`]).
 pub(crate) fn commit_show(heap: usize, index: u32, handle: u64, expected_key: u64) {
+    slot_wait::drain();
+    let change = slot_wait::Change::Show {
+        heap,
+        index,
+        handle,
+        key: expected_key,
+    };
+    if !slot_wait::hold(change) {
+        commit_show_now(heap, index, handle, expected_key);
+    }
+}
+
+/// [`commit_show`] now: true if it wrote the slot.
+fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key: u64) -> bool {
     let heaps = super::SHADER_HEAPS
         .read()
         .unwrap_or_else(|e| e.into_inner());
@@ -352,8 +369,10 @@ pub(crate) fn commit_show(heap: usize, index: u32, handle: u64, expected_key: u6
         let key = u64::from(generation) << 32 | u64::from(i);
         if tag == VIEW_TAG && key == expected_key {
             let _ = host.mirror(index, handle, true);
+            return true;
         }
     }
+    false
 }
 
 /// Re-queues a deferred texture view slot when a command list is reset
@@ -2337,6 +2356,7 @@ impl HostHeap {
         if self.sampler {
             return 0;
         }
+        slot_wait::drain();
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
@@ -2371,6 +2391,15 @@ impl HostHeap {
             if key == 0 {
                 continue;
             }
+            if flying > 0
+                && slot_wait::hold(slot_wait::Change::Remake {
+                    host: std::ptr::from_ref(self) as usize,
+                    index: slot,
+                    key,
+                })
+            {
+                continue;
+            }
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
@@ -2393,6 +2422,23 @@ impl HostHeap {
             );
         }
         remade
+    }
+
+    /// Slot `index` made again from `key` if it still shows it
+    /// ([`slot_wait`]); true if it was.
+    fn remake_slot(&self, index: u32, key: u64) -> bool {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if key == 0 || made.get(index as usize) != Some(&key) {
+            return false;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return false;
+        };
+        let Some((kept, _)) = make(&view, self.cpu(index)) else {
+            return false;
+        };
+        self.keep(index, kept);
+        true
     }
 
     /// The memory of the texture title slot `index` views is not mapped
@@ -3245,6 +3291,16 @@ impl HostHeap {
                 changed.push((index, handle));
             }
         }
+        let compared = super::sync_in_place::now();
+        let mirrored = self.mirror_changed(changed);
+        super::sync_in_place::mirrored_since(compared);
+        mirrored
+    }
+
+    /// The mirroring half of [`HostHeap::mirror_copied_page`]: [`HostHeap::mirror`]
+    /// for each of `changed` (title slot, handle), whose records the caller
+    /// found new. Returns how many.
+    pub(crate) fn mirror_changed(&self, changed: &[(u32, u64)]) -> u64 {
         if !changed.is_empty() {
             // The records' lock once for the batch, and the buffer changes'
             // once, not once for each record mirrored (some 270 a page,

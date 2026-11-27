@@ -13,6 +13,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod sync_in_place;
+#[cfg(windows)]
 mod tabled_all;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -221,6 +223,10 @@ pub(crate) fn sync_heaps() {
     let mut batch_asked: Vec<u32> = Vec::new();
     let mut batch_pages: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut changed: Vec<(u32, u64)> = Vec::new();
+    // `VICTORY_SYNC_IN_PLACE=1`: view heaps' records compared where they are.
+    let mut all_held = sync_in_place::on().then(sync_in_place::all);
+    let mut live: Vec<u64> = Vec::new();
+    let mut scratch = sync_in_place::Scratch::default();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
@@ -234,6 +240,11 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        live.push(host.id());
+        let mut held = all_held
+            .as_mut()
+            .filter(|_| step == 32)
+            .map(|all| all.of(host.id(), mirrored_count));
         let mut ranges = written.take(start as usize, end as usize);
         let mut retries = heap
             .table_retries
@@ -260,6 +271,20 @@ pub(crate) fn sync_heaps() {
                     retries.after_read(page, retry_at);
                 }
                 pages += 1;
+                if let Some(held) = held.as_deref_mut() {
+                    mirrored += sync_in_place::page(
+                        host,
+                        held,
+                        start,
+                        from,
+                        to,
+                        mirrored_count,
+                        &asked,
+                        &mut scratch,
+                    );
+                    page += crate::watch::PAGE;
+                    continue;
+                }
                 if asked.is_empty() {
                     mirrored += flush_sync_batch(
                         host,
@@ -304,6 +329,10 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
+    if let Some(all) = all_held.as_mut() {
+        all.keep_only(&live);
+    }
+    drop(all_held);
     for (count, n) in SYNCED.iter().zip([
         pages,
         looked,
@@ -423,6 +452,59 @@ pub(crate) fn sync_heaps_wait(ticket: u64) {
     }
 }
 
+/// The ticket the next [`sync_heaps_start`] would get: a round for it, or
+/// any later one, begins after this call (`VICTORY_HEAP_ROUND_SHARE`'s
+/// stamps, `crate::heap_rounds`). `0` when there is no worker.
+#[cfg(windows)]
+pub(crate) fn heap_sync_next() -> u64 {
+    let (worker, spawned) = heap_sync_worker();
+    if !spawned {
+        return 0;
+    }
+    worker.state.lock().unwrap_or_else(|e| e.into_inner()).0 + 1
+}
+
+/// A round for ticket `need` or later: the ticket to wait for, and how it
+/// was had ([`crate::round_share::decide`]: done already, asked already by
+/// someone else, or asked now).
+#[cfg(windows)]
+pub(crate) fn sync_heaps_share(need: u64) -> (u64, crate::round_share::Decision) {
+    use crate::round_share::Decision;
+    let (worker, spawned) = heap_sync_worker();
+    if !spawned {
+        sync_heaps();
+        return (0, Decision::Ask);
+    }
+    let (ticket, decision) = {
+        let mut state = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = crate::round_share::decide(state.0, state.1, need);
+        if decision == Decision::Ask {
+            state.0 += 1;
+            (state.0, decision)
+        } else {
+            (need, decision)
+        }
+    };
+    if decision == Decision::Ask {
+        worker.cv.notify_one();
+    }
+    (ticket, decision)
+}
+
+/// Whether any of `ranges` (`[from, to)`) overlaps a registered
+/// shader-visible descriptor heap (one look at the heaps for all).
+#[cfg(windows)]
+pub(crate) fn any_in_shader_heap(ranges: impl IntoIterator<Item = (usize, usize)>) -> bool {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return false;
+    }
+    ranges.into_iter().any(|(from, to)| {
+        let (from, to) = (from as u64, to as u64);
+        from < to && heaps.iter().any(|&(hs, he, _)| from < he && hs < to)
+    })
+}
+
 /// Whether `[start, start + len)` overlaps any registered shader-visible
 /// descriptor heap.
 #[cfg(windows)]
@@ -450,6 +532,23 @@ fn flush_sync_batch(
     if batch_pages.is_empty() {
         return 0;
     }
+    let began = sync_in_place::now();
+    let mirrored = flush_sync_pages(host, start, step, batch_pages, batch_asked, page_bytes, changed);
+    sync_in_place::batch_since(began);
+    mirrored
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn flush_sync_pages(
+    host: &host::HostHeap,
+    start: u64,
+    step: u64,
+    batch_pages: &mut Vec<(usize, usize, usize, usize)>,
+    batch_asked: &mut Vec<u32>,
+    page_bytes: &mut Vec<u8>,
+    changed: &mut Vec<(u32, u64)>,
+) -> u64 {
     let batch_from = batch_pages[0].0;
     let batch_to = batch_pages.last().unwrap().1;
     let mut mirrored = 0u64;
@@ -537,6 +636,7 @@ pub(crate) fn sync_line(frames: f64) {
         c[9],
         place.join(", ")
     );
+    sync_in_place::line(frames);
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

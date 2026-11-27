@@ -428,7 +428,8 @@ fn control_regions(st: &Structured, skip_wide: bool) -> Option<Vec<(usize, Vec<b
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if (skip_wide && st.wide.contains(&d))
+        // (a branch each host wave takes for itself separates the halves of a console wave)
+        if (skip_wide && st.wide.contains(&d) && !st.host_wide.contains(&d))
             || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
         {
             continue; // a wave-wide or uniform branch: all lanes go the same way

@@ -474,13 +474,19 @@ def parse_victory_log(text: str) -> dict[str, object]:
     }
 
 
+def release_build_cmd(env: dict[str, str] | None = None) -> list[str]:
+    """The release build; `--features dlss` when VICTORY_DLSS_SDK names the NVIDIA DLSS SDK
+    (kept outside the repository), so VICTORY_UPSCALE=dlss runs DLSS instead of a stretch."""
+    env = os.environ if env is None else env
+    cmd = ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)]
+    if env.get("VICTORY_DLSS_SDK", "").strip():
+        cmd += ["--features", "dlss"]
+    return cmd
+
+
 @throttled("build")
 def cmd_build(args: argparse.Namespace) -> int:
-    rel_step = (
-        "cargo build release",
-        ["cargo", "build", "--release", "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)],
-        REPO_ROOT,
-    )
+    rel_step = ("cargo build release", release_build_cmd(), REPO_ROOT)
     diag_step = (
         "cargo build diag",
         [
@@ -642,7 +648,12 @@ def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
     quiet = getattr(args, "quiet", False)
     tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
     if quiet:
-        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+        # Take the free slots at once (none left to writers) and suspend running builds and worktree
+        # tools for the run: no wait for the machine's builds to finish, none competing with the game.
+        with dev_throttle.free_build_slots(LOCKS_DIR, tag, leave=0) as held, \
+                dev_throttle.builds_suspended() as paused:
+            print(f"DEV {what}: quiet: holding {len(held)} of {dev_throttle.build_slots()} build slots, "
+                  f"{paused} build/tool processes suspended for the run", flush=True)
             yield
         return
     with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:

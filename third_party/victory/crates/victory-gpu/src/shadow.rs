@@ -3224,6 +3224,13 @@ fn in_wide() -> bool {
     IN_WIDE.with(|c| c.get())
 }
 
+/// Runs `f` as a job of [`wide_chunks`] runs: wide work it asks for runs
+/// on this thread (`crate::tex_early`'s checks, which ran in `wide_chunks`).
+pub(crate) fn as_wide_job<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = WideGuard::enter();
+    f()
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -3245,12 +3252,16 @@ fn wide(jobs: Vec<Job>) {
         done: Mutex::new(false),
         cv: std::sync::Condvar::new(),
     });
+    #[cfg(test)]
+    let scope = lazy::lazy_test_scope_now();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let wait = wait.clone();
             queue.push_back(Box::new(move || {
                 {
+                    #[cfg(test)]
+                    let _scope = lazy::LazyTestScope::enter(scope);
                     let _guard = WideGuard::enter();
                     job();
                 }

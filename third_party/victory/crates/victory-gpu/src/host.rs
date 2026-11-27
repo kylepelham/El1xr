@@ -686,6 +686,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.0 == target && state.1.is_none() {
             state.1 = Some((std::time::Instant::now(), worked()));
+            crate::card_awake::idle();
         }
     }
 }
@@ -709,6 +710,7 @@ fn card_clock_line(frames: f64, ms: f64) {
             0.0
         }
     );
+    crate::card_awake::line(frames, ms, idle);
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -1006,6 +1008,9 @@ pub(crate) struct HostList {
     /// a draw/dispatch) since its last reset, so submitting it needs
     /// `descriptor::sync_heaps` and `make_waiting`.
     uses_heaps: std::sync::atomic::AtomicBool,
+    /// `VICTORY_HEAP_ROUND_SHARE`: the heap-sync ticket it needs a round
+    /// from, stamped when the title gave it to a queue (0: none).
+    pub(crate) heap_stamp: std::sync::atomic::AtomicU64,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -3481,8 +3486,8 @@ pub(crate) use late::{
     walls_landed, walls_trace,
 };
 use late::{
-    COPIES_JOINED, continues, declared_writes, hand_back, join_copies, late_line, late_threads,
-    read_backs, relay_hand_back, relay_wait, settle_now, stale_under_flights, wait_unlocked,
+    COPIES_JOINED, continues, declared_writes, hand_back, heap_landed, join_copies, late_line,
+    late_threads, read_backs, relay_hand_back, relay_wait, settle_now, stale_under_flights, wait_unlocked,
 };
 #[cfg(test)]
 pub(crate) use late::{HOST_COPY, READ_BACK, relay_hand_back_for_test};
@@ -3718,6 +3723,7 @@ impl Host {
                 twins: Mutex::default(),
                 plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 uses_heaps: std::sync::atomic::AtomicBool::new(false),
+                heap_stamp: std::sync::atomic::AtomicU64::new(0),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -3775,6 +3781,7 @@ impl Host {
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        crate::card_awake::sent(&self.device);
         if let Some((since, worked_then)) = state.1.take() {
             crate::timeline::card_idle(since.elapsed());
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -3817,6 +3824,7 @@ impl Host {
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         let landed_count = items.len() as u64;
+        let mut _landing = None;
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -3842,6 +3850,7 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> =
                     flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                _landing = Some(crate::round_share::Landing::begin());
                 if !no_copy_back() {
                     self.relay_card_back(&plans, fetch);
                     // (Neptune) The kernel forgets the writes of these merges together.
@@ -3880,6 +3889,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        heap_landed(&items);
         // In the order given: what tells the title the card is done.
         let told = items.iter().filter(|i| !matches!(i, Late::Run(_))).count();
         let mut last = 0;
@@ -4314,6 +4324,8 @@ impl Host {
             };
             let item_count = items.len() as u64;
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
+            // From the copy-backs until the read-backs below are done.
+            let mut _landing = None;
             if !counted {
                 counted = true;
                 LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -4366,6 +4378,7 @@ impl Host {
                     ));
                 }
                 submitting(3, flights);
+                _landing = Some(crate::round_share::Landing::begin());
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
@@ -4393,6 +4406,7 @@ impl Host {
                     }
                 }
                 hand_back(&back);
+                heap_landed(&items);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -4463,7 +4477,7 @@ impl Host {
             && crate::descriptor::async_sync_on()
             && runs.iter().any(|l| l.uses_heaps.load(Ordering::Relaxed))
         {
-            heap_rounds = crate::heap_rounds::Rounds::start();
+            heap_rounds = crate::heap_rounds::Rounds::start_for(runs);
         }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -4647,6 +4661,7 @@ impl Host {
             }
             let (list_wrote_heap, textures) = list.run_deferred(&mut batch, heap_rounds.asked());
             if list_wrote_heap {
+                crate::round_share::list_wrote();
                 heap_rounds.wrote();
             }
             pending_preludes.push((list, textures));
@@ -4896,12 +4911,14 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let _landing = crate::round_share::Landing::begin();
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         hand_back(&back);
+        crate::round_share::touched(back.iter().flat_map(|(_, r)| r.iter().copied()));
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5144,6 +5161,7 @@ impl HostList {
         crate::texture::alias_skip::reset(&self.alias_log);
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
+        self.heap_stamp.store(0, Ordering::Relaxed);
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -6121,7 +6139,10 @@ impl HostList {
                 // And the records the sanitizer made empty (`VICTORY_CLAMP_AFTER_WRITER`).
                 crate::indirect::SAN[2]
                     .fetch_add(u64::from(words.add(5).read_volatile()), Ordering::Relaxed);
-                for k in 0..6 {
+                // And the records its budget emptied (`VICTORY_INDIRECT_BUDGET_LOG2`).
+                crate::indirect::budget::EMPTIED
+                    .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6360,7 +6381,7 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
-                    } else if !batch.pending_textures.is_empty() {
+                    } else if !batch.pending_textures.is_empty() || batch.early.started() {
                         // Host callbacks can use a refresh result, including the
                         // mip mask that maps a reserved texture for this upload.
                         batch.flush_textures();
@@ -6392,7 +6413,12 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        if crate::tex_check::parallel_refresh() {
+                        if crate::tex_check::parallel_refresh() && crate::tex_early::on() {
+                            let staging = upload.staging.clone();
+                            batch
+                                .early
+                                .start(move || crate::shadow::as_wide_job(|| staging.refresh()));
+                        } else if crate::tex_check::parallel_refresh() {
                             batch.pending_textures.push(upload.staging.clone());
                         } else {
                             upload.staging.refresh();
@@ -6629,6 +6655,9 @@ struct Batch {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Due staging buffers deferred until the next title write or flush.
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Due checks started at their step (`VICTORY_TEX_EARLY=1`), joined where
+    /// `pending_textures` are run.
+    early: crate::tex_early::Early,
     /// Disjoint upload-memory fills (`dst`, `src`, `len`) deferred until the
     /// next title write or flush so large batches copy in parallel.
     pending_fills: Vec<(usize, usize, usize)>,
@@ -6730,11 +6759,17 @@ impl Batch {
 
     /// Refreshes any queued due textures side by side (`crate::tex_check`).
     fn flush_textures(&mut self) {
+        if let Some(joined) = self.early.join() {
+            crate::tex_early::account(joined);
+            flush::textures(joined.checks, joined.wall_us);
+        }
         if !self.pending_textures.is_empty() {
             let started = std::time::Instant::now();
             let textures = self.pending_textures.len();
             crate::tex_check::check_textures(std::mem::take(&mut self.pending_textures));
-            flush::textures(textures, started.elapsed().as_micros() as u64);
+            let us = started.elapsed().as_micros() as u64;
+            flush::textures(textures, us);
+            crate::tex_early::waited_today(textures, us);
         }
     }
 
@@ -7776,6 +7811,7 @@ impl Meter {
         tracing::info!(
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
+        crate::indirect::budget::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
@@ -7841,6 +7877,7 @@ impl Meter {
         crate::port::log(frames);
         crate::port_cbv::log(frames);
         crate::tex_check::log(frames);
+        crate::tex_early::log(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         crate::resource::room_line();
@@ -8369,6 +8406,7 @@ impl Host {
                 crate::capture::probe(&self.device, list, texture)
             };
             let watched = crate::popwatch::take(&self.device, list, texture);
+            let audited = crate::present_audit::take(&self.device, list, texture, index, frame);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
@@ -8408,6 +8446,9 @@ impl Host {
             };
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
+            }
+            if let Some(audited) = audited {
+                crate::present_audit::sent(audited, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
@@ -8567,6 +8608,7 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             crate::overlay::start(hwnd, self.adapter.clone());
+            crate::menu::start(hwnd);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,

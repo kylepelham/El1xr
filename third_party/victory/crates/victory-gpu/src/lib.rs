@@ -38,6 +38,8 @@ mod alloc_backoff;
 mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod ambient_miss;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 #[cfg(windows)]
@@ -61,6 +63,8 @@ pub mod frametime;
 pub mod hitch;
 pub mod host_facts;
 #[cfg(windows)]
+pub mod card_awake;
+#[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
 mod joined_apart;
@@ -69,6 +73,8 @@ mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
+mod round_share;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod land_aside;
@@ -76,6 +82,7 @@ mod land_aside;
 mod list_reap;
 #[cfg(windows)]
 mod output_views;
+pub mod menu;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -104,6 +111,8 @@ mod inplace;
 #[cfg(windows)]
 mod popwatch;
 #[cfg(windows)]
+mod present_audit;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -130,6 +139,7 @@ mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
+pub mod upscale_live;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -159,6 +169,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod tex_check;
+mod tex_early;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

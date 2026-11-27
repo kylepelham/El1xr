@@ -149,6 +149,16 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // VICTORY_UPSCALE_LIVE_TEST (off without it): live upscale changes on a timer.
+        victory_gpu::upscale_live::spawn_test_schedule(|s| {
+            if let Err(why) = victory_loader::resolution::request_ffx_scale(s) {
+                tracing::warn!(
+                    scale = s,
+                    why,
+                    "VICTORY_UPSCALE_LIVE_TEST: render scale not changed"
+                );
+            }
+        });
     }
     // VICTORY_LOAD_FPS=<rate> (off without it): the title runs at that rate
     // while it loads and at its own 30 after. At 25 or more frames a second

@@ -37,6 +37,15 @@
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around and scrubs
 //! NaN/Inf values from the scattering volume.
+//!
+//! (foxhound `9f8838b`) Reflections are traced too, at half the picture's
+//! size: rays the title's screen-space march resolves
+//! (`CS_ResolveScreenSpace`) take the light seen on screen; the others go to
+//! the structures, find nothing, and `CS_RayMiss` gives each the sky's light
+//! from the sky's cube maps: bright sky in dark rooms, on glass and on
+//! eyes. `VICTORY_AMBIENT_SPECULAR` puts in, right after that program, the
+//! same estimate taken along the reflected direction ([`Role::Miss`]); the
+//! screen-space resolve that comes next still writes what it found over it.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -56,6 +65,10 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Gives the reflection rays that found nothing the sky's light
+    /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes'):
+    /// only with `VICTORY_AMBIENT_SPECULAR` set.
+    Miss,
 }
 
 /// The program's part in this, by its name in the container.
@@ -67,9 +80,21 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if specular().is_some() && is_miss(container) {
+        Some(Role::Miss)
     } else {
         None
     }
+}
+
+/// `CS_RayMiss_` and the eight hex digits of a variant's hash.
+fn is_miss(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_RayMiss_";
+    container.windows(NAME.len() + 9).any(|w| {
+        w.starts_with(NAME)
+            && w[NAME.len()..NAME.len() + 8].iter().all(u8::is_ascii_hexdigit)
+            && w[NAME.len() + 8] == b'_'
+    })
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -80,6 +105,14 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the miss program writes the reflected light (R11G11B10, half the
+/// picture's size) and where it reads the depth it is given (a 32-bit depth
+/// of the picture's size).
+pub(crate) const MISS_LIGHT: (u8, u32) = (1, 104);
+pub(crate) const MISS_DEPTH: (u8, u32) = (0, 1000);
+/// The miss program's first root constant: which surfaces its rays are of.
+pub(crate) const MISS_OPAQUE: u32 = 0;
+pub(crate) const MISS_ALPHA: u32 = 1;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -102,9 +135,44 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether a stand-in is on (for the diffuse light or for reflections):
+/// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+}
+
+/// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]` (foxhound `9f8838b`; off by
+/// default): reflections whose rays found nothing take `share` of the
+/// estimate along the reflected direction instead of the sky's light; `sky`
+/// (0 to 1, 0 if not given) of them stays the title's sky, made no brighter
+/// than the estimate. Unset or 0: the title's sky.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Specular {
+    pub(crate) share: f32,
+    pub(crate) sky: f32,
+}
+
+fn parse_specular(set: &str) -> Option<Specular> {
+    let mut parts = set
+        .split(',')
+        .map(|t| t.trim().parse::<f32>().ok().filter(|v| v.is_finite()));
+    let share = parts.next().flatten().filter(|v| *v > 0.0)?;
+    let sky = parts.next().flatten().map_or(0.0, |v| v.clamp(0.0, 1.0));
+    Some(Specular { share, sky })
+}
+
+pub(crate) fn specular() -> Option<Specular> {
+    static SET: OnceLock<Option<Specular>> = OnceLock::new();
+    *SET.get_or_init(|| parse_specular(&std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default()))
+}
+
+/// `VICTORY_AMBIENT_SPECULAR_ALPHA=0`: the alpha layer's misses (glass,
+/// foam, wakes; the depth read is the opaque one behind them) keep the
+/// title's sky. Unset: they take the estimate too (foxhound's default: glass
+/// in a dark room mirrored the bright sky without it).
+pub(crate) fn specular_alpha() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -397,6 +465,62 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(max(was, found));
 }
 #endif
+
+#ifdef REFLECT
+RWTexture2D<float3> reflected : register(u0);
+// Each texel of the reflections' image (half the picture's size): the light
+// the points around send along the reflected direction, as `raise` takes it
+// along the normal; `level` is the share, `constant` the share of the
+// title's sky kept, made no brighter than that.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void reflect_light(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float2 size = float2(width, height);
+    int2 p = int2((float2(at.xy) + 0.5) * size / float2(w, h));
+    float3 c = seen(p, size);
+    // Nothing is reflected by the sky.
+    if (c.z >= 999.0) return;
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    float3 v = normalize(c);
+    float3 ray = v - 2.0 * dot(v, n) * n;
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float wgt = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += wgt * points[at0];
+        sg += wgt * points[at0 + 1];
+        sb += wgt * points[at0 + 2];
+        sum += wgt;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    // Radiance from the first moments: three times the direction's share
+    // for an even spread of directions, a little less for a smooth image.
+    float3 found = all + 2.0 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
+    found = clamp(found, 0.1 * all, 3.0 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level;
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float3 was = reflected[at.xy];
+    was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
+    float has = dot(was, LUMA);
+    was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
+    reflected[at.xy] = lerp(found, was, constant);
+}
+#endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
@@ -412,6 +536,8 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    /// Made only with `VICTORY_AMBIENT_SPECULAR` set.
+    reflect: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -451,6 +577,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = match specular() {
+        Some(_) => Some(pipeline("REFLECT", s!("reflect_light"))?),
+        None => None,
+    };
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -460,6 +590,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -495,6 +626,8 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
+    /// The size of the depth (the image's but for [`Role::Miss`]).
+    pub(crate) depth_size: [u32; 2],
 }
 
 /// After the title's program of that role, in `list` with the program's view
@@ -505,14 +638,27 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
-        Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+    // The share of the estimate, and the constant (for reflections: the
+    // share of the title's sky kept); the keep runs for either stand-in.
+    let (level, constant) = match (role, set(), specular()) {
+        (Role::Miss, _, Some(s)) => (s.share, s.sky),
+        (Role::Miss, _, None) => return false,
+        (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),
+        (_, Set::Off, _) => return false,
+        (_, Set::Estimate(level), _) => (level, 0.0f32),
+        (_, Set::Constant(level), _) => (0.0, level),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    let estimate = role == Role::Miss || constant == 0.0;
+    if role != Role::Radiance && estimate && !KEPT.load(Ordering::Relaxed) {
+        if role == Role::Miss {
+            crate::ambient_miss::note(crate::ambient_miss::Note::NotReady);
+        }
         return false;
     }
+    let reflect = match (role, &pass.reflect) {
+        (Role::Miss, None) => return false,
+        (_, reflect) => reflect,
+    };
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
@@ -549,8 +695,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
-    words[6] = views.size[0];
-    words[7] = views.size[1];
+    words[6] = views.depth_size[0];
+    words[7] = views.depth_size[1];
     words[8] = follow.to_bits();
     words[9] = most().to_bits();
     words[10] = air().to_bits();
@@ -588,6 +734,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
+            Role::Miss => {
+                // The points afresh, from this frame's depth: the diffuse
+                // stand-in makes them later in the frame.
+                run(&pass.place, 8, 9, 1);
+                run(&pass.gather, 20, 45, 1);
+                if let Some(reflect) = reflect {
+                    run(reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                }
+            }
         }
     }
     true
@@ -614,6 +769,81 @@ mod tests {
         assert_eq!(parse_settle("500,0"), Some(Settle { ms: 500.0, jump: 0.0 }));
         assert_eq!(parse_settle("0"), None);
         assert_eq!(parse_settle("off"), None);
+    }
+
+    #[test]
+    fn specular_settings() {
+        assert_eq!(parse_specular(""), None);
+        assert_eq!(parse_specular("0"), None);
+        assert_eq!(parse_specular("off"), None);
+        assert_eq!(parse_specular("1"), Some(Specular { share: 1.0, sky: 0.0 }));
+        assert_eq!(parse_specular("0.6, 0.25"), Some(Specular { share: 0.6, sky: 0.25 }));
+        assert_eq!(parse_specular("0.6,7"), Some(Specular { share: 0.6, sky: 1.0 }));
+        assert_eq!(parse_specular("0.6,x"), Some(Specular { share: 0.6, sky: 0.0 }));
+    }
+
+    #[test]
+    fn miss_programs_by_name() {
+        assert!(is_miss(b"..CS_RayMiss_de6b91a6_Wrapped.."));
+        assert!(!is_miss(b"..CS_RayMiss_Volumetrics_3c5d8c00_Wrapped.."));
+        assert!(!is_miss(b"..CS_ScreenProbe_RayMiss_80a88544_Wrapped.."));
+        // Switch off (the test run does not set it): no program is given the role.
+        if specular().is_none() {
+            assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), None);
+        }
+    }
+
+    /// The source without the reflections' pass: what it was before.
+    fn source_before() -> String {
+        let from = SOURCE.find("#ifdef REFLECT").expect("the reflections' pass");
+        let to = from + SOURCE[from..].find("#endif\n").expect("its end") + "#endif\n".len();
+        format!("{}{}", &SOURCE[..from], &SOURCE[to..])
+    }
+
+    /// Every pass that was there compiles to the same bytes with the
+    /// reflections' pass in the source (with and without
+    /// `VICTORY_AMBIENT_VIOLET`): switched off, nothing of ours changes.
+    #[test]
+    fn the_other_passes_are_unchanged() {
+        let before = source_before();
+        assert!(!before.contains("reflect_light"));
+        let parts = [
+            ("KEEP", s!("keep")),
+            ("KEEP", s!("mean")),
+            ("PLACE", s!("place")),
+            ("GATHER", s!("gather")),
+            ("RAISE", s!("raise")),
+            ("AIR", s!("clear_air")),
+        ];
+        for violet in ["", "#define VIOLET\n"] {
+            for (part, entry) in parts {
+                let made = |source: &str| {
+                    crate::host::compile(&format!("#define {part}\n{violet}{source}"), entry, s!("cs_5_1"))
+                        .expect("the pass")
+                };
+                assert_eq!(made(SOURCE), made(&before), "{part} {violet:?}");
+            }
+        }
+    }
+
+    /// The reflections' pass compiles, and the host takes it.
+    #[test]
+    fn the_reflections_pass_builds() {
+        let code = crate::host::compile(&format!("#define REFLECT\n{SOURCE}"), s!("reflect_light"), s!("cs_5_1"))
+            .expect("the reflections' pass");
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: the root signature is inside the shader; plain creations.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("its root signature");
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            };
+            let _: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).expect("its pipeline");
+        }
     }
 
     #[test]

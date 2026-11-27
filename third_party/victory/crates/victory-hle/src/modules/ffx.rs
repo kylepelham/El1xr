@@ -199,7 +199,9 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 }
             }
             #[cfg(windows)]
-            {
+            let live = live_mode();
+            #[cfg(windows)]
+            if live != Some(victory_gpu::upscale_live::Live::Native) {
                 let up = victory_gpu::upscale::Upscale {
                     colour: d.colour.resource as u64,
                     depth: d.depth.resource as u64,
@@ -209,12 +211,12 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                     render: d.render,
                     jitter: d.jitter,
                     motion_scale: d.motion_scale,
-                    reset: d.reset != 0,
+                    reset: d.reset != 0 || mode_changed(),
                     pre_exposure: d.pre_exposure,
                     near: d.camera_near,
                     far: d.camera_far,
                     frame_ms: d.frame_time_delta,
-                    dlss: asked_mode() == Some(Mode::Dlss),
+                    dlss: live == Some(victory_gpu::upscale_live::Live::Dlss),
                 };
                 if victory_gpu::upscale::upscale(d.list, &up) {
                     return 0;
@@ -245,6 +247,28 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
         // SAFETY: the title's own `ffxDispatch`, with its own arguments.
         real => unsafe { std::mem::transmute::<usize, Dispatch>(real)(context, desc) },
     }
+}
+
+/// The upscale to record: a live request (`victory_gpu::upscale_live`) over
+/// `VICTORY_UPSCALE`. `Native` passes the dispatch to the title's own DLL.
+#[cfg(windows)]
+fn live_mode() -> Option<victory_gpu::upscale_live::Live> {
+    use victory_gpu::upscale_live::Live;
+    victory_gpu::upscale_live::mode().or_else(|| {
+        asked_mode().map(|m| match m {
+            Mode::Stretch => Live::Stretch,
+            Mode::Dlss => Live::Dlss,
+        })
+    })
+}
+
+/// Whether the upscale mode changed since the last upscale recorded here:
+/// the new upscaler starts without the old one's history.
+#[cfg(windows)]
+fn mode_changed() -> bool {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let now = victory_gpu::upscale_live::generation();
+    SEEN.swap(now, Ordering::Relaxed) != now
 }
 
 /// What the title's import of `ffxDispatch` is bound to. The DLL is not an
