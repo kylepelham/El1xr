@@ -198,6 +198,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -338,9 +339,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
     Ok(Translated {
         host,
         used,
+        tables,
         stores,
         dxil,
     })
@@ -740,10 +743,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    // A set, not a list: every draw and dispatch checks each of its shaders
+    // against `VICTORY_SKIP_PIPELINES`.
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes(&value).into_iter().collect()
     });
     if hashes.is_empty() {
         return None;
@@ -785,6 +790,101 @@ pub(crate) fn note_drop(this: This) {
             })
     };
     note_why(why);
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrepareFailure {
+    #[default]
+    Unclassified,
+    SkippedPipeline,
+    MissingHostPipeline,
+    PipelineKind,
+    IndexBuffer,
+    DynamicDescriptorTable,
+    ShaderMemoryViews,
+    RootUavBuffer,
+    RootUavHeap,
+    RootUavSlot,
+    RootSrvHeap,
+    RootSrvSlot,
+}
+
+/// Keep the first example of each failure per pipeline, with room for every
+/// kind even when one compute pipeline repeatedly fails during world load.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn new_indirect_example(
+    seen: &mut Vec<(u32, String, PrepareFailure)>,
+    kind: u32,
+    key: &str,
+    why: PrepareFailure,
+) -> bool {
+    const PER_KIND: usize = 8;
+    if seen.iter().any(|(k, p, r)| *k == kind && p == key && *r == why)
+        || seen.iter().filter(|(k, _, _)| *k == kind).count() >= PER_KIND
+    {
+        return false;
+    }
+    seen.push((kind, key.to_owned(), why));
+    true
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_indirect_prepare(
+    this: This,
+    why: PrepareFailure,
+    (kind, stride, max): (u32, u32, u32),
+    (args, address): (&crate::shadow::Shadow, u64),
+    counter: Option<&(Arc<crate::shadow::Shadow>, u64)>,
+) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_PREPARE_LOG").is_some_and(|v| v == "1"))
+    {
+        return;
+    }
+    static SEEN: Mutex<Vec<(u32, String, PrepareFailure)>> = Mutex::new(Vec::new());
+    let key = shaders_of(this);
+    if !new_indirect_example(
+        &mut SEEN.lock().unwrap_or_else(|e| e.into_inner()),
+        kind,
+        &key,
+        why,
+    ) {
+        return;
+    }
+    let shaders: Vec<_> = if this.is_null() {
+        Vec::new()
+    } else {
+        pipeline(this)
+            .shaders
+            .iter()
+            .map(|s| (s.stage, s.hash.as_str()))
+            .collect()
+    };
+    let command = match kind {
+        0 => "draw",
+        1 => "draw indexed",
+        2 => "dispatch",
+        10 => "dispatch mesh",
+        _ => "unknown",
+    };
+    tracing::info!(
+        frame = crate::frame::current(),
+        kind,
+        command,
+        stride,
+        max,
+        reason = ?why,
+        pipeline = ?this,
+        guest_shaders = ?shaders,
+        arguments = format_args!("{address:#x}"),
+        argument_buffer = args.id(),
+        argument_offset = args.offset(address),
+        count_address = counter.map(|(_, at)| *at),
+        count_buffer = counter.map(|(s, _)| s.id()),
+        count_offset = counter.map(|(s, at)| s.offset(*at)),
+        "indirect command preparation failed"
+    );
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -1024,6 +1124,7 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+mod early;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
@@ -1173,5 +1274,65 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn indirect_prepare_examples_preserve_each_command_kind() {
+        use PrepareFailure::{DynamicDescriptorTable, IndexBuffer};
+
+        let mut seen = Vec::new();
+        assert!(new_indirect_example(
+            &mut seen,
+            2,
+            "first",
+            DynamicDescriptorTable
+        ));
+        assert!(!new_indirect_example(
+            &mut seen,
+            2,
+            "first",
+            DynamicDescriptorTable
+        ));
+        for key in 1..8 {
+            assert!(new_indirect_example(
+                &mut seen,
+                2,
+                &key.to_string(),
+                DynamicDescriptorTable
+            ));
+        }
+        assert!(!new_indirect_example(
+            &mut seen,
+            2,
+            "later",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(
+            &mut seen,
+            10,
+            "first",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(
+            &mut seen,
+            1,
+            "other",
+            DynamicDescriptorTable
+        ));
+        assert!(new_indirect_example(&mut seen, 1, "other", IndexBuffer));
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn parse_skip_hashes_normalizes_and_filters_entries() {
+        let set: std::collections::HashSet<String> = parse_skip_hashes(
+            " 0123456789ABCDEF , invalid , fedcba9876543210, 0123456789abcdef ",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("0123456789abcdef"));
+        assert!(set.contains("fedcba9876543210"));
     }
 }

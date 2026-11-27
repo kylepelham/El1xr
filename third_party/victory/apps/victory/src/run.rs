@@ -80,6 +80,11 @@ pub fn run(
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxDispatch")
+        {
+            victory_hle::modules::ffx::set_real_dispatch(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
         victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
@@ -109,7 +114,28 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // `VICTORY_UPSCALE=stretch|dlss` (opt-in on Series S, or Series X with
+    // `VICTORY_UPSCALER=7`): `ffxDispatch` alone is intercepted by
+    // `victory_hle::modules::ffx`; the rest of the DLL stays the title's.
+    // Unset (default): untouched, preserving default native 4K Series X.
+    let upscale_mode = victory_hle::modules::ffx::asked_mode();
+    let take = victory_hle::modules::ffx::should_take_dispatch(
+        victory_hle::console::current() == victory_hle::console::Console::SeriesS,
+        victory_loader::resolution::asked_upscaler(),
+        victory_hle::modules::fidelityfx::enabled(),
+        upscale_mode,
+    );
+    if take {
+        println!(
+            "upscale        the title's ffxDispatch is ours (VICTORY_UPSCALE={})",
+            upscale_mode.unwrap().as_str()
+        );
+    } else if upscale_mode.is_some() && !victory_hle::modules::fidelityfx::enabled() {
+        println!(
+            "upscale        VICTORY_UPSCALE ignored on Series X without VICTORY_UPSCALER=7 (keeping native upscaler)"
+        );
+    }
+    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]
@@ -125,6 +151,14 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    victory_hle::modules::audio::mute::start();
+    struct MuteStop;
+    impl Drop for MuteStop {
+        fn drop(&mut self) {
+            victory_hle::modules::audio::mute::stop();
+        }
+    }
+    let _mute_stop = MuteStop;
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -199,6 +233,27 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// Intercepts only `amd_fidelityfx_loader_xbox.dll!ffxDispatch` when opted in
+/// via `VICTORY_UPSCALE=stretch|dlss`; forwards all other imports unchanged.
+#[cfg(windows)]
+struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for TakeDispatch<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        let ours = self.1
+            && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
+        if ours {
+            return victory_loader::Resolution::Found {
+                address: victory_hle::modules::ffx::dispatch_address(),
+                provenance: victory_loader::Provenance::Hle,
+            };
+        }
+        self.0.resolve(dll, symbol)
+    }
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
@@ -355,6 +410,55 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn take_dispatch_only_intercepts_ffx_dispatch_when_enabled() {
+        use victory_loader::{ImportResolver, Provenance, Resolution};
+        use victory_pe::ImportSymbol;
+
+        struct Inner;
+        impl ImportResolver for Inner {
+            fn resolve(&self, _: &str, _: &ImportSymbol) -> Resolution {
+                Resolution::Found {
+                    address: 0x1234,
+                    provenance: Provenance::Title,
+                }
+            }
+        }
+
+        let dispatch = ImportSymbol::Name {
+            hint: 0,
+            name: "ffxDispatch".to_owned(),
+        };
+        let other = ImportSymbol::Name {
+            hint: 0,
+            name: "ffxCreateContext".to_owned(),
+        };
+        let loader = victory_hle::modules::ffx::LOADER;
+
+        // Disabled (default): every import falls through to Inner.
+        let off = super::TakeDispatch(&Inner, false);
+        assert!(matches!(
+            off.resolve(loader, &dispatch),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
+        ));
+
+        // Enabled: only amd_fidelityfx_loader_xbox.dll!ffxDispatch is taken.
+        let on = super::TakeDispatch(&Inner, true);
+        assert!(matches!(
+            on.resolve(loader, &dispatch),
+            Resolution::Found { address, provenance: Provenance::Hle }
+                if address == victory_hle::modules::ffx::dispatch_address()
+        ));
+        assert!(matches!(
+            on.resolve(loader, &other),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
+        ));
+        assert!(matches!(
+            on.resolve("other.dll", &dispatch),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
+        ));
     }
 }
 

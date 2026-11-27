@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3), with PS5 HID input when XInput reports no pads or both
+//! sources are explicitly requested. With no pad the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +21,9 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+#[cfg(any(windows, test))]
+mod dualsense;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -86,6 +90,65 @@ const FALLBACK_BUTTONS: [(u8, u32); 18] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// Opt-in GTA V PC-style keyboard mapping (`VICTORY_KBM_GTA=1`).
+/// Left stick: WASD; Right stick: mouse look (toggle F2 / ~ or click) + IJKL fallback;
+/// Triggers: LMB/RMB (or C/Z); Mouse: MMB=R3, X1=LB, X2=RB.
+const FALLBACK_BUTTONS_GTA: [(u8, u32); 20] = [
+    (0x1B, MENU),           // Esc: Pause / Menu
+    (b'V', VIEW),           // V: Camera / View
+    (0x0D, A),              // Enter: Confirm / A
+    (0xA0, A),              // Left Shift: Sprint / A
+    (0xA1, A),              // Right Shift: Sprint / A
+    (0x08, B),              // Backspace: Back / B
+    (b'R', B),              // R: Reload / Melee / B
+    (0x20, X),              // Space: Jump / Handbrake / X
+    (b'F', Y),              // F: Enter-Exit Vehicle / Y
+    (0x26, UP),             // Up: D-Pad Up (Phone)
+    (0x28, DOWN),           // Down: D-Pad Down
+    (0x25, LEFT),           // Left: D-Pad Left
+    (0x27, RIGHT),          // Right: D-Pad Right
+    (b'E', RIGHT),          // E: Interact / Horn (D-Pad Right)
+    (0x09, LEFT_SHOULDER),  // Tab: Weapon Wheel / LB
+    (b'Q', RIGHT_SHOULDER), // Q: Cover / RB
+    (0xA2, LEFT_STICK),     // Left Ctrl: Stealth / L3
+    (0xA3, LEFT_STICK),     // Right Ctrl: Stealth / L3
+    (0xA4, LEFT_STICK),     // Left Alt: L3
+    (b'C', RIGHT_STICK),    // C: Look Behind / R3
+];
+
+fn env_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn gta_kbm_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        let on = env_truthy(std::env::var("VICTORY_KBM_GTA").ok().as_deref());
+        if on {
+            tracing::info!(
+                "GTA V PC KBM mapping enabled (VICTORY_KBM_GTA=1; F2/~ or click toggles mouse look)"
+            );
+        }
+        on
+    });
+    *ENABLED
+}
+
+/// True while opt-in GTA KBM mouse-look is actively captured; `lifecycle::window_proc`
+/// uses this to hide the cursor on `WM_SETCURSOR`.
+pub(crate) fn hide_cursor_for_mouse_look() -> bool {
+    #[cfg(windows)]
+    {
+        host::gta_mouse_look_active()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -128,6 +191,9 @@ trait Source: Send {
 struct Mouse {
     left: bool,
     right: bool,
+    middle: bool,
+    x1: bool,
+    x2: bool,
     x: f32,
     y: f32,
 }
@@ -144,7 +210,7 @@ fn mouse() -> Mouse {
     }
 }
 
-fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
+fn fallback_with(keys: &[KeyState], mouse: Mouse, gta_mode: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -152,13 +218,39 @@ fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
             0.0
         }
     };
+    let table: &[(u8, u32)] = if gta_mode {
+        &FALLBACK_BUTTONS_GTA
+    } else {
+        &FALLBACK_BUTTONS
+    };
+    let mut buttons = table
+        .iter()
+        .filter(|(vk, _)| on(*vk) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
+    let (left_trigger, right_trigger) = if gta_mode {
+        if mouse.middle {
+            buttons |= RIGHT_STICK;
+        }
+        if mouse.x1 {
+            buttons |= LEFT_SHOULDER;
+        }
+        if mouse.x2 {
+            buttons |= RIGHT_SHOULDER;
+        }
+        (
+            f32::from(u8::from(mouse.right)),
+            f32::from(u8::from(mouse.left)),
+        )
+    } else {
+        (
+            f32::max(on(b'Z'), f32::from(u8::from(mouse.right))),
+            f32::max(on(b'C'), f32::from(u8::from(mouse.left))),
+        )
+    };
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: f32::max(on(b'Z'), f32::from(u8::from(mouse.right))),
-        right_trigger: f32::max(on(b'C'), f32::from(u8::from(mouse.left))),
+        buttons,
+        left_trigger,
+        right_trigger,
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: (on(b'L') - on(b'J') + mouse.x).clamp(-1.0, 1.0),
@@ -487,7 +579,26 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse())));
+        let gta = gta_kbm_enabled();
+        if any_pad && gta {
+            #[cfg(windows)]
+            host::disarm_gta_mouse_look();
+        }
+        let fallback = (!any_pad).then(|| {
+            let m = if gta {
+                #[cfg(windows)]
+                {
+                    host::gta_mouse()
+                }
+                #[cfg(not(windows))]
+                {
+                    Mouse::default()
+                }
+            } else {
+                mouse()
+            };
+            Value::Pad(fallback_with(&keys, m, gta))
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1096,7 +1207,8 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, then PS5 pads, the keyboard while our process
+/// has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1159,10 +1271,13 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The input snapshot for this poll and the HID connection owning each slot.
+        pads: [Option<PadState>; PADS],
+        hid_slots: [Option<u64>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1173,8 +1288,23 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if slot == 0 {
+                let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                self.pads = super::dualsense::slots(
+                    super::dualsense::mode(),
+                    xinput,
+                    &mut self.hid_slots,
+                    super::dualsense::pads,
+                );
+            }
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1396,8 +1526,224 @@ mod host {
                 right,
                 x: held.x.clamp(-1.0, 1.0),
                 y: (-held.y).clamp(-1.0, 1.0),
+                ..Mouse::default()
             }
         }
+    }
+
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    const VK_MBUTTON: i32 = 0x04;
+    const VK_XBUTTON1: i32 = 0x05;
+    const VK_XBUTTON2: i32 = 0x06;
+    const VK_F2: i32 = 0x71;
+    const VK_OEM_3: i32 = 0xC0;
+
+    static GTA_MOUSE_LOOK_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn gta_mouse_look_active() -> bool {
+        GTA_MOUSE_LOOK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn parse_mouse_sens(value: Option<&str>) -> f32 {
+        value
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.clamp(0.1, 10.0))
+            .unwrap_or(1.0)
+    }
+
+    fn gta_mouse_sens() -> f32 {
+        static SENS: LazyLock<f32> =
+            LazyLock::new(|| parse_mouse_sens(std::env::var("VICTORY_MOUSE_SENS").ok().as_deref()));
+        *SENS
+    }
+
+    fn gta_mouse_invert_y() -> bool {
+        static INVERT: LazyLock<bool> =
+            LazyLock::new(|| env_truthy(std::env::var("VICTORY_MOUSE_INVERT_Y").ok().as_deref()));
+        *INVERT
+    }
+
+    #[derive(Default)]
+    struct GtaMouseLook {
+        active: bool,
+        toggle_held: bool,
+        click_held: bool,
+        consume_click: bool,
+        clipped: bool,
+        last_hwnd: usize,
+        prev_x: i32,
+        prev_y: i32,
+        has_prev: bool,
+        smooth_x: f32,
+        smooth_y: f32,
+    }
+
+    static GTA_MOUSE: Mutex<GtaMouseLook> = Mutex::new(GtaMouseLook {
+        active: false,
+        toggle_held: false,
+        click_held: false,
+        consume_click: false,
+        clipped: false,
+        last_hwnd: 0,
+        prev_x: 0,
+        prev_y: 0,
+        has_prev: false,
+        smooth_x: 0.0,
+        smooth_y: 0.0,
+    });
+
+    fn refresh_window_cursor(hwnd: windows_sys::Win32::Foundation::HWND) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HTCLIENT, SendNotifyMessageW, WM_SETCURSOR,
+        };
+        if !hwnd.is_null() {
+            // SAFETY: non-blocking cursor refresh on our own window.
+            unsafe { SendNotifyMessageW(hwnd, WM_SETCURSOR, hwnd as usize, HTCLIENT as isize) };
+        }
+    }
+
+    fn release_gta_mouse_look(st: &mut GtaMouseLook) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::ClipCursor;
+        if st.clipped {
+            // SAFETY: passing null releases any cursor clip rectangle.
+            unsafe { ClipCursor(std::ptr::null()) };
+            st.clipped = false;
+        }
+        let was_active = st.active;
+        let hwnd = st.last_hwnd as windows_sys::Win32::Foundation::HWND;
+        st.active = false;
+        st.consume_click = false;
+        st.has_prev = false;
+        st.smooth_x = 0.0;
+        st.smooth_y = 0.0;
+        GTA_MOUSE_LOOK_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        if was_active {
+            refresh_window_cursor(hwnd);
+        }
+    }
+
+    pub(super) fn disarm_gta_mouse_look() {
+        let mut st = lock(&GTA_MOUSE);
+        st.toggle_held = false;
+        st.click_held = false;
+        release_gta_mouse_look(&mut st);
+    }
+
+    pub(super) fn gta_mouse() -> Mouse {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            ClipCursor, GetCursorPos, GetWindowInfo, SetCursorPos, WINDOWINFO,
+        };
+        let mut st = lock(&GTA_MOUSE);
+        if !focused() {
+            st.toggle_held = false;
+            st.click_held = false;
+            release_gta_mouse_look(&mut st);
+            return Mouse::default();
+        }
+        // SAFETY: plain queries on our focused window.
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let toggle = GetAsyncKeyState(VK_F2) < 0 || GetAsyncKeyState(VK_OEM_3) < 0;
+            let toggle_pressed = toggle && !st.toggle_held;
+            st.toggle_held = toggle;
+
+            let left_now = GetAsyncKeyState(VK_LBUTTON) < 0;
+            let right_now = GetAsyncKeyState(VK_RBUTTON) < 0;
+            let middle_now = GetAsyncKeyState(VK_MBUTTON) < 0;
+            let x1_now = GetAsyncKeyState(VK_XBUTTON1) < 0;
+            let x2_now = GetAsyncKeyState(VK_XBUTTON2) < 0;
+
+            let mut info: WINDOWINFO = std::mem::zeroed();
+            info.cbSize = size_of::<WINDOWINFO>() as u32;
+            let mut cursor = POINT { x: 0, y: 0 };
+            if GetWindowInfo(hwnd, &mut info) == 0 || GetCursorPos(&mut cursor) == 0 {
+                release_gta_mouse_look(&mut st);
+                return Mouse::default();
+            }
+            let rect = info.rcClient;
+            let over_client = cursor.x >= rect.left
+                && cursor.x < rect.right
+                && cursor.y >= rect.top
+                && cursor.y < rect.bottom;
+            let clicked = left_now && !st.click_held && over_client;
+            st.click_held = left_now;
+
+            if toggle_pressed {
+                if st.active {
+                    release_gta_mouse_look(&mut st);
+                } else {
+                    st.active = true;
+                    st.consume_click = false;
+                    st.has_prev = false;
+                    st.last_hwnd = hwnd as usize;
+                    GTA_MOUSE_LOOK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    refresh_window_cursor(hwnd);
+                }
+            } else if !st.active && clicked {
+                st.active = true;
+                st.consume_click = true;
+                st.has_prev = false;
+                st.last_hwnd = hwnd as usize;
+                GTA_MOUSE_LOOK_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                refresh_window_cursor(hwnd);
+            }
+
+            if !st.active {
+                return Mouse::default();
+            }
+
+            st.last_hwnd = hwnd as usize;
+            st.consume_click &= left_now;
+            let left = left_now && !st.consume_click;
+
+            if rect.right > rect.left && rect.bottom > rect.top {
+                ClipCursor(&rect);
+                st.clipped = true;
+            }
+            let cx = (rect.left + rect.right) / 2;
+            let cy = (rect.top + rect.bottom) / 2;
+            let (dx, dy) = if st.has_prev {
+                (cursor.x - st.prev_x, cursor.y - st.prev_y)
+            } else {
+                (0, 0)
+            };
+            SetCursorPos(cx, cy);
+            st.prev_x = cx;
+            st.prev_y = cy;
+            st.has_prev = true;
+
+            let sens = gta_mouse_sens();
+            let y_sign = if gta_mouse_invert_y() { 1.0 } else { -1.0 };
+            const GAIN: f32 = 0.035;
+            st.smooth_x = st.smooth_x * 0.5 + dx as f32 * GAIN * sens * 0.5;
+            st.smooth_y = st.smooth_y * 0.5 + (dy as f32 * y_sign) * GAIN * sens * 0.5;
+
+            Mouse {
+                left,
+                right: right_now,
+                middle: middle_now,
+                x1: x1_now,
+                x2: x2_now,
+                x: st.smooth_x.clamp(-1.0, 1.0),
+                y: st.smooth_y.clamp(-1.0, 1.0),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_mouse_sens_clamps_and_defaults() {
+        assert_eq!(parse_mouse_sens(None), 1.0);
+        assert_eq!(parse_mouse_sens(Some("")), 1.0);
+        assert_eq!(parse_mouse_sens(Some("-2")), 1.0);
+        assert_eq!(parse_mouse_sens(Some("0")), 1.0);
+        assert_eq!(parse_mouse_sens(Some("NaN")), 1.0);
+        assert_eq!(parse_mouse_sens(Some("0.01")), 0.1);
+        assert_eq!(parse_mouse_sens(Some("2.5")), 2.5);
+        assert_eq!(parse_mouse_sens(Some("99")), 10.0);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1430,6 +1776,47 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    /// Hardware probe, not a check: prints what each host slot holds
+    /// whenever that changes, for `VICTORY_PROBE_SECS` (default 60), so a
+    /// pad can be unplugged, switched to Bluetooth or put behind a remapper
+    /// while it runs. `cargo test -p victory-hle probe_host_pads -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs real pads and someone to plug them"]
+    fn probe_host_pads() {
+        let secs = std::env::var("VICTORY_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let end = Instant::now() + Duration::from_secs(secs);
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("victory_hle::modules::gameinput=debug")
+            .with_test_writer()
+            .try_init();
+        let mut host = Host::default();
+        let mut last = String::new();
+        let start = Instant::now();
+        while Instant::now() < end {
+            let mut line = String::new();
+            for slot in 0..PADS {
+                let xinput = host.xinput(slot).is_some();
+                let pad = host.pad(slot);
+                let from = match (pad, xinput) {
+                    (None, _) => "-",
+                    (Some(_), true) => "xinput",
+                    (Some(_), false) => "hid",
+                };
+                let pressed = pad.map(|p| p.buttons).unwrap_or(0);
+                line += &format!("[{slot}: {from} {pressed:#06x}] ");
+            }
+            line += &format!("hid pads: {}", super::dualsense::pads().len());
+            if line != last {
+                println!("{:6.1}s {line}", start.elapsed().as_secs_f32());
+                last = line;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1788,5 +2175,68 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn gta_kbm_maps_pc_keys_and_mouse_buttons_to_console_pad() {
+        let keys = vec![
+            key(b'W'),
+            key(b'D'),
+            key(0xA0), // Left Shift -> A (Sprint)
+            key(0x20), // Space -> X (Jump / Handbrake)
+            key(b'F'), // F -> Y (Enter/Exit Vehicle)
+            key(b'R'), // R -> B (Reload / Melee)
+            key(b'Q'), // Q -> RB (Cover)
+            key(0x09), // Tab -> LB (Weapon Wheel)
+            key(b'E'), // E -> D-Pad Right (Interact)
+            key(b'V'), // V -> View (Camera)
+            key(b'C'), // C -> R3 (Look Behind)
+            key(0xA2), // Left Ctrl -> L3 (Stealth)
+        ];
+        let pad = fallback_with(
+            &keys,
+            Mouse {
+                left: true,
+                right: true,
+                middle: true,
+                x1: true,
+                x2: true,
+                x: 0.4,
+                y: -0.25,
+            },
+            true,
+        );
+        assert_eq!(pad.left_x, 1.0);
+        assert_eq!(pad.left_y, 1.0);
+        assert_eq!(pad.right_trigger, 1.0);
+        assert_eq!(pad.left_trigger, 1.0);
+        assert_eq!(pad.right_x, 0.4);
+        assert_eq!(pad.right_y, -0.25);
+        for bit in [
+            A,
+            B,
+            X,
+            Y,
+            RIGHT,
+            VIEW,
+            LEFT_SHOULDER,
+            RIGHT_SHOULDER,
+            LEFT_STICK,
+            RIGHT_STICK,
+        ] {
+            assert_ne!(pad.buttons & bit, 0, "expected bit {bit:#x} to be set");
+        }
+    }
+
+    #[test]
+    fn env_truthy_accepts_expected_values() {
+        assert!(env_truthy(Some("1")));
+        assert!(env_truthy(Some(" true ")));
+        assert!(env_truthy(Some("YES")));
+        assert!(env_truthy(Some("On")));
+        assert!(!env_truthy(None));
+        assert!(!env_truthy(Some("")));
+        assert!(!env_truthy(Some("0")));
+        assert!(!env_truthy(Some("false")));
     }
 }

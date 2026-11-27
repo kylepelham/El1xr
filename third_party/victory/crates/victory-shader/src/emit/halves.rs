@@ -285,7 +285,15 @@ impl<'a> Lower<'a> {
     /// compare (whose result would depend on the host's denormal mode).
     pub(super) fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        let zero_factor = self.s.m.const_f32_bits(a).is_some_and(|bits| bits & 0x7F80_0000 == 0)
+            || self.s.m.const_f32_bits(b).is_some_and(|bits| bits & 0x7F80_0000 == 0);
+        if zero_factor {
+            return self.s.m.f32(0);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if a == b {
+            return m;
+        }
         let exp = self.s.m.i32(0x7F80_0000);
         let izero = self.s.m.i32(0);
         let is_zero = |l: &mut Self, v: V| {
@@ -321,10 +329,20 @@ impl<'a> Lower<'a> {
     /// the legacy rule that a zero factor makes the product +0 whatever the
     /// other factor is (an infinity or no number too).
     pub(super) fn legacy_fmad(&mut self, a: V, b: V, acc: V) -> V {
-        let (a, b, acc) = (self.ftz(a), self.ftz(b), self.ftz(acc));
+        let zero_factor = self.s.m.const_f32_bits(a).is_some_and(|bits| bits & 0x7F80_0000 == 0)
+            || self.s.m.const_f32_bits(b).is_some_and(|bits| bits & 0x7F80_0000 == 0);
+        let acc = self.ftz(acc);
         let c = self.cur;
-        let fused = self.fmad(a, b, acc);
         let zero = self.s.m.f32(0);
+        if zero_factor {
+            return self.s.m.bin(c, Bin::Add, zero, acc);
+        }
+        if a == b {
+            let a = self.ftz(a);
+            return self.fmad(a, a, acc);
+        }
+        let (a, b) = (self.ftz(a), self.ftz(b));
+        let fused = self.fmad(a, b, acc);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -352,6 +370,24 @@ pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+    control_regions(st, true)
+}
+
+/// Blocks every thread of the group reaches: not inside any branch, wave-wide ones included.
+/// A wave-wide branch is uniform for one console wave and not for the other wave of a group.
+pub(super) fn every_thread_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let n = st.exits.len();
+    let mut all = vec![true; n];
+    for (_, region) in control_regions(st, false)? {
+        for b in (0..n).filter(|&b| region[b]) {
+            all[b] = false;
+        }
+    }
+    Some(all)
+}
+
+/// Per-lane branch regions. `skip_wide` leaves out branches the wave takes together.
+fn control_regions(st: &Structured, skip_wide: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -392,7 +428,9 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        if (skip_wide && st.wide.contains(&d))
+            || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+        {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it

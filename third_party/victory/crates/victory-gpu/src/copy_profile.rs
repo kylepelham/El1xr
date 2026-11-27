@@ -1,19 +1,22 @@
-//! Opt-in per-shadow and per-reason copy-volume profiler (`VICTORY_COPY_PROFILE=1`).
+//! Copy-volume profile of shadow refreshes (`VICTORY_COPY_PROFILE=1`, off by default).
 //!
-//! Zero cost when unset (single cached boolean check). When enabled, logs a
-//! breakdown of every byte counted in `PREPARING[1]` alongside the frame line:
-//! - split by source (`Shadow::update` by shadow kind, `Batch::flush_fills`, `Step::Copy`)
-//! - split by dirty reason (`first_ever`, `mask_4k`, `whole_64k_view`, `whole_64k_other`,
-//!   `unwatched`, plus `partial_unmarked` pages whose `copied` stamp was not advanced)
-//! - `copy_changed` scan bytes vs actually differing bytes
-//! - top 15 individual shadows by MB/frame copied.
+//! Splits the bytes the submissions copy out of title memory per frame by where
+//! they go (shadow kind, batch fills, `Step::Copy`), by why a page was taken
+//! (never copied, 4 KiB sub-pages, a whole 64 KiB page of view memory or of
+//! other memory, an unwatched copy), how much of a `copy_changed` compare
+//! really differed, and the shadows that copy the most. Off, every hook is one
+//! cached boolean test.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
+const KERNEL_PAGE: u64 = 4096;
+const PAGE: u64 = 64 * 1024;
+const TOP: usize = 15;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
 pub(crate) enum ShadowKind {
     BufCard = 0,
     BufHost = 1,
@@ -23,9 +26,16 @@ pub(crate) enum ShadowKind {
     WinHost = 5,
 }
 
-impl ShadowKind {
-    const COUNT: usize = 6;
+const KINDS: [ShadowKind; 6] = [
+    ShadowKind::BufCard,
+    ShadowKind::BufHost,
+    ShadowKind::WinTransient,
+    ShadowKind::WinCard,
+    ShadowKind::WinRebar,
+    ShadowKind::WinHost,
+];
 
+impl ShadowKind {
     const fn label(self) -> &'static str {
         match self {
             Self::BufCard => "buf_card",
@@ -38,56 +48,31 @@ impl ShadowKind {
     }
 }
 
-/// Exact reason `stale_mask` fell back to a whole 64 KiB page.
+/// Why a page was taken by a watched refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
+enum Reason {
+    First = 0,
+    Mask4k = 1,
+    WholeView = 2,
+    WholeOther = 3,
+    Unwatched = 4,
+}
+
+const REASONS: [&str; 5] = [
+    "first_ever",
+    "mask_4k",
+    "whole_64k_view",
+    "whole_64k_other",
+    "unwatched",
+];
+
+/// Why `watch::stale_mask` fell back to the whole 64 KiB page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WholeWhy {
     WholeStamp = 0,
     NoSubsPart = 1,
     ZeroMask = 2,
     NoWatch4k = 3,
-}
-
-/// Whether watched refreshes expand partial edge pages to whole 64 KiB page
-/// boundaries (clamped to `[start, end)` and skipping any edge page that
-/// overlaps pending shader writes) so `copied` timestamps advance instead of
-/// re-copying the same partial pages on every submission (`VICTORY_EXPAND_PARTIAL=0`
-/// restores partial-only clipping).
-pub(crate) fn expand_partial_pages() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EXPAND_PARTIAL").is_none_or(|v| v != "0"))
-}
-
-/// Computes `(eff_from, eff_to)` for a watched refresh of `[from, to)` inside
-/// a shadow covering `[start, end)`. Expands partial first/last 64 KiB pages to
-/// whole page boundaries (clamped to `[start, end)`) whenever `allow_expand` is
-/// true, `VICTORY_EXPAND_PARTIAL` is not `"0"`, and `skip_busy` does not overlap
-/// that edge page.
-pub(crate) fn expand_bounds(
-    from: usize,
-    to: usize,
-    start: usize,
-    end: usize,
-    skip_busy: &[(usize, usize)],
-    allow_expand: bool,
-) -> (usize, usize) {
-    if !allow_expand || from >= to || !expand_partial_pages() {
-        return (from, to);
-    }
-    const PAGE: usize = crate::watch::PAGE;
-    let first_page = from / PAGE;
-    let last_page = (to - 1) / PAGE;
-    let first_lo = (first_page * PAGE).max(start);
-    let first_hi = ((first_page + 1) * PAGE).min(end);
-    let last_lo = (last_page * PAGE).max(start);
-    let last_hi = ((last_page + 1) * PAGE).min(end);
-    let can_first =
-        from > first_lo && !skip_busy.iter().any(|&(a, e)| a < first_hi && e > first_lo);
-    let can_last = to < last_hi && !skip_busy.iter().any(|&(a, e)| a < last_hi && e > last_lo);
-    (
-        if can_first { first_lo } else { from },
-        if can_last { last_hi } else { to },
-    )
 }
 
 pub(crate) fn enabled() -> bool {
@@ -97,290 +82,259 @@ pub(crate) fn enabled() -> bool {
 
 static FILL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static STEP_COPY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
-static KIND_BYTES: [AtomicU64; ShadowKind::COUNT] =
-    [const { AtomicU64::new(0) }; ShadowKind::COUNT];
-static KIND_CALLS: [AtomicU64; ShadowKind::COUNT] =
-    [const { AtomicU64::new(0) }; ShadowKind::COUNT];
-static KIND_US: [AtomicU64; ShadowKind::COUNT] = [const { AtomicU64::new(0) }; ShadowKind::COUNT];
-
-// Reason counters: [bytes, pages_or_calls]
-// 0: first_ever, 1: mask_4k, 2: whole_view, 3: whole_other, 4: unwatched, 5: partial_unmarked
-static REASON_BYTES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-static REASON_COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-
-// Whole-page fallback sub-reasons (pages)
+static KIND: [[AtomicU64; 3]; 6] = [const { [const { AtomicU64::new(0) }; 3] }; 6];
+static REASON: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
 static WHOLE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-// copy_changed: [read_bytes, changed_bytes]
 static DIFF: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-#[derive(Default, Clone, Copy)]
-pub(crate) struct UpdateCounts {
-    pub(crate) first_bytes: u64,
-    pub(crate) first_pages: u64,
-    pub(crate) mask4k_bytes: u64,
-    pub(crate) mask4k_pages: u64,
-    pub(crate) whole_view_bytes: u64,
-    pub(crate) whole_view_pages: u64,
-    pub(crate) whole_other_bytes: u64,
-    pub(crate) whole_other_pages: u64,
-    pub(crate) unwatched_bytes: u64,
-    pub(crate) partial_unmarked_bytes: u64,
-    pub(crate) partial_unmarked_pages: u64,
+/// One refresh on this thread: reason bytes (upper bound: whole 64 KiB page or
+/// its 4 KiB sub-pages), `copy_changed` bytes read and differing, view memory.
+#[derive(Clone, Copy, Default)]
+struct Refresh {
+    reason: [u64; 5],
+    diff: [u64; 2],
+    view: bool,
 }
 
-#[derive(Clone, Copy)]
-struct ShadowEntry {
+thread_local! {
+    static NOW: Cell<Refresh> = const { Cell::new(Refresh { reason: [0; 5], diff: [0; 2], view: false }) };
+}
+
+#[derive(Clone, Copy, Default)]
+struct Entry {
     start: u64,
     len: u64,
-    kind: ShadowKind,
-    is_view: bool,
+    kind: Option<ShadowKind>,
+    view: bool,
     calls: u64,
+    asked: u64,
     bytes: u64,
     us: u64,
-    first_bytes: u64,
-    mask4k_bytes: u64,
-    whole_view_bytes: u64,
-    whole_other_bytes: u64,
-    unwatched_bytes: u64,
-    partial_unmarked_bytes: u64,
-    diff_read: u64,
-    diff_changed: u64,
-    sum_ask: u64,
+    reason: [u64; 5],
+    diff: [u64; 2],
 }
 
-static SHADOWS: Mutex<Option<HashMap<u64, ShadowEntry>>> = Mutex::new(None);
+static SHADOWS: Mutex<Option<HashMap<u64, Entry>>> = Mutex::new(None);
 
-pub(crate) fn note_fill(bytes: usize, us: u64) {
-    if !enabled() || bytes == 0 {
+/// A refresh starts on this thread; `view` when it is view memory.
+pub(crate) fn begin(view: bool) {
+    NOW.with(|c| {
+        c.set(Refresh {
+            view,
+            ..Refresh::default()
+        })
+    });
+}
+
+/// Why a page with last copy `prev` (`0`: never) and sub-page `mask` was
+/// taken, and its bytes at most.
+fn classify(prev: u64, mask: Option<u16>, view: bool) -> (Reason, u64) {
+    match mask {
+        _ if prev == 0 => (Reason::First, PAGE),
+        Some(m) => (Reason::Mask4k, u64::from(m.count_ones()) * KERNEL_PAGE),
+        None if view => (Reason::WholeView, PAGE),
+        None => (Reason::WholeOther, PAGE),
+    }
+}
+
+/// A watched refresh takes `page` (last copied at `prev`, `0` never) with
+/// `mask` 4 KiB sub-pages (`None`: the whole page).
+pub(crate) fn page(prev: u64, mask: Option<u16>) {
+    if !enabled() {
         return;
     }
-    FILL[0].fetch_add(1, Relaxed);
-    FILL[1].fetch_add(bytes as u64, Relaxed);
-    FILL[2].fetch_add(us, Relaxed);
+    NOW.with(|c| {
+        let mut r = c.get();
+        let (reason, bytes) = classify(prev, mask, r.view);
+        r.reason[reason as usize] += bytes;
+        c.set(r);
+    });
 }
 
-pub(crate) fn note_step_copy(bytes: usize, us: u64) {
-    if !enabled() || bytes == 0 {
-        return;
-    }
-    STEP_COPY[0].fetch_add(1, Relaxed);
-    STEP_COPY[1].fetch_add(bytes as u64, Relaxed);
-    STEP_COPY[2].fetch_add(us, Relaxed);
-}
-
-pub(crate) fn note_whole_why(why: WholeWhy) {
+pub(crate) fn whole_why(why: WholeWhy) {
     if enabled() {
         WHOLE_WHY[why as usize].fetch_add(1, Relaxed);
     }
 }
 
-thread_local! {
-    static TL_DIFF: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-pub(crate) fn begin_diff() {
-    if enabled() {
-        TL_DIFF.with(|c| c.set((0, 0)));
-    }
-}
-
-pub(crate) fn note_diff(read: usize, changed: usize) {
+/// `copy_changed` read `read` bytes, of which `changed` differed.
+pub(crate) fn diff(read: usize, changed: usize) {
     if !enabled() || read == 0 {
         return;
     }
     DIFF[0].fetch_add(read as u64, Relaxed);
     DIFF[1].fetch_add(changed as u64, Relaxed);
-    TL_DIFF.with(|c| {
-        let (r, ch) = c.get();
-        c.set((r + read as u64, ch + changed as u64));
+    NOW.with(|c| {
+        let mut r = c.get();
+        r.diff[0] += read as u64;
+        r.diff[1] += changed as u64;
+        c.set(r);
     });
 }
 
+pub(crate) fn fill(bytes: usize, us: u64) {
+    if enabled() && bytes > 0 {
+        add3(&FILL, bytes as u64, us);
+    }
+}
+
+pub(crate) fn step_copy(bytes: usize, us: u64) {
+    if enabled() && bytes > 0 {
+        add3(&STEP_COPY, bytes as u64, us);
+    }
+}
+
+fn add3(at: &[AtomicU64; 3], bytes: u64, us: u64) {
+    at[0].fetch_add(1, Relaxed);
+    at[1].fetch_add(bytes, Relaxed);
+    at[2].fetch_add(us, Relaxed);
+}
+
+/// The refresh begun by [`begin`] ends: `copied` bytes of the `asked` ones,
+/// `unwatched` when copied whole without the write watch.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn note_shadow_update(
+pub(crate) fn end(
     id: u64,
     start: u64,
     len: u64,
     kind: ShadowKind,
-    is_view: bool,
-    ask_len: usize,
+    asked: usize,
     copied: usize,
     us: u64,
-    counts: UpdateCounts,
+    unwatched: bool,
 ) {
-    if !enabled() || copied == 0 {
+    let mut r = NOW.with(|c| c.take());
+    if copied == 0 {
         return;
     }
-    let k = kind as usize;
-    KIND_BYTES[k].fetch_add(copied as u64, Relaxed);
-    KIND_CALLS[k].fetch_add(1, Relaxed);
-    KIND_US[k].fetch_add(us, Relaxed);
-
-    REASON_BYTES[0].fetch_add(counts.first_bytes, Relaxed);
-    REASON_COUNT[0].fetch_add(counts.first_pages, Relaxed);
-    REASON_BYTES[1].fetch_add(counts.mask4k_bytes, Relaxed);
-    REASON_COUNT[1].fetch_add(counts.mask4k_pages, Relaxed);
-    REASON_BYTES[2].fetch_add(counts.whole_view_bytes, Relaxed);
-    REASON_COUNT[2].fetch_add(counts.whole_view_pages, Relaxed);
-    REASON_BYTES[3].fetch_add(counts.whole_other_bytes, Relaxed);
-    REASON_COUNT[3].fetch_add(counts.whole_other_pages, Relaxed);
-    REASON_BYTES[4].fetch_add(counts.unwatched_bytes, Relaxed);
-    if counts.unwatched_bytes > 0 {
-        REASON_COUNT[4].fetch_add(1, Relaxed);
+    if unwatched {
+        r.reason[Reason::Unwatched as usize] += copied as u64;
     }
-    REASON_BYTES[5].fetch_add(counts.partial_unmarked_bytes, Relaxed);
-    REASON_COUNT[5].fetch_add(counts.partial_unmarked_pages, Relaxed);
-
-    let mut guard = SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    let e = map.entry(id).or_insert(ShadowEntry {
-        start,
-        len,
-        kind,
-        is_view,
-        calls: 0,
-        bytes: 0,
-        us: 0,
-        first_bytes: 0,
-        mask4k_bytes: 0,
-        whole_view_bytes: 0,
-        whole_other_bytes: 0,
-        unwatched_bytes: 0,
-        partial_unmarked_bytes: 0,
-        diff_read: 0,
-        diff_changed: 0,
-        sum_ask: 0,
-    });
-    let (diff_r, diff_c) = TL_DIFF.with(|c| c.replace((0, 0)));
+    add3(&KIND[kind as usize], copied as u64, us);
+    for (i, &b) in r.reason.iter().enumerate() {
+        if b > 0 {
+            REASON[i][0].fetch_add(b, Relaxed);
+            REASON[i][1].fetch_add(1, Relaxed);
+        }
+    }
+    let mut map = SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry(id).or_default();
+    e.start = start;
+    e.len = len;
+    e.kind = Some(kind);
+    e.view |= r.view;
     e.calls += 1;
+    e.asked += asked as u64;
     e.bytes += copied as u64;
     e.us += us;
-    e.first_bytes += counts.first_bytes;
-    e.mask4k_bytes += counts.mask4k_bytes;
-    e.whole_view_bytes += counts.whole_view_bytes;
-    e.whole_other_bytes += counts.whole_other_bytes;
-    e.unwatched_bytes += counts.unwatched_bytes;
-    e.partial_unmarked_bytes += counts.partial_unmarked_bytes;
-    e.diff_read += diff_r;
-    e.diff_changed += diff_c;
-    e.sum_ask += ask_len as u64;
+    for i in 0..5 {
+        e.reason[i] += r.reason[i];
+    }
+    e.diff[0] += r.diff[0];
+    e.diff[1] += r.diff[1];
 }
 
+fn take3(at: &[AtomicU64; 3]) -> [u64; 3] {
+    [
+        at[0].swap(0, Relaxed),
+        at[1].swap(0, Relaxed),
+        at[2].swap(0, Relaxed),
+    ]
+}
+
+/// The profile lines, every meter period of `frames` frames.
 pub(crate) fn line(frames: f64) {
     if !enabled() || frames <= 0.0 {
         return;
     }
     let mb = |b: u64| b as f64 / 1e6 / frames;
-    let ms = |u: u64| u as f64 / 1e3 / frames;
+    let ms = |us: u64| us as f64 / 1e3 / frames;
     let per = |n: u64| n as f64 / frames;
-
-    let fill_n = FILL[0].swap(0, Relaxed);
-    let fill_b = FILL[1].swap(0, Relaxed);
-    let fill_u = FILL[2].swap(0, Relaxed);
-    let sc_n = STEP_COPY[0].swap(0, Relaxed);
-    let sc_b = STEP_COPY[1].swap(0, Relaxed);
-    let sc_u = STEP_COPY[2].swap(0, Relaxed);
-
-    let kinds = [
-        ShadowKind::BufCard,
-        ShadowKind::BufHost,
-        ShadowKind::WinTransient,
-        ShadowKind::WinCard,
-        ShadowKind::WinRebar,
-        ShadowKind::WinHost,
-    ];
-    let mut kind_parts = Vec::with_capacity(ShadowKind::COUNT);
-    let mut shadow_total_b = 0u64;
-    for k in kinds {
-        let b = KIND_BYTES[k as usize].swap(0, Relaxed);
-        let n = KIND_CALLS[k as usize].swap(0, Relaxed);
-        let u = KIND_US[k as usize].swap(0, Relaxed);
-        shadow_total_b += b;
+    let [fill_n, fill_b, fill_us] = take3(&FILL);
+    let [step_n, step_b, step_us] = take3(&STEP_COPY);
+    let mut kinds = Vec::new();
+    let mut shadows = 0;
+    for kind in KINDS {
+        let [n, b, us] = take3(&KIND[kind as usize]);
+        shadows += b;
         if b > 0 {
-            kind_parts.push(format!(
+            kinds.push(format!(
                 "{} {:.1} MB ({:.0}x, {:.2} ms)",
-                k.label(),
+                kind.label(),
                 mb(b),
                 per(n),
-                ms(u)
+                ms(us)
             ));
         }
     }
     tracing::info!(
-        "copy_profile/frame: total {:.1} MB (shadows {:.1} MB [{}]; fills {:.1} MB {:.0}x {:.2} ms; step_copy {:.1} MB {:.0}x {:.2} ms)",
-        mb(shadow_total_b + fill_b + sc_b),
-        mb(shadow_total_b),
-        kind_parts.join(", "),
+        "copy profile per frame (VICTORY_COPY_PROFILE=1): {:.1} MB copied; shadows {:.1} MB [{}]; fills {:.1} MB ({:.0}x, {:.2} ms); step copies {:.1} MB ({:.0}x, {:.2} ms)",
+        mb(shadows + fill_b + step_b),
+        mb(shadows),
+        kinds.join(", "),
         mb(fill_b),
         per(fill_n),
-        ms(fill_u),
-        mb(sc_b),
-        per(sc_n),
-        ms(sc_u),
+        ms(fill_us),
+        mb(step_b),
+        per(step_n),
+        ms(step_us),
     );
-
-    let rb = [0, 1, 2, 3, 4, 5].map(|i| REASON_BYTES[i].swap(0, Relaxed));
-    let rc = [0, 1, 2, 3, 4, 5].map(|i| REASON_COUNT[i].swap(0, Relaxed));
-    let ww = [0, 1, 2, 3].map(|i| WHOLE_WHY[i].swap(0, Relaxed));
-    let diff_r = DIFF[0].swap(0, Relaxed);
-    let diff_c = DIFF[1].swap(0, Relaxed);
+    let reasons: Vec<String> = REASONS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let b = REASON[i][0].swap(0, Relaxed);
+            let n = REASON[i][1].swap(0, Relaxed);
+            format!("{name} {:.1} MB ({:.0}x)", mb(b), per(n))
+        })
+        .collect();
+    let why = [0, 1, 2, 3].map(|i| per(WHOLE_WHY[i].swap(0, Relaxed)));
+    let (read, changed) = (DIFF[0].swap(0, Relaxed), DIFF[1].swap(0, Relaxed));
     tracing::info!(
-        "copy_profile reasons/frame: first_ever {:.1} MB ({:.0} pg), mask_4k {:.1} MB ({:.0} pg), \
-         whole_64k_view {:.1} MB ({:.0} pg), whole_64k_other {:.1} MB ({:.0} pg), \
-         unwatched {:.1} MB ({:.0}x), partial_unmarked {:.1} MB ({:.0} pg); \
-         whole_why(pg): whole_stamp {:.0}, no_subs {:.0}, zero_mask {:.0}, no_watch4k {:.0}; \
-         copy_changed: read {:.1} MB -> diff {:.1} MB",
-        mb(rb[0]),
-        per(rc[0]),
-        mb(rb[1]),
-        per(rc[1]),
-        mb(rb[2]),
-        per(rc[2]),
-        mb(rb[3]),
-        per(rc[3]),
-        mb(rb[4]),
-        per(rc[4]),
-        mb(rb[5]),
-        per(rc[5]),
-        per(ww[0]),
-        per(ww[1]),
-        per(ww[2]),
-        per(ww[3]),
-        mb(diff_r),
-        mb(diff_c),
+        "copy profile reasons per frame (page bound): {}; whole pages from the 4 KiB watch: newer whole stamp {:.0}, no sub-page stamps {:.0}, empty mask {:.0}, watch off {:.0}; copy_changed read {:.1} MB, differing {:.1} MB",
+        reasons.join(", "),
+        why[0],
+        why[1],
+        why[2],
+        why[3],
+        mb(read),
+        mb(changed),
     );
-
-    let entries = SHADOWS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut list: Vec<(u64, ShadowEntry)> = entries.into_iter().flatten().collect();
+    let taken = SHADOWS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut list: Vec<(u64, Entry)> = taken.into_iter().flatten().collect();
     list.sort_unstable_by_key(|&(_, e)| std::cmp::Reverse(e.bytes));
-    for (id, e) in list.into_iter().take(15) {
-        let avg_ask_kb = if e.calls > 0 {
-            e.sum_ask as f64 / e.calls as f64 / 1024.0
-        } else {
-            0.0
-        };
+    for (id, e) in list.into_iter().take(TOP) {
         tracing::info!(
-            "  copy_profile top: id={id} {:#x}+{:#x} ({:.2} MB) {} view={} | {:.1} MB/f ({:.1}x/f, {:.2} ms/f, avg_ask {:.0} KB) \
-             [first {:.1}, 4k {:.1}, w_view {:.1}, w_oth {:.1}, unw {:.1}, part_unm {:.1}; diff {:.1}/{:.1} MB]",
+            "  copy profile top: copy {id} {:#x}+{:#x} ({:.2} MB) {} view={} | {:.1} MB/frame in {:.1} refreshes ({:.2} ms, {:.0} KB asked each) [first {:.1}, 4k {:.1}, whole view {:.1}, whole other {:.1}, unwatched {:.1}; differing {:.1} of {:.1} MB compared]",
             e.start,
             e.len,
-            e.len as f64 / (1 << 20) as f64,
-            e.kind.label(),
-            u8::from(e.is_view),
+            e.len as f64 / f64::from(1 << 20),
+            e.kind.map_or("?", ShadowKind::label),
+            u8::from(e.view),
             mb(e.bytes),
             per(e.calls),
             ms(e.us),
-            avg_ask_kb,
-            mb(e.first_bytes),
-            mb(e.mask4k_bytes),
-            mb(e.whole_view_bytes),
-            mb(e.whole_other_bytes),
-            mb(e.unwatched_bytes),
-            mb(e.partial_unmarked_bytes),
-            mb(e.diff_changed),
-            mb(e.diff_read),
+            e.asked as f64 / e.calls.max(1) as f64 / 1024.0,
+            mb(e.reason[0]),
+            mb(e.reason[1]),
+            mb(e.reason[2]),
+            mb(e.reason[3]),
+            mb(e.reason[4]),
+            mb(e.diff[1]),
+            mb(e.diff[0]),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_are_sorted_by_reason_and_sized_by_mask() {
+        assert_eq!(classify(0, Some(1), true), (Reason::First, PAGE));
+        assert_eq!(classify(5, Some(0b101), false), (Reason::Mask4k, 2 * KERNEL_PAGE));
+        assert_eq!(classify(5, None, true), (Reason::WholeView, PAGE));
+        assert_eq!(classify(5, None, false), (Reason::WholeOther, PAGE));
     }
 }

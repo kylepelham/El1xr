@@ -124,9 +124,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -159,7 +159,10 @@ pub fn loop_limit() -> u32 {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `auto`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -171,12 +174,26 @@ pub fn loop_limit() -> u32 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -331,6 +348,15 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -492,6 +518,37 @@ thread_local! {
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Meet sites the face-relocation compute emitted, or 0 before it is translated.
+pub fn defrag_meet_sites() -> u32 {
+    lower::meet_sites()
+}
+
+/// Shader LDS reads and writes that received their own half-meet.
+pub fn defrag_lds_sites() -> (u32, u32) {
+    lower::meet_lds_sites()
+}
+
+/// One logical wave per group (64 threads), with a validated wave32 PSO on RTX.
+fn is_scene_kernel(io: &crate::native::StageIo, digest: [u8; 16]) -> bool {
+    matches!(io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && matches!(
+            digest,
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                // CS_Visibility
+                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                // CS_Tree_BatchCull
+                | [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57]
+                // CS_Tree_BatchCull_ImposterOnly
+                | [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82]
+                // CS_TransmissionVolumetrics_Tiled
+                | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                // CS_TransmissionVolumetrics_Tiled_LocalLights
+                | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                // CS_CollisionRaytraced
+                | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
+        )
+}
+
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
 /// host; where an approximate form translates the program, the paired form instead if it
 /// does.
@@ -586,18 +643,36 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // One logical wave per group, with a wave32 PSO on RTX. The particle
+        // light-atlas shaders that reset the card are not in this list.
+        // Explicit policy wins.
+        let scene_kernel = is_scene_kernel(&native.io, c.digest);
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.
-        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        let wide_last = wide_option.as_ref().is_some_and(|v| v == "last");
+        // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
+        // divergent LDS is read and written in one region, so it only lowers
+        // once that region is taken by both halves of a wave. The other wave
+        // of the group does not wait (`with_half_meets`). Not the global switch.
+        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
+        // are dropped and a run can be compared with one where it executes.
+        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        let defrag = !defrag_off
+            && c.digest
+                == [
+                    0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a,
+                    0xa1, 0x23, 0xc6,
+                ];
         // `VICTORY_WAVE32_NVIDIA=1` ([`nvidia`]): a compute program of an `ACCC` container
         // stopped at a lane mask exchanged where not every lane runs gets its active-lane
         // loop taken wave-wide (a single guest wave can iterate it until both host halves are
         // done; [`widen`] checks the latch and the convergence). Unless `VICTORY_WAVE_WIDE`
         // is set: explicit policy wins.
         let driver_loop = nvidia::enabled()
-            && std::env::var_os("VICTORY_WAVE_WIDE").is_none()
+            && wide_option.is_none()
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -647,7 +722,7 @@ fn emit_forms(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || defrag {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -655,7 +730,11 @@ fn emit_forms(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop && !wide_on);
+                        let again = if defrag {
+                            lower::with_half_meets(|| widen(c, native, base, why, false))
+                        } else {
+                            widen(c, native, base, why, driver_loop && !wide_on)
+                        };
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again;
@@ -866,6 +945,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // One program only: two console waves, and a meet per wave instead of a group barrier.
+        crate::native::StageIo::Cs(cs)
+            if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -1187,6 +1269,16 @@ mod tests {
     use super::parse_loop_limit;
 
     #[test]
+    fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+        for value in [None, Some("auto"), Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 3);
+        }
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
+    }
+
+    #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);
@@ -1272,6 +1364,162 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// A pixel shader with `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (bit 12)
+    /// and no depth/stencil export emits DXIL `EARLY_DEPTH` (`[earlydepthstencil]`)
+    /// without setting any `SFI0` bit, and validates cleanly. When depth is
+    /// exported, `EARLY_DEPTH` is suppressed so validation still succeeds.
+    #[test]
+    fn depth_before_shader_emits_valid_early_depth_flag() {
+        let emit_ps = |db_shader_control: u32, depth_export: bool| -> Vec<u8> {
+            let words: Vec<u32> = if depth_export {
+                vec![
+                    0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                    0xF800_1881,
+                    0x0000_0000, // exp mrtz v0, off, off, off done vm
+                    0xBF81_0000,
+                ]
+            } else {
+                vec![
+                    0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                    0xF800_180F,
+                    0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
+                    0xBF81_0000,
+                ]
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let out_el = if depth_export {
+                SigElement {
+                    name: "SV_Depth".into(),
+                    index: 0,
+                    kind: 17,
+                    comp: 9,
+                    interp: 0,
+                    row: None,
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                }
+            } else {
+                SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0xF,
+                    half: false,
+                }
+            };
+            let osg1 = container::signature(&[out_el], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            out.dxil
+        };
+
+        let plain = emit_ps(0, false);
+        let early = emit_ps(1 << 12, false);
+        assert_ne!(plain, early, "DEPTH_BEFORE_SHADER should emit EARLY_DEPTH metadata");
+        let early_host = Container::parse(&early).unwrap();
+        let early_sfi0 =
+            u64::from_le_bytes(early_host.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_eq!(early_sfi0, 0, "EARLY_DEPTH has no SFI0 feature bit");
+
+        // Depth export with bit 12 set must suppress EARLY_DEPTH (identical to bit 12 clear).
+        let depth_plain = emit_ps(1, true);
+        let depth_with_bit12 = emit_ps((1 << 12) | 1, true);
+        assert_eq!(depth_plain, depth_with_bit12);
+    }
+
+    /// A pixel shader that kills lanes in whole-quad mode (`s_wqm`) and exports
+    /// two colour targets under the same live-lane guard translates cleanly:
+    /// the earlier colour export shares the final export's guard.
+    #[test]
+    fn live_quad_kill_with_multiple_colour_exports_translates() {
+        let words = [
+            0xBECC_037Eu32, // s_mov_b32 s76, exec_lo
+            0x7C28_00F2,    // v_cmpx_gt_f32 exec_lo, 1.0, v0
+            0x8A4C_7E4C,    // s_andn2_b32 s76, s76, exec_lo
+            0xBF84_0008,    // s_cbranch_scc0 -> end
+            0xBE81_094C,    // s_wqm_b32 s1, s76
+            0xBEFE_0301,    // s_mov_b32 exec_lo, s1
+            0x7E02_02F2,    // v_mov_b32 v1, 1.0
+            0xBEFE_034C,    // s_mov_b32 exec_lo, s76
+            0xF800_100F,
+            0x0101_0101,    // exp mrt0 v1, v1, v1, v1 vm (not done)
+            0xF800_181F,
+            0x0101_0101,    // exp mrt1 v1, v1, v1, v1 done vm
+            0xBF81_0000,    // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = |index, row| SigElement {
+            name: "SV_Target".into(),
+            index,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[target(0, 0), target(1, 1)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -2710,4 +2958,35 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    #[test]
+    fn scene_kernel_matches_only_allowlisted_one_wave_computes() {
+        use crate::native::ComputeIo;
+        let cs64 = StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [8, 8, 1],
+        });
+        let cs128 = StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [128, 1, 1],
+        });
+        let vs = StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let digests = [
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1],
+            [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c],
+            [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57],
+            [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82],
+            [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90],
+            [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6],
+            [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9],
+        ];
+        for d in digests {
+            assert!(is_scene_kernel(&cs64, d));
+            assert!(!is_scene_kernel(&cs128, d));
+            assert!(!is_scene_kernel(&vs, d));
+        }
+        assert!(!is_scene_kernel(&cs64, [0u8; 16]));
+    }
 }

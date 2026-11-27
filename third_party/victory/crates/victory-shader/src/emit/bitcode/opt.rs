@@ -165,7 +165,7 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => *v = f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             *a = f(*a);
             *b = f(*b);
@@ -439,7 +439,7 @@ impl Module {
                     };
                     return Some(self.k(ty, bits, r));
                 }
-                match (op, ka, kb) {
+                if let Some(v) = match (op, ka, kb) {
                     (
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
@@ -455,8 +455,67 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    (Bin::Sub | Bin::Xor, _, _) if a == b => Some(self.k(ty, bits, 0)),
                     _ => None,
+                } {
+                    return Some(v);
                 }
+                // Bitwise complement identities: `x & !x == 0`, `x | !x == -1`, `x ^ !x == -1`.
+                if matches!(op, Bin::And | Bin::Or | Bin::Xor) {
+                    let is_not = |v: V, target: V| -> bool {
+                        let V::Inst(j) = v else { return false };
+                        let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op else {
+                            return false;
+                        };
+                        (x == target && self.int_k(y).is_some_and(|k| k.1 == all))
+                            || (y == target && self.int_k(x).is_some_and(|k| k.1 == all))
+                    };
+                    if is_not(a, b) || is_not(b, a) {
+                        let r = if op == Bin::And { 0 } else { all };
+                        return Some(self.k(ty, bits, r));
+                    }
+                }
+                // Reassociate wrapping integer `Add`/`And`/`Or`/`Xor` with two constants:
+                // `(x op k1) op k2 -> x op (k1 op k2)` (also cancels double negation `!!c`).
+                if matches!(op, Bin::Add | Bin::And | Bin::Or | Bin::Xor) {
+                    let (inner, k2) = match (ka, kb) {
+                        (None, Some(k)) => (a, k),
+                        (Some(k), None) => (b, k),
+                        _ => return None,
+                    };
+                    let V::Inst(j) = inner else { return None };
+                    let Op::Bin(op2, x, y) = self.insts[j as usize].op else {
+                        return None;
+                    };
+                    if op2 != op {
+                        return None;
+                    }
+                    let (base, k1) = match (self.int_k(x), self.int_k(y)) {
+                        (None, Some((_, k))) => (x, k),
+                        (Some((_, k)), None) => (y, k),
+                        _ => return None,
+                    };
+                    let combined = match op {
+                        Bin::Add => k1.wrapping_add(k2) & all,
+                        Bin::And => k1 & k2,
+                        Bin::Or => k1 | k2,
+                        Bin::Xor => k1 ^ k2,
+                        _ => unreachable!(),
+                    };
+                    return match op {
+                        Bin::Add | Bin::Or | Bin::Xor if combined == 0 => Some(base),
+                        Bin::And if combined == all => Some(base),
+                        Bin::And if combined == 0 => Some(self.k(ty, bits, 0)),
+                        Bin::Or if combined == all => Some(self.k(ty, bits, all)),
+                        _ => {
+                            let kc = self.k(ty, bits, combined);
+                            self.insts[i as usize].op = Op::Bin(op, base, kc);
+                            *changed = true;
+                            None
+                        }
+                    };
+                }
+                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -506,23 +565,46 @@ impl Module {
                     return Some(self.bool(holds(0, 0, 32)));
                 }
                 // A bit widened and tested again is the bit.
-                if p == pred::NE
-                    && self.int_k(b).is_some_and(|k| k.1 == 0)
-                    && let V::Inst(z) = a
-                    && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
-                    && self.type_of(x) == ty
+                let zext_bit = |v: V| -> Option<V> {
+                    let V::Inst(z) = v else { return None };
+                    let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op else {
+                        return None;
+                    };
+                    (self.type_of(x) == ty).then_some(x)
+                };
+                if let Some(x) = zext_bit(a)
+                    && let Some((_, k)) = self.int_k(b)
+                    && matches!(
+                        (p, k),
+                        (pred::NE | pred::IUGT, 0) | (pred::EQ | pred::IUGE, 1)
+                    )
                 {
                     return Some(x);
                 }
                 None
             }
-            Op::Select(c, mut t, mut f) => {
+            Op::Select(mut c, mut t, mut f) => {
                 if let Some((_, c)) = self.int_k(c) {
                     return Some(if c != 0 { t } else { f });
                 }
+                // `select(!x, t, f) -> select(x, f, t)`: removes the inversion
+                // and lets inner selects under `x` collapse below.
+                let mut inner = false;
+                while let V::Inst(j) = c
+                    && let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op
+                {
+                    let flipped = match (self.int_k(x), self.int_k(y)) {
+                        (None, Some((1, 1))) => Some(x),
+                        (Some((1, 1)), None) => Some(y),
+                        _ => None,
+                    };
+                    let Some(next) = flipped else { break };
+                    c = next;
+                    std::mem::swap(&mut t, &mut f);
+                    inner = true;
+                }
                 // Under the same condition an inner select is one of its
                 // operands (two guarded writes of one register in a row).
-                let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
                     && c2 == c
@@ -617,6 +699,7 @@ impl Module {
             | Op::Select(..)
             | Op::Extract(..)
             | Op::Gep(..) => Effect::Pure,
+            Op::VolatileLoad(_) => Effect::Reads,
             Op::Load(p) => {
                 // A constant table reads the same whatever is stored.
                 let base = match *p {
@@ -657,6 +740,12 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // A size query stays where the lowering put it: AMD's D3D12
+            // compiler (amdxc64 32.0.32029.2010, RDNA4) crashes making the
+            // pipeline of some compute programs when one `getDimensions`
+            // serves the uses of another below it (29 of the title's
+            // `CS_RaytracingResolve` programs; RDNA2 makes them either way).
+            Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -1319,6 +1408,65 @@ mod tests {
     }
 
     #[test]
+    fn reassociation_complement_and_inverted_select_fold() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (zero, one, four, eight, all) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(4),
+            m.i32(8),
+            m.i32(u32::MAX),
+        );
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![four, four]);
+        // Self-cancellation: x - x = 0, x ^ x = 0.
+        let sub_self = m.bin(b, Bin::Sub, x, x);
+        let xor_self = m.bin(b, Bin::Xor, x, x);
+        // Complement identities: x & ~x = 0, x | ~x = -1.
+        let nx = m.bin(b, Bin::Xor, x, all);
+        let and_not = m.bin(b, Bin::And, x, nx);
+        let or_not = m.bin(b, Bin::Or, x, nx);
+        // Associative constant chains: (x + 4) + 8 -> x + 12; (x & 0xff) & 0x0f -> x & 0x0f.
+        let add1 = m.bin(b, Bin::Add, x, four);
+        let add2 = m.bin(b, Bin::Add, add1, eight);
+        let mff = m.i32(0xff);
+        let m0f = m.i32(0x0f);
+        let mask1 = m.bin(b, Bin::And, x, mff);
+        let mask2 = m.bin(b, Bin::And, mask1, m0f);
+        // Double boolean negation & inverted select collapsing an inner select:
+        // select(!c, select(c, x, y), add2) -> select(c, add2, y).
+        let c = m.cmp(b, pred::IULT, x, y);
+        let t = m.bool(true);
+        let nc = m.bin(b, Bin::Xor, c, t);
+        let nnc = m.bin(b, Bin::Xor, nc, t);
+        let z = m.cast(b, Cast::ZExt, nnc, i32t);
+        let z_eq1 = m.cmp(b, pred::EQ, z, one);
+        let inner = m.select(b, z_eq1, x, y);
+        let outer = m.select(b, nc, inner, add2);
+
+        m.call(b, writes, vec![sub_self, xor_self]);
+        m.call(b, writes, vec![and_not, or_not]);
+        m.call(b, writes, vec![outer, mask2]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0], vec![zero, zero]);
+        assert_eq!(st[1], vec![zero, all]);
+        // `add1` and `mask1` and `nc`/`nnc`/`z`/`z_eq1`/`inner` are all dead:
+        // body has 2 reads + add(x,12) + and(x,0xf) + cmp(x<y) + select(c,add,y) + 3 stores = 9.
+        assert_eq!(body(&m, b), 9);
+        m.write();
+    }
+
+    #[test]
     fn float_arithmetic_is_not_folded() {
         let Kit {
             mut m, b, writes, ..
@@ -1419,6 +1567,31 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write();
+    }
+
+    #[test]
+    fn a_size_query_is_not_reused() {
+        let Diamond {
+            k: Kit {
+                mut m, b, writes, ..
+            },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(fty);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let top = m.call(b, dims, vec![x, y]);
+        m.call(b, writes, vec![top, top]);
+        let again = m.call(then, dims, vec![x, y]);
+        m.call(then, writes, vec![again, again]);
+        m.optimise(REUSE);
+        assert_eq!(stores(&m, then), [[again, again]]);
+        assert_eq!(body(&m, then), 2);
         m.write();
     }
 
