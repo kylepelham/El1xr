@@ -141,6 +141,7 @@ pub fn run(
         );
     }
     show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
+    victory_hle::bvh_hook::install(&image)?; // VICTORY_BVH_HOOK=1 (LNX); off: nothing
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
     #[cfg(windows)]

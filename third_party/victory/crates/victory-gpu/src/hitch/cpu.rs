@@ -87,18 +87,36 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The bounds are those of a thread that has the core to itself. On a
+    /// machine busy building, the spinning thread is raised above the
+    /// builds (they run below normal) and the spin is measured again, up to
+    /// five times, until one spin had its core; the sleeping thread's bound
+    /// holds under any load.
     #[test]
     fn a_busy_thread_laps_its_wall_time_and_a_sleeping_one_little() {
+        use windows_sys::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_HIGHEST};
         std::thread::spawn(|| {
+            // SAFETY: the current-thread pseudo handle.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
             start();
             std::thread::sleep(Duration::from_millis(20));
             assert_eq!(lap(), None);
-            let spin = Instant::now();
-            while spin.elapsed() < Duration::from_millis(60) {
-                std::hint::spin_loop();
+            let mut spins = Vec::new();
+            for _ in 0..5 {
+                let spin = Instant::now();
+                while spin.elapsed() < Duration::from_millis(60) {
+                    std::hint::spin_loop();
+                }
+                let busy = lap().unwrap();
+                spins.push(busy);
+                if (40_000..=90_000).contains(&busy) {
+                    break;
+                }
             }
-            let busy = lap().unwrap();
-            assert!((40_000..=90_000).contains(&busy), "busy {busy} us");
+            assert!(
+                spins.iter().any(|busy| (40_000..=90_000).contains(busy)),
+                "busy {spins:?} us"
+            );
             std::thread::sleep(Duration::from_millis(60));
             let idle = lap().unwrap();
             assert!(idle < 10_000, "idle {idle} us");

@@ -1357,6 +1357,21 @@ fn target_changes(address: u64) -> &'static std::sync::atomic::AtomicU32 {
     &TARGET_CHANGES[(address >> 16) as usize % TARGET_BUCKETS]
 }
 
+/// (`VICTORY_LIST_READABLE_ONCE`, `crate::readable_once`) What [`alias_of`]
+/// goes by for title texture `this`: the count of targets that entered the
+/// table near its memory (0 for one it cannot alias, not placed).
+#[cfg(windows)]
+pub(crate) fn alias_stamp(this: This) -> u32 {
+    let r = resource(this);
+    if r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+        target_changes(r.data() as u64)
+            .load(std::sync::atomic::Ordering::Acquire)
+            .wrapping_add(1)
+    } else {
+        0
+    }
+}
+
 /// The host GPU wrote title texture `this` by a copy or resolve.
 #[cfg(windows)]
 pub(crate) fn mark_host_written(this: This) {
@@ -1382,6 +1397,7 @@ pub(crate) fn host_written_mark(this: This) -> bool {
 /// has none). Called under the staging table's lock.
 #[cfg(windows)]
 pub(crate) fn set_staged_first(this: This, first: u32) {
+    crate::readable_once::bump(this as usize);
     if !this.is_null() {
         resource(this)
             .host
@@ -1610,7 +1626,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                         .is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly {
-                host_texture_as(&r.desc, r.host.state, clear, true).ok()
+                host_texture_as(&r.desc, r.host.state, clear, true, false).ok()
             } else {
                 None
             };
@@ -1629,7 +1645,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => host_texture(&r.desc, r.host.state, clear, blockable(r)),
         };
         let texture = match texture {
             Ok(texture) => texture,
@@ -1680,6 +1696,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        crate::readable_once::bump(this as usize);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2996,15 +3013,28 @@ fn no_texture(code: HRESULT) -> NoTexture {
     }
 }
 
+/// Whether the host copy of `r` may lie in a block (`crate::texpool`): a
+/// texture the title places and fills from a layout the upload reads, so it
+/// is uploaded before it is read and a piece's old bytes are never seen.
+/// Source: uiliannn/VItoriaBr 5668b8bbdc.
+#[cfg(windows)]
+fn blockable(r: &Resource) -> bool {
+    crate::texpool::texture_heaps()
+        && r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        && fills(&r.desc)
+        && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags; `blockable`: see [`blockable`].
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    blockable: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
-    host_texture_as(desc, state, clear, false)
+    host_texture_as(desc, state, clear, false, blockable)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -3015,6 +3045,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
+    blockable: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -3065,6 +3096,25 @@ fn host_texture_as(
         }
         value
     });
+    // In a piece of a block (`VICTORY_TEXTURE_HEAPS=1`).
+    if blockable
+        && !reserved
+        && clear_value.is_none()
+        && d.sample_count <= 1
+        // SAFETY: the description has the host layout (as below).
+        && let Some(t) = unsafe {
+            crate::texpool::texture(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+            )
+        }
+    {
+        crate::host::name(&t, || {
+            format!("texture {}x{} f{} flags {:#x} in a block", d.width, d.height, d.format, d.flags)
+        });
+        return Ok(t);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -3276,6 +3326,8 @@ fn hand_out_resource(
             no_target: std::sync::atomic::AtomicU32::new(0),
         },
     });
+    #[cfg(windows)]
+    crate::readable_once::bump(std::ptr::from_ref::<Resource>(&resource) as usize);
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -3303,6 +3355,7 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::readable_once::bump(std::ptr::from_ref::<Resource>(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {

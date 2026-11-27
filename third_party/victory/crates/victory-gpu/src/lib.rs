@@ -18,6 +18,10 @@
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod barrier_skip;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod card_share;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod cold_skip;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -31,9 +35,15 @@ pub mod device;
 #[cfg(windows)]
 mod alloc_backoff;
 #[cfg(windows)]
+mod buffer_ahead;
+#[cfg(windows)]
 mod ambient;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod bake_ahead;
 #[cfg(windows)]
 mod draw;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod drop_why;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -43,6 +53,11 @@ mod flight_settle;
 pub mod frame;
 pub mod frametime;
 pub mod hitch;
+pub mod host_facts;
+#[cfg(windows)]
+mod card_constants;
+#[cfg(windows)]
+mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
@@ -64,18 +79,30 @@ mod relay_runs;
 #[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
+mod snap;
+#[cfg(windows)]
 mod scratch_spare;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod launch;
+#[cfg(windows)]
+mod indirect_fit;
 #[cfg(windows)]
 mod cores;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod popwatch;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
 pub mod list;
+#[cfg(windows)]
+pub mod native_rt;
+#[cfg(windows)]
+mod rt_bind;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -89,6 +116,8 @@ pub mod root;
 mod stretch;
 #[cfg(windows)]
 mod table_defer;
+#[cfg(windows)]
+mod readable_once;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
@@ -109,6 +138,10 @@ mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
+mod merge_runs;
+#[cfg(windows)]
 mod windowup;
 #[cfg(windows)]
 mod tiles;
@@ -117,6 +150,8 @@ pub mod signature;
 mod tex_check;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod texpool;
 #[cfg(windows)]
 mod texstore;
 #[cfg(windows)]

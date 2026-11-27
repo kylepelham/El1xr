@@ -54,6 +54,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+mod guard4k;
 mod holes;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
@@ -752,6 +753,7 @@ fn port6_count(what: usize, n: u64) {
 
 /// Renderer port #6's line of the frame lines, per frame.
 pub(crate) fn port_guard_line(frames: f64) {
+    guard4k::line(frames);
     if frames <= 0.0 {
         return;
     }
@@ -1174,6 +1176,9 @@ fn clean_set(block: usize, clean: bool) -> u64 {
     if let Some(part) = part_of(&CLEAN, block, clean) {
         part.0[block % PART].store(val, std::sync::atomic::Ordering::Release);
     }
+    if !clean && guard4k::on() {
+        guard4k::not_clean(block);
+    }
     val
 }
 
@@ -1194,6 +1199,11 @@ fn clean_set_range(from: usize, to: usize, clean: bool) -> u64 {
         if let Some(part) = part_of(&CLEAN, block, clean) {
             for b in block..stop {
                 part.0[b % PART].store(val, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if !clean && guard4k::on() {
+            for b in block..stop {
+                guard4k::not_clean(b);
             }
         }
         block = stop;
@@ -3675,6 +3685,15 @@ fn guard_shared(
     let mut uncommitted_until = first;
     let mut next_lazy = 0usize;
     let mut cursor = first;
+    // (feedcard) `VICTORY_GUARD_4K=1`: blocks whose open 4 KiB pages were noted written alone.
+    let mut pages_only: Vec<usize> = Vec::new();
+    let mut asked = 0;
+    let mut now = || {
+        if asked == 0 {
+            asked = next_asking();
+        }
+        asked
+    };
 
     while cursor < last {
         if let Some(clean_end) = g.clean.run_end_in(cursor, last) {
@@ -3762,6 +3781,13 @@ fn guard_shared(
                 for blk in d..prot_end {
                     let mut claims = Claims::none();
                     if claims.try_one(blk) && g.protected.contains(blk) && !g.clean.contains(blk) {
+                        if guard4k::on() {
+                            match guard4k::close(blk, &mut now) {
+                                guard4k::Closed::Failed => continue,
+                                guard4k::Closed::Pages { only: true } => pages_only.push(blk),
+                                guard4k::Closed::Pages { only: false } | guard4k::Closed::None => {}
+                            }
+                        }
                         let uncovered = if view_guard() {
                             cover_aliases_claimed(
                                 &g,
@@ -3823,6 +3849,9 @@ fn guard_shared(
 
     if let Some((rf, rt)) = run.take() {
         protect_claimed(&g, rf, rt, coalesce, alias_batch, &mut epochs);
+    }
+    if !pages_only.is_empty() {
+        written.retain(|b| pages_only.binary_search(b).is_err());
     }
     (written, epochs)
 }
@@ -4257,6 +4286,7 @@ fn note_protected(g: &Guards, from: usize, to: usize, mark_clean: bool) -> u64 {
         g.placeholder_absent.remove_range(from, to);
         absent_set_range(from, to, ABSENT_NONE);
     }
+    guard4k::ready(from, to);
     g.protected.insert_range(from, to);
     PROTECTED.set_range(from, to);
     VIEWS.set_range(from, to);
@@ -4663,6 +4693,12 @@ fn open_faulted(at: usize) -> (usize, bool) {
             return (0, writable(at));
         }
         if !g.aliased.contains(block) {
+            // (feedcard) `VICTORY_GUARD_4K=1`: the 4 KiB page alone.
+            if guard4k::on()
+                && let Some(answer) = guard4k::fault(&g, block, at)
+            {
+                return answer;
+            }
             if !g.protected.remove(block) {
                 return (0, writable(at));
             }
@@ -5243,7 +5279,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let ahead = guard_open_ahead();
-        if port_guard() {
+        if port_guard() || guard4k::on() {
             let (opened, already_writable) = open_faulted(at);
             if opened != 0 {
                 if ahead > 1 {
@@ -5290,6 +5326,7 @@ fn install() {
         watch_alias_batch(),
         port_guard(),
         guard_open_ahead(),
+        guard4k::on(),
     );
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| {

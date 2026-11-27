@@ -552,6 +552,9 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Re
     unsafe {
         std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), ptr, table.len() * 8);
         let l = &list.list;
+        // Stamped only here: a reader whose record is clean records nothing.
+        #[cfg(windows)]
+        crate::gpucost::mark(l, || "ours: indirect sanitize after writer");
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -606,6 +609,39 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
         ),
         dst,
     )
+}
+
+/// (El1xr) `VICTORY_SPLIT_AHEAD=1`: a dispatch split into parts
+/// ([`bound_split`]) whose record nothing the list has recorded so far lets
+/// its shaders write is clamped in the list's prelude with the other records
+/// clamped ahead ([`record_ahead`]) instead of by a pass of its own before it
+/// (default: in place, as before). In place, each of some 287 a frame was a dispatch of
+/// ours between two waits for every earlier shader write (1.49 ms of the
+/// card a frame in `VICTORY_GPU_COST`).
+pub(crate) fn split_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// Executes the [`SPLIT`] parts of a dispatch clamped into `records` at the
+/// byte `at`, the program's group base (root parameter `param`, word
+/// `dword`) set to each part's first group, and back to 0 after.
+pub(crate) fn execute_parts(
+    l: &ID3D12GraphicsCommandList,
+    (param, dword): (u32, u32),
+    signature: &ID3D12CommandSignature,
+    (records, at): (&ID3D12Resource, u64),
+) {
+    // SAFETY: an open list with the dispatch's pipeline and roots set; the
+    // list keeps `records`, left as arguments by its clamp.
+    unsafe {
+        for part in 0..SPLIT {
+            l.SetComputeRoot32BitConstant(param, part * PART, dword);
+            let from = at + u64::from(part) * PART_BYTES;
+            l.ExecuteIndirect(signature, 1, records, from, None, 0);
+        }
+        l.SetComputeRoot32BitConstant(param, 0, dword);
+    }
 }
 
 /// Bits of the clamp's `has_count`.
@@ -793,7 +829,19 @@ pub(crate) fn record_ahead(
     chunks: &mut [(ID3D12Resource, bool)],
     jobs: &[Ahead],
 ) {
-    let Some(c) = clamp() else { return };
+    if let Some(c) = clamp() {
+        record_ahead_with(c, l, budget, chunks, jobs);
+    }
+}
+
+/// [`record_ahead`] with the clamp `c`.
+fn record_ahead_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    budget: u64,
+    chunks: &mut [(ID3D12Resource, bool)],
+    jobs: &[Ahead],
+) {
     let used = jobs.len().div_ceil(AHEAD_SLOTS as usize).min(chunks.len());
     if used == 0 || !budget.is_multiple_of(4) {
         return;
@@ -843,7 +891,9 @@ pub(crate) fn record_ahead(
                 Some(_) => (src_base, *offset as u32),
                 None => (src_base.wrapping_add(*offset), 0),
             };
-            let constants = [*kind, *stride, 1u32, args_offset, 0, 0];
+            // A dispatch here is one split into parts ([`split_ahead`]).
+            let how = if *kind == 2 { IN_PARTS } else { 0 };
+            let constants = [*kind, *stride, 1u32, args_offset, how, 0];
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, src_gpu);
@@ -1787,6 +1837,59 @@ void main() {
             let made: [u32; 6] = unsafe { readback_ptr.cast::<[u32; 6]>().read_volatile() };
             assert_eq!(made, parts, "{asked:?}");
         }
+    }
+
+    /// (El1xr) Dispatches clamped ahead (`split_ahead`) come out of their
+    /// slots in the same parts as clamped in place, and are charged.
+    #[test]
+    fn warp_dispatch_clamped_ahead_is_made_in_parts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let cases: [([u32; 3], [u32; 6]); 3] = [
+            ([115_200, 1, 1], [65_535, 1, 1, 49_665, 1, 1]),
+            ([5, 3, 2], [5, 3, 2, 0, 3, 2]),
+            ([200_000, 1, 1], [65_535, 1, 1, 0, 1, 1]),
+        ];
+        let (src_buf, src_ptr, _) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(AHEAD_SLOT * 3);
+        let chunk = warp.default_uav(AHEAD_SLOTS * AHEAD_SLOT);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0xA5, 256);
+            for (index, (asked, _)) in cases.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr.add(index * 16), 12);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, (AHEAD_SLOT * 3) as usize);
+        }
+        let jobs: Vec<Ahead> = (0..cases.len())
+            .map(|index| (src_buf.clone(), index as u64 * 16, 2, 12))
+            .collect();
+        let mut chunks = [(chunk.clone(), false)];
+        record_ahead_with(&warp.clamp, &warp.list, budget_gpu, &mut chunks, &jobs);
+        assert!(chunks[0].1);
+        done_on(&warp.list, &chunk);
+        // SAFETY: an open list and live buffers.
+        unsafe {
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &chunk, 0, AHEAD_SLOT * 3)
+        };
+        warp.submit_and_wait();
+        for (index, (asked, parts)) in cases.iter().enumerate() {
+            // SAFETY: the mapping holds the slots the copy wrote.
+            let made: [u32; 6] = unsafe {
+                readback_ptr
+                    .add(index * AHEAD_SLOT as usize)
+                    .cast::<[u32; 6]>()
+                    .read_volatile()
+            };
+            assert_eq!(&made, parts, "{asked:?}");
+        }
+        // SAFETY: the budget the clamps charged.
+        let spent = unsafe { (budget_ptr as *const u32).read_volatile() };
+        assert_ne!(spent, 0, "dispatches clamped ahead are charged");
     }
 
     /// A window of mesh records clamped ahead: the filled ones come out as

@@ -1,7 +1,9 @@
 """tools/dev_throttle.py caps parallel builds machine-wide and refuses builds on a nearly full drive."""
 
+import contextlib
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -84,7 +86,145 @@ def test_quiet_bench_flag_holds_all_slots(tmp_path, monkeypatch):
         with pytest.raises(TimeoutError):
             with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
                 pass
+    monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
     loud = dev.build_parser().parse_args(["bench"])
     with dev._quiet(loud, "bench"):
         with dev_throttle.build_slot(tmp_path, "build", timeout_s=0.3):
             pass
+
+
+def test_free_build_slots_leave_writers_one_and_never_wait(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
+    with dev_throttle.free_build_slots(tmp_path, "run") as held:
+        assert len(held) == 2
+        # Writers keep exactly one slot while the run lasts.
+        with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3) as slot:
+            assert slot not in held
+            with pytest.raises(TimeoutError):
+                with dev_throttle.build_slot(tmp_path, "writer2", timeout_s=0.3):
+                    pass
+    # Released at the end: all three are free again.
+    with dev_throttle.all_build_slots(tmp_path, "after", timeout_s=0.3):
+        pass
+
+
+def test_free_build_slots_take_only_what_is_free(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
+    with dev_throttle.build_slot(tmp_path, "running", timeout_s=0.3) as running:
+        with dev_throttle.free_build_slots(tmp_path, "run") as held:
+            # One build runs: the two free slots are taken, none is waited for.
+            assert len(held) == 2 and running not in held
+    with dev_throttle.build_slot(tmp_path, "a", timeout_s=0.3), dev_throttle.build_slot(tmp_path, "b", timeout_s=0.3):
+        with dev_throttle.free_build_slots(tmp_path, "run") as held:
+            # Two builds run: the last slot is taken, writers keep their two.
+            assert len(held) == 1
+
+
+def test_free_build_slots_do_not_wait_when_all_are_busy(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "2")
+    with dev_throttle.all_build_slots(tmp_path, "builds", timeout_s=0.3):
+        started = time.monotonic()
+        with dev_throttle.free_build_slots(tmp_path, "run") as held:
+            assert held == []
+        assert time.monotonic() - started < 0.2
+
+
+def test_a_single_slot_is_left_to_writers(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "1")
+    with dev_throttle.free_build_slots(tmp_path, "run") as held:
+        assert held == []
+        with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3):
+            pass
+
+
+def test_loud_capture_holds_free_slots(tmp_path, monkeypatch):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path)
+    monkeypatch.setenv("ANYXBOXX_BUILD_SLOTS", "3")
+    monkeypatch.setattr(dev.dev_throttle, "builds_idle", lambda: contextlib.nullcontext(0))
+    args = dev.build_parser().parse_args(["capture"])
+    with dev._quiet(args, "capture"):
+        with dev_throttle.build_slot(tmp_path, "writer", timeout_s=0.3):
+            with pytest.raises(TimeoutError):
+                with dev_throttle.build_slot(tmp_path, "writer2", timeout_s=0.3):
+                    pass
+
+
+class FakePsutil:
+    """Just enough of psutil for `builds_idle`: named processes with children and a class."""
+
+    class NoSuchProcess(Exception):
+        pass
+
+    class AccessDenied(Exception):
+        pass
+
+    def __init__(self):
+        self.procs = []
+
+    def add(self, name, nice, created=1.0, parent=None):
+        proc = FakeProc(self, len(self.procs) + 100, name, nice, created, parent)
+        self.procs.append(proc)
+        return proc
+
+    def process_iter(self, _attrs):
+        return [p for p in self.procs if p.alive]
+
+
+class FakeProc:
+    def __init__(self, ps, pid, name, nice, created, parent):
+        self.ps, self.pid, self.info, self._nice, self.created, self.parent = (
+            ps, pid, {"name": name}, nice, created, parent
+        )
+        self.alive = True
+
+    def _check(self):
+        if not self.alive:
+            raise FakePsutil.NoSuchProcess()
+
+    def children(self, recursive=False):
+        self._check()
+        out = [p for p in self.ps.procs if p.parent is self and p.alive]
+        if recursive:
+            for child in list(out):
+                out.extend(child.children(recursive=True))
+        return out
+
+    def nice(self, value=None):
+        self._check()
+        if value is None:
+            return self._nice
+        self._nice = value
+
+    def create_time(self):
+        self._check()
+        return self.created
+
+
+def test_builds_run_idle_for_the_run_and_get_their_class_back():
+    ps = FakePsutil()
+    below, normal, idle = 0x4000, 0x20, dev_throttle.IDLE_PRIORITY_CLASS
+    cargo = ps.add("cargo.exe", below)
+    rustc = ps.add("rustc.exe", below, parent=cargo)
+    link = ps.add("link.exe", normal, parent=rustc)
+    other = ps.add("Code.exe", normal)
+    gone = ps.add("rustc.exe", below)
+    changed = ps.add("rustc.exe", below)
+    with dev_throttle.builds_idle(ps) as lowered:
+        assert lowered == 5
+        assert [p.nice() for p in (cargo, rustc, link, gone, changed)] == [idle] * 5
+        assert other.nice() == normal
+        # Meanwhile: one ends, someone else sets one's class, cargo starts a new rustc (idle, inherited).
+        gone.alive = False
+        changed.nice(normal)
+        late = ps.add("rustc.exe", idle, created=time.time() + 1, parent=cargo)
+    assert (cargo.nice(), rustc.nice(), link.nice()) == (below, below, normal)
+    assert changed.nice() == normal
+    assert late.nice() == below
+    assert other.nice() == normal
+
+
+def test_builds_idle_is_a_no_op_without_psutil(monkeypatch):
+    monkeypatch.setattr(dev_throttle.os, "name", "posix")
+    with dev_throttle.builds_idle() as lowered:
+        assert lowered == 0

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -23,7 +24,12 @@ from typing import Iterator
 
 import dev_driver
 import dev_gate
+import dev_greps
+import dev_png
+import dev_prewarm
+import dev_stats
 import dev_throttle
+import dev_train
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VICTORY_DIR = REPO_ROOT / "third_party" / "victory"
@@ -259,6 +265,7 @@ def build_launcher_command(
     skip_intro: bool = False,
     data_dir: Path | None = None,
     title_args: list[str] | None = None,
+    extra: list[str] | None = None,
 ) -> list[str]:
     parts = [
         "&",
@@ -281,6 +288,8 @@ def build_launcher_command(
     if overrides:
         entries = "; ".join(f"{_ps_quote(k)} = {_ps_quote(v)}" for k, v in overrides.items())
         parts.extend(["-Override", f"@{{ {entries} }}"])
+    if extra:
+        parts.extend(extra)
     return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", " ".join(parts)]
 
 
@@ -389,6 +398,8 @@ def parse_victory_log(text: str) -> dict[str, object]:
     first_ts: datetime | None = None
     first_world_ts: datetime | None = None
     world_window_ts: list[tuple[datetime, float]] = []
+    timed_windows: list[dev_stats.Window] = []
+    hitches: list[tuple[datetime, int, float]] = []
 
     for raw_line in text.splitlines():
         line = ANSI_RE.sub("", raw_line)
@@ -421,9 +432,16 @@ def parse_victory_log(text: str) -> dict[str, object]:
         if m_card and frame_ms is not None:
             # GPU busy: the share of the frame the card had work of ours queued.
             busy_rows.append(frame_ms * float(m_card.group(1)) / 100.0)
+        hitch = dev_stats.parse_hitch_line(line)
+        if hitch and line_ts is not None:
+            hitches.append((line_ts, *hitch))
         pacing = parse_pacing_line(line)
         if pacing:
             pacing_windows.append(pacing)
+            if line_ts is not None:
+                timed_windows.append(dev_stats.Window(
+                    line_ts, pacing["p50"], pacing["p99"], pacing["max"], pacing["over100"], pacing["draws"]
+                ))
             if pacing["draws"] >= WORLD_DRAWS_MIN and line_ts is not None:
                 if first_world_ts is None:
                     first_world_ts = line_ts
@@ -454,6 +472,7 @@ def parse_victory_log(text: str) -> dict[str, object]:
         "refused": refused,
         "device_removed": device_removed,
         **summarize_pacing(pacing_windows),
+        **dev_stats.world_phase(timed_windows, hitches),
     }
 
 
@@ -531,23 +550,45 @@ def cmd_policy(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def cmd_bench(args: argparse.Namespace) -> int:
-    log_path = DEV_DIR / "bench.log"
-    try:
-        game_dir = resolve_game_dir(args.game_dir)
-        overrides = apply_fast_boot(args, parse_overrides(args.override))
-        title_args = parse_title_args(args.title_args)
-        if args.save:
-            resolve_save_dir(args.save)
-    except (FileNotFoundError, ValueError) as exc:
-        ensure_coord_dirs()
-        log_path.write_text(f"error: {exc}\n", encoding="utf-8")
-        print(
-            "DEV bench FAIL boot_s=0.0 settled_s=0.0 fps=0.0 gpu_ms=0.0 prep_ms=0.0 dstorage_mbs=0.0 refused=0 "
-            "p50_ms=0.0 p99_ms=0.0 max_ms=0.0 sd_ms=0.0 jitter_ms=0.0 over50=0 hitches=0"
-        )
-        return 1
+BENCH_FIELDS = (
+    ("boot_s", ".1f"), ("settled_s", ".1f"), ("fps", ".1f"), ("gpu_ms", ".1f"), ("prep_ms", ".1f"),
+    ("gpu_busy_ms", ".1f"), ("dstorage_mbs", ".1f"), ("refused", "d"), ("p50_ms", ".1f"), ("p99_ms", ".1f"),
+    ("max_ms", ".1f"), ("sd_ms", ".1f"), ("jitter_ms", ".1f"), ("over50", "d"), ("hitches", "d"),
+    ("steady_p99_ms", ".1f"), ("stream_s", ".1f"), ("world_over100", "d"), ("world_over250", "d"),
+    ("worst_ms", ".1f"), ("worst_frame", "d"),
+)
 
+
+def bench_fields(stats: dict[str, object]) -> str:
+    """The figures of a `DEV bench` line, in their fixed order."""
+    return " ".join(
+        f"{key}={int(stats[key]) if spec == 'd' else float(stats[key]):{spec}}" for key, spec in BENCH_FIELDS
+    )
+
+
+def apply_snaps(overrides: dict[str, str], every_s: float, snap_dir: Path) -> dict[str, str]:
+    """`--snap-every N`: the game writes a PNG every N seconds (victory-gpu `snap.rs`) into
+    `snap_dir`, emptied of an earlier run's snaps first."""
+    if every_s <= 0:
+        return overrides
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    for old in snap_dir.glob("snap-*.png"):
+        old.unlink()
+    return {"VICTORY_SNAP_EVERY_S": f"{every_s:g}", "VICTORY_SNAP_DIR": str(snap_dir), **overrides}
+
+
+def run_bench(
+    args: argparse.Namespace, overrides: dict[str, str], log_path: Path, snap_dir: Path, what: str = "bench"
+) -> tuple[dict[str, object], int | None, int | None, int]:
+    """One timed release run under gpu.lock and `_quiet(args, what)`: (stats, driver resets before
+    and after, snaps written).
+    Raises FileNotFoundError or ValueError (before anything runs) for a bad game folder or save."""
+    game_dir = resolve_game_dir(args.game_dir)
+    overrides = apply_fast_boot(args, overrides)
+    title_args = parse_title_args(args.title_args)
+    if args.save:
+        resolve_save_dir(args.save)
+    overrides = apply_snaps(overrides, args.snap_every, snap_dir)
     overrides, mute = apply_mute_default(overrides, args.unmute)
     with isolated_save_data_dir(args.save, "bench") as data_dir:
         cmd = build_launcher_command(
@@ -559,33 +600,32 @@ def cmd_bench(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock("bench"), _quiet(args, "bench"):
+        with acquire_gpu_lock(what), _quiet(args, what):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
-
     stats = parse_victory_log(read_log_text(log_path))
-    ok = int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
-    status = "PASS" if ok else "FAIL"
-    print(
-        f"DEV bench {status} "
-        f"boot_s={float(stats['boot_s']):.1f} "
-        f"settled_s={float(stats['settled_s']):.1f} "
-        f"fps={float(stats['fps']):.1f} "
-        f"gpu_ms={float(stats['gpu_ms']):.1f} "
-        f"prep_ms={float(stats['prep_ms']):.1f} "
-        f"gpu_busy_ms={float(stats['gpu_busy_ms']):.1f} "
-        f"dstorage_mbs={float(stats['dstorage_mbs']):.1f} "
-        f"refused={int(stats['refused'])} "
-        f"p50_ms={float(stats['p50_ms']):.1f} "
-        f"p99_ms={float(stats['p99_ms']):.1f} "
-        f"max_ms={float(stats['max_ms']):.1f} "
-        f"sd_ms={float(stats['sd_ms']):.1f} "
-        f"jitter_ms={float(stats['jitter_ms']):.1f} "
-        f"over50={int(stats['over50'])} "
-        f"hitches={int(stats['hitches'])} "
-        f"driver_resets={_count(resets_after)}"
-    )
+    snaps = len(list(snap_dir.glob("snap-*.png"))) if args.snap_every > 0 else 0
+    return stats, resets_before, resets_after, snaps
+
+
+def bench_ok(stats: dict[str, object]) -> bool:
+    return int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    log_path = DEV_DIR / "bench.log"
+    snap_dir = DEV_DIR / "bench_snaps"
+    try:
+        stats, resets_before, resets_after, snaps = run_bench(args, parse_overrides(args.override), log_path, snap_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        ensure_coord_dirs()
+        log_path.write_text(f"error: {exc}\n", encoding="utf-8")
+        print(f"DEV bench FAIL {bench_fields(parse_victory_log(''))}")
+        return 1
+    ok = bench_ok(stats)
+    snapped = f" snaps={snaps} snap_dir={snap_dir}" if args.snap_every > 0 else ""
+    print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}")
     _print_driver_warning(resets_before, resets_after)
     return 0 if ok else 1
 
@@ -594,11 +634,24 @@ def _count(value: int | None) -> str:
     return "?" if value is None else str(value)
 
 
-def _quiet(args: argparse.Namespace, what: str):
-    """`--quiet`: hold every build slot for the run so no build competes with the game."""
-    if getattr(args, "quiet", False):
-        return dev_throttle.all_build_slots(LOCKS_DIR, f"{JOB or 'main'}:quiet-{what}")
-    return contextlib.nullcontext()
+@contextlib.contextmanager
+def _quiet(args: argparse.Namespace, what: str) -> Iterator[None]:
+    """`--quiet`: hold every build slot for the run so no build competes with the game.
+    Otherwise: hold the slots free right now without waiting (writers keep at least one), and run
+    the builds already going at idle priority, until the run ends."""
+    quiet = getattr(args, "quiet", False)
+    tag = f"{JOB or 'main'}:{'quiet' if quiet else 'run'}-{what}"
+    if quiet:
+        with dev_throttle.all_build_slots(LOCKS_DIR, tag):
+            yield
+        return
+    with dev_throttle.free_build_slots(LOCKS_DIR, tag) as held, dev_throttle.builds_idle() as idled:
+        print(
+            f"DEV {what}: holding {len(held)} of {dev_throttle.build_slots()} build slots for the run; "
+            f"{idled} build processes at idle priority",
+            flush=True,
+        )
+        yield
 
 
 def _print_driver_warning(before: int | None, after: int | None) -> None:
@@ -640,7 +693,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock(f"capture:{safe_tag}"):
+        with acquire_gpu_lock(f"capture:{safe_tag}"), _quiet(args, "capture"):
             resets_before = dev_driver.resets_since_boot()
             run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
@@ -655,6 +708,170 @@ def cmd_capture(args: argparse.Namespace) -> int:
         f"driver_resets={_count(resets_after)} dir={cap_dir}"
     )
     _print_driver_warning(resets_before, resets_after)
+    return 0 if ok else 1
+
+
+def train_compare(plan: dev_train.Plan, done: dict[int, dict[str, object]], train_dir: Path, a: str, b: str) -> int:
+    """Side-by-side PNGs of two runs' snaps: each of run A's (left) with run B's nearest in time."""
+    try:
+        sa, sb = dev_train.find_run(plan, done, a), dev_train.find_run(plan, done, b)
+    except dev_train.PlanError as exc:
+        print(f"error: {exc}")
+        print("DEV train-compare FAIL reason=run")
+        return 1
+    ida, idb = (dev_train.run_id(s, str(done[s]["set"])) for s in (sa, sb))
+    pairs = dev_train.pair_snaps(
+        dev_train.snaps(train_dir / f"{ida}_snaps"), dev_train.snaps(train_dir / f"{idb}_snaps")
+    )
+    out_dir = train_dir / f"compare_{ida}_vs_{idb}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("cmp-*.png"):
+        old.unlink()
+    for t, left, u, right in pairs:
+        image = dev_png.side_by_side(dev_png.read_png(left), dev_png.read_png(right))
+        dev_png.write_png(out_dir / f"cmp-{t:04d}s-{u:04d}s.png", image)
+    ok = bool(pairs)
+    print(f"DEV train-compare {'PASS' if ok else 'FAIL'} left={ida} right={idb} pairs={len(pairs)} dir={out_dir}")
+    return 0 if ok else 1
+
+
+def train_greps_from(plan_path: Path, plan: dev_train.Plan, sources: list[str]) -> int:
+    """Adds the log-line phrases of writers' ready.md batch items to the plan's [greps]."""
+    found = []
+    for source in sources:
+        path = Path(source)
+        if not path.is_file():
+            print(f"error: no file {path}")
+            print("DEV train-greps FAIL reason=source")
+            return 1
+        found += dev_greps.extract(read_log_text(path), path.parent.name or path.stem)
+    added, skipped = dev_greps.merge_found({n: p.pattern for n, p in plan.greps.items()}, found)
+    dev_greps.add_to_plan(plan_path, added)
+    for f in added:
+        print(f"{f.name} = {f.regex}  # {f.note}")
+    dev_train.load_plan(plan_path)
+    print(f"DEV train-greps PASS added={len(added)} skipped={skipped} plan={plan_path}")
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """One run of a batch plan (`--run`), or the report across its runs (`--report`, `--list`)."""
+    try:
+        plan = dev_train.load_plan(Path(args.plan))
+    except (OSError, dev_train.PlanError) as exc:
+        print(f"error: {exc}")
+        print("DEV train FAIL reason=plan")
+        return 1
+    train_dir = DEV_DIR / f"train_{plan.name}"
+    done = dev_train.load_results(train_dir)
+    if args.list:
+        print(dev_train.listing(plan, done), end="")
+        print(f"DEV train-list PASS runs={len(done)} next={dev_train.next_pending(plan, done)} dir={train_dir}")
+        return 0
+    if args.compare:
+        return train_compare(plan, done, train_dir, *args.compare)
+    if args.greps_from:
+        return train_greps_from(Path(args.plan), plan, args.greps_from)
+    if args.report:
+        scans = {
+            step: dev_greps.scan_log(read_log_text(log), plan.greps)
+            for step, rec in done.items()
+            if (log := train_dir / f"{dev_train.run_id(step, str(rec['set']))}.log").exists()
+        }
+        text, figures = dev_train.report(plan, done, scans)
+        train_dir.mkdir(parents=True, exist_ok=True)
+        (train_dir / "report.md").write_text(text, encoding="utf-8")
+        (train_dir / "report.json").write_text(json.dumps(figures, indent=2), encoding="utf-8")
+        print(text, end="")
+        print(f"DEV train-report PASS runs={len(done)} next={dev_train.next_pending(plan, done)} "
+              f"report={train_dir / 'report.md'}")
+        return 0
+    try:
+        step, name = dev_train.pick(plan, done, args.run)
+    except dev_train.PlanError as exc:
+        print(f"error: {exc}")
+        print("DEV train FAIL reason=run")
+        return 1
+    rid = dev_train.run_id(step, name)
+    train_dir.mkdir(parents=True, exist_ok=True)
+    log_path = train_dir / f"{rid}.log"
+    bench_args = argparse.Namespace(
+        game_dir=args.game_dir, fast_boot=plan.fast_boot, save=plan.save, skip_intro=False, title_args=[],
+        unmute=plan.unmute, diag=False, seconds=plan.seconds, quiet=plan.quiet, snap_every=plan.snap_every,
+    )
+    try:
+        stats, before, after, snaps = run_bench(
+            bench_args, dict(plan.sets[name]), log_path, train_dir / f"{rid}_snaps", what="train"
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}")
+        print(f"DEV train FAIL run={rid} reason=setup")
+        return 1
+    ok = bench_ok(stats)
+    done[step] = {
+        "step": step, "set": name, "overrides": plan.sets[name], "ok": ok, "stats": stats,
+        "resets_before": before, "resets_after": after, "snaps": snaps, "log": str(log_path),
+        "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    dev_train.save_result(train_dir, step, done[step])
+    print(
+        f"{_dev_line('train', ok, {'run': rid})} {bench_fields(stats)} driver_resets={_count(after)} "
+        f"snaps={snaps} next={dev_train.next_pending(plan, done)} log={log_path}"
+    )
+    _print_driver_warning(before, after)
+    return 0 if ok else 1
+
+
+@throttled("prewarm")
+def cmd_prewarm(args: argparse.Namespace) -> int:
+    """Translate every shader the title ships into the shader cache for these switch values, without the title
+    (`dev_prewarm`). Holds a build slot (it is a build's worth of CPU); `--pipelines` also takes the gpu lock."""
+    profile = "diag" if args.diag else "release"
+    log_path = DEV_DIR / f"prewarm_{profile}.log"
+    try:
+        game_dir = resolve_game_dir(args.game_dir)
+        missing = [str(p) for p in dev_prewarm.needed_files(game_dir) if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(f"prewarm needs {', '.join(missing)}")
+        overrides = parse_overrides(args.override)
+    except (FileNotFoundError, ValueError) as exc:
+        log_path.write_text(f"error: {exc}\n", encoding="utf-8")
+        print(f"DEV prewarm FAIL profile={profile} secs=0.0 shaders=0 hits=0 translated=0 refused=0 log={log_path}")
+        return 1
+    # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
+    # overrides, mute and skip-intro (not in the key, but kept identical).
+    overrides, mute = apply_mute_default(overrides, args.unmute)
+    overrides = dev_prewarm.prewarm_overrides(overrides, args.pipelines, args.host_wave, args.view_limit)
+    cmd = build_launcher_command(
+        game_dir=game_dir,
+        diag=args.diag,
+        overrides=overrides,
+        mute=mute,
+        skip_intro=True,
+        extra=dev_prewarm.launcher_extra(args.pipelines, args.jobs),
+    )
+    gpu = acquire_gpu_lock("prewarm") if args.pipelines else contextlib.nullcontext()
+    t0 = time.monotonic()
+    with gpu:
+        ok, outputs = run_logged_steps([("prewarm", cmd, REPO_ROOT)], log_path)
+    secs = time.monotonic() - t0
+    text = outputs.get("prewarm", "")
+    counts = dev_prewarm.parse_summary(text)
+    device = dev_prewarm.device_made(text)
+    ok = ok and counts["shaders"] > 0 and (args.pipelines or not device)
+    fields = {
+        "profile": profile,
+        "secs": f"{secs:.1f}",
+        "warm_s": str(counts["warm_s"]),
+        "shaders": str(counts["shaders"]),
+        "hits": str(counts["hits"]),
+        "translated": str(counts["translated"]),
+        "refused": str(counts["refused"]),
+        "pipelines": str(counts["pipelines"]),
+        "device": "1" if device else "0",
+        "log": str(log_path),
+    }
+    print(_dev_line("prewarm", ok, fields))
     return 0 if ok else 1
 
 
@@ -719,6 +936,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet", action="store_true",
         help="Hold every build slot during the run (waits for running builds) for numbers not skewed by builds.",
     )
+    p_bench.add_argument(
+        "--snap-every", type=float, default=0.0, metavar="N",
+        help="Save a PNG of the presented frame every N seconds (VICTORY_SNAP_EVERY_S) into dev/bench_snaps/.",
+    )
     p_bench.set_defaults(func=cmd_bench)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")
@@ -744,6 +965,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cap.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
     p_cap.set_defaults(func=cmd_capture)
+
+    p_train = sub.add_parser(
+        "train", help="Batch plan: one bench run per call (--run), or the report across its runs (--report)."
+    )
+    p_train.add_argument("--plan", required=True, help="Plan file (.toml or .json); see tools/dev_train.py.")
+    mode = p_train.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--run", default="next", metavar="next|N|SET",
+        help="Run one step: next (default) pending step, step N again, or SET (its next pending step, else an extra run).",
+    )
+    mode.add_argument("--report", action="store_true", help="Table of every run, medians by set and deltas, flags and [greps] per run.")
+    mode.add_argument("--list", action="store_true", help="The steps, done or pending, with their overrides.")
+    mode.add_argument(
+        "--compare", nargs=2, metavar=("A", "B"),
+        help="Side-by-side PNGs: each snap of run A (left) with run B's nearest in time (A, B: step, run id or set).",
+    )
+    mode.add_argument(
+        "--greps-from", nargs="+", metavar="READY_MD",
+        help="Add the backticked log lines of these ready.md files' batch items to the plan's [greps].",
+    )
+    p_train.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_train.set_defaults(func=cmd_train)
+
+    p_pre = sub.add_parser(
+        "prewarm",
+        help="Translate every shader the title ships into the shader cache for these switch values (no game run).",
+    )
+    p_pre.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override (the arm's).")
+    p_pre.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p_pre.add_argument("--diag", action="store_true", help="Warm the diag build's cache (what `capture` runs).")
+    p_pre.add_argument("--unmute", action="store_true", help="As bench/capture --unmute (not in the key).")
+    p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
+    p_pre.add_argument(
+        "--pipelines", action="store_true",
+        help="Also make the compute pipelines (makes a device on the card: takes the gpu lock).",
+    )
+    p_pre.add_argument(
+        "--host-wave", type=int, default=dev_prewarm.DEFAULT_HOST_WAVE,
+        help="The host's most wave lanes, as a run's log states it (default: 32, this RTX 5090).",
+    )
+    p_pre.add_argument(
+        "--view-limit", type=int, default=dev_prewarm.DEFAULT_VIEW_LIMIT,
+        help="The host view heap's null slot: its views minus one (default: 999999, this RTX 5090).",
+    )
+    p_pre.set_defaults(func=cmd_prewarm)
 
     p_scout = sub.add_parser("scout", help="Run tools/scout_ecosystem.py.")
     p_scout.add_argument("scout_args", nargs=argparse.REMAINDER, help="Extra arguments forwarded to scout.")

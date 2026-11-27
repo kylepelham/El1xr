@@ -50,6 +50,9 @@ pub const SLOT_FAULTS: u8 = 253;
 /// Root UAV `u<SLOT_MEET>`: three dwords the face-relocation compute adds to,
 /// meetings, wait iterations and wait atomics. Ours, not the title's.
 pub const SLOT_MEET: u8 = 252;
+/// Root SRV `t<SLOT_TLAS>`: a top level built with the host's DXR
+/// (`VICTORY_NATIVE_BVH`) for inline ray queries ([`super::ray_query`]).
+pub const SLOT_TLAS: u8 = 251;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -96,6 +99,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// AllocateRayQuery (inline ray tracing, tier 1.1).
+    pub const RAYTRACING_1_1: u64 = 1 << 25;
 }
 
 pub(crate) struct Types {
@@ -604,23 +609,24 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                    let (var, shape, extra) = super::ray_query::srv_md(&mut self, slot, u);
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
-                        Some(self.m.md_value(u)),
+                        Some(self.m.md_value(var)),
                         Some(empty),
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, shape)),
                         Some(i32c(&mut self, 0)),
-                        None,
+                        extra,
                     ];
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
-                        dxil_kind: 11,
+                        dxil_kind: shape,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
@@ -783,7 +789,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        super::mesh_launch::mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
@@ -874,6 +880,9 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
+        }
+        if self.flags & flags::RAYTRACING_1_1 != 0 {
+            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

@@ -96,8 +96,10 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+mod mesh_launch;
 pub mod nvidia;
 mod own_bits;
+mod ray_query;
 mod rect;
 mod sampler;
 mod shader;
@@ -120,12 +122,13 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
+pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
 

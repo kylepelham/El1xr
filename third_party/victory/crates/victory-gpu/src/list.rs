@@ -166,7 +166,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -748,6 +748,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        crate::timeline::closed(std::ptr::from_ref(host) as usize);
         host.close();
     }
     S_OK
@@ -1008,7 +1009,9 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         return false;
     }
     let (from, to) = (from as u64, to as u64);
-    if !crate::host::shader_written(from as usize, len as usize) {
+    let written = crate::host::shader_written(from as usize, len as usize);
+    let order = crate::port_order::order_on();
+    if !written && !crate::port_cbv::copy_order_on() && !order {
         return false;
     }
     let (Some(source), Some(target)) =
@@ -1016,12 +1019,27 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     else {
         return false;
     };
-    if source.left(from) < len || target.left(to) < len || source.unwatched() || target.unwatched()
-    {
+    // (`crate::port_cbv::copy_order_on`) Into a copy draws' constant buffers are viewed in.
+    let for_order = !written && crate::port_cbv::was_viewed(&target);
+    // (`crate::port_order`) Into title memory in place; memory in place is not watched, and
+    // nothing refreshes it over what the card copies there.
+    let in_place = !written && crate::port_order::copy_on_card(&target);
+    if !written && !for_order && !in_place {
         return false;
     }
-    if std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len {
+    let unwatched = |s: &crate::shadow::Shadow| s.unwatched() && !(order && s.in_place());
+    if source.left(from) < len || target.left(to) < len || unwatched(&source) || unwatched(&target)
+        || std::sync::Arc::ptr_eq(&source, &target) && from < to + len && to < from + len
+    {
+        crate::port_cbv::ordered(for_order, false);
+        if in_place {
+            crate::port_order::copied(false);
+        }
         return false;
+    }
+    crate::port_cbv::ordered(for_order, true);
+    if in_place {
+        crate::port_order::copied(true);
     }
     // What the title's CPU side wrote of both first, then the copy, then
     // its bytes back into title memory when the list has run.
@@ -1058,6 +1076,9 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
         ];
         list.list.ResourceBarrier(&back);
     }
+    list.card_constants.wrote(to as usize, len as usize, &target);
+    // (feedcard) What the CPU makes of it at submission (`VICTORY_CARD_READ_COPY=1`).
+    list.card_copied(to as usize, from as usize, len as usize);
     crate::host::CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
@@ -2068,6 +2089,7 @@ extern "system" fn execute_indirect(
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    crate::drop_why::signature(args, stride, max, !count.is_null());
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -2084,6 +2106,7 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        crate::drop_why::set("signature of another shape, or arguments or count outside buffers");
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -2092,9 +2115,11 @@ extern "system" fn execute_indirect(
         ));
     }
     if ran {
+        crate::drop_why::ran();
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::drop_why::count("indirect");
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -2313,7 +2338,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2325,6 +2350,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
+        && !crate::barrier_skip::skip(count, groups)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
@@ -2339,7 +2365,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
