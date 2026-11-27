@@ -19,7 +19,8 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
@@ -56,12 +57,20 @@ struct Heap {
     created: bool,
 }
 
-static HEAP: Mutex<Heap> = Mutex::new(Heap {
+static HEAP: RwLock<Heap> = RwLock::new(Heap {
     blocks: BTreeMap::new(),
     by_apu: BTreeMap::new(),
     free: BTreeMap::new(),
     created: false,
 });
+
+fn heap_read() -> RwLockReadGuard<'static, Heap> {
+    HEAP.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn heap_write() -> RwLockWriteGuard<'static, Heap> {
+    HEAP.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Device addresses start above 0, which means "none" to titles.
 const APU_BASE: u32 = 0x0001_0000;
@@ -104,17 +113,28 @@ impl Heap {
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let apu_size = u32::try_from(layout.size()).ok()?;
+    let apu_align = u32::try_from(layout.align()).ok()?;
+    // Allocate and zero outside `HEAP` so large streaming buffers (32+ MB)
+    // never stall concurrent XMA decoding or mixer address lookups.
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
-    heap.by_apu.insert(apu, ptr as usize);
+    let apu = {
+        let mut heap = heap_write();
+        let Some(apu) = heap.take(apu_size, apu_align) else {
+            drop(heap);
+            // SAFETY: just allocated with `layout`.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+            return None;
+        };
+        heap.blocks
+            .insert(ptr as usize, Block { size, apu, layout });
+        heap.by_apu.insert(apu, ptr as usize);
+        apu
+    };
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
     if size >= 32 << 20 {
@@ -124,7 +144,7 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
 }
 
 fn heap_free(ptr: *mut u8) {
-    let mut heap = lock(&HEAP);
+    let mut heap = heap_write();
     let Some(block) = heap.blocks.remove(&(ptr as usize)) else {
         return;
     };
@@ -145,7 +165,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
     if cached == 0 {
         return E_INVALIDARG;
     }
-    let mut heap = lock(&HEAP);
+    let mut heap = heap_write();
     if heap.created {
         return ALREADY_ALLOCATED;
     }
@@ -161,7 +181,7 @@ pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
 
 /// The device address of any byte of a heap block, 0 elsewhere.
 fn heap_map(ptr: usize) -> u32 {
-    let heap = lock(&HEAP);
+    let heap = heap_read();
     match heap.blocks.range(..=ptr).next_back() {
         Some((&start, block)) if ptr < start + block.size.max(1) => {
             block.apu + (ptr - start) as u32
@@ -172,7 +192,7 @@ fn heap_map(ptr: usize) -> u32 {
 
 /// The host address of a device address, if a heap block holds it.
 fn heap_unmap(apu: u32) -> Option<*mut u8> {
-    let heap = lock(&HEAP);
+    let heap = heap_read();
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let block = &heap.blocks[&host];
     (apu < start.saturating_add(block.size.max(1) as u32))
@@ -182,10 +202,12 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
 /// `len` bytes of title memory at a device address, if one heap block holds
 /// them all.
 fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
-    let heap = lock(&HEAP);
+    let heap = heap_read();
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= heap.blocks[&host].size)
         // SAFETY: inside a live heap block, which the title and the audio
         // hardware share like on the console.
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
@@ -327,6 +349,8 @@ const INPUT_INVALID: u32 = 4;
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable per-frame decode buffer to avoid allocating on every frame.
+    pcm_scratch: Vec<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -380,14 +404,15 @@ struct Context(*mut u32);
 
 impl Context {
     fn get(self, word: usize) -> u32 {
-        // SAFETY: inside the context array; the title reads and writes it
-        // concurrently, like the hardware's.
-        unsafe { self.0.add(word).read_volatile() }
+        // SAFETY: 4-byte aligned word inside the 256-byte-aligned context array;
+        // the title reads and writes it concurrently, like the hardware's.
+        unsafe { AtomicU32::from_ptr(self.0.add(word)) }.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
         // SAFETY: as above.
-        unsafe { self.0.add(word).write_volatile(value) }
+        unsafe { AtomicU32::from_ptr(self.0.add(word)) }.store(value, Ordering::Release);
     }
 
     fn field(self, word: usize, shift: u32, bits: u32) -> u32 {
@@ -396,7 +421,14 @@ impl Context {
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
         let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let shifted = (value << shift) & mask;
+        // SAFETY: 4-byte aligned word inside the context array; atomic CAS
+        // avoids clobbering concurrent title updates to sibling bitfields
+        // (such as valid-input bits 20-21 in word 0 or input 1 size in word 1).
+        let slot = unsafe { AtomicU32::from_ptr(self.0.add(word)) };
+        let _ = slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            Some((old & !mask) | shifted)
+        });
     }
 
     fn channels(self) -> usize {
@@ -426,6 +458,7 @@ impl Xma {
         *slot = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            pcm_scratch: Vec::with_capacity(xma::FRAME_SAMPLES * context.channels()),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -494,7 +527,8 @@ impl Xma {
     }
 
     /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Returns the number of enabled voices visited.
+    fn pump(&self) -> usize {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
@@ -510,6 +544,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        active
     }
 }
 
@@ -541,8 +576,10 @@ fn pump(context: Context, voice: &mut Voice) {
             return;
         }
         let write = context.field(0, 27, 5);
-        let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let Some(address) = context.get(7).checked_add(write * BLOCK_BYTES as u32) else {
+            return;
+        };
+        let Some(out) = heap_bytes(address, BLOCK_BYTES) else {
             return;
         };
         for pair in out.as_chunks_mut::<2>().0 {
@@ -581,9 +618,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.pcm_scratch.clear();
+                decoder.flush(&mut voice.pcm_scratch);
+                voice.pcm.extend(voice.pcm_scratch.drain(..));
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -601,6 +638,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     };
     let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
         context.set_field(0, 20 + current, 1, 0);
+        context.set_field(2, 0, 26, 0);
         return true;
     };
     let mut at = context.field(2, 0, 26) as usize;
@@ -608,17 +646,19 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
     let Some(frame) = xma::read_frame(data, at) else {
-        // This input is used up.
+        // This input is used up; reset the bit offset so a refill starts fresh.
         context.set_field(0, 20 + current, 1, 0);
+        context.set_field(2, 0, 26, 0);
         return true;
     };
     let decoder = voice.decoder.get_or_insert_with(|| {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    let pcm = &mut voice.pcm_scratch;
+    pcm.clear();
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&frame.data, frame.bits, pcm) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
@@ -692,9 +732,15 @@ fn wake_decoder() {
                 .name("victory XMA decoder".into())
                 .spawn(|| {
                     loop {
-                        xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        let active = xma().pump();
+                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono (1.33 ms stereo).
+                        // When no voice is enabled, park longer; `enable` unparks immediately.
+                        let wait = if active > 0 {
+                            std::time::Duration::from_millis(2)
+                        } else {
+                            std::time::Duration::from_millis(50)
+                        };
+                        std::thread::park_timeout(wait);
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -852,10 +898,14 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
-    static SEEN: Mutex<u64> = Mutex::new(0);
-    if command < 64 && *lock(&SEEN) & 1 << command == 0 {
-        *lock(&SEEN) |= 1 << command;
-        tracing::info!(command, "first coprocessor command of this kind");
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if command < 64 {
+        let bit = 1u64 << command;
+        if SEEN.load(Ordering::Relaxed) & bit == 0
+            && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0
+        {
+            tracing::info!(command, "first coprocessor command of this kind");
+        }
     }
     let mut state = state(this);
     let word = |at: usize| -> Option<u32> {
@@ -988,7 +1038,7 @@ mod tests {
         assert_eq!(ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1), S_OK);
         // The freed range is free again, whichever part `c` took.
         assert!(
-            lock(&HEAP)
+            heap_read()
                 .free
                 .iter()
                 .any(|(&s, &e)| s <= apu_a + 0x800 && apu_a + 0x1000 <= e)
@@ -1209,5 +1259,96 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn concurrent_context_set_field_preserves_sibling_bitfields() {
+        let mut words = [0u32; 16];
+        let ptr = words.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            // Decoder thread repeatedly updating write_block (bits 27..32).
+            let t1 = s.spawn(move || {
+                let ctx = Context(ptr as *mut u32);
+                for i in 0..50_000u32 {
+                    ctx.set_field(0, 27, 5, i & 0x1f);
+                }
+            });
+            // Title streaming thread updating input 0 size (bits 0..12) and valid_1 (bit 21).
+            let t2 = s.spawn(move || {
+                let ctx = Context(ptr as *mut u32);
+                for i in 0..50_000u32 {
+                    ctx.set_field(0, 0, 12, (i & 0xfff) | 1);
+                    ctx.set_field(0, 21, 1, 1);
+                }
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+        });
+        let ctx = Context(words.as_mut_ptr());
+        assert_eq!(ctx.field(0, 21, 1), 1, "valid_input_1 bit must not be lost");
+        assert_eq!(ctx.field(0, 0, 12), ((49_999 & 0xfff) | 1));
+        assert_eq!(ctx.field(0, 27, 5), 49_999 & 0x1f);
+    }
+
+    #[test]
+    fn exhausted_input_resets_read_bit_for_refill() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 1, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>());
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+
+        // Start with read bit pointed at padding (0x7fff length) so `read_frame` returns None.
+        context.set(0, 2 | (1 << 20) | (4 << 22));
+        context.set(1, (1 << 31) | (3 << 27));
+        context.set(2, 32 + 3 * 31);
+        context.set(5, input_apu);
+
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            pcm_scratch: Vec::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        assert!(decode(context, &mut voice));
+        assert_eq!(context.field(0, 20, 1), 0, "consumed input cleared");
+        assert_eq!(context.field(2, 0, 26), 0, "read bit reset for next refill");
+
+        // Refilling input 0 without touching word 2 resumes decoding cleanly.
+        context.set_field(0, 20, 1, 1);
+        assert!(decode(context, &mut voice));
+        assert_eq!(voice.pcm.len(), xma::FRAME_SAMPLES);
+
+        ApuFree(input);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn heap_bytes_rejects_length_overflow() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 16, 1), S_OK);
+        assert!(heap_bytes(apu + 16, usize::MAX).is_none());
+        ApuFree(ptr);
     }
 }

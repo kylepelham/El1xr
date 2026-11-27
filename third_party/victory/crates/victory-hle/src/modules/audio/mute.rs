@@ -6,9 +6,20 @@
 //! XAudio2/game audio timing stay untouched.
 
 #[cfg(windows)]
+use std::sync::Mutex;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
+use std::thread::JoinHandle;
+#[cfg(windows)]
 use std::time::Duration;
+
+#[cfg(windows)]
+static STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static HANDLE: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 /// Whether a `VICTORY_MUTE` value enables muting (`"1"` or `"true"`, case-insensitive).
 pub fn is_enabled_value(value: Option<&str>) -> bool {
@@ -30,69 +41,132 @@ pub fn start() {
     }
     #[cfg(windows)]
     {
-        static STARTED: AtomicBool = AtomicBool::new(false);
         if STARTED.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Err(e) = std::thread::Builder::new()
+        STOP.store(false, Ordering::Release);
+        match std::thread::Builder::new()
             .name("victory-mute".into())
-            .spawn(run_daemon)
+            .spawn(|| run_daemon_until(&STOP))
         {
-            tracing::warn!("audio mute thread not started: {e}");
+            Ok(handle) => {
+                *HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            }
+            Err(e) => {
+                STARTED.store(false, Ordering::Release);
+                tracing::warn!("audio mute thread not started: {e}");
+            }
         }
     }
 }
 
+/// Signals the background mute daemon to stop, releases COM, and waits for it to exit.
+/// Safe to call even if `start` was not called or `VICTORY_MUTE` was not enabled.
+pub fn stop() {
+    #[cfg(windows)]
+    {
+        STOP.store(true, Ordering::Release);
+        let handle = HANDLE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = handle {
+            handle.thread().unpark();
+            let _ = handle.join();
+            STARTED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// RAII guard for a thread's COM apartment: declared before any COM interface
+/// so all interfaces drop before `CoUninitialize()` runs.
 #[cfg(windows)]
-fn run_daemon() {
-    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+struct ComGuard;
+
+#[cfg(windows)]
+impl ComGuard {
+    fn init_mta() -> windows::core::Result<Self> {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+        // SAFETY: initializes COM (MTA) on the calling thread; both `S_OK` and
+        // `S_FALSE` succeed via `.ok()` and require a matching `CoUninitialize`.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        use windows::Win32::System::Com::CoUninitialize;
+        // SAFETY: matches the successful `CoInitializeEx` in `ComGuard::init_mta`.
+        unsafe { CoUninitialize() };
+    }
+}
+
+#[cfg(windows)]
+fn create_enumerator() -> windows::core::Result<windows::Win32::Media::Audio::IMMDeviceEnumerator> {
+    use windows::Win32::Media::Audio::MMDeviceEnumerator;
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    // SAFETY: COM is initialized on this thread; standard Core Audio CLSID.
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+}
+
+#[cfg(windows)]
+fn run_daemon_until(stop: &AtomicBool) {
+    let _com = match ComGuard::init_mta() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("audio mute COM init failed: {e}");
+            return;
+        }
     };
 
     let pid = std::process::id();
-    // SAFETY: initializes COM (MTA) on this dedicated daemon thread.
-    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    if let Err(e) = hr.ok() {
-        tracing::warn!("audio mute COM init failed: {e}");
-        return;
-    }
-
-    // SAFETY: COM is initialized on this thread; standard Core Audio CLSID.
-    let enumerator: IMMDeviceEnumerator =
-        match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("audio mute device enumerator failed: {e}");
-                // SAFETY: matches successful `CoInitializeEx` above.
-                unsafe { CoUninitialize() };
-                return;
-            }
-        };
+    let mut enumerator = match create_enumerator() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::warn!("audio mute device enumerator failed: {e}");
+            return;
+        }
+    };
 
     let mut logged = false;
     let mut muted_once = false;
-    loop {
-        match mute_process_sessions(&enumerator, pid) {
-            Ok(true) => {
-                muted_once = true;
-                if !logged {
-                    tracing::info!("audio session muted (VICTORY_MUTE=1)");
-                    logged = true;
+    while !stop.load(Ordering::Acquire) {
+        if enumerator.is_none() {
+            match create_enumerator() {
+                Ok(e) => enumerator = Some(e),
+                Err(e) => {
+                    tracing::debug!("audio mute enumerator recreate failed: {e}");
                 }
             }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::debug!("audio mute poll failed: {e}");
+        }
+        if let Some(ref current) = enumerator {
+            match mute_process_sessions(current, pid) {
+                Ok(true) => {
+                    muted_once = true;
+                    if !logged {
+                        tracing::info!("audio session muted (VICTORY_MUTE=1)");
+                        logged = true;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("audio mute poll failed (will recreate enumerator): {e}");
+                    // Drop the potentially stale COM proxy (e.g. audio service restart).
+                    enumerator = None;
+                }
             }
+        }
+        if stop.load(Ordering::Acquire) {
+            break;
         }
         let interval = if muted_once {
             Duration::from_secs(1)
         } else {
             Duration::from_millis(100)
         };
-        std::thread::sleep(interval);
+        std::thread::park_timeout(interval);
     }
+    // Drop `enumerator` explicitly before `_com` runs `CoUninitialize`.
+    drop(enumerator);
 }
 
 #[cfg(windows)]
@@ -170,5 +244,46 @@ mod tests {
         assert!(!is_enabled_value(Some("FALSE")));
         assert!(!is_enabled_value(Some("yes")));
         assert!(!is_enabled_value(Some("2")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enum_audio_endpoints_scans_all_active_render_devices_cleanly() {
+        use super::{ComGuard, create_enumerator, mute_process_sessions};
+        // Run on a dedicated thread so COM MTA init does not conflict with any
+        // STA apartment that another test might set on the test runner thread.
+        let handle = std::thread::spawn(|| {
+            let _com = ComGuard::init_mta().expect("COM MTA init should succeed");
+            let enumerator = create_enumerator().expect("MMDeviceEnumerator should create");
+            let muted = mute_process_sessions(&enumerator, std::process::id())
+                .expect("EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) should succeed");
+            // This unit test process creates no audio client, so no session belongs to it.
+            assert!(!muted);
+            drop(enumerator);
+        });
+        handle.join().expect("mute endpoint scan thread panicked");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_wakes_and_exits_cleanly_when_stopped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || super::run_daemon_until(&stop_flag));
+        // Give the daemon time to complete its first poll and park.
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().expect("mute daemon panicked on shutdown");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "daemon should wake promptly on stop, took {:?}",
+            start.elapsed()
+        );
     }
 }
