@@ -1243,7 +1243,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let want = |i: usize| pages.map(|p| p[i]).filter(|&p| p != 0);
-    lift_thread();
+    victory_gpu::priority::stream_thread();
     let _call = Call::begin();
     let mut physical = physical();
     if !scatter_runs() && side_by_side::threads() > 1 {
@@ -1415,7 +1415,7 @@ static SCATTER: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    lift_thread();
+    victory_gpu::priority::stream_thread();
     let _making = probe::Making::begin(probe::Kind::Copy);
     let _call = Call::begin();
     let mut physical = physical();
@@ -1664,34 +1664,6 @@ fn remap_keep() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_KEEP").is_some_and(|v| v == "1"))
-}
-
-/// Lifts the calling thread above normal priority if it is below normal,
-/// once per thread (`VICTORY_STREAM_PRIORITY=1`, after cool_fox 49d71266b2).
-/// Called where the title's streaming thread scatters pages and copies page
-/// mappings: that thread runs below normal, and every mapping call it makes
-/// waits for the process's address-space lock behind our guards' and the
-/// driver's protection changes, so loading waits on it.
-fn lift_thread() {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-    };
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_some_and(|v| v == "1")) {
-        return;
-    }
-    thread_local!(static LOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
-    if LOOKED.with(|l| l.replace(true)) {
-        return;
-    }
-    // SAFETY: plain calls on this thread's pseudo handle.
-    unsafe {
-        let thread = GetCurrentThread();
-        let was = GetThreadPriority(thread);
-        if matches!(was, -2..0) && SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) != 0 {
-            tracing::info!(was, "a title thread that maps pages lifted above normal priority (VICTORY_STREAM_PRIORITY=1)");
-        }
-    }
 }
 
 /// Whether `[base, base + pages)` shows `pages` already, page for page.

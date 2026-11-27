@@ -332,6 +332,8 @@ def test_a_live_run_gets_its_schedule_and_its_report_section(tmp_path, monkeypat
     plan = tmp_path / "b9.toml"
     plan.write_text(plan_text, encoding="utf-8")
     calls, _ = setup_train(dev, tmp_path, monkeypatch, log)
+    # The plan's made-up switch, Live, whatever the real registry says.
+    monkeypatch.setattr(dev.dev_warm, "apply_kinds", lambda root: {"VICTORY_AWAKE": "Live"})
     assert dev.main(["train", "--plan", str(plan), "--run", "next"]) == 0
     overrides, seconds, quiet = calls[0]
     schedule = Path(overrides["VICTORY_SETTINGS_SCHEDULE"])
@@ -414,3 +416,11 @@ def test_greps_from_all_reads_every_ready_md(tmp_path, monkeypatch, capsys):
     dev.main(["train", "--plan", str(plan), "--greps-from", "all"])
     text = plan.read_text(encoding="utf-8")
     assert "alpha joins per frame" in text and "beta skipped" in text
+
+
+def test_apply_kinds_reads_the_settings_registry():
+    kinds = dev_warm.apply_kinds(Path(__file__).resolve().parents[1])
+    assert kinds is not None and len(kinds) > 100
+    assert kinds["VICTORY_PRESENT_CAP"] == "Live" and kinds["VICTORY_CARD_AWAKE"] == "Live"
+    assert kinds["VICTORY_CARD_WINDOWS_MB"] == "Restart"
+    assert kinds["VICTORY_PORT_CBV"] == "Retranslate"

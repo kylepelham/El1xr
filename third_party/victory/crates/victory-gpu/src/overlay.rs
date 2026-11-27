@@ -97,13 +97,36 @@ fn frame_figures() -> (f64, f64) {
     (FPS_X100.load(Ordering::Relaxed) as f64 / 100.0, MS_X100.load(Ordering::Relaxed) as f64 / 100.0)
 }
 
+/// The game window and adapter while `VICTORY_OVERLAY=0`, for the in-game
+/// menu turning it on.
+static PARKED: Mutex<Option<(usize, Option<IDXGIAdapter3>)>> = Mutex::new(None);
+
 /// Starts the overlay thread for the game window `hwnd` (the first call only).
+/// `VICTORY_OVERLAY` is live: 0 hides the panel as F10 does, anything else
+/// shows it, starting the thread if it was off at start.
 pub(crate) fn start(hwnd: windows::Win32::Foundation::HWND, adapter: Option<IDXGIAdapter3>) {
-    static ONCE: Once = Once::new();
+    static HOOKED: Once = Once::new();
+    HOOKED.call_once(|| victory_core::settings::on_change("VICTORY_OVERLAY", changed));
+    let game = hwnd.0 as usize;
     if std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "0") {
+        *PARKED.lock().unwrap_or_else(|e| e.into_inner()) = Some((game, adapter));
         return;
     }
-    let game = hwnd.0 as usize;
+    spawn(game, adapter);
+}
+
+fn changed(value: &str) {
+    let on = value != "0";
+    VISIBLE.store(on, Ordering::Relaxed);
+    let mut parked = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+    if on && let Some((game, adapter)) = parked.take() {
+        drop(parked);
+        spawn(game, adapter);
+    }
+}
+
+fn spawn(game: usize, adapter: Option<IDXGIAdapter3>) {
+    static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let spawned = std::thread::Builder::new()
             .name("victory-overlay".into())
