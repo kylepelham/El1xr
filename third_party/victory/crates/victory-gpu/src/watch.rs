@@ -1337,11 +1337,10 @@ fn dirty4k_mode() -> u8 {
 }
 
 /// Whether the journal keeps the 4 KiB pages found ([`SUB_PAGES`]): with the
-/// switch on (unless [`watch_4k`] already handles 4 KiB sub-pages lock-free via
-/// [`SUBS`]), and in both phases of `alt` (the phase without counts what it
+/// switch on, and in both phases of `alt` (the phase without counts what it
 /// would have saved).
 pub(crate) fn dirty4k_kept() -> bool {
-    !watch_4k() && dirty4k_mode() != 0
+    dirty4k_mode() != 0
 }
 
 /// With [`dirty4k_kept`]: the entries of [`SUB_PAGES`] for the pages of

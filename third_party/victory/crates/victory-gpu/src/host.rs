@@ -9092,7 +9092,7 @@ impl HostList {
                 }
             };
             let us = started.elapsed().as_micros() as u64;
-            crate::copy_profile::note_step_copy(copied, us);
+            crate::copy_profile::step_copy(copied, us);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -9417,7 +9417,7 @@ impl Batch {
             }
         }
         let us = started.elapsed().as_micros() as u64;
-        crate::copy_profile::note_fill(total_bytes, us);
+        crate::copy_profile::fill(total_bytes, us);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
     }
