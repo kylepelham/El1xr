@@ -512,6 +512,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let _hitch = crate::hitch::span(crate::hitch::Phase::PipelineWait);
     let (lock, done) = &p.completion;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.slow() {

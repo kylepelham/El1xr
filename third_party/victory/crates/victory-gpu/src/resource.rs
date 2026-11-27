@@ -5546,4 +5546,12 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    #[test]
+    fn a8_unorm_stays_out_of_r8_typeless_family() {
+        assert_eq!(family(65), 65);
+        for fmt in 60..=64 {
+            assert_eq!(family(fmt), 60);
+        }
+    }
 }

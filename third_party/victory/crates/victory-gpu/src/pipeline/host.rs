@@ -315,6 +315,9 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    /// Actual library key and declared color formats for opt-in mismatch reports.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) traced_targets: Option<(String, D3D12_RT_FORMAT_ARRAY)>,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -345,6 +348,33 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
+}
+
+/// The lane bounds in the translated shader's pipeline validation data.
+/// Valid DXIL can still require a wave wider than the device supports.
+fn wave_lanes(dxil: &[u8]) -> Option<[u32; 2]> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    Some([
+        u32::from_le_bytes(info.get(16..20)?.try_into().ok()?),
+        u32::from_le_bytes(info.get(20..24)?.try_into().ok()?),
+    ])
+}
+
+/// Records the translated DXIL digest and declared wave lanes beside the
+/// original shader hash when a host pipeline is refused.
+fn log_refused_stage(shader: &Shader) {
+    if let Some(t) = shader.translated() {
+        let dxil = &t.host.dxil;
+        tracing::warn!(
+            ?shader,
+            host_dxil = %blake3::hash(dxil),
+            wave_lanes = ?wave_lanes(dxil),
+            "translated stage of a refused pipeline"
+        );
+    }
 }
 
 impl HostPipeline {
@@ -593,6 +623,7 @@ impl HostPipeline {
                         static_samplers = samplers.len(),
                         "host pipeline refused"
                     );
+                    log_refused_stage(stages[0].0);
                     return None;
                 }
             };
@@ -601,6 +632,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                #[cfg(feature = "diagnostics")]
+                traced_targets: None,
                 pso,
                 root,
                 stages: bound,
@@ -656,6 +689,9 @@ impl HostPipeline {
                     // The state too: the shaders alone make a pipeline
                     // with another state (`victory translate` pairs).
                     tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
+                    for (shader, _) in &stages {
+                        log_refused_stage(shader);
+                    }
                     host.log_messages();
                     return None;
                 }
@@ -665,6 +701,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                #[cfg(feature = "diagnostics")]
+                traced_targets: crate::draw::rtv_trace::enabled().then_some((name, g.targets)),
                 pso,
                 root,
                 stages: bound,
@@ -673,7 +711,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 is_bake,
-                state: String::new(),
+                state: state_summary(g, depth_bounds),
             });
         }
 
@@ -751,7 +789,8 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let mut library_key = name(rect_gs.as_ref());
+        let mut made = make(&desc, &library_key);
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(
@@ -761,7 +800,8 @@ impl HostPipeline {
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            library_key = name(None);
+            made = make(&desc, &library_key);
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -786,6 +826,8 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            #[cfg(feature = "diagnostics")]
+            traced_targets: crate::draw::rtv_trace::enabled().then_some((library_key, g.targets)),
             pso,
             root,
             stages: bound,
@@ -794,39 +836,38 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             is_bake,
-            state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
-                    format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0,
-                        f.StencilDepthFailOp.0,
-                        f.StencilPassOp.0,
-                        f.StencilFunc.0
-                    )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
-            },
+            state: state_summary(g, depth_bounds),
         })
     }
+}
+
+fn state_summary(g: &GraphicsState, depth_bounds: bool) -> String {
+    let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+    let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+        format!(
+            "fail {} depth-fail {} pass {} func {}",
+            f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+        )
+    };
+    let bounds = if depth_bounds { " bounds true" } else { "" };
+    format!(
+        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+        d.DepthEnable.as_bool(),
+        d.DepthWriteMask.0,
+        d.DepthFunc.0,
+        d.StencilEnable.as_bool(),
+        d.StencilReadMask,
+        d.StencilWriteMask,
+        face(&d.FrontFace),
+        face(&d.BackFace),
+        r.CullMode.0,
+        r.FrontCounterClockwise.as_bool(),
+        b.BlendEnable.as_bool(),
+        b.SrcBlend.0,
+        b.DestBlend.0,
+        b.BlendOp.0,
+        b.RenderTargetWriteMask
+    )
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.

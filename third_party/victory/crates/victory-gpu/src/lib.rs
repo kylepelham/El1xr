@@ -43,11 +43,15 @@ pub mod external;
 pub mod fence;
 pub mod frame;
 pub mod frametime;
+<<<<<<< HEAD
 #[cfg(all(windows, feature = "diagnostics"))]
 mod gpucost;
 #[cfg(feature = "mimalloc")]
 pub mod heap;
 mod heap_pass;
+=======
+pub mod hitch;
+>>>>>>> exp/next
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
@@ -72,6 +76,21 @@ pub mod pipeline;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+<<<<<<< HEAD
+=======
+mod relay_runs;
+#[cfg(windows)]
+mod screenshot;
+#[cfg(windows)]
+mod scratch_spare;
+#[cfg(windows)]
+mod indirect;
+#[cfg(windows)]
+mod cores;
+#[cfg(windows)]
+mod inplace;
+#[cfg(windows)]
+>>>>>>> exp/next
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -96,6 +115,10 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod stretch;
+#[cfg(windows)]
+mod copy_profile;
+#[cfg(windows)]
+mod refresh_prof;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

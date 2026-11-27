@@ -459,3 +459,35 @@ def test_mute_switch_sets_victory_mute_and_allows_override(tmp_path, faux_outil)
     )
     assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
     assert _valeurs(fini.stdout)["VICTORY_MUTE"] == "0"
+
+
+def test_skip_intro_data_dir_and_title_args(tmp_path, faux_outil):
+    texte = _lanceur()
+    assert "[switch]$SkipIntro" in texte
+    assert "[string]$DataDir" in texte
+    assert "[string[]]$TitleArgs" in texte
+    assert "VICTORY_SKIP_INTRO" not in _table(texte)
+
+    data_dir = tmp_path / "isolated_data"
+    fini, appels, _, jeu = _lancer(
+        tmp_path / "fast",
+        faux_outil,
+        echo=("VICTORY_SKIP_INTRO", "VICTORY_DATA_DIR"),
+        commande=f"-SkipIntro -DataDir '{data_dir}' -TitleArgs @('-skipToIIS', '-flag=1')",
+    )
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    vals = _valeurs(fini.stdout)
+    assert vals["VICTORY_SKIP_INTRO"] == "1"
+    assert vals["VICTORY_DATA_DIR"] == str(data_dir)
+    assert appels[-1] == f"victory run {jeu / 'game_scarlett_master.exe'} --execute -- -skipToIIS -flag=1"
+
+    fini_ov, _, _, _ = _lancer(
+        tmp_path / "override",
+        faux_outil,
+        echo=("VICTORY_SKIP_INTRO", "VICTORY_DATA_DIR"),
+        commande=f"-SkipIntro -DataDir '{data_dir}' -Override @{{ VICTORY_SKIP_INTRO = '0'; VICTORY_DATA_DIR = 'custom' }}",
+    )
+    assert fini_ov.returncode == CODE_SORTIE_VICTORY, fini_ov.stderr
+    vals_ov = _valeurs(fini_ov.stdout)
+    assert vals_ov["VICTORY_SKIP_INTRO"] == "0"
+    assert vals_ov["VICTORY_DATA_DIR"] == "custom"
