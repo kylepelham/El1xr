@@ -2072,6 +2072,9 @@ impl State {
         }
         let mut made = std::mem::take(&mut self.scratch_made);
         crate::table_defer::begin(p.is_bake, compute);
+        if p.is_bake {
+            crate::load_rate::bake_seen();
+        }
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
