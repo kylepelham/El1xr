@@ -1,13 +1,14 @@
-//! NVIDIA DLSS in place of the title's FidelityFX upscale (`VICTORY_UPSCALE=dlss`,
-//! builds with `--features dlss`).
+//! NVIDIA DLSS in place of the title's FidelityFX upscale (`VICTORY_UPSCALE=dlss`).
 //!
 //! Ported from `Peppacodes/playablegames-peppa` (`b3c3766546`, from
 //! `avatarmanz/VIctory-7900XTX` PR #203 by YeokiNoewChi).
 //!
-//! The SDK (NVIDIA/DLSS on GitHub: `include`, `lib/Windows_x86_64`) is not part
-//! of this repository: the build links `nvsdk_ngx_d.lib` from
-//! `VICTORY_DLSS_SDK`, and `nvngx_dlss.dll` is looked for in `VICTORY_DLSS_DIR`
-//! (else beside the executable). Any failure leaves the caller to stretch.
+//! No SDK in the build: NGX is the driver's own core, loaded at runtime
+//! (`crate::ngx`). `nvngx_dlss.dll` is looked for in `VICTORY_DLSS_DIR`, else
+//! beside the executable, else the newest DLSS the driver keeps in its
+//! model store (`%ProgramData%/NVIDIA/NGX/models/dlss`, copied once as
+//! `%TEMP%/victory-ngx/dlss-<version>/nvngx_dlss.dll`). Any failure leaves the
+//! caller to stretch.
 //!
 //! Switches: `VICTORY_DLSS_QUALITY` (0 performance .. 2 quality, 5 DLAA; 2 by
 //! default), `VICTORY_DLSS_MV_SIGN=-1` (motion vectors the other way),
@@ -15,82 +16,18 @@
 //! format), `VICTORY_DLSS_DEPTH_INVERTED=0|1` (default: by near > far),
 //! `VICTORY_DLSS_SHARPNESS=<0..1>`.
 
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, c_int, c_void};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-use crate::upscale::{dlss_create_flags, dlss_dll_present, resolve_dlss_dir};
-
-type Result = c_int;
-const SUCCESS: Result = 1;
-const FEATURE_SUPER_SAMPLING: c_int = 1;
-const ENGINE_CUSTOM: c_int = 0;
-const VERSION_API: c_int = 0x15;
-
-#[repr(C)]
-struct PathList {
-    path: *const *const u16,
-    length: c_uint,
-}
-
-#[repr(C)]
-struct Logging {
-    callback: *const c_void,
-    minimum: c_int,
-    disable_other_sinks: bool,
-}
-
-#[repr(C)]
-struct CommonInfo {
-    paths: PathList,
-    internal: *const c_void,
-    logging: Logging,
-}
-
-#[link(name = "nvsdk_ngx_d", kind = "static")]
-unsafe extern "C" {
-    fn NVSDK_NGX_D3D12_Init_with_ProjectID(
-        project: *const c_char,
-        engine: c_int,
-        engine_version: *const c_char,
-        data_path: *const u16,
-        device: *mut c_void,
-        info: *const CommonInfo,
-        version: c_int,
-    ) -> Result;
-    fn NVSDK_NGX_D3D12_GetCapabilityParameters(out: *mut *mut c_void) -> Result;
-    fn NVSDK_NGX_D3D12_CreateFeature(
-        list: *mut c_void,
-        feature: c_int,
-        params: *mut c_void,
-        out: *mut *mut c_void,
-    ) -> Result;
-    fn NVSDK_NGX_D3D12_ReleaseFeature(handle: *mut c_void) -> Result;
-    fn NVSDK_NGX_D3D12_EvaluateFeature_C(
-        list: *mut c_void,
-        handle: *const c_void,
-        params: *const c_void,
-        callback: *const c_void,
-    ) -> Result;
-    fn NVSDK_NGX_Parameter_SetUI(p: *mut c_void, name: *const c_char, value: c_uint);
-    fn NVSDK_NGX_Parameter_SetI(p: *mut c_void, name: *const c_char, value: c_int);
-    fn NVSDK_NGX_Parameter_SetF(p: *mut c_void, name: *const c_char, value: f32);
-    fn NVSDK_NGX_Parameter_SetD3d12Resource(
-        p: *mut c_void,
-        name: *const c_char,
-        value: *mut c_void,
-    );
-    fn NVSDK_NGX_Parameter_GetI(p: *mut c_void, name: *const c_char, out: *mut c_int) -> Result;
-}
-
-/// A parameter name as the SDK spells it.
-macro_rules! name {
-    ($s:literal) => {
-        concat!($s, "\0").as_ptr().cast::<c_char>()
-    };
-}
+use crate::ngx::{
+    CommonInfo, ENGINE_CUSTOM, FEATURE_SUPER_SAMPLING, Logging, Params, PathList, SUCCESS,
+    VERSION_API, name,
+};
+use crate::upscale::{DLSS_DLL_NAME, dlss_create_flags, dlss_dll_present, resolve_dlss_dir};
 
 /// What the title gives an upscale, as the host's resources.
 pub(crate) struct Inputs<'a> {
@@ -117,7 +54,8 @@ struct Feature {
 }
 
 struct Dlss {
-    params: *mut c_void,
+    core: &'static crate::ngx::Core,
+    params: Params,
     feature: Option<Feature>,
     /// Features replaced by a live change, released once no list uses them.
     retired: crate::upscale_live::Retired<usize>,
@@ -147,19 +85,62 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain([0]).collect()
 }
 
+/// The newest DLSS in the driver's model store: `versions/<n>/files/*.bin`
+/// (each a renamed `nvngx_dlss.dll`), with its version number.
+pub(crate) fn newest_in_store(store: &Path) -> Option<(u64, PathBuf)> {
+    std::fs::read_dir(store.join("versions"))
+        .ok()?
+        .flatten()
+        .filter_map(|v| {
+            let n: u64 = v.file_name().to_str()?.parse().ok()?;
+            let bin = std::fs::read_dir(v.path().join("files"))
+                .ok()?
+                .flatten()
+                .map(|f| f.path())
+                .find(|f| f.extension().is_some_and(|x| x == "bin") && f.is_file())?;
+            Some((n, bin))
+        })
+        .max_by_key(|(n, _)| *n)
+}
+
+/// A folder holding the driver store's newest `nvngx_dlss.dll`, copied under
+/// `data` once per version.
+fn from_driver_store(data: &Path) -> Option<PathBuf> {
+    let store = PathBuf::from(std::env::var_os("ProgramData")?).join("NVIDIA/NGX/models/dlss");
+    let (version, bin) = newest_in_store(&store)?;
+    let dir = data.join(format!("dlss-{version}"));
+    if !dlss_dll_present(&dir) {
+        std::fs::create_dir_all(&dir).ok()?;
+        let tmp = dir.join("nvngx_dlss.dll.part");
+        std::fs::copy(&bin, &tmp).ok()?;
+        std::fs::rename(&tmp, dir.join(DLSS_DLL_NAME)).ok()?;
+    }
+    tracing::info!(store = %bin.display(), version, "DLSS: using the driver store's nvngx_dlss.dll");
+    Some(dir)
+}
+
 fn init(device: &ID3D12Device) -> Option<Dlss> {
+    let core = match crate::ngx::core() {
+        Ok(c) => c,
+        Err(why) => {
+            tracing::warn!(why, "DLSS: no NGX core; the upscale stays a stretch");
+            return None;
+        }
+    };
+    let data = std::env::temp_dir().join("victory-ngx");
     let env_dir = std::env::var_os("VICTORY_DLSS_DIR");
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let dir = resolve_dlss_dir(env_dir.as_deref(), exe_dir.as_deref())?;
-    if !dlss_dll_present(&dir) {
+    let dir = resolve_dlss_dir(env_dir.as_deref(), exe_dir.as_deref())
+        .filter(|d| dlss_dll_present(d))
+        .or_else(|| from_driver_store(&data));
+    let Some(dir) = dir else {
         tracing::warn!(
-            dir = %dir.display(),
-            "DLSS: nvngx_dlss.dll not found in search directory; trying driver NGX store or falling back to stretch"
+            "DLSS: no nvngx_dlss.dll (VICTORY_DLSS_DIR, the executable's folder, the driver store); the upscale stays a stretch"
         );
-    }
-    let data = std::env::temp_dir().join("victory-ngx");
+        return None;
+    };
     let _ = std::fs::create_dir_all(&data);
     let dir_w = wide(dir.as_os_str());
     let data_w = wide(data.as_os_str());
@@ -178,29 +159,29 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
     };
     let project = CString::new("5e2f9a3c-1b7d-4c8e-9a6f-0d3b2c1e4f57").ok()?;
     let version = CString::new("1.0").ok()?;
-    // SAFETY: live strings and device; the SDK copies what it keeps.
+    // SAFETY: live strings and device; the core copies what it keeps.
     let r = unsafe {
-        NVSDK_NGX_D3D12_Init_with_ProjectID(
+        (core.init_project_id)(
             project.as_ptr(),
             ENGINE_CUSTOM,
             version.as_ptr(),
             data_w.as_ptr(),
             device.as_raw(),
-            &info,
             VERSION_API,
+            &info,
         )
     };
     if r != SUCCESS {
         tracing::warn!(
             result = format_args!("{r:#x}"),
             dir = %dir.display(),
-            "DLSS: the SDK did not start; the upscale stays a stretch"
+            "DLSS: NGX did not start; the upscale stays a stretch"
         );
         return None;
     }
     let mut params = std::ptr::null_mut();
     // SAFETY: an out pointer.
-    let r = unsafe { NVSDK_NGX_D3D12_GetCapabilityParameters(&mut params) };
+    let r = unsafe { (core.get_capability_parameters)(&mut params) };
     if r != SUCCESS || params.is_null() {
         tracing::warn!(
             result = format_args!("{r:#x}"),
@@ -208,18 +189,20 @@ fn init(device: &ID3D12Device) -> Option<Dlss> {
         );
         return None;
     }
-    let mut available = 0;
+    let params = Params(params);
     // SAFETY: live parameters.
-    unsafe { NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.Available"), &mut available) };
+    let available = unsafe { params.get_i(name!("SuperSampling.Available")) }.unwrap_or(0);
     if available == 0 {
         tracing::warn!("DLSS: super sampling is not available on this card or driver");
         return None;
     }
     tracing::info!(
         dir = %dir.display(),
+        core = %core.dir.display(),
         "DLSS: started; the title's upscale is DLSS (VICTORY_UPSCALE=dlss)"
     );
     Some(Dlss {
+        core,
         params,
         feature: None,
         retired: crate::upscale_live::Retired::new(),
@@ -268,9 +251,10 @@ pub(crate) fn record(
     let hdr = flags & crate::upscale::DLSS_FLAG_HDR != 0;
     let inverted = flags & crate::upscale::DLSS_FLAG_DEPTH_INVERTED != 0;
     let live = crate::upscale_live::any();
-    // SAFETY: handles the SDK made, no longer used by any list in flight.
+    let release = dlss.core.release_feature;
+    // SAFETY: handles the core made, no longer used by any list in flight.
     dlss.retired
-        .tick(|h| unsafe { _ = NVSDK_NGX_D3D12_ReleaseFeature(h as *mut c_void) });
+        .tick(|h| unsafe { _ = release(h as *mut c_void) });
     let quality = crate::upscale_live::quality()
         .unwrap_or_else(|| env_f("VICTORY_DLSS_QUALITY", 2.0) as c_int);
     let key = [
@@ -291,23 +275,23 @@ pub(crate) fn record(
                 // A live change: lists in flight may still evaluate it.
                 dlss.retired.retire(old.handle as usize);
             } else {
-                // SAFETY: a handle the SDK made.
-                unsafe { NVSDK_NGX_D3D12_ReleaseFeature(old.handle) };
+                // SAFETY: a handle the core made.
+                unsafe { release(old.handle) };
             }
         }
         let mut handle = std::ptr::null_mut();
         // SAFETY: live parameters and an open list.
         let r = unsafe {
-            NVSDK_NGX_Parameter_SetUI(p, name!("CreationNodeMask"), 1);
-            NVSDK_NGX_Parameter_SetUI(p, name!("VisibilityNodeMask"), 1);
-            NVSDK_NGX_Parameter_SetUI(p, name!("Width"), in_w);
-            NVSDK_NGX_Parameter_SetUI(p, name!("Height"), in_h);
-            NVSDK_NGX_Parameter_SetUI(p, name!("OutWidth"), out.Width as u32);
-            NVSDK_NGX_Parameter_SetUI(p, name!("OutHeight"), out.Height);
-            NVSDK_NGX_Parameter_SetI(p, name!("PerfQualityValue"), quality);
-            NVSDK_NGX_Parameter_SetI(p, name!("DLSS.Feature.Create.Flags"), flags);
-            NVSDK_NGX_Parameter_SetI(p, name!("DLSS.Enable.Output.Subrects"), 0);
-            NVSDK_NGX_D3D12_CreateFeature(list.as_raw(), FEATURE_SUPER_SAMPLING, p, &mut handle)
+            p.set_ui(name!("CreationNodeMask"), 1);
+            p.set_ui(name!("VisibilityNodeMask"), 1);
+            p.set_ui(name!("Width"), in_w);
+            p.set_ui(name!("Height"), in_h);
+            p.set_ui(name!("OutWidth"), out.Width as u32);
+            p.set_ui(name!("OutHeight"), out.Height);
+            p.set_i(name!("PerfQualityValue"), quality);
+            p.set_i(name!("DLSS.Feature.Create.Flags"), flags);
+            p.set_i(name!("DLSS.Enable.Output.Subrects"), 0);
+            (dlss.core.create_feature)(list.as_raw(), FEATURE_SUPER_SAMPLING, p.0, &mut handle)
         };
         if r != SUCCESS || handle.is_null() {
             tracing::warn!(
@@ -344,24 +328,22 @@ pub(crate) fn record(
     let scale = |s: f32| if s == 0.0 { 1.0 } else { s };
     // SAFETY: live parameters, resources and feature; an open list.
     let r = unsafe {
-        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Color"), inputs.colour.as_raw());
-        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Output"), inputs.output.as_raw());
-        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Depth"), raw(inputs.depth));
-        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("MotionVectors"), raw(inputs.motion));
-        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("ExposureTexture"), raw(inputs.exposure));
-        NVSDK_NGX_Parameter_SetF(p, name!("Jitter.Offset.X"), jit * inputs.jitter[0]);
-        NVSDK_NGX_Parameter_SetF(p, name!("Jitter.Offset.Y"), jit * inputs.jitter[1]);
-        NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.X"), mv * scale(inputs.motion_scale[0]));
-        NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.Y"), mv * scale(inputs.motion_scale[1]));
-        NVSDK_NGX_Parameter_SetI(p, name!("Reset"), inputs.reset as c_int);
-        NVSDK_NGX_Parameter_SetF(
-            p,
+        p.set_resource(name!("Color"), inputs.colour.as_raw());
+        p.set_resource(name!("Output"), inputs.output.as_raw());
+        p.set_resource(name!("Depth"), raw(inputs.depth));
+        p.set_resource(name!("MotionVectors"), raw(inputs.motion));
+        p.set_resource(name!("ExposureTexture"), raw(inputs.exposure));
+        p.set_f(name!("Jitter.Offset.X"), jit * inputs.jitter[0]);
+        p.set_f(name!("Jitter.Offset.Y"), jit * inputs.jitter[1]);
+        p.set_f(name!("MV.Scale.X"), mv * scale(inputs.motion_scale[0]));
+        p.set_f(name!("MV.Scale.Y"), mv * scale(inputs.motion_scale[1]));
+        p.set_i(name!("Reset"), inputs.reset as c_int);
+        p.set_f(
             name!("Sharpness"),
             crate::upscale_live::sharpness()
                 .unwrap_or_else(|| env_f("VICTORY_DLSS_SHARPNESS", 0.0)),
         );
-        NVSDK_NGX_Parameter_SetF(
-            p,
+        p.set_f(
             name!("DLSS.Pre.Exposure"),
             if inputs.pre_exposure > 0.0 {
                 inputs.pre_exposure
@@ -369,18 +351,16 @@ pub(crate) fn record(
                 1.0
             },
         );
-        NVSDK_NGX_Parameter_SetF(p, name!("FrameTimeDeltaInMsec"), inputs.frame_ms);
-        NVSDK_NGX_Parameter_SetUI(
-            p,
+        p.set_f(name!("FrameTimeDeltaInMsec"), inputs.frame_ms);
+        p.set_ui(
             name!("DLSS.Render.Subrect.Dimensions.Width"),
             render[0].min(in_w),
         );
-        NVSDK_NGX_Parameter_SetUI(
-            p,
+        p.set_ui(
             name!("DLSS.Render.Subrect.Dimensions.Height"),
             render[1].min(in_h),
         );
-        NVSDK_NGX_D3D12_EvaluateFeature_C(list.as_raw(), feature.handle, p, std::ptr::null())
+        (dlss.core.evaluate_feature)(list.as_raw(), feature.handle, p.0, std::ptr::null())
     };
     if r != SUCCESS {
         static TOLD: std::sync::Once = std::sync::Once::new();
@@ -393,4 +373,29 @@ pub(crate) fn record(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newest_in_store;
+
+    #[test]
+    fn the_newest_store_version_with_a_bin_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        assert_eq!(newest_in_store(store), None);
+        for (v, file) in [
+            ("131356", "160_A.bin"),
+            ("20316928", "160_B.bin"),
+            ("30000000", "readme.txt"),
+        ] {
+            let files = store.join("versions").join(v).join("files");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join(file), b"MZ").unwrap();
+        }
+        std::fs::create_dir_all(store.join("versions/notanumber/files")).unwrap();
+        let (v, bin) = newest_in_store(store).unwrap();
+        assert_eq!(v, 20316928);
+        assert!(bin.ends_with("160_B.bin"));
+    }
 }

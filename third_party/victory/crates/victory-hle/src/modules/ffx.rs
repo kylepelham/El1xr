@@ -7,8 +7,8 @@
 //!
 //! When opted in (on Series S, or on Series X with `VICTORY_UPSCALER=7`),
 //! `ffxDispatch` alone is taken here: an upscale dispatch becomes native
-//! NVIDIA DLSS SR (`VICTORY_UPSCALE=dlss` with `--features dlss` and
-//! `nvngx_dlss.dll`) or a plain bilinear stretch (`VICTORY_UPSCALE=stretch`,
+//! NVIDIA DLSS SR (`VICTORY_UPSCALE=dlss`, through the driver's NGX core and
+//! an `nvngx_dlss.dll`) or a plain bilinear stretch (`VICTORY_UPSCALE=stretch`,
 //! also the fallback if DLSS cannot run). Any other dispatch, and any upscale
 //! we could not record, is forwarded to the title's own DLL.
 //!

@@ -140,7 +140,7 @@ pub fn dlss_dll_present(dir: &Path) -> bool {
 }
 
 /// Records the title's upscale in place of its FidelityFX passes: DLSS when
-/// asked for (`up.dlss`), built with `--features dlss`, and NGX succeeds;
+/// asked for (`up.dlss`) and NGX (the driver's core) succeeds;
 /// otherwise a plain bilinear stretch (`crate::stretch`). Returns `false` if
 /// nothing was recorded (the caller may fall back to the title's DLL).
 #[cfg(windows)]
@@ -177,7 +177,6 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
         crate::list::ensure_state(list, output, UNORDERED);
 
         if up.dlss {
-            #[cfg(feature = "dlss")]
             {
                 let input = |addr: u64| {
                     if addr == 0 {
@@ -211,15 +210,6 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
                     frame_ms: up.frame_ms,
                 };
                 done = crate::dlss::record(&host.device, &list.list, &inputs);
-            }
-            #[cfg(not(feature = "dlss"))]
-            {
-                static TOLD: std::sync::Once = std::sync::Once::new();
-                TOLD.call_once(|| {
-                    tracing::warn!(
-                        "VICTORY_UPSCALE=dlss requested, but this binary was built without `--features dlss` (requires VICTORY_DLSS_SDK and nvngx_dlss.dll); falling back to stretch"
-                    );
-                });
             }
         }
 

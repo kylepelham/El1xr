@@ -28,9 +28,6 @@ diagnostics = []
 # process heap it shares with the title and the drivers; VICTORY_ALLOC=system
 # goes back to that heap for a run.
 mimalloc = ["dep:mimalloc"]
-# NVIDIA DLSS for the title's upscale (`VICTORY_UPSCALE=dlss`); needs the DLSS
-# SDK (NVIDIA/DLSS: include, lib/Windows_x86_64) at `VICTORY_DLSS_SDK`.
-dlss = []
 
 [lints]
 workspace = true
