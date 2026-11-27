@@ -348,6 +348,15 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -1449,6 +1458,68 @@ mod tests {
         let depth_plain = emit_ps(1, true);
         let depth_with_bit12 = emit_ps((1 << 12) | 1, true);
         assert_eq!(depth_plain, depth_with_bit12);
+    }
+
+    /// A pixel shader that kills lanes in whole-quad mode (`s_wqm`) and exports
+    /// two colour targets under the same live-lane guard translates cleanly:
+    /// the earlier colour export shares the final export's guard.
+    #[test]
+    fn live_quad_kill_with_multiple_colour_exports_translates() {
+        let words = [
+            0xBECC_037Eu32, // s_mov_b32 s76, exec_lo
+            0x7C28_00F2,    // v_cmpx_gt_f32 exec_lo, 1.0, v0
+            0x8A4C_7E4C,    // s_andn2_b32 s76, s76, exec_lo
+            0xBF84_0008,    // s_cbranch_scc0 -> end
+            0xBE81_094C,    // s_wqm_b32 s1, s76
+            0xBEFE_0301,    // s_mov_b32 exec_lo, s1
+            0x7E02_02F2,    // v_mov_b32 v1, 1.0
+            0xBEFE_034C,    // s_mov_b32 exec_lo, s76
+            0xF800_100F,
+            0x0101_0101,    // exp mrt0 v1, v1, v1, v1 vm (not done)
+            0xF800_181F,
+            0x0101_0101,    // exp mrt1 v1, v1, v1, v1 done vm
+            0xBF81_0000,    // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = |index, row| SigElement {
+            name: "SV_Target".into(),
+            index,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[target(0, 0), target(1, 1)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
