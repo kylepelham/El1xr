@@ -72,16 +72,26 @@ thread_local! {
     pub(super) static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Blocks `[from, to)` were made read-only by the guards: room for their open pages, made here
-/// (never in the fault handler, which must not allocate).
+/// Blocks `[from, to)` were made read-only whole by the guards (their claims held): room for
+/// their open pages, made here (never in the fault handler, which must not allocate), and the
+/// pages noted open before forgotten. Those were opened while the block was protected; since then
+/// it lost its protection another way (opened whole: a copy-back of ours, a remap, an alias), so
+/// what they wrote is taken whole already, and they are read-only again now. Left noted, the next
+/// write fault on one would find it "open already" and not handle it (batch 1: the title's write
+/// to a read-only page, unhandled).
 pub(super) fn ready(from: usize, to: usize) {
     if !on() {
         return;
     }
     let mut block = from;
     while block < to {
-        let _ = part_of(&OPEN, block, true);
-        block = (block / super::PART + 1) * super::PART;
+        let end = ((block / super::PART + 1) * super::PART).min(to);
+        if let Some(part) = part_of(&OPEN, block, true) {
+            for b in block..end {
+                part.0[b % super::PART].store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        block = end;
     }
 }
 
@@ -98,9 +108,11 @@ pub(super) fn not_clean(block: usize) {
 pub(super) fn fault(g: &Guards, block: usize, at: usize) -> Option<(usize, bool)> {
     let cell = &part_of(&OPEN, block, false)?.0[block % super::PART];
     let bit = 1u64 << ((at % BLOCK) / KERNEL_PAGE);
-    if cell.load(Acquire) & bit != 0 {
-        // Open already: the fault is not ours.
-        return Some((0, writable(at)));
+    if cell.load(Acquire) & bit != 0 && writable(at) {
+        // Open already (another thread's fault opened it first): the fault is not ours. Noted
+        // open and still read-only (a check that could not make the whole run read-only again
+        // left it so): opened again below; it stays noted, so the next check takes it.
+        return Some((0, true));
     }
     let was_clean = g.clean.contains(block);
     if was_clean {
@@ -256,6 +268,64 @@ mod tests {
     /// SAFETY: `at` is inside a live view.
     unsafe fn poke(at: usize) {
         unsafe { (at as *mut u8).write_volatile(7) };
+    }
+
+    #[test]
+    fn a_page_noted_open_before_the_block_was_opened_whole_and_guarded_again_faults_and_is_seen() {
+        // Batch 1's crash: page 3 opened alone, then the block opened whole by a write through
+        // the kernel (`writing`, the title's file read) and guarded again by the next check. Page 3 was still noted open,
+        // so the title's next write to it, read-only again, was taken for another thread's and
+        // left unhandled.
+        const SIZE: usize = 2 * BLOCK;
+        FORCED.with(|f| f.set(true));
+        install();
+        let (section, at) = view(SIZE);
+        let (first, last) = (at / BLOCK, (at + SIZE) / BLOCK);
+        let b = first + 1;
+        let page3 = at + BLOCK + 3 * KERNEL_PAGE;
+        check(first, last);
+        check(first, last);
+        // SAFETY: the view, guarded: the handler opens the 4 KiB page written.
+        unsafe { poke(page3) };
+        assert_eq!(open_of(b), (1 << 3, true));
+        super::super::writing(at + BLOCK + 9 * KERNEL_PAGE, 16);
+        assert_eq!(check(first, last), vec![b], "opened whole: written whole");
+        assert_eq!(open_of(b), (0, false), "guarded again whole: nothing noted open");
+        let before = stamp(b);
+        // SAFETY: as above; without the fix this write is not handled and the test process dies.
+        unsafe { poke(page3) };
+        assert_eq!(open_of(b), (1 << 3, true));
+        assert_eq!(check(first, last), Vec::<usize>::new());
+        assert!(stamp(b) > before, "the write is noted at its 4 KiB page");
+        FORCED.with(|f| f.set(false));
+        drop_view(section, at, SIZE);
+    }
+
+    #[test]
+    fn a_page_noted_open_but_read_only_is_opened_again_on_its_fault() {
+        // A check that could not make every open run read-only again leaves pages it did make
+        // read-only noted open (`Closed::Failed`): their next write must still be handled.
+        const SIZE: usize = 2 * BLOCK;
+        FORCED.with(|f| f.set(true));
+        install();
+        let (section, at) = view(SIZE);
+        let (first, last) = (at / BLOCK, (at + SIZE) / BLOCK);
+        let b = first + 1;
+        let page5 = at + BLOCK + 5 * KERNEL_PAGE;
+        check(first, last);
+        check(first, last);
+        // SAFETY: as in the other tests.
+        unsafe { poke(page5) };
+        assert!(super::super::writable(page5));
+        assert!(super::protect_page(page5, windows_sys::Win32::System::Memory::PAGE_READONLY));
+        assert_eq!(open_of(b), (1 << 5, true), "noted open, read-only");
+        // SAFETY: as above; handled, or the test process dies.
+        unsafe { poke(page5) };
+        assert!(super::super::writable(page5));
+        assert_eq!(check(first, last), Vec::<usize>::new());
+        assert_eq!(open_of(b), (0, false));
+        FORCED.with(|f| f.set(false));
+        drop_view(section, at, SIZE);
     }
 
     #[test]
