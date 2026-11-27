@@ -129,6 +129,9 @@ static WINDOW_STATE: Mutex<Option<Window>> = Mutex::new(None);
 
 /// Presents the swap chain's current buffer as configured and times it.
 pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
+    if crate::camera::on() {
+        crate::camera::frame_end(|at, out| crate::host::read_into(at as *const u8, out));
+    }
     let c = config();
     let mut guard = WINDOW_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.get_or_insert_with(|| Window {

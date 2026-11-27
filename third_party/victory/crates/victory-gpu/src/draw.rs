@@ -10,6 +10,8 @@
 
 #[cfg(windows)]
 mod mesh_launch;
+#[cfg(windows)]
+mod camera_tap;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2036,6 +2038,9 @@ impl State {
         if crate::bake_watch::on() {
             let stages = p.stages.iter().map(|s| s.shader.hash.as_str());
             crate::bake_watch::binding(list as *const HostList as usize, stages, p.is_bake);
+        }
+        if crate::camera::on() {
+            self.camera_tap(p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {

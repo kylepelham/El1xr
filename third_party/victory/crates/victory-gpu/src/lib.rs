@@ -146,6 +146,7 @@ pub mod framegen;
 mod ngx;
 pub mod upscale;
 pub mod upscale_live;
+pub mod camera;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
