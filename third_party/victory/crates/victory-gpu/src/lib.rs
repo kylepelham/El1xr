@@ -168,6 +168,8 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod material_demand;
+#[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod ramline;

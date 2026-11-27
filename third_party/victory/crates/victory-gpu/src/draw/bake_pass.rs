@@ -17,7 +17,7 @@ thread_local! {
 }
 
 /// Reads `n` dwords at title address `at`, if its memory is there.
-fn words(at: u64, n: usize) -> Option<Vec<u32>> {
+pub(super) fn words(at: u64, n: usize) -> Option<Vec<u32>> {
     if at == 0 || n == 0 || !crate::texture::committed(at as *const u8, n * 4) {
         return None;
     }
@@ -163,7 +163,7 @@ impl State {
     }
 
     /// The first view heap bound that is not a sampler heap, with its host heap.
-    fn view_heap(
+    pub(super) fn view_heap(
         &self,
     ) -> Option<(
         &'static crate::descriptor::Heap,
