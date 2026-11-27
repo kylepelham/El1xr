@@ -241,6 +241,11 @@ impl Pending {
 
     fn make(&self) {
         self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // (bootfast) `VICTORY_PIPELINE_RECIPES=1`: written down for the
+        // offline warm-up.
+        if super::recipe::on() && matches!(self.made.get(), Some(Some(_))) {
+            super::recipe::made(&self.key, &self.shaders, self.graphics.as_deref());
+        }
     }
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
@@ -432,7 +437,25 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
     if p.left_out.is_some() {
         return None;
     }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
+    let made = HostPipeline::new(&p.shaders, None).is_some();
+    if made {
+        // (bootfast) With `VICTORY_PIPELINE_RECIPES=1` a compute warm-up
+        // writes them down too.
+        super::recipe::made(&p.key, &p.shaders, None);
+    }
+    Some(made)
+}
+
+/// (bootfast) Makes the host pipeline of a recipe (`super::recipe`) for the
+/// library on disk: the key it comes out with, and whether it has one
+/// (`None`: left out).
+pub(crate) fn warm_recipe(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> (String, Option<bool>) {
+    let p = Pending::new(shaders, graphics);
+    if p.left_out.is_some() {
+        return (p.key, None);
+    }
+    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
+    (p.key, Some(made))
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

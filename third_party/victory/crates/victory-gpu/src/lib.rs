@@ -57,6 +57,8 @@ pub mod host_facts;
 #[cfg(windows)]
 mod card_constants;
 #[cfg(windows)]
+mod joined_apart;
+#[cfg(windows)]
 mod port_order;
 #[cfg(windows)]
 mod heap_rounds;

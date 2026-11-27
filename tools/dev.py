@@ -904,7 +904,7 @@ def cmd_prewarm(args: argparse.Namespace) -> int:
     text = outputs.get("prewarm", "")
     counts = dev_prewarm.parse_summary(text)
     device = dev_prewarm.device_made(text)
-    ok = ok and counts["shaders"] > 0 and (args.pipelines or not device)
+    ok = ok and counts["shaders"] > 0 and (counts["recipes"] > 0 if args.pipelines else not device)
     fields = {
         "profile": profile,
         "secs": f"{secs:.1f}",
@@ -913,10 +913,14 @@ def cmd_prewarm(args: argparse.Namespace) -> int:
         "hits": str(counts["hits"]),
         "translated": str(counts["translated"]),
         "refused": str(counts["refused"]),
-        "pipelines": str(counts["pipelines"]),
         "device": "1" if device else "0",
         "log": str(log_path),
     }
+    if args.pipelines:
+        for key in ("recipes", "compiled", "from_library", "recipes_refused", "left_out", "unreadable", "other_key",
+                    "recipes_s"):
+            fields[key] = str(counts[key])
+        fields["log"] = fields.pop("log")
     print(_dev_line("prewarm", ok, fields))
     return 0 if ok else 1
 
@@ -1054,7 +1058,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
     p_pre.add_argument(
         "--pipelines", action="store_true",
-        help="Also make the compute pipelines (makes a device on the card: takes the gpu lock).",
+        help="Then make the host pipelines of the recipes runs wrote down (VICTORY_PIPELINE_RECIPES=1) into the "
+        "pipeline library (makes a device on the card: hold the Drift gpu lock as for bench).",
     )
     p_pre.add_argument(
         "--host-wave", type=int, default=dev_prewarm.DEFAULT_HOST_WAVE,
