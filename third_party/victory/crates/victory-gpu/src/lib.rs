@@ -40,6 +40,8 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+#[cfg(windows)]
+mod flight_settle;
 pub mod frame;
 pub mod frametime;
 pub mod hitch;
@@ -50,6 +52,8 @@ mod heap_rounds;
 mod host;
 #[cfg(windows)]
 mod land_aside;
+#[cfg(windows)]
+mod list_reap;
 #[cfg(windows)]
 mod output_views;
 #[cfg(windows)]
@@ -86,6 +90,8 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod stretch;
+#[cfg(windows)]
+mod table_defer;
 #[cfg(all(windows, feature = "dlss"))]
 mod dlss;
 pub mod upscale;
@@ -110,6 +116,8 @@ mod windowup;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+mod tex_check;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

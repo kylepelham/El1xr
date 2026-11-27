@@ -2059,6 +2059,7 @@ impl State {
             list.bind_pipeline(&p.pso, &p.root, &p.name);
         }
         let mut made = std::mem::take(&mut self.scratch_made);
+        crate::table_defer::begin(p.is_bake, compute);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -4536,6 +4537,7 @@ impl State {
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             let mut plain = ready_tables_on() && !group.has_uav;
+            let mut deferred = false;
             textures.clear();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
@@ -4603,6 +4605,20 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        // (worldstream) A texture read for the first time is made ready on
+                        // the prepare threads; the slot reads nothing until then.
+                        if crate::table_defer::wait(
+                            &view,
+                            entry.map(|u| u.kind).or_else(|| {
+                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                            }),
+                            title_first.map(|t| t + k),
+                        ) {
+                            host.make_null_for(index, &view);
+                            plain = false;
+                            deferred = true;
+                            continue;
+                        }
                         match group
                             .has_half(k * 8)
                             .then(|| crate::descriptor::host::half_view(&view))
@@ -4633,7 +4649,9 @@ impl State {
                                     }
                                 }
                             }
+                            crate::table_defer::serving(title_first.map(|t| t + k));
                             readable(list, kind, &view);
+                            crate::table_defer::serving(None);
                         } else {
                             // Another shader sharing this table may read this slot, so do not
                             // mark the table ready for all future shaders without readable().
@@ -4661,7 +4679,9 @@ impl State {
                     }
                 }
             }
-            self.fresh_tables.insert(key, (first, scratch_epoch));
+            if !deferred {
+                self.fresh_tables.insert(key, (first, scratch_epoch));
+            }
             if plain {
                 let here = std::ptr::from_ref(list) as usize;
                 let (tested, _) = TESTED_DEPTH.get();
