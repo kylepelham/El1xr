@@ -29,6 +29,8 @@ pub(crate) mod lazy;
 #[path = "shadow_build.rs"]
 mod build;
 mod placement;
+#[path = "shadow_plan_split.rs"]
+pub(crate) mod plan_split;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -6522,6 +6524,7 @@ impl Shadow {
             let planning = crate::refresh_prof::start();
             let runs = {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanWaitUs, planning);
                 if has_deferred {
                     copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
                         is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
@@ -6539,38 +6542,56 @@ impl Shadow {
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         let planning = crate::refresh_prof::start();
+        let mut page_mask = |page: usize, prev: u64, sub: Option<(u64, u16)>| {
+            let mask = if four_k {
+                let m = crate::watch::stale_mask(page, prev);
+                crate::watch::note_4k(m);
+                m
+            } else {
+                let found = sub
+                    .filter(|&(before, _)| prev != 0 && before <= prev)
+                    .map(|(_, bits)| bits);
+                crate::watch::dirty4k_count(found, narrow && found.is_some());
+                if narrow { found } else { None }
+            };
+            crate::copy_profile::page(prev, mask);
+            mask
+        };
+        let skip_idx =
+            |idx: usize| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire));
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
         // with CopiedPages bitset consistency, partial-page stamps, and lazy-deferred skipping.
-        let bytes_runs = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            copied.plan_stale_subpages(
-                base,
-                start,
-                end,
-                from,
-                to,
-                now,
-                written,
-                subs,
-                |page, prev, sub| {
-                    let mask = if four_k {
-                        let m = crate::watch::stale_mask(page, prev);
-                        crate::watch::note_4k(m);
-                        m
-                    } else {
-                        let found = sub
-                            .filter(|&(before, _)| prev != 0 && before <= prev)
-                            .map(|(_, bits)| bits);
-                        crate::watch::dirty4k_count(found, narrow && found.is_some());
-                        if narrow { found } else { None }
-                    };
-                    crate::copy_profile::page(prev, mask);
-                    mask
-                },
-                |idx| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)),
-            )
+        let bytes_runs = if plan_split::on() {
+            // (feedcard, #88) The masks of pages taken whole and the runs after the lock.
+            let claimed = {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanWaitUs, planning);
+                copied.plan_stale_subpages_claim(
+                    base,
+                    start,
+                    end,
+                    from,
+                    to,
+                    now,
+                    written,
+                    subs,
+                    &mut page_mask,
+                    skip_idx,
+                )
+            };
+            crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, planning);
+            claimed.finish(&mut page_mask)
+        } else {
+            let runs = {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanWaitUs, planning);
+                copied.plan_stale_subpages(
+                    base, start, end, from, to, now, written, subs, &mut page_mask, skip_idx,
+                )
+            };
+            crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, planning);
+            runs
         };
-        crate::refresh_prof::finish(crate::refresh_prof::P::StalePlanUs, planning);
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(bytes_runs.into_iter());
