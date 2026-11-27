@@ -901,6 +901,15 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
+/// `VICTORY_UAV_ELIDE` (on unless `0`): a wait for every earlier shader
+/// write (ours before a clamp, sanitize or card copy, and the title's barrier
+/// groups) is left out when the list recorded no draw or dispatch since the
+/// last such wait. `0` waits every time, as before.
+pub(crate) fn uav_elide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_ELIDE").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

@@ -8132,7 +8132,7 @@ impl HostList {
 
     /// Returns `true` and clears the flag if a global UAV barrier is needed.
     pub(crate) fn take_uav_dirty(&self) -> bool {
-        self.uav_dirty.swap(false, Ordering::Relaxed)
+        self.uav_dirty.swap(false, Ordering::Relaxed) || !crate::indirect::uav_elide()
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`

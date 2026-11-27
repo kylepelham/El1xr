@@ -400,6 +400,32 @@ pub(crate) fn log(frames: f64, frame_ms: f64) {
         }
     }
     kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    // The title's by command kind (level 2: the label's first word, or two
+    // for "title ..." labels).
+    let mut title: Vec<(String, u64, u64)> = Vec::new();
+    for (label, (n, ticks, _)) in rows
+        .iter()
+        .filter(|r| !r.0.starts_with("ours") && !r.0.starts_with("idle"))
+    {
+        let words = if label.starts_with("title") { 2 } else { 1 };
+        let kind = label.split(' ').take(words).collect::<Vec<_>>().join(" ");
+        match title.iter_mut().find(|k| k.0 == kind) {
+            Some(k) => {
+                k.1 += ticks;
+                k.2 += n;
+            }
+            None => title.push((kind, *ticks, *n)),
+        }
+    }
+    title.sort_by_key(|k| std::cmp::Reverse(k.1));
+    tracing::info!(
+        "gpu cost, the title's by kind per frame: {}",
+        title
+            .iter()
+            .map(|(k, t, n)| format!("{k} {:.2} ms in {:.0}", ms(*t), *n as f64 / frames))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     tracing::info!(
         "gpu cost per frame (VICTORY_GPU_COST): {:.2} ms timed, ours {:.2} ms, the title's {:.2} ms, \
          idle between timed lists {:.2} ms ({:.1} gaps over 100 ms a frame left out); \
