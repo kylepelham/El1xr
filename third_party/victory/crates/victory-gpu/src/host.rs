@@ -7852,9 +7852,12 @@ impl HostList {
         self.cbv_epoch.store(0, Ordering::Relaxed);
         self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
-        crate::list_reap::let_go_all(&mut *self.deferred());
-        crate::list_reap::let_go(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()));
-        crate::list_reap::let_go(&mut self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        *self.deferred() = Deferred::default();
+        use crate::list_reap::{alone, let_go};
+        let_go(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()), |(_, _, h)| alone(h));
+        let_go(&mut self.twins.lock().unwrap_or_else(|e| e.into_inner()), |u| {
+            alone(&u.depth) && std::sync::Arc::strong_count(&u.twin) == 1 && alone(&u.twin.colour)
+        });
         self.plane_clobbered.store(false, Ordering::Relaxed);
         self.uses_heaps.store(false, Ordering::Relaxed);
         self.pipelines
