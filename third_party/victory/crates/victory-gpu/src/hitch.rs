@@ -15,7 +15,13 @@
 //! build) a thread of ours also samples the presenting thread's stack while
 //! a frame runs late, and names its most frequent stacks for frames of
 //! [`stacks::SAMPLE_FROM_MS`] or more ([`stacks`]).
+//!
+//! `VICTORY_FRAME_PHASES=1` also writes every frame's phases, all of them,
+//! on three sets of threads: ours that presents, the title's that called
+//! the present, and all others ([`frame_line`]).
 
+#[cfg(windows)]
+mod cpu;
 #[cfg(windows)]
 pub(crate) mod stacks;
 
@@ -52,9 +58,19 @@ pub enum Phase {
     Remap,
     /// Bringing lazily kept host copies in on a fault.
     Lazy,
+    /// Our thread that runs the queues' lines, waiting for work.
+    Idle,
+    /// The title's present waiting for the one before it to be sent.
+    PresentTurn,
+    /// Binding a draw or dispatch as its list is recorded.
+    Bind,
 }
 
-const PHASES: usize = 12;
+const PHASES: usize = 15;
+
+/// Banks of [`MICROS`]: the presenting thread, the title's thread that
+/// called the present (if another), all other threads.
+const BANKS: usize = 3;
 
 pub(crate) const NAMES: [&str; PHASES] = [
     "submit",
@@ -69,15 +85,20 @@ pub(crate) const NAMES: [&str; PHASES] = [
     "shader translate",
     "memory remap",
     "lazy copies",
+    "waiting for work",
+    "present turn",
+    "binding",
 ];
 
-/// Microseconds and calls per phase since the last present: `[0]` on the
-/// presenting thread, `[1]` on all others.
-static MICROS: [[AtomicU64; PHASES]; 2] = [const { [const { AtomicU64::new(0) }; PHASES] }; 2];
-static CALLS: [[AtomicU64; PHASES]; 2] = [const { [const { AtomicU64::new(0) }; PHASES] }; 2];
+/// Microseconds and calls per phase since the last present, per bank
+/// ([`BANKS`]).
+static MICROS: [[AtomicU64; PHASES]; BANKS] = [const { [const { AtomicU64::new(0) }; PHASES] }; BANKS];
+static CALLS: [[AtomicU64; PHASES]; BANKS] = [const { [const { AtomicU64::new(0) }; PHASES] }; BANKS];
 
 /// The thread that presented last (its id as `thread_id` gives it).
 static PRESENTER: AtomicU32 = AtomicU32::new(0);
+/// The title's thread that called the present last.
+static TITLE: AtomicU32 = AtomicU32::new(0);
 
 /// Hitch lines written since the start, and frames over the threshold.
 pub(crate) static COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -112,7 +133,49 @@ fn os_thread_id() -> u32 {
 }
 
 fn bank() -> usize {
-    usize::from(PRESENTER.load(Ordering::Relaxed) != thread_id())
+    let me = thread_id();
+    if PRESENTER.load(Ordering::Relaxed) == me {
+        0
+    } else if TITLE.load(Ordering::Relaxed) == me {
+        1
+    } else {
+        2
+    }
+}
+
+/// The title calls a present on this thread.
+pub fn title_presents() {
+    TITLE.store(thread_id(), Ordering::Relaxed);
+    #[cfg(windows)]
+    stacks::title_presents(thread_id());
+    #[cfg(windows)]
+    if every_frame() {
+        TITLE_CPU_US.store(cpu::lap().unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// The CPU time of the title's presenting thread between its last two
+/// presents (`u64::MAX`: not known).
+static TITLE_CPU_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// CPU microseconds of a frame: our presenting thread, the title's, the
+/// whole process (`None`: not known).
+type Cpu = [Option<u64>; 3];
+
+fn cpu_now() -> Cpu {
+    #[cfg(windows)]
+    {
+        let title = TITLE_CPU_US.load(Ordering::Relaxed);
+        [cpu::lap(), (title != u64::MAX).then_some(title), cpu::process_lap()]
+    }
+    #[cfg(not(windows))]
+    [None; 3]
+}
+
+/// Whether every frame's phases are written (`VICTORY_FRAME_PHASES=1`).
+fn every_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_PHASES").is_some_and(|v| v == "1"))
 }
 
 fn credit(phase: Phase, micros: u64, call: bool) {
@@ -193,7 +256,7 @@ pub(crate) fn presented(frame: u64) {
             open.set(Some((p, now)));
         }
     });
-    let taken: [[(u64, u64); PHASES]; 2] = std::array::from_fn(|b| {
+    let taken: [[(u64, u64); PHASES]; BANKS] = std::array::from_fn(|b| {
         std::array::from_fn(|i| {
             (
                 MICROS[b][i].swap(0, Ordering::Relaxed),
@@ -208,6 +271,9 @@ pub(crate) fn presented(frame: u64) {
     let frame_us = (now - last).as_micros() as u64;
     #[cfg(windows)]
     stacks::frame_ended(frame, frame_us, me);
+    if every_frame() {
+        tracing::info!("{}", frame_line(frame, frame_us, &taken, cpu_now()));
+    }
     let threshold = threshold_ms();
     if threshold == 0 || frame_us < threshold * 1000 {
         return;
@@ -259,9 +325,11 @@ fn named(phases: &[(usize, u64, u64)]) -> String {
 }
 
 /// The hitch line for a frame of `frame_us`.
-pub(crate) fn line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; 2]) -> String {
+pub(crate) fn line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; BANKS]) -> String {
     let presenter = top(&taken[0], 3);
-    let others = top(&taken[1], 3);
+    let merged: [(u64, u64); PHASES] =
+        std::array::from_fn(|i| (taken[1][i].0 + taken[2][i].0, taken[1][i].1 + taken[2][i].1));
+    let others = top(&merged, 3);
     let ours: u64 = taken[0].iter().map(|&(us, _)| us).sum();
     let outside = frame_us.saturating_sub(ours);
     format!(
@@ -275,6 +343,40 @@ pub(crate) fn line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; 2])
         } else {
             named(&others)
         }
+    )
+}
+
+/// Every phase of a bank that ran, in microseconds and calls, and for a
+/// single thread what the frame spent outside them.
+fn all(bank: &[(u64, u64); PHASES], frame_us: Option<u64>) -> String {
+    let mut parts: Vec<String> = bank
+        .iter()
+        .enumerate()
+        .filter(|(_, (us, n))| *us > 0 || *n > 0)
+        .map(|(i, (us, n))| format!("{} {us}/{n}", NAMES[i]))
+        .collect();
+    if let Some(frame_us) = frame_us {
+        let ours: u64 = bank.iter().map(|&(us, _)| us).sum();
+        parts.push(format!("outside {}", frame_us.saturating_sub(ours)));
+    }
+    parts.join(", ")
+}
+
+/// The line of every frame (`VICTORY_FRAME_PHASES=1`): each bank's phases
+/// as microseconds/calls, and the CPU time of our presenting thread, the
+/// title's and the process.
+pub(crate) fn frame_line(frame: u64, frame_us: u64, taken: &[[(u64, u64); PHASES]; BANKS], cpu: Cpu) -> String {
+    let title = TITLE.load(Ordering::Relaxed);
+    let own = title != 0 && title != PRESENTER.load(Ordering::Relaxed);
+    let cpu = cpu.map(|us| us.map_or("?".to_owned(), |us| us.to_string()));
+    format!(
+        "frame phases: frame {frame} took {frame_us} us; ours: {}; title: {}; others: {}; cpu us: ours {}, title {}, process {}",
+        all(&taken[0], Some(frame_us)),
+        all(&taken[1], own.then_some(frame_us)),
+        all(&taken[2], None),
+        cpu[0],
+        cpu[1],
+        cpu[2]
     )
 }
 
@@ -309,17 +411,36 @@ mod tests {
 
     #[test]
     fn the_line_names_the_longest_phases_and_the_rest() {
-        let mut taken = [[(0u64, 0u64); PHASES]; 2];
+        let mut taken = [[(0u64, 0u64); PHASES]; BANKS];
         taken[0][Phase::HeapBuffers as usize] = (900_000, 1);
         taken[0][Phase::Submit as usize] = (50_000, 12);
         taken[0][Phase::Present as usize] = (500, 1);
-        taken[1][Phase::Remap as usize] = (700_000, 1400);
+        taken[1][Phase::Remap as usize] = (300_000, 400);
+        taken[2][Phase::Remap as usize] = (400_000, 1000);
         let text = line(7, 1_200_000, &taken);
         assert_eq!(
             text,
             "hitch: frame 7 took 1200.0 ms; presenting thread: heap buffers 900.0 ms (1x), submit 50.0 ms (12x), \
              outside our calls 249.5 ms; other threads: memory remap 700.0 ms (1400x)"
         );
+    }
+
+    #[test]
+    fn the_frame_line_names_every_phase_of_each_bank() {
+        let mut taken = [[(0u64, 0u64); PHASES]; BANKS];
+        taken[0][Phase::Submit as usize] = (20_000, 24);
+        taken[0][Phase::Idle as usize] = (9_000, 30);
+        taken[0][Phase::Present as usize] = (500, 1);
+        taken[1][Phase::Bind as usize] = (6_000, 4000);
+        taken[1][Phase::PresentTurn as usize] = (2_000, 1);
+        taken[2][Phase::Remap as usize] = (300, 7);
+        let ours = all(&taken[0], Some(40_000));
+        assert_eq!(ours, "submit 20000/24, present 500/1, waiting for work 9000/30, outside 10500");
+        assert_eq!(all(&taken[1], None), "present turn 2000/1, binding 6000/4000");
+        assert_eq!(all(&taken[2], None), "memory remap 300/7");
+        let line = frame_line(3, 40_000, &taken, [Some(30_000), None, Some(200_000)]);
+        assert!(line.starts_with("frame phases: frame 3 took 40000 us; ours: submit 20000/24"));
+        assert!(line.ends_with("cpu us: ours 30000, title ?, process 200000"), "{line}");
     }
 
     #[test]
