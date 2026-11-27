@@ -72,6 +72,10 @@ impl State {
     /// nothing get the estimate along the reflected direction
     /// (`crate::ambient::after`). False if nothing was recorded.
     pub(super) fn ambient_miss(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let specular = crate::ambient::specular().is_some();
+        if !specular && crate::ambient_sky::sky_bound().is_none() {
+            return false;
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -87,7 +91,13 @@ impl State {
                 _ => None,
             })
             .unwrap_or(u32::MAX);
-        if !takes(layer, crate::ambient::specular_alpha()) {
+        // (#393) Under `VICTORY_AMBIENT_SKY_BOUND` the alpha layer is bounded,
+        // not estimated (the depth read is the opaque one behind it).
+        let sky = crate::ambient_sky::bound_for(layer);
+        let estimate = specular
+            && takes(layer, crate::ambient::specular_alpha())
+            && !(sky.is_some() && layer == crate::ambient::MISS_ALPHA);
+        if !estimate && sky.is_none() {
             note(Note::Water);
             return false;
         }
@@ -149,6 +159,36 @@ impl State {
                 d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
             })
         });
+        // `crate::ambient_sky`: the rays' image alone, bounded.
+        let bounded = |of: &D3D12_RESOURCE_DESC, image| {
+            let Some(multiple) = sky else {
+                return false;
+            };
+            let ran = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && of.Format.0 == 26
+                && crate::ambient::sky_bound(
+                    list,
+                    &Views {
+                        image,
+                        depth: None,
+                        size: [of.Width as u32, of.Height],
+                        slices: 1,
+                        depth_size: [of.Width as u32, of.Height],
+                    },
+                    multiple,
+                );
+            crate::ambient_sky::note(ran, layer);
+            ran
+        };
+        if !estimate {
+            return match image {
+                Some((of, image)) => bounded(&of, image),
+                None => {
+                    crate::ambient_sky::note(false, layer);
+                    false
+                }
+            };
+        }
         let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
         let depth = (!stencil_at(MISS_DEPTH))
             .then(|| entry(ResourceType::Srv, MISS_DEPTH))
@@ -176,8 +216,15 @@ impl State {
                         depth_size: [of.Width as u32, of.Height],
                     },
                 );
-            note(if ran { Note::Bound(layer) } else { Note::NotReady });
-            ran
+            if ran {
+                note(Note::Bound(layer));
+                return true;
+            }
+            if bounded(of, image) {
+                return true;
+            }
+            note(Note::NotReady);
+            false
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(
