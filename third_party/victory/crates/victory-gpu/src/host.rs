@@ -4191,6 +4191,7 @@ fn late_line(frames: f64) {
             p[8],
             p[9],
         );
+        flush::log(frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; the flights were settled all the same {:.1} times: {unwatched:.1} for memory \
@@ -7239,7 +7240,7 @@ impl Host {
             .saturating_sub(flush_one_before);
         PREP_PARTS[5].fetch_add(def_us.saturating_sub(flush_one_delta), Ordering::Relaxed);
         let t_flush = std::time::Instant::now();
-        batch.flush();
+        flush::last(|| batch.flush());
         crate::watch::ask_once_end();
         PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
         let t_pre = std::time::Instant::now();
@@ -9046,7 +9047,9 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            crate::copy_profile::step_copy(copied, us);
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
         (wrote_heap, textures)
@@ -9362,14 +9365,20 @@ impl Batch {
                 }
             }
         }
-        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let us = started.elapsed().as_micros() as u64;
+        crate::copy_profile::fill(total_bytes, us);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
+        flush::fills(started.elapsed().as_micros() as u64, total_bytes);
     }
 
     /// Refreshes any queued due textures side by side (`crate::tex_check`).
     fn flush_textures(&mut self) {
         if !self.pending_textures.is_empty() {
+            let started = std::time::Instant::now();
+            let textures = self.pending_textures.len();
             crate::tex_check::check_textures(std::mem::take(&mut self.pending_textures));
+            flush::textures(textures, started.elapsed().as_micros() as u64);
         }
     }
 
@@ -9384,6 +9393,9 @@ impl Batch {
 
     fn flush(&mut self) {
         let copies = self.ops.take();
+        let flush_started = std::time::Instant::now();
+        flush::add(flush::F::Flushes, 1);
+        flush::add(flush::F::Copies, copies.len() as u64);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = copies.iter().filter(|c| c.refresh_span.is_some()).count() > 1
@@ -9397,110 +9409,15 @@ impl Batch {
                     .filter_map(|c| c.refresh_span),
             );
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            flush::add(flush::F::AskAheadUs, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && copies.len() >= 2 {
-            // Split large `Refresh` steps (>= 2 MiB) into 1 MiB 64 KiB-page-
-            // aligned chunks so a huge shadow (e.g. 174 MB world heap) fans out
-            // across all cores while preserving per-shadow step order across
-            // passes.
-            const SPLIT_MIN: usize = 2 << 20;
-            const SPLIT_CHUNK: usize = 1 << 20;
-            const PAGE: usize = crate::watch::PAGE;
-            enum FlushTask {
-                Copy(ShadowBatch<std::sync::Arc<crate::shadow::Shadow>>),
-                Chunk(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-            }
-            let mut pending = copies;
-            while !pending.is_empty() {
-                if pending.len() == 1 {
-                    pending.pop().unwrap().run();
-                    break;
-                }
-                let pass = std::time::Instant::now();
-                let mut tasks: Vec<FlushTask> = Vec::with_capacity(pending.len());
-                let mut next: Vec<ShadowBatch<std::sync::Arc<crate::shadow::Shadow>>> = Vec::new();
-                for mut copy in pending {
-                    let big = copy.steps.iter().position(|s| {
-                        matches!(*s, ShadowStep::Refresh(f, t) if t.saturating_sub(f) >= SPLIT_MIN)
-                    });
-                    match big {
-                        Some(0) => {
-                            if let ShadowStep::Refresh(from, to) = copy.steps.remove(0) {
-                                let mut at = from;
-                                while at < to {
-                                    let raw = at.saturating_add(SPLIT_CHUNK).min(to);
-                                    let end = if raw < to {
-                                        let aligned = raw & !(PAGE - 1);
-                                        if aligned > at {
-                                            aligned
-                                        } else {
-                                            (at & !(PAGE - 1)).saturating_add(PAGE).min(to)
-                                        }
-                                    } else {
-                                        to
-                                    };
-                                    tasks.push(FlushTask::Chunk(copy.shadow.clone(), at, end));
-                                    at = end;
-                                }
-                            }
-                            if !copy.steps.is_empty() {
-                                next.push(copy);
-                            }
-                        }
-                        Some(pos) => {
-                            let rest = copy.steps.split_off(pos);
-                            tasks.push(FlushTask::Copy(ShadowBatch {
-                                shadow: copy.shadow.clone(),
-                                refresh_span: None,
-                                steps: copy.steps,
-                            }));
-                            next.push(ShadowBatch {
-                                shadow: copy.shadow,
-                                refresh_span: None,
-                                steps: rest,
-                            });
-                        }
-                        None => tasks.push(FlushTask::Copy(copy)),
-                    }
-                }
-                let tasks = std::sync::Arc::new(tasks);
-                let total = tasks.len();
-                crate::shadow::wide_chunks(total, 1, move |start, end| {
-                    let mut copied = 0usize;
-                    for task in &tasks[start..end] {
-                        match task {
-                            FlushTask::Copy(copy) => copied += copy.run_wide(),
-                            FlushTask::Chunk(shadow, from, to) => {
-                                #[cfg(feature = "diagnostics")]
-                                let each = std::time::Instant::now();
-                                copied += shadow.update(*from, to - from);
-                                #[cfg(feature = "diagnostics")]
-                                crate::copystat::range(
-                                    *from,
-                                    to - from,
-                                    each.elapsed().as_micros() as u64,
-                                    0,
-                                );
-                            }
-                        }
-                    }
-                    if copied > 0 {
-                        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-                    }
-                });
-                PREPARING[0].fetch_add(pass.elapsed().as_micros() as u64, Ordering::Relaxed);
-                pending = next;
-            }
-        } else {
-            for copy in copies {
-                copy.run();
-            }
-        }
+        flush::refresh(copies, wide_refresh());
         if ahead {
             crate::watch::ask_ahead_done();
         }
         self.flush_fills();
         self.flush_textures();
+        flush::add(flush::F::TotalUs, flush_started.elapsed().as_micros() as u64);
     }
 }
 
@@ -10649,6 +10566,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::submit_chunk::line(frames);
+        crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
@@ -11826,6 +11744,9 @@ fn pump() {
         }
     }
 }
+
+#[path = "host_flush.rs"]
+mod flush;
 
 #[cfg(test)]
 #[path = "host_tests.rs"]
