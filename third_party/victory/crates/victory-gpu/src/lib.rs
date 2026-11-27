@@ -31,6 +31,8 @@ pub mod device;
 #[cfg(windows)]
 mod alloc_backoff;
 #[cfg(windows)]
+mod buffer_ahead;
+#[cfg(windows)]
 mod ambient;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;

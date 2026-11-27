@@ -7312,6 +7312,17 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 copied_buffer(key, len, size)
             });
         }
+        // `VICTORY_BUFFER_AHEAD`: the host buffers are made with the tables
+        // let go, so that threads making copies of different buffers make
+        // them side by side (`crate::buffer_ahead`); the first to be done
+        // gives the buffer its copy, and a copy made for nothing goes.
+        if crate::buffer_ahead::on() {
+            drop(map);
+            let made = copied_buffer(key, len, size)?;
+            let mut map = buffers();
+            let entry = map.get_mut(&key)?;
+            return Some(entry.shadow.get_or_insert(made).clone());
+        }
         entry.shadow = Some(copied_buffer(key, len, size)?);
     }
     entry.shadow.clone()
