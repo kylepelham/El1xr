@@ -157,6 +157,8 @@ mod trace_va;
 #[cfg(windows)]
 mod refresh_prof;
 #[cfg(windows)]
+mod card_prof;
+#[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]
 mod timeline;

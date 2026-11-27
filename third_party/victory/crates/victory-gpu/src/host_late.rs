@@ -5,7 +5,10 @@
 use super::*;
 
 pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
+    use crate::card_prof::P;
     use std::sync::Arc;
+    let mut lap = crate::card_prof::Lap::new();
+    crate::card_prof::add(P::StaleCalls, 1);
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
@@ -65,7 +68,9 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    lap.mark(P::StaleWalk);
     if late_exact() {
+        crate::card_prof::add(P::StaleCopies, spans.len() as u64);
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
@@ -88,12 +93,15 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
                 })
                 .collect();
             crate::shadow::wide_run(jobs);
+            lap.mark(P::StaleMerge);
             return stale.load(Ordering::Relaxed);
         }
         let mut runs_left = under_writes_runs();
-        return spans.iter().any(|(shadow, from, to)| {
+        let stale = spans.iter().any(|(shadow, from, to)| {
             shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
         });
+        lap.mark(P::StaleMerge);
+        return stale;
     }
     spans
         .iter()
@@ -732,6 +740,7 @@ pub(super) fn late_line(frames: f64) {
             p[9],
         );
         flush::log(frames);
+        crate::card_prof::log(frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; the flights were settled all the same {:.1} times: {unwatched:.1} for memory \
