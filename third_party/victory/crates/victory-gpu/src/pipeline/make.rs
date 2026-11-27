@@ -69,6 +69,8 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
+    } else if water_light_out(shaders) {
+        Some("the water's tiled light (VICTORY_WATER_LIGHT=0), left out")
     } else {
         None
     }
@@ -91,6 +93,26 @@ fn named_out(shaders: &[Arc<Shader>]) -> bool {
             .collect()
     });
     !hashes.is_empty() && shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
+/// The light in the water's volume, in tiles (`CS_TransmissionVolumetrics_Tiled` and
+/// `_Tiled_LocalLights`): one 64-lane wave a group, run on a host of 32-lane waves in the
+/// wave-wide form (`WAVE_WIDE_DEFAULT` in `shader_cache.rs`), which left whole tiles of
+/// open water dark around boats, shores and bridges and took about 15 ms of the card a frame
+/// (RTX 5070, 25 fps with them, 30 without). After trustno1-coder/VIctory-NVIDIA 35c156087e,
+/// which leaves them out by default there; here only with `VICTORY_WATER_LIGHT=0` (unset or 1:
+/// made as before). Left out, the water has no light of its own depth (darker, bluer).
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_out(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| std::env::var("VICTORY_WATER_LIGHT").is_ok_and(|v| v.trim() == "0"));
+    out && water_light_named(shaders.iter().map(|s| s.hash.as_str()))
+}
+
+/// Whether one of these shader hashes is one of [`WATER_LIGHT`].
+fn water_light_named<'a>(mut hashes: impl Iterator<Item = &'a str>) -> bool {
+    hashes.any(|h| WATER_LIGHT.contains(&h))
 }
 
 /// Passes whose output lasts the whole run or feeds every face: the
@@ -1230,6 +1252,20 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.scene_waited.load(Ordering::Relaxed));
         assert!(matches!(p.made.get(), Some(None)), "the first use waits until the worker has answered");
+    }
+
+    /// The water light's two tiled programs are named, and no other shader; with
+    /// `VICTORY_WATER_LIGHT` unset nothing is left out.
+    #[test]
+    fn the_water_light_is_named_and_left_out_only_with_its_switch() {
+        assert!(water_light_named(["5dc3b25986622949"].into_iter()));
+        assert!(water_light_named(["1aa247ed3653b616", "6f225b641c5b0708"].into_iter()));
+        assert!(!water_light_named(["1aa247ed3653b616", "926c46bab3b86bd6"].into_iter()));
+        assert!(!water_light_named(std::iter::empty()));
+        if std::env::var_os("VICTORY_WATER_LIGHT").is_none() {
+            assert!(!water_light_out(&[]));
+            assert!(left_out(&[]).is_none());
+        }
     }
 
     /// `VICTORY_LEAVE_OUT` is read once; with it unset nothing is named.
