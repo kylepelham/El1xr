@@ -95,6 +95,7 @@ mod intersect_tests;
 pub mod host;
 mod idiom;
 mod link;
+mod loops_wave;
 mod lower;
 pub mod meet;
 mod mesh_launch;
@@ -1092,8 +1093,25 @@ fn paired(
     lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// The translated program, and the wave size it requires of the host: [`emit_program_plain`],
+/// and with `VICTORY_LOOPS_WAVE=1` its loops taken by each host wave together where that helps
+/// ([`loops_wave::again`]).
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    loops_wave::again(first, native, p, st, |st, res| {
+        emit_program_plain(c, native, p, st, io, res)
+    })
+}
+
+/// The translated program, and the wave size it requires of the host.
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
