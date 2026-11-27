@@ -3777,6 +3777,12 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// `DispatchX`: its dimensions may be thread counts (`crate::rt_diag`).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let [x, y, z] = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
+        self.dispatch(list, x, y, z);
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
@@ -3808,6 +3814,7 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -3819,6 +3826,9 @@ impl State {
                 self.list_dropped_roots([x, y, z]);
             }
             return;
+        }
+        if crate::rt_diag::on() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::rt_diag::builder(true);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -5216,6 +5226,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             return false;
         }

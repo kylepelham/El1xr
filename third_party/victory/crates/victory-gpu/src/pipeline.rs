@@ -692,6 +692,27 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
         && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// A compute pipeline's shader hash (cheap) and, when `group`, its
+/// thread-group size (parses the container).
+#[cfg(windows)]
+pub(crate) fn compute_group(this: This, group: bool) -> Option<(String, Option<[u32; 3]>)> {
+    use victory_shader::{Container, FourCC, native::StageIo};
+    if this.is_null() {
+        return None;
+    }
+    let shader = pipeline(this).shaders.iter().find(|s| s.stage == "compute")?;
+    if !group {
+        return Some((shader.hash.clone(), None));
+    }
+    let c = Container::parse(&shader.container).ok()?;
+    let part = c.part(FourCC::DXIL).or_else(|| c.part(FourCC::ACCC))?;
+    let programs = victory_shader::native_programs(part.data).ok()?;
+    programs.iter().find_map(|p| match &p.io {
+        StageIo::Cs(cs) => Some((shader.hash.clone(), Some(cs.threads))),
+        _ => None,
+    })
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
