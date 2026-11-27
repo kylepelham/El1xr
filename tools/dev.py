@@ -626,6 +626,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     snapped = f" snaps={snaps} snap_dir={snap_dir}" if args.snap_every > 0 else ""
     print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}")
     _print_driver_warning(resets_before, resets_after)
+    _print_hang_lines(log_path)
     return 0 if ok else 1
 
 
@@ -657,6 +658,12 @@ def _print_driver_warning(before: int | None, after: int | None) -> None:
     line = dev_driver.warning(before, after)
     if line:
         print(line)
+
+
+def _print_hang_lines(log_path: Path) -> None:
+    """The run's device-removed report and hang watch lines (`dev_greps.hang_lines`), if any."""
+    for line in dev_greps.hang_lines(read_log_text(log_path)):
+        print(f"DEV hang: {line}")
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -707,6 +714,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
         f"driver_resets={_count(resets_after)} dir={cap_dir}"
     )
     _print_driver_warning(resets_before, resets_after)
+    _print_hang_lines(log_path)
     return 0 if ok else 1
 
 
@@ -863,6 +871,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         f"snaps={snaps} next={dev_train.next_pending(plan, done)} log={log_path}"
     )
     _print_driver_warning(before, after)
+    _print_hang_lines(log_path)
     return 0 if ok else 1
 
 
