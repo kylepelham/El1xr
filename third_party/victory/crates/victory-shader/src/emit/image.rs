@@ -520,6 +520,52 @@ impl Lower<'_> {
                 // level). The console takes derivatives from neighbouring
                 // lanes there; compute them from the lanes if a resolve
                 // shows the wrong mip.
+                // `VICTORY_COMPUTE_QUAD_LOD=1`: the level from the lane quads (`quad_lod.rs`).
+                60 | 61 if !self.s.pixel && self.quad_lod(kind) => {
+                    let scale = if op == 61 {
+                        // A bias scales the footprint by 2^bias (as for `61` below).
+                        let bias = addr_u32(self, usize::from(offset_word))?;
+                        let bias = if *a16 {
+                            let low = self.s.m.i32(0xFFFF);
+                            let bias = self.s.m.bin(c, Bin::And, bias, low);
+                            to_float(self, bias)
+                        } else {
+                            self.as_float(bias)
+                        };
+                        Some(self.unary(21, bias))
+                    } else {
+                        None
+                    };
+                    if offset_word {
+                        // Immediates where the word is a constant in range (as for `60` below).
+                        let w = addr_val(self, 0)?;
+                        if let Some(w) = self.s.m.int_value(w) {
+                            let w = w as u32;
+                            let field = |k: usize| {
+                                let x = (w >> (8 * k) & 0x3F) as i32;
+                                if x >= 32 { x - 64 } else { x }
+                            };
+                            let n = offsets.min(2);
+                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
+                                for (k, o) in os.iter_mut().enumerate().take(n) {
+                                    *o = self.s.m.i32(field(k) as u32);
+                                }
+                            }
+                        }
+                    }
+                    let g = self.quad_gradients(&cs[..spatial], scale);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));

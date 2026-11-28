@@ -6,12 +6,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-/// One call: the native's hash and its argument slots, named for its result.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Natives run back to back on the game thread, each fed what the earlier ones returned:
+/// `call(hash, args)` runs one (`None`: not in the table). Gets the call's `args`.
+pub type Script = fn(&mut dyn FnMut(u64, &[u64]) -> Option<[u64; 4]>, &[u64]) -> Option<[u64; 4]>;
+
+/// One call: the native's hash and its argument slots, named for its result. With a `script`,
+/// the script runs instead (and `hash` is its first native, for the logs).
+#[derive(Clone, Debug)]
 pub struct Call {
     pub name: &'static str,
     pub hash: u64,
     pub args: Vec<u64>,
+    pub script: Option<Script>,
 }
 
 /// How a call went.
@@ -90,6 +96,7 @@ mod tests {
             name,
             hash,
             args: args.to_vec(),
+            script: None,
         }
     }
 

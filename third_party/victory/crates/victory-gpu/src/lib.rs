@@ -24,6 +24,8 @@ mod card_share;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod cold_skip;
 pub mod console;
+#[cfg(windows)]
+mod commitline;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
@@ -90,6 +92,8 @@ mod pieces_diag;
 mod pieces_log;
 #[cfg(windows)]
 mod read_there;
+#[cfg(windows)]
+mod pieces_dump;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;

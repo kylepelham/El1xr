@@ -371,6 +371,8 @@ extern "system" fn unknown_pipeline(
     static CALLS: AtomicU32 = AtomicU32::new(0);
     let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     crate::pieces_diag::call(desc);
+    #[cfg(windows)]
+    crate::pieces_dump::call(desc);
     crate::pipeline::native_retry::refused(crate::pipeline::native_retry::Slot::Graphics, desc);
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).

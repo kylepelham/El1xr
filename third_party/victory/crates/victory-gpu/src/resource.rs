@@ -1924,6 +1924,9 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    if filled >= FLOOR && crate::commitline::pressed() {
+        return false; // (El1xr) VICTORY_COMMIT_FLOOR_MB
+    }
     if let Some(limit) = texture_budget_limit() {
         return filled < limit;
     }

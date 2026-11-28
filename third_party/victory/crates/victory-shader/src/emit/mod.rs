@@ -119,6 +119,8 @@ mod underwater;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod quad_lod_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -407,13 +409,18 @@ pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
         && water_tile_slots::rewrite(native)
 }
 
+/// The part whose data holds a container's native programs, as the translator reads it: `DXIL`,
+/// else `ACCC` (native code another compiler made, only with `VICTORY_WAVE32_NVIDIA=1`), else the
+/// part of a program made from loose pieces (`crate::pieces`), which no title's container has.
+pub fn program_part<'a, 'c>(c: &'c Container<'a>) -> Option<&'c crate::Part<'a>> {
+    c.part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC).filter(|_| nvidia::enabled()))
+        .or_else(|| c.part(FourCC::PIECES))
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    // (`ACCC`, native code another compiler made, only with `VICTORY_WAVE32_NVIDIA=1`)
-    let dxil = c
-        .part(FourCC::DXIL)
-        .or_else(|| c.part(FourCC::ACCC).filter(|_| nvidia::enabled()))
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let dxil = program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
     let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {

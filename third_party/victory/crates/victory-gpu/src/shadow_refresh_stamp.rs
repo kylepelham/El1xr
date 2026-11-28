@@ -32,6 +32,9 @@ static ON: victory_core::settings::Live =
 #[cfg(test)]
 thread_local! {
     static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's own stretch counter: other tests' submissions (on their own
+    /// threads) move the shared one at any time.
+    static OWN_EPOCH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Live: read once per refresh.
@@ -48,11 +51,20 @@ static EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// A submission begins, or a step of ours is about to write title memory.
 pub(crate) fn expire() {
+    #[cfg(test)]
+    if let Some(e) = OWN_EPOCH.with(std::cell::Cell::get) {
+        OWN_EPOCH.with(|o| o.set(Some(e + 1)));
+        return;
+    }
     EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 /// With the switch on: the stretch a refresh starting now stamps with.
 pub(crate) fn epoch_if_on() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(e) = OWN_EPOCH.with(std::cell::Cell::get) {
+        return on().then_some(e);
+    }
     on().then(|| EPOCH.load(Ordering::Acquire))
 }
 
@@ -113,6 +125,24 @@ pub(crate) fn force(on: Option<bool>) {
     FORCED.with(|f| f.set(on));
 }
 
+/// This thread's stretches counted apart from the shared counter until dropped.
+#[cfg(test)]
+pub(crate) struct OwnEpoch(Option<u64>);
+
+#[cfg(test)]
+impl OwnEpoch {
+    pub(crate) fn enter() -> Self {
+        Self(OWN_EPOCH.with(|o| o.replace(Some(1))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnEpoch {
+    fn drop(&mut self) {
+        OWN_EPOCH.with(|o| o.set(self.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,13 +179,17 @@ mod tests {
     /// refresh of a range inside the first copies nothing with the switch, and
     /// a new stretch or a dropped stamp copies again. The title memory is a
     /// plain allocation, not write-watched, so every refresh without the
-    /// stamp copies its whole range.
+    /// stamp copies its whole range. Kept apart from the other tests: its own
+    /// stretch counter (their submissions expire the shared one) and no lazy
+    /// test at the same time (pages they arm make no copy stampable).
     #[test]
     fn stamped_refreshes_leave_the_same_copy() {
         use std::sync::Arc;
         let Some(h) = crate::host::host() else {
             return;
         };
+        let _lazy = crate::shadow::lazy::test_disable_lazy_copyback();
+        let _epoch = OwnEpoch::enter();
         const LEN: usize = 3 * super::super::PAGE;
         let title: Vec<u8> = (0..LEN + 4096).map(|i| (i * 7 + 3) as u8).collect();
         let base = title.as_ptr() as usize;
