@@ -141,9 +141,10 @@ impl State {
             })
             .collect();
         let incomplete = read.iter().any(|&(_, _, a)| a.incomplete());
-        // `VICTORY_BAKE_REPLAY`: the draw is kept to be drawn again once these arrive.
+        // `VICTORY_BAKE_REPLAY`: the draw is kept to be drawn again once these arrive (and, with
+        // `VICTORY_BAKE_ZERO_WAIT`, once an input drawn on zeros fills).
         if crate::bake_replay::mode() > 0 {
-            bake_replay::BAKE.set(Some(incomplete));
+            bake_replay::BAKE.set(Some(incomplete || bake_zero::DRAWN_ZERO.get()));
         }
         if incomplete {
             crate::bake_fresh::incomplete(crate::frame::current(), bake_pass::bake_hash(p), &read);
