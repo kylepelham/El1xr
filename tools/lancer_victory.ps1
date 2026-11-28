@@ -323,6 +323,8 @@ if (-not $NoTunedSettings) {
         VICTORY_RESULT_RING              = '1'         # batch 5K: compare result slices handed back as read (prep -0.47, +0.85 fps)
         VICTORY_FLUSH_BESIDE             = '1'         # batch 5J/K: final flush refreshes beside the preludes (batch_flush 7.88 -> 6.23, prep -0.85)
         VICTORY_RESET_ASIDE              = '1'         # batch 5M: landed lists and their preludes reset on victory-land-aside (prep -1.0, run_other -0.57)
+        VICTORY_CARD_BLOCK_REUSE         = '1'         # batch 5O: card pieces zeroed and reused (blocks 4480 -> 2944 MB, fps 23.6 -> 26.0)
+        VICTORY_HEAP_WARM                = '1'         # batch 5N/O: view heaps' host copies made on the loading screen (world-entry frame 1048 -> 614 ms)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {

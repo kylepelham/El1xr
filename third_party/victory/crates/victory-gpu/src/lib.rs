@@ -231,6 +231,8 @@ pub mod shader_cache;
 mod wave_more;
 mod zero_out;
 #[cfg(windows)]
+mod face_watch;
+#[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
 mod memory;

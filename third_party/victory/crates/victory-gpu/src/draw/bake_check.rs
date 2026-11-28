@@ -60,7 +60,7 @@ impl State {
         inputs
     }
 
-    fn bake_check_slot(
+    pub(super) fn bake_check_slot(
         &self,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,

@@ -1097,6 +1097,10 @@ impl PreludeUpload {
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
             return None;
         };
+        // (texflicker) The host copy holds the title's texture from here on.
+        self.copy
+            .uploaded_from
+            .fetch_min(self.staging.first, std::sync::atomic::Ordering::AcqRel);
         if crate::bake_watch::on() {
             let (at, len) = self.staging.memory();
             if let Some((baked_at, baked)) = in_host_written(at as u64, len as u64, self.resource) {

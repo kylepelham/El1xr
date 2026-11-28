@@ -123,9 +123,16 @@ pub(crate) enum Kind {
     KeptAside,
     /// Milliseconds from the title's present call to its present beginning.
     PresentLagMs,
+    /// Table slots left null while their texture is made ready
+    /// (`crate::table_defer`).
+    TableNulled,
+    /// Of those, slots whose texture's host copy held an upload already.
+    TableNulledFilled,
+    /// Such slots read as they are (`VICTORY_PREPARE_PRUNE_SAFE`).
+    TableKeptFilled,
 }
 
-pub(crate) const KINDS: usize = 33;
+pub(crate) const KINDS: usize = 36;
 const NAMES: [&str; KINDS] = [
     "ran",
     "dropped",
@@ -160,6 +167,9 @@ const NAMES: [&str; KINDS] = [
     "forced_runs",
     "kept_aside",
     "present_lag_ms",
+    "table_nulled",
+    "table_nulled_filled",
+    "table_kept_filled",
 ];
 
 static NOW: [AtomicU32; KINDS] = [const { AtomicU32::new(0) }; KINDS];

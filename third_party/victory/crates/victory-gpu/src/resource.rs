@@ -1232,6 +1232,11 @@ pub(crate) struct HostTexture {
     /// many levels the copy put in (its views show them).
     pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
     pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// (texflicker) The first level a list's prelude copied title memory
+    /// into it from, counted when that list was submitted (`u32::MAX`: none
+    /// yet): a table that reads it later finds it filled
+    /// (`crate::table_defer`, `VICTORY_PREPARE_PRUNE_SAFE`).
+    pub(crate) uploaded_from: std::sync::atomic::AtomicU32,
     /// The host texture's resource flags (render target, depth, unordered
     /// access, denied shader resource), read once: a texture's description
     /// never changes, and every read of it asked the driver again.
@@ -1827,6 +1832,26 @@ impl Drop for MadeHere {
 #[cfg(windows)]
 pub(crate) fn made_here() -> [u64; 2] {
     MADE_HERE.with(std::cell::Cell::get)
+}
+
+/// (texflicker) For title texture `this`'s host copy: the first level a
+/// submitted upload from title memory filled ([`HostTexture::uploaded_from`],
+/// `u32::MAX`: none yet); `None`: no host copy now. Not a use of it.
+#[cfg(windows)]
+pub(crate) fn host_copy_uploaded_from(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    r.host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(host, _)| host.uploaded_from.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// (Neptune) Whether title texture `this` has its host copy now. Not a use
@@ -2915,6 +2940,7 @@ impl HostTexture {
             tiled: None,
             prefill: Default::default(),
             prefilled: Default::default(),
+            uploaded_from: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
@@ -2945,6 +2971,7 @@ impl HostTexture {
             tiled: Some(tiled),
             prefill: Default::default(),
             prefilled: Default::default(),
+            uploaded_from: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }
