@@ -33,6 +33,7 @@ mod recheck_tail;
 pub(crate) mod remade_safe;
 mod slot_wait;
 mod srgb_cast;
+pub(crate) mod swap_watch;
 pub(crate) mod view_ages;
 mod view_addresses;
 pub(crate) mod view_cache;
@@ -3890,6 +3891,7 @@ impl HostHeap {
                 // (`levels_wait`, `VICTORY_LEVELS_WAIT_SHOWN`).
             } else {
                 crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsMade);
+                let prior = made[index as usize];
                 made[index as usize] = key;
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
@@ -3897,6 +3899,11 @@ impl HostHeap {
                         resolved = copy;
                         if view_ages::on() {
                             view_ages::shown(self.ages_key(), index);
+                        }
+                        // `VICTORY_SWAP_WATCH`: what the slot showed before.
+                        if prior != key && !self.sampler && swap_watch::on() {
+                            let old = (prior != 0).then(|| view_at(prior as u32, (prior >> 32) as u32)).flatten();
+                            swap_watch::made(self.ages_key(), index, old.as_ref(), &view);
                         }
                     }
                     None => {
