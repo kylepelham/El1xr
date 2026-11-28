@@ -296,6 +296,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_PREPARE_FLUSH", Apply::Restart),
     ("VICTORY_PRESENT_AUDIT", Apply::Live),
     ("VICTORY_PROBE_SECS", Apply::Restart),
+    ("VICTORY_PSO_CANON", Apply::Restart),
+    ("VICTORY_PSO_DUPES", Apply::Restart),
     ("VICTORY_QUEUE_HOST_TEXTURES", Apply::Live),
     ("VICTORY_QUEUE_MARKS", Apply::Live),
     ("VICTORY_QUEUE_WAIT", Apply::Restart),

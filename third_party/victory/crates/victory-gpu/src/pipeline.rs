@@ -1487,6 +1487,8 @@ mod eager;
 #[cfg(windows)]
 mod recipe;
 #[cfg(windows)]
+mod pso_canon;
+#[cfg(windows)]
 pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
 #[cfg(windows)]
 mod translate_ahead;
