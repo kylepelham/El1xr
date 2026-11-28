@@ -7087,6 +7087,16 @@ impl Shadow {
         card_piece_of(self.start as usize, self.len as usize, span, i)
     }
 
+    /// (El1xr) `VICTORY_FETCH_CHECK`: of a copy in the card's memory, the
+    /// piece offset `at` lies in and the offsets the compare hashes of it
+    /// (`crate::fetch_check::hashed`, cut at the card buffer's size).
+    pub(crate) fn card_hashed(&self, at: usize) -> Option<(u32, usize, usize)> {
+        let size = self.card.as_ref()?.size as usize;
+        let piece = ((self.start as usize + at) / PIECE - self.start as usize / PIECE) as u32;
+        let (lo, hi) = crate::fetch_check::hashed(piece, (self.start as usize % PIECE) as u32, size);
+        Some((piece, lo, hi))
+    }
+
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
     /// bytes of this copy came back from the card and `written` of them
     /// went into title memory. Summed per buffer and logged once a frame:
