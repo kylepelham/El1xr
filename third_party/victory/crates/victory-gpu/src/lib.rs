@@ -156,6 +156,8 @@ mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
 mod flicker_catch;
+#[cfg(windows)]
+mod present_own;
 mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;

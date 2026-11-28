@@ -3028,9 +3028,10 @@ fn late_exact() -> bool {
 /// (diagnostics; it reads the frame back at once). A frame that is saved
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
-/// idle host objects go (it needs nothing in the air).
+/// idle host objects go (it needs nothing in the air). Not while
+/// `VICTORY_PRESENT_OWN_FRAME` is set (`crate::present_own`).
 pub(crate) fn late_free_present() -> bool {
-    late_stage() > 2
+    crate::present_own::sent_ahead(late_stage(), crate::present_own::level())
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
