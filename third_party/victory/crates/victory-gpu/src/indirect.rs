@@ -1416,6 +1416,89 @@ void main() {
         assert_eq!(slot_now(1, piece_now(2).len()), piece_now(2));
     }
 
+    /// (El1xr) `VICTORY_FETCH_CHECK` (`crate::fetch_check`), on the software
+    /// adapter: the compare, with and without `SNAP`, stores behind its
+    /// results each compared piece's hash, which is the hash
+    /// `fetch_check::hash` makes of the piece's bytes as `fetch_check::hashed`
+    /// cuts them, and of what a kept slot holds.
+    #[test]
+    fn warp_card_compare_stores_the_hash_the_fetch_check_makes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const SLOT: usize = 65568;
+        const AT: usize = 65536;
+        let hash_at = crate::fetch_check::HASH_AT as usize;
+        for (snap, skew) in [(false, 0u32), (true, 0x1f08u32)] {
+            let base = if snap {
+                format!("#define SNAP 1\n{}", crate::host::CARD_COMPARE)
+            } else {
+                crate::host::CARD_COMPARE.to_string()
+            };
+            let source = crate::fetch_check::compare_source_for(&base, true);
+            let compare = compile_cs(&warp.device, &source).expect("the checking card compare must compile on WARP");
+            let size = PIECE * PIECES as usize;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer((hash_at + 64) as u64);
+            let (_snaps, snaps_ptr, snaps_gpu) = warp.shared_buffer((AT + SLOT * 4) as u64);
+            let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+            // SAFETY: the mappings hold what is written.
+            unsafe {
+                std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+                std::ptr::write_bytes(snaps_ptr, 0, AT + SLOT * 4);
+            }
+            let run = |warp: &mut WarpHarness, mode: u32| {
+                // SAFETY: our open list, live buffers, the compare's own root
+                // signature; the mappings hold what is read and written.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [0u32, skew, size as u32, PIECES, 0, mode, 0, 4];
+                    let words = if snap { 8 } else { 6 };
+                    warp.list.SetComputeRoot32BitConstants(0, words, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    if snap {
+                        warp.list.SetComputeRootUnorderedAccessView(4, snaps_gpu);
+                    }
+                    warp.list.Dispatch(PIECES, 1, 1);
+                }
+                warp.submit_and_wait();
+            };
+            run(&mut warp, 0);
+            // SAFETY: inside the mapping.
+            unsafe {
+                let at = (PIECE + 1234).saturating_sub(skew as usize) + 4000;
+                now_ptr.add(at).write_volatile(now_ptr.add(at).read_volatile() ^ 0x40);
+            }
+            run(&mut warp, 2);
+            for piece in 0..PIECES {
+                let (lo, hi) = crate::fetch_check::hashed(piece, skew, size);
+                // SAFETY: inside the mappings, which the card has written.
+                let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(lo).cast_const(), hi - lo) };
+                let (flag, stored) = unsafe {
+                    (
+                        differs_ptr.cast::<u32>().add(piece as usize).read_volatile(),
+                        differs_ptr.add(hash_at).cast::<u32>().add(piece as usize).read_volatile(),
+                    )
+                };
+                assert_eq!(flag != 0, piece == 1, "snap {snap} piece {piece}");
+                assert_eq!(stored, crate::fetch_check::hash(bytes), "snap {snap} piece {piece}");
+                if snap && flag >= 2 {
+                    // SAFETY: inside the mapping.
+                    let kept = unsafe {
+                        std::slice::from_raw_parts(snaps_ptr.add(AT + (flag as usize - 2) * SLOT).cast_const(), hi - lo)
+                    };
+                    assert_eq!(crate::fetch_check::hash(kept), stored, "the kept slot of piece {piece}");
+                }
+            }
+        }
+    }
+
     /// (Neptune) The masked pass (`crate::host::CARD_PATCH`), on the
     /// software adapter: of two blocks that follow one another, the bytes
     /// whose mask bit is set go from the one buffer to the other, and no

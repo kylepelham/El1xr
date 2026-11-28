@@ -62,6 +62,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_EXPOSURE_WATCH", "Logs the exposure passes' targets and the constants they read."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
+    ("VICTORY_FETCH_CHECK", "Relay fetches are hashed and fetched again if torn (black skin)."),
     ("VICTORY_FIXED_TRIPS", "Loops with a count fixed in code run to their end, not a stage cap."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
     ("VICTORY_FLUSH_ONE_PASS", "Runs a wide flush in one pass on helper threads, without barriers."),
