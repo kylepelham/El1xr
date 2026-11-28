@@ -864,6 +864,8 @@ pub(crate) fn record_ahead(
     }
 }
 
+pub(crate) mod card_budget;
+
 /// [`record_ahead`] with the clamp `c`.
 fn record_ahead_with(
     c: &Clamp,
@@ -1001,6 +1003,9 @@ void main() {
 
     #[path = "../wide_tests.rs"]
     mod wide_tests;
+
+    #[path = "../card_budget_tests.rs"]
+    mod card_budget_tests;
 
     #[path = "../send_own_warp_tests.rs"]
     mod send_own_warp_tests;
