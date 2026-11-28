@@ -72,7 +72,7 @@ fn copies_value(value: Option<&str>) -> bool {
 /// copy into one before any view of it is not.
 pub(crate) fn copy_order_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    copies_on()
+    (copies_on() || victory_shader::emit::heap_buffer_address())
         && *ON.get_or_init(|| {
             std::env::var_os("VICTORY_PORT_CBV_COPY_ORDER").is_none_or(|v| v != "0")
         })

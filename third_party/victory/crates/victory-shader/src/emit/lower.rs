@@ -47,6 +47,8 @@ mod dpp;
 mod descriptor_data;
 #[path = "heap_address.rs"]
 pub(super) mod heap_address;
+#[path = "buffer_address.rs"]
+pub(super) mod buffer_address;
 #[path = "mask_elsewhere.rs"]
 pub(super) mod mask_elsewhere;
 
@@ -3136,10 +3138,10 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{
-            MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
-        };
+    /// The directory lookup of [`Lower::memory`]: `(copy_number, byte_in_copy)` before the
+    /// heap handle is built.
+    fn memory_lookup(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3194,14 +3196,21 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (copy, byte)
+    }
+
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        use super::shader::USER_MEMORY_BASE;
+        let (copy, byte) = self.memory_lookup(lo, hi, guard);
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self
             .s
             .heap_handle(c, slot, false, true, (self.window_properties, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
     }
 
@@ -6052,6 +6061,16 @@ impl<'a> Lower<'a> {
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
+        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) By title address: a buffer view's range or a
+        // constant buffer's, from the host's table by title slot.
+        if kind.is_none()
+            && let Some(xs) = self.heap_buffer_load(&src, None, addr, count, None)?
+        {
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
@@ -6110,6 +6129,17 @@ impl<'a> Lower<'a> {
             }
             let both = self.end_guarded(at, &both);
             for (k, x) in both.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A table's constant buffer by title address: the host
+        // need not make the table afresh for it. (Also one no used-resource entry names: the
+        // host's copy of the table would not reach it.)
+        if kind.is_none_or(|u| u.kind == ResourceType::Cbv)
+            && let Some(xs) = self.table_cbv_load(&src, addr, count)?
+        {
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6498,6 +6528,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler {
+            self.table_cbv_kept(src);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);

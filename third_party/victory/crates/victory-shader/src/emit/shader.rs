@@ -67,6 +67,19 @@ pub const SLOT_REMAP: u8 = 249;
 /// keeps, pair `i` the title address (low, high) of the buffer or ray-tracing structure view at
 /// title slot `i` (0: none). Slots past the last read the last, never written.
 pub const SLOT_VIEW_ADDRESSES: u8 = 248;
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The root SRV `t<SLOT_BUFFER_RANGES>` in [`ROOT_CBV_SPACE`] of
+/// a shader that reads buffers it picks from the view heap by their title address
+/// (`lower::buffer_address`): [`BUFFER_RANGES_COUNT`] entries of four dwords the host keeps, entry
+/// `i` the buffer view at title slot `i`: its first byte's address (low, high), its size in
+/// bytes, its element stride; all 0 for a slot with no buffer view. Slots past the last read the
+/// last, never written.
+pub const SLOT_BUFFER_RANGES: u8 = 246;
+/// Entries of the [`SLOT_BUFFER_RANGES`] buffer: every title slot (1,245,184 in the retail title).
+pub const BUFFER_RANGES_COUNT: u32 = 1 << 21;
+/// Bit 31 of dword 1 of a [`SLOT_BUFFER_RANGES`] entry: the host already placed the view
+/// in a numbered copy of [`SLOT_MEMORY`], so dword 0 is the byte offset in that copy and
+/// dword 1 without this bit is the copy number (skipping the page directory and fault buffer).
+pub const BUFFER_RANGE_DIRECT: u32 = 1 << 31;
 /// Pairs of the [`SLOT_VIEW_ADDRESSES`] buffer.
 pub const VIEW_ADDRESSES_COUNT: u32 = 1 << 21;
 /// (`VICTORY_LOOP_CAP_WATCH=1`) The root UAV `u<SLOT_LOOP_CAP>` in [`ROOT_CBV_SPACE`]: two
@@ -139,6 +152,19 @@ pub const USER_SHADOW_BASE_SECOND: u32 = 0x108;
 /// `RootType::Other` code of a user-data dword the host sets: the program's number in the
 /// [`SLOT_LOOP_CAP`] buffer (`VICTORY_LOOP_CAP_WATCH=1`).
 pub const USER_LOOP_CAP_ID: u32 = 0x109;
+
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) `RootType::Other` code of a user-data dword the host sets:
+/// the title view slot of the first descriptor of the table of root parameter `slot` (whatever
+/// slots the host binds the table at), for constant buffers read through the table by title
+/// address ([`SLOT_BUFFER_RANGES`]); [`NO_TABLE_SLOT`] for none. Asked at dword 0. Asked at
+/// [`TABLE_SLOT_KEPT`] too (the value unused) when the shader also reads a constant buffer of
+/// that table through its descriptor: then the host keeps making the table's constant buffers.
+pub const USER_TABLE_SLOT: u32 = 0x10a;
+/// See [`USER_TABLE_SLOT`].
+pub const TABLE_SLOT_KEPT: u32 = 1;
+/// See [`USER_TABLE_SLOT`]: past every entry of the ranges table (which reads 0 there), and
+/// far from wrapping when a descriptor's distance is added.
+pub const NO_TABLE_SLOT: u32 = 1 << 30;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

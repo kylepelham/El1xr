@@ -38,6 +38,7 @@ pub(crate) mod swap_watch;
 mod sweep_fast;
 pub(crate) mod view_ages;
 mod view_addresses;
+pub(crate) mod buffer_ranges;
 pub(crate) mod view_cache;
 pub(crate) use list_views::on as list_views;
 
@@ -237,6 +238,9 @@ pub(crate) struct HostHeap {
     /// (`VICTORY_HEAP_VIEW_ADDRESS=1`) View heaps: the title address of the view at each title
     /// slot ([`view_addresses`]).
     addresses: Option<(ID3D12Resource, u64, usize)>,
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) View heaps: the buffer range of the view at each title
+    /// slot ([`buffer_ranges`]).
+    ranges: Option<buffer_ranges::Table>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1395,7 +1399,7 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 =
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
-fn view_stride(view: &View) -> Option<u32> {
+pub(crate) fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -1704,6 +1708,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             addresses: (!sampler).then(view_addresses::make).flatten(),
+            ranges: (!sampler).then(buffer_ranges::make).flatten(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
@@ -1945,6 +1950,24 @@ impl HostHeap {
     /// and GPU address.
     pub(crate) fn addresses(&self) -> Option<(&ID3D12Resource, u64)> {
         self.addresses.as_ref().map(|a| (&a.0, a.1))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The table of buffer ranges by title slot.
+    pub(crate) fn buffer_ranges(&self) -> Option<&buffer_ranges::Table> {
+        self.ranges.as_ref()
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Upgrades slot `index`'s buffer range entry using the
+    /// already-resolved `shadow` from the heap buffer pass (avoids a second shadow lookup).
+    pub(crate) fn write_buffer_range_shadow(
+        &self,
+        index: u32,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        at: u64,
+        len: u64,
+        stride: u32,
+    ) {
+        buffer_ranges::write_shadow(&self.ranges, index, shadow, at, len, stride);
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -3206,6 +3229,7 @@ impl HostHeap {
             };
         }
         view_addresses::write(&self.addresses, index, view);
+        buffer_ranges::write(&self.ranges, index, view);
         // The set is only written here: a slot with its flag set is in it,
         // and the lock is taken only to put one in or to take one out.
         let flagged = self.slot_flags.get(index as usize);
@@ -3754,6 +3778,9 @@ impl HostHeap {
         record_change: bool,
     ) -> Option<(View, Option<BufferCopy>)> {
         if !self.slot_in_bounds(index, for_draw) {
+            if let Some(table) = &self.ranges {
+                buffer_ranges::write_past(table, index, handle);
+            }
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -3936,6 +3963,10 @@ impl HostHeap {
                 crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsMade);
                 let prior = made[index as usize];
                 made[index as usize] = key;
+                if matches!(view, View::Constant(..)) && buffer_ranges::skip_cbv_views() {
+                    buffer_ranges::note_cbv_view_skipped();
+                    self.keep(index, None);
+                } else {
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
                         self.keep(index, kept);
@@ -3968,6 +3999,7 @@ impl HostHeap {
                             }
                         }
                     }
+                }
                 }
                 self.made_too[index as usize].store(key, std::sync::atomic::Ordering::Release);
             }

@@ -287,6 +287,13 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader's code can store through raw title memory (`Flat`/`Global`/`Smem`);
+    /// false when it only stores through buffer descriptors (`Mubuf`/`Mtbuf`), so
+    /// `VICTORY_HEAP_BUFFER_ADDRESS=1` read-only loads never declare all directory copies written.
+    pub(crate) memory_stores: bool,
+    /// Whether the shader's code accesses raw title memory directly (`Flat`/`Global`, BVH walk,
+    /// scalar store/atomic) rather than only through `SLOT_BUFFER_RANGES`.
+    pub(crate) raw_memory: bool,
     /// The host DXIL, moved out of `host`: read only to make a pipeline. With
     /// `VICTORY_DROP_DXIL=1` it is let go after each pipeline and translated
     /// again (the disk cache) when another needs it ([`Shader::dxil`]).
@@ -440,6 +447,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let mut host = crate::shader_cache::host_shader(container)?;
     let dxil = Mutex::new(Some(Arc::new(std::mem::take(&mut host.dxil))));
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let memory_stores = programs.is_empty() || programs.iter().any(memory_stores);
+    let raw_memory = programs.is_empty() || programs.iter().any(raw_memory);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -450,12 +459,16 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
+    let by_address = crate::draw::table_plan::cbvs_by_address(&host.user_data);
+    let tables =
+        crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views, &by_address);
     Ok(Translated {
         host,
         used,
         tables,
         stores,
+        memory_stores,
+        raw_memory,
         dxil,
     })
 }
@@ -936,6 +949,47 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Like [`stores`], restricted to instructions that can write through `SLOT_MEMORY`
+/// (`Flat`/`Global`/`Smem` stores or atomics, excluding scratch, plus indirect jumps).
+#[cfg(windows)]
+fn memory_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether `program` can access raw title memory directly (flat/global non-scratch instructions,
+/// BVH ray-box/triangle walks, scalar stores/atomics, or indirect jumps) rather than only reading
+/// buffer descriptors via `SLOT_BUFFER_RANGES`.
+#[cfg(windows)]
+fn raw_memory(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global => name.is_none_or(|n| !n.contains("scratch")),
+            Encoding::Smem => name.is_none_or(|n| n.contains("store") || n.contains("atomic")),
+            Encoding::Mimg => name.is_some_and(|n| n.contains("bvh")),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }

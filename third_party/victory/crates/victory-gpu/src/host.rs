@@ -987,6 +987,7 @@ pub(crate) struct HostList {
     /// nothing again (`crate::draw`, the tables made afresh).
     pub(crate) changes: std::sync::atomic::AtomicU64,
     pub(crate) card_constants: crate::card_constants::PerList,
+    pub(crate) memory_ready: crate::memory::ListReady,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -3764,6 +3765,7 @@ impl Host {
                 cbv_epoch: std::sync::atomic::AtomicU64::new(0),
                 twins_writing: std::sync::atomic::AtomicBool::new(false),
                 card_constants: Default::default(),
+                memory_ready: Default::default(),
                 ahead_chunks: Mutex::default(),
                 left_open: crate::fresh_open::mark(),
                 prelude_open: std::sync::atomic::AtomicBool::new(false),
@@ -5302,6 +5304,7 @@ impl HostList {
         self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         self.card_constants.clear();
+        self.memory_ready.reset();
         crate::read_back_pool::give(&mut self.deferred().backs, |b| b.0);
         *self.deferred() = Deferred::default();
         use crate::list_reap::{alone, let_go};

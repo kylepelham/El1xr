@@ -599,6 +599,7 @@ fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap
         [[0.0f32; 4]; 5 * 3],
         [[0.0f32; 4]; 9 * 2],
     );
+    let zeros = vec![0u32; FAULT_DWORDS as usize];
     let views = [
         View::Texture(13, 7, &t0),
         View::RawUav(4),
@@ -606,7 +607,7 @@ fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap
         View::Texture(5, 3, &t3),
         View::NullTexture,
         View::Texture(9, 2, &t5),
-        View::RawUav(FAULT_DWORDS),
+        View::RawUavData(&zeros),
     ];
     let mut table = vec![2u32; FULL_REMAP as usize];
     table[0] = 0;
@@ -676,4 +677,393 @@ fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap
         assert_eq!(w[0][..2], [13, 7], "{label}");
         assert!(noted(&w).is_empty(), "{label}");
     }
+}
+
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A program that picks a raw buffer from the view heap by a
+/// root constant (`s0`, root type `ResourceHeap`), loads two dwords at byte `s1` and stores them
+/// to the raw UAV at heap index 1.
+fn heap_buffer_program() -> NativeProgram {
+    let mut program = native(&[]);
+    let words = [
+        0x8F14_8500, // s_lshl_b32 s20, s0, 5
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0x2800_0000, // s_load_dwordx4 s[8:11], s[4:5], s20
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0x7E00_0201, // v_mov_b32 v0, s1
+        0xE034_1000,
+        0x8002_0100, // buffer_load_dwordx2 v[1:2], v0, s[8:11], 0 offen
+        0xE074_0000,
+        0x8004_0100, // buffer_store_dwordx2 v[1:2], off, s[16:19], 0
+        S_ENDPGM,
+    ];
+    program.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    program.layout[1].root = RootType::ResourceHeap;
+    program.used.clear();
+    program
+}
+
+fn translate_buffer_address(native: &NativeProgram, on: bool) -> HostShader {
+    let was = super::lower::buffer_address::FORCED.replace(Some(on));
+    let shader = translate(native);
+    super::lower::buffer_address::FORCED.set(was);
+    shader
+}
+
+/// Runs `shader` (one of [`heap_buffer_program`]'s kind) on `host` with root constants `s0`,
+/// `s1`, the heap `views`, the buffer ranges table `ranges` and the memory directory
+/// `directory` (zeroed strides and faults), and returns the first `n` dwords of the UAV at heap
+/// index 1.
+#[allow(clippy::too_many_arguments)]
+fn run_by_address(
+    host: &Host,
+    label: &str,
+    shader: &HostShader,
+    views: &[View],
+    ranges: &[u32],
+    directory: &[u32],
+    [s0, s1]: [u32; 2],
+    n: usize,
+) -> Vec<u32> {
+    let words = |root: RootType, dword: u32| match (root, dword) {
+        (RootType::Constants, 0) => Some(s0),
+        (RootType::Constants, 1) => Some(s1),
+        _ => None,
+    };
+    run_by_address_with(host, label, shader, views, ranges, directory, &words, n)
+}
+
+/// [`run_by_address`] with the user-data dwords `words` gives (0 for the rest, 1 for
+/// `USER_MEMORY_BASE`).
+#[allow(clippy::too_many_arguments)]
+fn run_by_address_with(
+    host: &Host,
+    label: &str,
+    shader: &HostShader,
+    views: &[View],
+    ranges: &[u32],
+    directory: &[u32],
+    words: &dyn Fn(RootType, u32) -> Option<u32>,
+    n: usize,
+) -> Vec<u32> {
+    use super::shader::{
+        MEMORY_FAULTS, SLOT_BUFFER_RANGES, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+        USER_MEMORY_BASE,
+    };
+    let (root, pso) = host
+        .compute_pipeline(shader)
+        .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (words(u.root, u.dword), u.root) {
+            (Some(w), _) => w,
+            (None, RootType::Other(USER_MEMORY_BASE)) => 1,
+            (None, _) => 0,
+        };
+    }
+    // root views after the constants, by slot, as the harness orders them
+    let mut roots = vec![(0, Root::Constants(ud))];
+    let mut slots: Vec<(u8, bool)> = shader
+        .root_srvs
+        .iter()
+        .map(|&s| (s, true))
+        .chain(shader.root_uavs.iter().map(|&s| (s, false)))
+        .collect();
+    slots.sort_unstable();
+    for (k, (slot, srv)) in slots.into_iter().enumerate() {
+        let data = match slot {
+            SLOT_STRIDES => vec![0; 64],
+            SLOT_BUFFER_RANGES => ranges.to_vec(),
+            SLOT_MEMORY => directory.to_vec(),
+            SLOT_FAULTS => vec![0; MEMORY_FAULTS as usize],
+            other => panic!("root view {other}"),
+        };
+        roots.push((k as u32 + 1, Root::View { srv, data }));
+    }
+    let words = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots,
+                views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+    words[0][..n].to_vec()
+}
+
+#[test]
+fn a_buffer_picked_from_the_heap_reads_the_same_bytes_by_address_as_through_its_descriptor() {
+    use super::shader::{SLOT_BUFFER_RANGES, SLOT_FAULTS, SLOT_MEMORY};
+    let program = heap_buffer_program();
+    let plain = translate_buffer_address(&program, false);
+    let by_address = translate_buffer_address(&program, true);
+    assert_ne!(plain.dxil, by_address.dxil);
+    assert!(
+        !plain.root_srvs.contains(&SLOT_BUFFER_RANGES) && !plain.root_srvs.contains(&SLOT_MEMORY),
+        "off: through the descriptor"
+    );
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    assert!(by_address.root_uavs.contains(&SLOT_FAULTS));
+    // The buffer: six dwords. Title memory page 3 (the host copy at heap slot 2) holds them at
+    // byte 0x10, with other bytes after them.
+    let data = [0x11u32, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let mut page = vec![0xDEAD_BEEFu32; 16384];
+    page[4..10].copy_from_slice(&data);
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Raw,
+        },
+        View::RawUav(4),
+        View::RawUavData(&page),
+    ];
+    // Ranges by title slot: 0 the buffer; 3 (no host descriptor at all) its second half.
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[..4].copy_from_slice(&[0x3_0010, 0, 24, 4]);
+    ranges[12..16].copy_from_slice(&[0x3_0018, 0, 16, 4]);
+    // The memory directory: page 3's copy is copy 1 (heap slot USER_MEMORY_BASE + 1 = 2).
+    let mut directory = vec![0u32; 2 * 8];
+    directory[6] = 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let run = |shader: &HostShader, s0: u32, s1: u32| {
+            run_by_address(&host, label, shader, &views, &ranges, &directory, [s0, s1], 2)
+        };
+        for (s1, want) in [(0, [0x11, 0x22]), (8, [0x33, 0x44]), (16, [0x55, 0x66])] {
+            assert_eq!(run(&plain, 0, s1), want, "{label}: descriptor, byte {s1}");
+            assert_eq!(run(&by_address, 0, s1), want, "{label}: by address, byte {s1}");
+        }
+        // past the end: zeros, as a raw view gives
+        for s1 in [24, 4096, 0xFFFF_FFF8] {
+            assert_eq!(run(&plain, 0, s1), [0, 0], "{label}: descriptor, byte {s1}");
+            assert_eq!(run(&by_address, 0, s1), [0, 0], "{label}: by address, byte {s1}");
+        }
+        // the last dword in, the next out: dword by dword, as the raw view
+        assert_eq!(run(&plain, 0, 20), [0x66, 0], "{label}: descriptor, byte 20");
+        assert_eq!(run(&by_address, 0, 20), [0x66, 0], "{label}: by address, byte 20");
+        // a title slot the host has no descriptor for reads its own buffer by address
+        assert_eq!(run(&by_address, 3, 0), [0x33, 0x44], "{label}: title slot 3");
+        assert_eq!(run(&by_address, 3, 16), [0, 0], "{label}: title slot 3 past its end");
+        // a slot with no buffer view (size 0) reads zeros
+        assert_eq!(run(&by_address, 5, 0), [0, 0], "{label}: no view");
+    }
+}
+
+/// A program that picks a constant buffer (or a buffer) from the view heap by a root constant
+/// (`s0`, root type `ResourceHeap`), reads eight dwords of it at byte `s1` with a scalar load and
+/// stores them to the raw UAV at heap index 1.
+fn heap_constants_program() -> NativeProgram {
+    let mut program = heap_buffer_program();
+    let mut words = vec![
+        0x8F14_8500, // s_lshl_b32 s20, s0, 5
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0x2800_0000, // s_load_dwordx4 s[8:11], s[4:5], s20
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0xF42C_0604,
+        0x0200_0000, // s_buffer_load_dwordx8 s[24:31], s[8:11], s1
+    ];
+    for out in 0..8u32 {
+        // v_mov_b32 v1, s<24 + out>; buffer_store_dword v1, off, s[16:19], 0 offset:4*out
+        words.push(0x7E00_0000 | 1 << 17 | 1 << 9 | (24 + out));
+        words.push(0x38 << 26 | 0x1C << 18 | (4 * out));
+        words.push(0x80 << 24 | (16 >> 2) << 16 | 1 << 8);
+    }
+    words.push(S_ENDPGM);
+    program.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    program
+}
+
+#[test]
+fn a_constant_buffer_picked_from_the_heap_reads_the_same_constants_by_address() {
+    use super::shader::{SLOT_BUFFER_RANGES, SLOT_MEMORY};
+    let program = heap_constants_program();
+    let plain = translate_buffer_address(&program, false);
+    let by_address = translate_buffer_address(&program, true);
+    assert!(!plain.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    // 256 bytes of constants, at byte 0x100 of title memory page 3.
+    let constants: Vec<u32> = (0..64).map(|k| 0x100 + k).collect();
+    let mut page = vec![0xDEAD_BEEFu32; 16384];
+    page[64..128].copy_from_slice(&constants);
+    let views = [View::Cbv(&constants), View::RawUav(8), View::RawUavData(&page)];
+    // Title slot 0: the constant buffer (stride 0); 3: a raw buffer over its last 32 bytes.
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[..4].copy_from_slice(&[0x3_0100, 0, 256, 0]);
+    ranges[12..16].copy_from_slice(&[0x3_01E0, 0, 32, 1]);
+    let mut directory = vec![0u32; 2 * 8];
+    directory[6] = 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let run = |shader: &HostShader, s0: u32, s1: u32| {
+            run_by_address(&host, label, shader, &views, &ranges, &directory, [s0, s1], 8)
+        };
+        for s1 in [0u32, 32, 128] {
+            let want = constants[(s1 / 4) as usize..][..8].to_vec();
+            assert_eq!(run(&plain, 0, s1), want, "{label}: descriptor, byte {s1}");
+            assert_eq!(run(&by_address, 0, s1), want, "{label}: by address, byte {s1}");
+        }
+        // the last 16 bytes in, the rest out
+        let mut want = constants[60..].to_vec();
+        want.extend([0; 4]);
+        assert_eq!(run(&by_address, 0, 240), want, "{label}: by address, byte 240");
+        // a buffer view the host has no descriptor for, by its own range
+        assert_eq!(run(&by_address, 3, 0), constants[56..], "{label}: title slot 3");
+    }
+}
+
+/// A program that reads eight dwords at byte `s1` of the constant buffer at dword 0 of its table
+/// (root parameter 1, `s4`) with a scalar load and stores them to the raw UAV at dword 8 of the
+/// table.
+fn table_constants_program() -> NativeProgram {
+    let mut program = native_of(&[], 4, 0);
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0xF42C_0604,
+        0x0200_0000, // s_buffer_load_dwordx8 s[24:31], s[8:11], s1
+    ];
+    for out in 0..8u32 {
+        // v_mov_b32 v1, s<24 + out>; buffer_store_dword v1, off, s[16:19], 0 offset:4*out
+        words.push(0x7E00_0000 | 1 << 17 | 1 << 9 | (24 + out));
+        words.push(0x38 << 26 | 0x1C << 18 | (4 * out));
+        words.push(0x80 << 24 | (16 >> 2) << 16 | 1 << 8);
+    }
+    words.push(S_ENDPGM);
+    program.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    program.used[0].kind = ResourceType::Cbv;
+    program
+}
+
+#[test]
+fn a_tables_constant_buffer_reads_the_same_constants_by_title_address() {
+    use super::shader::{
+        BUFFER_RANGES_COUNT, NO_TABLE_SLOT, SLOT_BUFFER_RANGES, SLOT_MEMORY, TABLE_SLOT_KEPT,
+        USER_TABLE_SLOT,
+    };
+    let program = table_constants_program();
+    let plain = translate_buffer_address(&program, false);
+    let by_address = translate_buffer_address(&program, true);
+    let asks = |s: &HostShader, dword: u32| {
+        s.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(USER_TABLE_SLOT) && u.slot == 1 && u.dword == dword)
+    };
+    assert!(!plain.root_srvs.contains(&SLOT_BUFFER_RANGES) && !asks(&plain, 0));
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    // the host is told the table's title slot, and that no constant buffer of it is read
+    // through its descriptor (so it need not make the table afresh for one)
+    assert!(asks(&by_address, 0) && !asks(&by_address, TABLE_SLOT_KEPT));
+    // 256 bytes of constants, at byte 0x100 of title memory page 3; the host's descriptor at
+    // heap slot 0 holds the same.
+    let constants: Vec<u32> = (0..64).map(|k| 0x200 + k).collect();
+    let mut page = vec![0xDEAD_BEEFu32; 16384];
+    page[64..128].copy_from_slice(&constants);
+    let views = [View::Cbv(&constants), View::RawUav(8), View::RawUavData(&page)];
+    // The table's title slots start at 4: entry 4 is the constant buffer's range.
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[16..20].copy_from_slice(&[0x3_0100, 0, 256, 0]);
+    let mut directory = vec![0u32; 2 * 8];
+    directory[6] = 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // the table bound at host slot 0 (a fresh copy, or in place), its title slot `title`
+        let run = |shader: &HostShader, s1: u32, title: u32| {
+            let words = move |root: RootType, dword: u32| match (root, dword) {
+                (RootType::Constants, 1) => Some(s1),
+                (RootType::Other(USER_TABLE_SLOT), 0) => Some(title),
+                _ => None,
+            };
+            run_by_address_with(&host, label, shader, &views, &ranges, &directory, &words, 8)
+        };
+        for s1 in [0u32, 32, 128] {
+            let want = constants[(s1 / 4) as usize..][..8].to_vec();
+            assert_eq!(run(&plain, s1, 4), want, "{label}: descriptor, byte {s1}");
+            assert_eq!(run(&by_address, s1, 4), want, "{label}: by address, byte {s1}");
+        }
+        // the last 16 bytes in, the rest out, as for a constant buffer picked from the heap
+        let mut want = constants[60..].to_vec();
+        want.extend([0; 4]);
+        assert_eq!(run(&by_address, 240, 4), want, "{label}: by address, byte 240");
+        // the title slot, not the bound one, names the range: none there reads zeros
+        assert_eq!(run(&by_address, 0, 5), [0; 8], "{label}: title slot 5");
+    }
+    // No table: past every entry of the host's ranges table (its last entry, never written,
+    // reads 0); not run here, where the table is 8 entries long and a root view has no bounds.
+    const { assert!(NO_TABLE_SLOT >= BUFFER_RANGES_COUNT && NO_TABLE_SLOT < u32::MAX / 2) };
+}
+
+#[test]
+fn a_direct_buffer_range_reads_its_copy_without_touching_the_memory_directory() {
+    use super::shader::{BUFFER_RANGE_DIRECT, SLOT_BUFFER_RANGES, SLOT_MEMORY};
+    let program = heap_buffer_program();
+    let by_address = translate_buffer_address(&program, true);
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    // A small unaligned 24-byte copy at offset 0x10 inside copy 1 (heap slot USER_MEMORY_BASE + 1 = 2).
+    let data = [0xAA11u32, 0xBB22, 0xCC33, 0xDD44, 0xEE55, 0xFF66];
+    let mut copy_bytes = vec![0xDEAD_BEEFu32; 64];
+    copy_bytes[4..10].copy_from_slice(&data);
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Raw,
+        },
+        View::RawUav(4),
+        View::RawUavData(&copy_bytes),
+    ];
+    // Slot 0: direct copy 1 at byte offset 0x10, size 24, stride 4.
+    // Slot 2: direct copy 1 at byte offset 0x18, size 16, stride 4.
+    // Slot 5: empty [0, 0, 0, 0].
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[..4].copy_from_slice(&[0x10, BUFFER_RANGE_DIRECT | 1, 24, 4]);
+    ranges[8..12].copy_from_slice(&[0x18, BUFFER_RANGE_DIRECT | 1, 16, 4]);
+    // Empty memory directory: proves direct entries never touch SLOT_MEMORY.
+    let directory = vec![0u32; 2 * 8];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 warp device; skipped");
+        return;
+    };
+    let run = |s0: u32, s1: u32| {
+        run_by_address(&host, "warp", &by_address, &views, &ranges, &directory, [s0, s1], 2)
+    };
+    assert_eq!(run(0, 0), [0xAA11, 0xBB22], "direct copy at offset 0x10");
+    assert_eq!(run(0, 8), [0xCC33, 0xDD44], "direct copy at offset 0x18");
+    assert_eq!(run(0, 20), [0xFF66, 0], "partial OOB returns 0 for trailing dword");
+    assert_eq!(run(0, 24), [0, 0], "OOB returns 0");
+    assert_eq!(run(2, 0), [0xCC33, 0xDD44], "second direct slot");
+    assert_eq!(run(5, 0), [0, 0], "empty slot returns 0");
 }

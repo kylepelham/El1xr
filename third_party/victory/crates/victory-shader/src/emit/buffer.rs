@@ -137,6 +137,25 @@ impl Lower<'_> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A buffer the program picks from the view heap, read
+        // whole dwords at a time with no format: by its title address, no host descriptor.
+        if !typed
+            && !store
+            && atomic.is_none()
+            && narrow.is_none()
+            && format.is_none()
+            && !d16
+            && used.is_none()
+            && let Some(xs) = self.heap_buffer_load(&src, index, off, count, guard)?
+        {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         // A buffer the program picks from the view heap by an index it
         // computes: no used-resource entry gives its stride, the host's
         // table by heap slot does; the access becomes a raw one at the

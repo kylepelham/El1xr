@@ -1,0 +1,272 @@
+//! (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Buffers the code picks from the view heap by an index it
+//! computes (root type `ResourceHeap`) are read by their title address, not through a host
+//! descriptor: the host keeps each title slot's buffer range in a table
+//! (`shader::SLOT_BUFFER_RANGES`: four dwords a slot, the address's low and high dwords, the
+//! size in bytes and the element stride; all 0 for a slot with no buffer view), and the load
+//! reads title memory there through the memory directory (`shader::SLOT_MEMORY`), as
+//! raw-address code does. A buffer view then needs no slot in the host's view heap (capped at
+//! 1,000,000 on the RTX 5090, under the title's 1,245,184), and a title slot past the host's
+//! reads its own buffer instead of another view or null.
+//!
+//! Read-only raw and structured loads of whole dwords only (`buffer_load_dword*` with no
+//! format, and scalar `s_buffer_load_dword*`, which also reach constant buffers this way):
+//! typed loads need the format's decode, stores and atomics go through the host's copies of
+//! title memory only once a write path there is proven, byte and short loads keep
+//! their descriptor. Out of bounds as a raw view: each dword past the size reads 0.
+
+use super::{Attr, Bin, Cast, Fields, Lower, NULL, Operand, Reg, RootType, Tag, V, Val, Why, pred};
+use crate::resource::Source;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the switch for this thread.
+    pub(in crate::emit) static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether heap-picked buffers are read by address (`VICTORY_HEAP_BUFFER_ADDRESS=1`).
+pub fn on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FORCED.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BUFFER_ADDRESS").is_some_and(|v| v == "1"))
+}
+
+impl Lower<'_> {
+    /// The title slot (not the host's: the table is by title slot) of the
+    /// descriptor `src` loads from the view heap, if it does.
+    fn heap_buffer_slot(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Source::Loaded { load, first } = *src else {
+            return Ok(None);
+        };
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        if self.x.native.layout.get(a.param).map(|p| p.root) != Some(RootType::ResourceHeap) {
+            return Ok(None);
+        }
+        let li = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            offset,
+            soffset,
+            ..
+        } = li.fields
+        else {
+            return Ok(None);
+        };
+        let c = self.cur;
+        let base = li.read(Reg::S(code)).ok_or("a descriptor load")?;
+        let mut addr = self.i32_of(base)?;
+        let k = self
+            .s
+            .m
+            .i32((offset as u32).wrapping_add(4 * u32::from(first)));
+        addr = self.s.m.bin(c, Bin::Add, addr, k);
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(li, &soffset)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, so);
+        }
+        let five = self.s.m.i32(5);
+        Ok(Some(self.s.m.bin(c, Bin::LShr, addr, five)))
+    }
+
+    /// A read-only load of `count` dwords from the buffer `src` picks from
+    /// the view heap, element `index` (if indexed) at byte `off`, by
+    /// address; `None` when `src` is not such a buffer or the switch is off.
+    pub(super) fn heap_buffer_load(
+        &mut self,
+        src: &Source,
+        index: Option<V>,
+        off: V,
+        count: u32,
+        guard: Option<V>,
+    ) -> Result<Option<Vec<V>>, Why> {
+        if !on() {
+            return Ok(None);
+        }
+        let Some(slot) = self.heap_buffer_slot(src)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.load_by_slot(slot, index, off, count, guard)))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A scalar load of `count` dwords at byte `off` of the
+    /// constant buffer `src` names in a descriptor table, by title address; `None` when `src` is
+    /// not a table's constant buffer loaded from the table or the switch is off. The table's
+    /// title slot is a host word ([`super::super::shader::USER_TABLE_SLOT`]): the root
+    /// argument may name the host's fresh copy of the table, whose slots the ranges table
+    /// does not know; the descriptor is the same distance past the start in both.
+    pub(super) fn table_cbv_load(
+        &mut self,
+        src: &Source,
+        off: V,
+        count: u32,
+    ) -> Result<Option<Vec<V>>, Why> {
+        use super::super::shader::USER_TABLE_SLOT;
+        if !on() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = *src else {
+            return Ok(None);
+        };
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param).copied() else {
+            return Ok(None);
+        };
+        if rp.root != RootType::Table {
+            return Ok(None);
+        }
+        let c = self.cur;
+        // the slot the root argument names, and the table's start there
+        let bound = self.heap_index(load, first, false)?;
+        let Val::I32(start) = self.user(a.param, 0) else {
+            return Ok(None);
+        };
+        let five = self.s.m.i32(5);
+        let start = self.s.m.bin(c, Bin::LShr, start, five);
+        let past = self.s.m.bin(c, Bin::Sub, bound, start);
+        let title = self.host_word(RootType::Other(USER_TABLE_SLOT), rp.slot, 0);
+        let slot = self.s.m.bin(c, Bin::Add, title, past);
+        Ok(Some(self.load_by_slot(slot, None, off, count, None)))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A descriptor of a table's constant buffer read through
+    /// the table after all: the host keeps the table's constant buffers made
+    /// ([`super::super::shader::TABLE_SLOT_KEPT`]).
+    pub(super) fn table_cbv_kept(&mut self, src: &Source) {
+        use super::super::shader::{TABLE_SLOT_KEPT, USER_TABLE_SLOT};
+        if !on() {
+            return;
+        }
+        let Some(u) = self.used_kind(src) else {
+            return;
+        };
+        if u.root != RootType::Table || u.kind != super::ResourceType::Cbv {
+            return;
+        }
+        let _ = self.host_word(RootType::Other(USER_TABLE_SLOT), u.slot, TABLE_SLOT_KEPT);
+    }
+
+    /// A read-only load of `count` dwords at byte `off` (of element `index`, if indexed) of the
+    /// buffer at title slot `slot`, by address.
+    fn load_by_slot(
+        &mut self,
+        slot: V,
+        index: Option<V>,
+        off: V,
+        count: u32,
+        guard: Option<V>,
+    ) -> Vec<V> {
+        use super::super::shader::{
+            BUFFER_RANGES_COUNT, BUFFER_RANGE_DIRECT, SLOT_BUFFER_RANGES, USER_MEMORY_BASE,
+        };
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // Inside the table whatever the slot (a root view has no bounds).
+        let last = self.s.m.i32(BUFFER_RANGES_COUNT - 1);
+        let slot = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Shl, slot, four);
+        let h = self.s.root_srv_handle(SLOT_BUFFER_RANGES);
+        let (iu, all, align) = (self.s.m.undef(i32t), self.s.m.i8(0xF), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, iu, all, align],
+        );
+        let words: Vec<V> = (0..4)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, k);
+                self.as_int(x)
+            })
+            .collect();
+        let (lo, hi, size, stride) = (words[0], words[1], words[2], words[3]);
+        let byte = match index {
+            Some(element) => {
+                let at = self.s.m.bin(c, Bin::Mul, element, stride);
+                self.s.m.bin(c, Bin::Add, at, off)
+            }
+            None => off,
+        };
+        let zero = self.s.m.i32(0);
+        // a load wholly past the end touches no memory (no fault for it, null copy 0)
+        let inside = self.s.m.cmp(c, pred::IULT, byte, size);
+        let active = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+            None => inside,
+        };
+        // Direct entry (`BUFFER_RANGE_DIRECT`): `lo` is byte offset in copy `hi & !DIRECT`.
+        // Skips the 64 KiB page directory and fault buffer (needed for small/unaligned buffers
+        // and eliminates per-load fault-sink stores). Out-of-bounds reads also take copy 0.
+        let direct_bit = self.s.m.i32(BUFFER_RANGE_DIRECT);
+        let direct_mask = self.s.m.i32(!BUFFER_RANGE_DIRECT);
+        let hi_flag = self.s.m.bin(c, Bin::And, hi, direct_bit);
+        let not_direct = self.s.m.cmp(c, pred::EQ, hi_flag, zero);
+        let direct_copy = self.s.m.bin(c, Bin::And, hi, direct_mask);
+        let direct_copy = self.s.m.select(c, inside, direct_copy, zero);
+        let direct_at = self.s.m.bin(c, Bin::Add, lo, byte);
+        let direct_at = self.s.m.select(c, inside, direct_at, zero);
+        let need_dir = self.s.m.bin(c, Bin::And, not_direct, active);
+        let at_guard = self.begin_guarded(Some(need_dir));
+        let (page_copy, page_at) = {
+            let b = self.cur;
+            // the address: the range's start plus the byte, with the carry
+            let sum = self.s.m.bin(b, Bin::Add, lo, byte);
+            let wrapped = self.s.m.cmp(b, pred::IULT, sum, lo);
+            let one = self.s.m.cast(b, Cast::ZExt, wrapped, i32t);
+            let high = self.s.m.bin(b, Bin::Add, hi, one);
+            self.memory_lookup(sum, high, Some(active))
+        };
+        let pair = self.end_guarded(at_guard, &[(page_copy, direct_copy), (page_at, direct_at)]);
+        let (copy, at) = (pair[0], pair[1]);
+        let c = self.cur;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let mem_slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = self
+            .s
+            .heap_handle(c, mem_slot, false, true, (self.window_properties, 0));
+        let mut out = Vec::new();
+        // four dwords a load, on in the same copy (a buffer's copy holds all of it)
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let at = if first == 0 {
+                at
+            } else {
+                let k = self.s.m.i32(4 * first);
+                self.s.m.bin(c, Bin::Add, at, k)
+            };
+            let mask = self.s.m.i8(((1u32 << n) - 1) as u8);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, iu, mask, align],
+            );
+            for j in 0..n {
+                let k = first + j;
+                let x = self.s.m.extract(c, r, j);
+                let x = self.as_int(x);
+                // dword k in bounds: byte + 4k + 4 <= size, without wrapping
+                let end = self.s.m.i32(4 * k + 4);
+                let end = self.s.m.bin(c, Bin::Add, byte, end);
+                let fits = self.s.m.cmp(c, pred::IULE, end, size);
+                let no_wrap = self.s.m.cmp(c, pred::IUGE, end, byte);
+                let ok = self.s.m.bin(c, Bin::And, fits, no_wrap);
+                out.push(self.s.m.select(c, ok, x, zero));
+            }
+        }
+        out
+    }
+}

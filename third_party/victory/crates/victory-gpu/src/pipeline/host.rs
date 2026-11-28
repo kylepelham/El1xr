@@ -515,6 +515,7 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_REMAP
                             || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
+                            || slot == victory_shader::emit::SLOT_BUFFER_RANGES
                             || slot == victory_shader::emit::SLOT_MEMORY
                             || slot == victory_shader::emit::SLOT_TLAS
                             || slot == victory_shader::emit::SLOT_TLAS_NEAR

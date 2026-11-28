@@ -822,6 +822,9 @@ pub(crate) struct Shadow {
     /// Highest `Host::fence` value signalled after a GPU submission that
     /// declared shader writes on this shadow (for lock-free cross-queue sync).
     last_write_fence: AtomicU64,
+    /// (`crate::memory`) Copy number in the title-memory directory (0: none; 1..=cap).
+    /// Bit 31 set once marked for per-list refresh (constant buffers / raw-address copies).
+    pub(crate) memory_copy: std::sync::atomic::AtomicU32,
     #[cfg(test)]
     lazy_opted_in: bool,
 }
@@ -5198,6 +5201,7 @@ impl Shadow {
             deferred_count: AtomicUsize::new(0),
             resync_count: AtomicUsize::new(0),
             last_write_fence: AtomicU64::new(0),
+            memory_copy: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             lazy_opted_in: lazy_copyback(),
         }
@@ -7577,6 +7581,32 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// An already-created host copy holding `[address, address + len)` (never creates a new window
+/// or buffer copy). If a registered title buffer owns the range without a copy yet, returns
+/// `None` instead of falling through to a loose window so the view never aliases a different copy.
+pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, entry)) = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+        {
+            return entry.shadow.clone();
+        }
+    }
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let (cell, _) = window_of(address, end, WINDOW);
+    for (&(start, wlen), shadow) in map.range((cell, 0)..=(address, u64::MAX)).rev() {
+        if start + wlen >= end {
+            return Some(shadow.clone());
+        }
+    }
+    None
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

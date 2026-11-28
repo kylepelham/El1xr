@@ -22,7 +22,7 @@ mod flicker_region;
 mod pixel_watch;
 mod root_gather;
 mod root_slots;
-mod table_plan;
+pub(crate) mod table_plan;
 #[cfg(windows)]
 pub(crate) use table_plan::TablePlan;
 #[cfg(all(test, windows))]
@@ -911,12 +911,13 @@ pub(crate) fn forget_heap_ranges(id: u64) {
 fn heap_buffer_look(
     view: &crate::descriptor::View,
     resolved: Option<crate::descriptor::host::BufferCopy>,
-) -> crate::heap_pass_split::Look<std::sync::Arc<crate::shadow::Shadow>> {
+) -> crate::heap_pass_split::Look<(std::sync::Arc<crate::shadow::Shadow>, u32)> {
     use crate::heap_pass_split::Look;
     let made = resolved.is_some();
+    let stride = crate::descriptor::host::view_stride(view).unwrap_or(0);
     match resolved.or_else(|| crate::descriptor::host::buffer_copy(view)) {
         Some((copy, address, len)) => Look::Keep {
-            copy,
+            copy: (copy, stride),
             from: address,
             to: address + len,
             made,
@@ -1956,6 +1957,17 @@ impl State {
                 _ => 0,
             };
         }
+        if kind == victory_shader::emit::USER_TABLE_SLOT {
+            // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The table's title slot, for its constant
+            // buffers read by title address (`TablePlan` leaves them out).
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => self.heap_of(table).map_or(
+                    victory_shader::emit::NO_TABLE_SLOT,
+                    |heap| ((table - heap.start) / 32) as u32,
+                ),
+                _ => victory_shader::emit::NO_TABLE_SLOT,
+            };
+        }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
@@ -1996,6 +2008,47 @@ impl State {
         }?;
         let (addresses, constants) = root_gather::gather(self.roots_ref(compute));
         crate::memory::ready(list, heap, addresses.as_slice(), constants.as_slice(), writes)
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Fast path for shaders that only use `SLOT_MEMORY` via
+    /// `SLOT_BUFFER_RANGES` (no raw-address pointers or stores): avoids scanning root constants.
+    fn memory_ready_buffers(&self, list: &HostList) -> Option<crate::memory::Ready> {
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host(),
+        }?;
+        crate::memory::ready_buffers(list, heap)
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Ensures `SLOT_BUFFER_RANGES` entries and host copies are
+    /// ready for every table constant buffer read by title address before the draw runs.
+    fn ensure_cbv_address_slots(&self, compute: bool, slots: &[(u8, u32)]) {
+        let roots = self.roots_ref(compute);
+        let mut last: Option<(u8, u64, &'static crate::descriptor::Heap, &crate::descriptor::host::HostHeap)> = None;
+        for &(root_slot, desc) in slots {
+            let (table, heap, host) = match last {
+                Some((s, t, hp, hh)) if s == root_slot => (t, hp, hh),
+                _ => {
+                    let Some(&Root::Table(table)) = roots.get(usize::from(root_slot)) else {
+                        continue;
+                    };
+                    let Some(heap) = self.heap_of(table) else {
+                        continue;
+                    };
+                    if heap.samplers() || (table - heap.start) % 32 != 0 {
+                        continue;
+                    }
+                    let Some(host) = heap.host() else {
+                        continue;
+                    };
+                    last = Some((root_slot, table, heap, host));
+                    (table, heap, host)
+                }
+            };
+            let title_slot = ((table - heap.start) / 32) as u32 + desc;
+            let view = crate::descriptor::view(table + u64::from(desc) * 32);
+            crate::descriptor::host::buffer_ranges::ensure_slot(host, title_slot, view.as_ref());
+        }
     }
 
     /// The bound heap holding `handle`.
@@ -2269,15 +2322,37 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Populate table constant buffer ranges and
+            // copies before `memory_ready` so per-draw tables never flash zeros on frame 1.
+            if !t.tables.cbv_address_slots.is_empty() {
+                self.ensure_cbv_address_slots(compute, &t.tables.cbv_address_slots);
+            }
             // Title memory by address: what the shader finds it by.
             let memory = if t
                 .host
                 .root_srvs
                 .contains(&victory_shader::emit::SLOT_MEMORY)
             {
+                let hba = victory_shader::emit::heap_buffer_address();
+                let memory_writes = if hba {
+                    (t.memory_stores || !write_skip())
+                        && !crate::pipeline::builder_quarantined(self.pipeline as This)
+                } else {
+                    writes
+                };
+                let raw_memory = !hba
+                    || t.raw_memory
+                    || !t
+                        .host
+                        .root_srvs
+                        .contains(&victory_shader::emit::SLOT_BUFFER_RANGES);
                 let ready = {
                     let _lap = BindLap::start(3);
-                    self.memory_ready(list, compute, writes)
+                    if !raw_memory && !memory_writes {
+                        self.memory_ready_buffers(list)
+                    } else {
+                        self.memory_ready(list, compute, memory_writes)
+                    }
                 };
                 let Some(ready) = ready else {
                     self.scratch_made = made;
@@ -2391,6 +2466,28 @@ impl State {
                                 self.bind_resource(list, compute, param, RootResource::Srv(gpu))
                             }
                             None => once!("a shader reads view addresses without their table"),
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_BUFFER_RANGES {
+                        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Ours: the buffer range of each
+                        // view heap slot's view, for buffers read by title address.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.buffer_ranges())
+                            .map(|t| t.root());
+                        match table {
+                            Some((buffer, gpu)) => {
+                                // The list may outlive the title's heap object.
+                                list.keep(buffer);
+                                self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+                            }
+                            None => once!("a shader reads buffer ranges without their table"),
                         }
                         continue;
                     }
@@ -2960,7 +3057,7 @@ impl State {
                 match look {
                     Look::Forget => ranges.forget(index),
                     Look::Orphan => ranges.orphan(index, record, entry),
-                    Look::Keep { copy, from, to, made } => {
+                    Look::Keep { copy: (copy, stride), from, to, made } => {
                         // Whether making the view just resolved the copy the
                         // slot reads: the slot then shows that copy.
                         #[cfg(feature = "diagnostics")]
@@ -2969,6 +3066,9 @@ impl State {
                         }
                         #[cfg(not(feature = "diagnostics"))]
                         let _ = made;
+                        if victory_shader::emit::heap_buffer_address() {
+                            host.write_buffer_range_shadow(index, &copy, from, to - from, stride);
+                        }
                         let key = std::sync::Arc::as_ptr(&copy) as usize;
                         ranges.keep(index, key, &copy, [from, to], record, entry);
                     }
@@ -4834,6 +4934,8 @@ impl State {
                     hash = (hash.rotate_left(5) ^ u64::from(group.has_half(k * 8)))
                         .wrapping_mul(K);
                 }
+                // (Another table than the same slots made with their constant buffers.)
+                hash = (hash.rotate_left(5) ^ u64::from(group.cbv_by_address)).wrapping_mul(K);
                 // (Neptune) By contents alone (`tables_by_content`): the title writes every
                 // draw's table at a place of its own, and two thirds of a frame's tables
                 // (9,600 of 15,200, 73,000 slots) were made afresh although others with the
@@ -5027,6 +5129,8 @@ impl State {
                 let view = views.get(table + u64::from(k) * 32);
                 crate::table_prof::part(crate::table_prof::P::Lookup, looked);
                 match view {
+                    // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Read by title address: nothing to copy.
+                    Some(View::Constant(..)) if group.cbv_by_address => host.make_null(index),
                     Some(View::Constant(address, size)) => {
                         let written = crate::port_cbv::written_level();
                         if written > 0
