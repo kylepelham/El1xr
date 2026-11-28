@@ -40,7 +40,11 @@ mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod ambient_cover;
+#[cfg(windows)]
 mod ambient_miss;
+#[cfg(windows)]
+mod ambient_places;
 #[cfg(windows)]
 mod ambient_reflect;
 #[cfg(windows)]
