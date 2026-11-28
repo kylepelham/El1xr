@@ -13,6 +13,8 @@
 use std::mem::offset_of;
 
 #[cfg(windows)]
+mod barrier_dedup;
+#[cfg(windows)]
 pub(crate) mod uav_clear;
 
 use crate::object::{
@@ -905,6 +907,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        barrier_dedup::apply(&mut host);
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
