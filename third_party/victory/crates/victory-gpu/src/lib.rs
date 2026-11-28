@@ -26,6 +26,8 @@ mod cold_skip;
 pub mod console;
 #[cfg(windows)]
 mod commitline;
+#[cfg(windows)]
+mod poolslack;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
