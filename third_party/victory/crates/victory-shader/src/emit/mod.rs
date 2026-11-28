@@ -173,6 +173,7 @@ pub use lower::thread_limit::on as dispatchx_mask;
 pub use lower::heap_address::on as heap_view_address;
 pub use lower::mask_elsewhere::on as mask_elsewhere;
 pub use div_zero::on as div_inf_zero;
+pub(crate) use lower::isa_fixes;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

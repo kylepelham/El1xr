@@ -326,6 +326,11 @@ if (-not $NoTunedSettings) {
         VICTORY_CARD_BLOCK_REUSE         = '1'         # batch 5O: card pieces zeroed and reused (blocks 4480 -> 2944 MB, fps 23.6 -> 26.0)
         VICTORY_HEAP_WARM                = '1'         # batch 5N/O: view heaps' host copies made on the loading screen (world-entry frame 1048 -> 614 ms)
         VICTORY_TABLE_NULL_ONCE          = '1'         # batch 5R2: the diner background dark one frame every ~2 s gone (0 vs 12-19 per run, no cost)
+        VICTORY_TEXTURE_HEAPS            = '1'         # batch 5T/U: streamed texture host copies in shared blocks (loading bundle: world frame 26.7 -> 24.6 s, boot 29.2 -> 26.2 s)
+        VICTORY_TEXTURE_BLOCK_THREAD     = '1'         # batch 5T/U: texture blocks made and freed on their own thread (loading bundle)
+        VICTORY_DSTORAGE_STAGING_MB      = '256'       # batch 5T/U: 256 MiB of DirectStorage source in flight, not 32 (loading bundle)
+        VICTORY_DSTORAGE_POLL_WAIT       = '1'         # batch 5T/U: the title's disk-read poll returns as reads finish (loading bundle)
+        VICTORY_BAKE_STAGE_ALL           = '1'         # batch 5T/U: bake passes staged together while loading (loading bundle)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {

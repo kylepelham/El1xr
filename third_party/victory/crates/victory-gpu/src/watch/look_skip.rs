@@ -101,6 +101,17 @@ pub(crate) fn submission(lists: impl IntoIterator<Item = usize>) {
     SUBMISSION.with(|s| s.set(youngest));
 }
 
+/// (critpath #88, `VICTORY_ASK_ASIDE`) The submission noted on this thread, taken to be handed to
+/// the thread that asks for it ([`handed`]).
+pub(crate) fn taken() -> Option<u64> {
+    SUBMISSION.with(Cell::take)
+}
+
+/// The submission [`taken`] on the submitting thread, noted on this one.
+pub(crate) fn handed(youngest: Option<u64>) {
+    SUBMISSION.with(|s| s.set(youngest));
+}
+
 /// The last kernel asking of a submission, as its end left it.
 struct Saved {
     /// When it began ([`now_us`]) and the frame it began in.
