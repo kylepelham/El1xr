@@ -548,7 +548,16 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// march through the title's voxels, not the structures, and light the
 /// picture: they run. `CSGenerateHairVB` is grouped with `RayOnly::Trace`
 /// so `CSComputeSkinning` remains on by default (opt-in skip only via
-/// `VICTORY_SKIP_RT_SKIN=1`).
+/// `VICTORY_SKIP_RT_SKIN=1`). The screen probes' BVH traces are
+/// `RayOnly::ProbeTrace`: `VICTORY_PROBE_TRACE=1` runs them alone while every
+/// node test answers no hit (`VICTORY_BVH_NO_HIT=1`), so their hit records
+/// are fresh misses that `CS_ScreenProbe_RayMiss` lights, not stale bytes.
+///
+/// `CS_ScreenProbes_ActivateRays` (39f0e9aeb156a61c) holds no node test: it
+/// walks the probe grid (`buffer_load_format_x`, about 2,400 of them), picks
+/// each active probe's rays and writes the ray requests that
+/// `CS_ScreenProbes_EvaluateRayRequests*` reads. `VICTORY_BVH_NO_HIT` does
+/// not change its translation; left out, the requests are never written.
 ///
 /// The reflections' `CS_RaytraceVBuffer*` (`RayOnly::VBuffer`) also traces
 /// the structures. A frame dispatches it twice, each on its own list: after
@@ -571,7 +580,9 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         RayOnly::Activate
     } else if has(b"CS_RaytraceVBuffer") && !has(b"Voxels") {
         RayOnly::VBuffer
-    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH")) || has(b"CSGenerateHairVB") {
+    } else if has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH") {
+        RayOnly::ProbeTrace
+    } else if has(b"CSGenerateHairVB") {
         RayOnly::Trace
     } else {
         RayOnly::No
@@ -588,6 +599,7 @@ enum RayOnly {
     Activate,
     Trace,
     VBuffer,
+    ProbeTrace,
 }
 
 #[cfg(all(test, windows))]
@@ -616,7 +628,7 @@ fn ray_programs_are_known_by_name() {
     );
     assert_eq!(
         for_rays(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."),
-        RayOnly::Trace
+        RayOnly::ProbeTrace
     );
     assert_eq!(
         for_rays(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."),
@@ -647,21 +659,26 @@ fn ray_programs_are_known_by_name() {
 /// (`VICTORY_BVH_NO_HIT=1` / `VICTORY_RT_MISS=1`) and the structure builder
 /// is off. `CS_RaytracingResolve*`, `CS_ScreenProbes_ActivateRays*`, and
 /// BVH-only trace/hair passes are skipped unless `VICTORY_RT_RESOLVE=1`,
-/// `VICTORY_ACTIVATE_RAYS=1`, or `VICTORY_RT_TRACE=1`.
+/// `VICTORY_ACTIVATE_RAYS=1`, or `VICTORY_RT_TRACE=1`; the screen probes'
+/// traces also run with `VICTORY_PROBE_TRACE=1` and `VICTORY_BVH_NO_HIT=1`.
 /// `CSComputeSkinning*` stays ON by default (skipping it caused a
 /// deterministic `0x887A0006` GPU hang at world entry on Series X); opt-in
 /// skip only via `VICTORY_SKIP_RT_SKIN=1`.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This, alpha_rays: bool) -> bool {
-    static SKIPS: [[OnceLock<bool>; 2]; 6] = [const { [const { OnceLock::new() }; 2] }; 6];
+    static SKIPS: [[OnceLock<bool>; 2]; 7] = [const { [const { OnceLock::new() }; 2] }; 7];
     if this.is_null() {
         return false;
     }
     let kind = pipeline(this).rt_only;
     *SKIPS[kind as usize][alpha_rays as usize].get_or_init(|| {
-        ray_kind_skipped(kind, alpha_rays, |name| {
+        let skip = ray_kind_skipped(kind, alpha_rays, |name| {
             std::env::var_os(name).is_some_and(|v| v == "1")
-        })
+        });
+        if !skip && matches!(kind, RayOnly::Activate | RayOnly::ProbeTrace) {
+            tracing::info!(?kind, alpha_rays, "ray-only pass runs (VICTORY_ACTIVATE_RAYS, VICTORY_PROBE_TRACE)");
+        }
+        skip
     })
 }
 
@@ -713,7 +730,7 @@ pub(crate) fn ray_views(this: This) -> Option<(Walks, Vec<(u8, u32, u32)>)> {
         _ if shader.hash.starts_with(GLASS_TRACE) => Walks::Glass,
         (_, Some(binding)) => Walks::Shadow(binding),
         (RayOnly::VBuffer, None) => Walks::VBuffer,
-        (RayOnly::Trace, None) => Walks::Trace,
+        (RayOnly::Trace | RayOnly::ProbeTrace, None) => Walks::Trace,
         _ => return None,
     };
     let views = shader
@@ -754,6 +771,10 @@ fn ray_kind_skipped(kind: RayOnly, alpha_rays: bool, on: impl Fn(&str) -> bool) 
         RayOnly::Resolve => off("VICTORY_RT_RESOLVE"),
         RayOnly::Activate => off("VICTORY_ACTIVATE_RAYS"),
         RayOnly::Trace => off("VICTORY_RT_TRACE"),
+        // Only where the translation answers every node test no hit.
+        RayOnly::ProbeTrace => {
+            off("VICTORY_RT_TRACE") && !(on("VICTORY_PROBE_TRACE") && on("VICTORY_BVH_NO_HIT"))
+        }
         RayOnly::VBuffer => {
             off("VICTORY_RT_TRACE") && (!alpha_rays || on("VICTORY_SKIP_RT_VBUFFER"))
         }
@@ -785,6 +806,44 @@ fn the_alpha_vbuffer_trace_runs_when_every_ray_misses() {
             with(&["VICTORY_BVH_NO_HIT", "VICTORY_SKIP_RT_VBUFFER", "VICTORY_RT_TRACE"])
         ));
         assert!(!ray_kind_skipped(RayOnly::VBuffer, alpha, with(&[])));
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn activate_rays_and_probe_traces_run_on_their_own_switches() {
+    let with = |set: &'static [&'static str]| move |name: &str| set.contains(&name);
+    for alpha in [false, true] {
+        assert!(ray_kind_skipped(RayOnly::ProbeTrace, alpha, with(&["VICTORY_BVH_NO_HIT"])));
+        assert!(!ray_kind_skipped(
+            RayOnly::Activate,
+            alpha,
+            with(&["VICTORY_BVH_NO_HIT", "VICTORY_ACTIVATE_RAYS"])
+        ));
+        // Without the miss translation a probe trace would walk unbuilt bytes.
+        assert!(ray_kind_skipped(
+            RayOnly::ProbeTrace,
+            alpha,
+            with(&["VICTORY_RT_MISS", "VICTORY_PROBE_TRACE"])
+        ));
+        let probe = with(&["VICTORY_BVH_NO_HIT", "VICTORY_PROBE_TRACE"]);
+        assert!(!ray_kind_skipped(RayOnly::ProbeTrace, alpha, probe));
+        // The other ray-only passes stay out.
+        assert!(ray_kind_skipped(RayOnly::Trace, alpha, probe));
+        assert!(ray_kind_skipped(RayOnly::Activate, alpha, probe));
+        assert!(ray_kind_skipped(RayOnly::Resolve, alpha, probe));
+        assert!(ray_kind_skipped(RayOnly::VBuffer, false, probe));
+        assert!(!ray_kind_skipped(
+            RayOnly::ProbeTrace,
+            alpha,
+            with(&["VICTORY_BVH_NO_HIT", "VICTORY_RT_TRACE"])
+        ));
+        assert!(!ray_kind_skipped(RayOnly::ProbeTrace, alpha, with(&[])));
+        assert!(!ray_kind_skipped(
+            RayOnly::ProbeTrace,
+            alpha,
+            with(&["VICTORY_BVH_NO_HIT", "VICTORY_BVH_BUILDER"])
+        ));
     }
 }
 

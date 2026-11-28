@@ -5,7 +5,6 @@
 use super::Apply;
 
 pub(super) const EXPERT: &[(&str, Apply)] = &[
-    ("VICTORY_ACTIVATE_RAYS", Apply::Restart),
     ("VICTORY_AGILITY_SDK", Apply::Restart),
     ("VICTORY_ALIAS_COMPATIBLE", Apply::Restart),
     ("VICTORY_ALIAS_COPY", Apply::Restart),
