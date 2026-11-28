@@ -2094,6 +2094,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
             }
 #endif
             differs.Store(out_at + group.x * 4u, flag);
+#ifdef HASH_AT
+            // (El1xr) `VICTORY_FETCH_CHECK`: the hash, for the landing to
+            // check what it fetches against (`crate::fetch_check`).
+            differs.Store(HASH_AT + out_at + group.x * 4u, all.x ^ (all.y * 3u) ^ (all.z * 5u) ^ (all.w * 7u));
+#endif
             // With the copy-back on its own thread: the next compare of the
             // piece finds what is written from here on.
             if (compare == 2u) hashes.Store4(piece * 16u, all);

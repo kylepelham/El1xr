@@ -747,6 +747,7 @@ pub(super) fn late_line(frames: f64) {
                 r[7],
             );
         }
+        crate::fetch_check::log(frames);
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS
                 .iter()
