@@ -648,6 +648,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root SRV of a host top level built from this scene before the
+    /// dispatch, or of address 0 for `None` ([`Host::dispatch`] only).
+    Tlas(Option<super::host_tlas::Scene>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -887,7 +890,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Tlas(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1422,6 +1425,13 @@ impl Host {
                 at.ptr += i * sampler_size;
                 dev.CreateSampler(s, at);
             }
+            let mut tlas = Vec::new();
+            for (_, arg) in &d.roots {
+                if let Root::Tlas(Some(scene)) = arg {
+                    tlas.push(super::host_tlas::build(dev, &list, scene, &mut keep)?);
+                }
+            }
+            let mut tlas = tlas.into_iter();
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
@@ -1458,6 +1468,10 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Tlas(scene) => {
+                        let at = if scene.is_some() { tlas.next().unwrap_or(0) } else { 0 };
+                        list.SetComputeRootShaderResourceView(*param, at);
                     }
                 }
             }

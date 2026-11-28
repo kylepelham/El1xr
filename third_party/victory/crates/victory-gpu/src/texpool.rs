@@ -39,7 +39,9 @@ mod maker;
 mod reuse;
 #[cfg(test)]
 mod unmap_costs;
-pub(crate) use buffers::{card_buffer, shared_buffer, upload_buffer};
+#[cfg(test)]
+mod zero_probe;
+pub(crate) use buffers::{buffer_desc, card_buffer, shared_buffer, upload_buffer};
 
 /// Bytes of a block. Pieces of more than half of one are not cut (with
 /// blocks made ahead, [`ahead`]: of more than one).

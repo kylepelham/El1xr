@@ -131,16 +131,19 @@ impl<'a> Lower<'a> {
             .map(|n| n.1)
             .ok_or("an untracked ray-tracing structure")?;
         if let BvhNodes::Native(marker) = nodes {
-            // The glass splice's ray query: the ray's origin, direction and
-            // extent; the node pointer and inverse direction are not read.
+            // A splice's ray query: the ray's origin, direction and extent,
+            // and the instance mask where the node pointer goes; the inverse
+            // direction is not read.
             let guard = self.guard(b, i)?;
+            let mask = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+            let mask = self.i32_of(mask)?;
             let mut x = Vec::with_capacity(7);
             for &r in &regs[1 + usize::from(wide)..8 + usize::from(wide)] {
                 let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
                 let v = self.i32_of(v)?;
                 x.push(self.as_float(v));
             }
-            self.glass_query(inst, dst, guard, marker, [x[1], x[2], x[3]], [x[4], x[5], x[6]], x[0]);
+            self.glass_query(inst, dst, guard, marker, mask, [x[1], x[2], x[3]], [x[4], x[5], x[6]], x[0]);
             return Ok(());
         }
         let (sort, barycentrics) = match nodes {

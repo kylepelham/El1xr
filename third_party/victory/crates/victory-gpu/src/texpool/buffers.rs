@@ -15,7 +15,9 @@
 //!
 //! Each piece is a placed buffer of its own, as the committed one was: the
 //! callers see the same description, state and address range, mapped the
-//! same way. A committed buffer starts as zeros, so a piece does too: a
+//! same way. A committed buffer starts as zeros ("almost always": a pass
+//! that reads before it writes zeros its buffer itself, `crate::zero_fill`),
+//! so a piece does too: a
 //! piece of the card's memory is cut only from memory no piece used before
 //! (heaps are made cleared; a block is let go once all its pieces are back),
 //! or (El1xr, `VICTORY_CARD_BLOCK_REUSE=1`) zeroed since on a copy queue
@@ -330,7 +332,7 @@ fn card_reuse(device: &ID3D12Device) {
     super::let_go(super::Which::Card, gone);
 }
 
-pub(super) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+pub(crate) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(1),

@@ -1,5 +1,6 @@
 //! `VICTORY_SHADOW_RASTER_TILES=<1|2>` (unset by default; only with every ray a miss,
-//! `VICTORY_BVH_NO_HIT=1` without the structure builder and without `VICTORY_NATIVE_BVH=1`):
+//! `VICTORY_BVH_NO_HIT=1` without the structure builder, and not while the shadow traces go to
+//! host top levels, `VICTORY_NATIVE_SHADOW=1`):
 //! the sun shadow's screen tiles are not handed to the ray-traced path.
 //!
 //! The title's sun shadow is tiled (`cascadeshadows_classify`). `CS_ShadowTileClassify` writes one
@@ -54,12 +55,17 @@ fn parse(value: Option<&str>) -> Option<u8> {
     }
 }
 
-/// The level, read once: `None` unless every ray is a miss and no host structures are built.
+/// Whether the rewrite applies: every ray a miss (`no_hit`), and the shadow traces not on host
+/// top levels (`native_shadow`: then the traced tiles are traced for real and keep their place).
+fn applies(no_hit: bool, native_shadow: bool) -> bool {
+    no_hit && !native_shadow
+}
+
+/// The level, read once: `None` unless [`applies`].
 fn level() -> Option<u8> {
     static LEVEL: OnceLock<Option<u8>> = OnceLock::new();
     *LEVEL.get_or_init(|| {
-        let native = std::env::var_os("VICTORY_NATIVE_BVH").is_some_and(|v| v == "1");
-        (super::lower::intersect::no_hit() && !native)
+        applies(super::lower::intersect::no_hit(), super::shadow_splice::native_shadow())
             .then(|| parse(std::env::var("VICTORY_SHADOW_RASTER_TILES").ok().as_deref()))
             .flatten()
     })
@@ -183,6 +189,18 @@ mod tests {
         assert_eq!(store_in(real, Some(1)), Some((0x2cc8, 1)));
         let longer = b"\x00CS_ShadowTileBalanceRTCost_03da1e4a_WrappedX\x00";
         assert_eq!(store_in(longer, Some(1)), None);
+    }
+
+    #[test]
+    fn it_stands_down_only_for_native_shadow_traces() {
+        // Every ray a miss: on, also with host structures built but the shadow traces not
+        // spliced (`VICTORY_NATIVE_BVH=1` alone).
+        assert!(applies(true, false));
+        // The shadow traces on host top levels: their tiles keep the traced place.
+        assert!(!applies(true, true));
+        // Rays that can hit (the builder): nothing to work around.
+        assert!(!applies(false, false));
+        assert!(!applies(false, true));
     }
 
     #[test]

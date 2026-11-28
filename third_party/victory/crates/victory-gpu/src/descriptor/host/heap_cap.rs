@@ -28,6 +28,17 @@
 //! - `3`: title slots past the host heap's read their own views, packed
 //!   into host slots taken from the dynamic ones, through a table
 //!   ([`super::heap_remap`]).
+//! - `4`: every view index the title computes reads a whole-heap table
+//!   (`victory_shader::emit::title_remap_full`), so the host lays its heap
+//!   out at launch without a new translation: title slots below
+//!   `VICTORY_HEAP_CAP_IDENTITY` (default 500,000) are the host's own as
+//!   before, `VICTORY_HEAP_CAP_DYNAMIC` (default 2^18) slots stay dynamic,
+//!   and every slot between packs the live views of title slots from the
+//!   identity limit up, as `=3` does. Logs as `2` does, over the whole heap.
+//! - `5`: as `4`, packed on demand: shaders note the title slots they read
+//!   that have no packed view yet (and packed ones the host asks about), and
+//!   the host packs those first and evicts packed views no shader touched
+//!   for a while ([`super::heap_remap`], `demand`).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -38,7 +49,7 @@ pub(crate) const SCAN_EVERY: u64 = 300;
 fn parse(value: Option<&str>) -> u8 {
     value
         .and_then(|v| v.trim().parse::<u8>().ok())
-        .map_or(0, |n| n.min(3))
+        .map_or(0, |n| n.min(5))
 }
 
 fn mode() -> u8 {
@@ -52,17 +63,86 @@ pub(crate) fn on() -> bool {
 }
 
 /// Whether title slots past the host heap read their own views
-/// (`VICTORY_HEAP_CAP=3`).
+/// (`VICTORY_HEAP_CAP=3` or `4`).
 pub(crate) fn remap_on() -> bool {
-    mode() == 3
+    mode() >= 3
+}
+
+/// Whether the whole heap goes through the table (`VICTORY_HEAP_CAP=4` or `5`).
+pub(crate) fn full_on() -> bool {
+    mode() >= 4
+}
+
+/// Whether packed views follow what shaders read (`VICTORY_HEAP_CAP=5`).
+pub(crate) fn demand_on() -> bool {
+    mode() == 5
 }
 
 /// Whether title slots past the host heap are logged.
 pub(crate) fn log_on() -> bool {
     static LOG: OnceLock<bool> = OnceLock::new();
     *LOG.get_or_init(|| {
-        mode() == 2 || std::env::var("VICTORY_HEAP_CAP_LOG").is_ok_and(|v| v.trim() == "1")
+        matches!(mode(), 2 | 4 | 5)
+            || std::env::var("VICTORY_HEAP_CAP_LOG").is_ok_and(|v| v.trim() == "1")
     })
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+/// (`=4`) Dynamic slots kept for per-draw tables on a capped heap whose
+/// last slot is `null`: `asked` (`VICTORY_HEAP_CAP_DYNAMIC`), default 2^18
+/// (2^17 ran out in the opening cutscene), between 2^16 and half the heap.
+pub(crate) fn dynamic_keep_of(null: u32, asked: Option<u32>) -> u32 {
+    asked.unwrap_or(1 << 18).clamp(1 << 16, (null / 2).max(1 << 16))
+}
+
+/// (`=4`) Title slots the host keeps as its own (identity) on a capped
+/// heap: `asked` (`VICTORY_HEAP_CAP_IDENTITY`), default 500,000, leaving at
+/// least the dynamic slots `keep` and the null slot.
+pub(crate) fn identity_of(null: u32, keep: u32, asked: Option<u32>) -> u32 {
+    asked
+        .unwrap_or(500_000)
+        .min(null.saturating_sub(keep + 1))
+        .max(1)
+}
+
+fn dynamic_keep(null: u32) -> u32 {
+    static KEEP: OnceLock<u32> = OnceLock::new();
+    *KEEP.get_or_init(|| dynamic_keep_of(null, env_u32("VICTORY_HEAP_CAP_DYNAMIC")))
+}
+
+/// The slots past the title's own on a view heap whose last slot is
+/// `null`: `dynamic` (`HostHeap::new`'s), or with `=4` on a capped heap
+/// all past the identity limit (the null, packed and dynamic slots).
+pub(super) fn extra_slots(null: u32, dynamic: u32) -> u32 {
+    if full_on() && null != 0 && null < super::UNCAPPED_VIEWS - 1 {
+        let keep = dynamic_keep(null);
+        null - identity_of(null, keep, env_u32("VICTORY_HEAP_CAP_IDENTITY"))
+    } else {
+        dynamic
+    }
+}
+
+/// (`=5`) The host slot of the fault buffer's raw UAV on a heap whose last
+/// slot is `null`: the one before it, the last dynamic slot.
+pub(crate) fn fault_slot_of(null: u32) -> u32 {
+    null - 1
+}
+
+/// (`=5`) Dynamic slots kept past the packed ones on a capped heap.
+pub(crate) fn dynamic_kept() -> u32 {
+    dynamic_keep(victory_shader::emit::view_heap_limit())
+}
+
+/// The host's title null slot (where a capped heap's title slots end and
+/// its dynamic ones begin), 0 when none; set by [`tell_translator`].
+static TITLE_NULL: AtomicU32 = AtomicU32::new(0);
+
+/// See [`TITLE_NULL`].
+pub(crate) fn title_null() -> u32 {
+    TITLE_NULL.load(Relaxed)
 }
 
 /// Dynamic slots now free (`HostHeap::dynamic`) of `dynamic`: the most
@@ -93,10 +173,35 @@ pub(crate) fn title_null_of(null: u32, dynamic: u32, uncapped_null: u32) -> Opti
 /// (`probe_view_limit`, `host_facts::assume_host_facts`).
 pub(crate) fn tell_translator(null: u32) {
     let slot = if on() {
-        title_null_of(null, super::dynamic_slots(null), super::UNCAPPED_VIEWS - 1)
+        title_null_of(
+            null,
+            extra_slots(null, super::dynamic_slots(null)),
+            super::UNCAPPED_VIEWS - 1,
+        )
     } else {
         None
     };
+    TITLE_NULL.store(slot.unwrap_or(0), Relaxed);
+    if full_on() {
+        victory_shader::emit::set_title_view_limit(0);
+        victory_shader::emit::set_title_remap_len(0);
+        victory_shader::emit::set_title_remap_full(slot.is_some());
+        let fault = if demand_on() && slot.is_some() {
+            fault_slot_of(null)
+        } else {
+            0
+        };
+        victory_shader::emit::set_title_fault_slot(fault);
+        if let Some(slot) = slot {
+            tracing::info!(
+                identity = slot,
+                null,
+                dynamic_kept = dynamic_keep(null),
+                "heap cap: every title view index reads the whole-heap table; title slots below {slot} are the host's own, the rest are packed"
+            );
+        }
+        return;
+    }
     victory_shader::emit::set_title_view_limit(slot.unwrap_or(0));
     let len = if slot.is_some() && remap_on() {
         victory_shader::emit::REMAP_LEN
@@ -139,11 +244,26 @@ pub(super) fn reserve(
     if sampler {
         return 0;
     }
-    let title_null = victory_shader::emit::title_view_limit();
+    // (`=5`) every view heap's fault slot is ours: never a per-draw table's
+    let mut fault = 0;
+    if demand_on() {
+        let slot = fault_slot_of(victory_shader::emit::view_heap_limit());
+        if let Some(k) = slot.checked_sub(first_dynamic).filter(|&k| k < dynamic) {
+            taken.set_taken(k as usize, 1);
+            fault = 1;
+        }
+    }
+    let title_null = title_null();
+    // (`=4`) only the heap whose own slots end at the identity limit packs
+    if full_on() && first_dynamic != title_null {
+        return fault;
+    }
     let Some(at) = reserved_of(title_null, first_dynamic, dynamic) else {
-        return 0;
+        return fault;
     };
-    let n = if remap_on() {
+    let n = if full_on() {
+        1 + super::heap_remap::packed_full(at, dynamic, dynamic_kept())
+    } else if remap_on() {
         1 + super::heap_remap::compact_of(super::heap_remap::compact_slots(), at, dynamic)
     } else {
         1
@@ -157,13 +277,19 @@ pub(super) fn reserve(
         reserved = n,
         "heap cap: host view slot {title_null} kept null; title slots {first_dynamic} and up have no host slot"
     );
-    n
+    n + fault
 }
 
 /// The root SRV of the `=3` remap table for a list drawing with `host`'s
 /// heap (`draw.rs`, `victory_shader::emit::SLOT_REMAP`).
 pub(crate) fn remap_root(list: &crate::host::HostList, host: &super::HostHeap) -> Option<u64> {
     super::heap_remap::root(list, host)
+}
+
+/// The `=3` readiness of packed views, once a frame from `draw.rs`
+/// `heap_buffers` ([`super::heap_remap::ready_pass`]).
+pub(crate) fn ready_packed(host: &super::HostHeap, ready: impl FnMut(&super::super::View) -> u64) {
+    super::heap_remap::ready_pass(host, ready);
 }
 
 /// Counts of title slots past the host heap since the last line: views
@@ -249,10 +375,11 @@ pub(crate) fn note_writes(
     }
 }
 
-/// What a scan of the title's records past the host heap found.
+/// What a scan of the title's records found: past the host heap's own
+/// slots, and (the census) below them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Scan {
-    /// Records naming a view (tag set).
+    /// Records naming a view (tag set), past the host's own slots.
     pub records: u64,
     /// Of those, records naming a view that is alive now.
     pub live: u64,
@@ -261,17 +388,27 @@ pub(crate) struct Scan {
     pub live_in_dynamic: u64,
     pub lowest_live: Option<u32>,
     pub highest_live: Option<u32>,
-    /// Up to 8 live slots, lowest first.
+    /// Up to 8 live slots past the host's own, lowest first.
     pub sample: Vec<u32>,
-    /// Live records by 65,536-slot block (block = slot >> 16).
+    /// Live records in the host's own slots.
+    pub live_own: u64,
+    /// Live records by 65,536-slot block (block = slot >> 16), whole heap.
     pub blocks: std::collections::BTreeMap<u32, u64>,
 }
 
 impl Scan {
     /// Adds the record at `slot`: `tagged` (it names a view), `live` (that
-    /// view is alive). `null` is the host heap's null slot.
-    pub(crate) fn add(&mut self, slot: u32, tagged: bool, live: bool, null: u32) {
+    /// view is alive). `count`: the host's own title slots; `null` the host
+    /// heap's null slot.
+    pub(crate) fn add(&mut self, slot: u32, tagged: bool, live: bool, count: u32, null: u32) {
         if !tagged {
+            return;
+        }
+        if slot < count {
+            if live {
+                self.live_own += 1;
+                *self.blocks.entry(slot >> 16).or_default() += 1;
+            }
             return;
         }
         self.records += 1;
@@ -289,13 +426,30 @@ impl Scan {
         }
         *self.blocks.entry(slot >> 16).or_default() += 1;
     }
+
+    /// Live title views in the whole heap.
+    pub(crate) fn live_total(&self) -> u64 {
+        self.live + self.live_own
+    }
 }
+
+/// Whether `live` title views and the most dynamic slots taken at once
+/// (`dynamic_peak`) fit a heap whose last slot is `null` with every live
+/// view packed (`=4` with no identity slots; two null slots).
+pub(crate) fn fits(live: u64, dynamic_peak: u64, null: u32) -> bool {
+    live + dynamic_peak + 2 <= u64::from(null) + 1
+}
+
+/// A census in progress: its first frame, the next slot, what it found.
+static CENSUS: Mutex<Option<(u64, u32, Scan)>> = Mutex::new(None);
+/// Title slots a call of [`watch`] reads at most.
+const CENSUS_CHUNK: u32 = 1 << 17;
 
 /// Once a frame from `sync_heaps`, for a title view heap at `start` of
 /// `title` slots whose host heap holds `count` and has its null slot at
-/// `null`: every [`SCAN_EVERY`] frames, the line of what was made and
-/// written past the host heap since the last, and a scan of the records
-/// there.
+/// `null`: every [`SCAN_EVERY`] frames a census of every title slot, read
+/// [`CENSUS_CHUNK`] slots a call; then the line of what it found and of
+/// what was made and written past the host heap since the last.
 pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, null: u32) {
     let count = host.count;
     if remap_on() && count < title {
@@ -306,26 +460,30 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
     }
     static LAST: Mutex<Option<u64>> = Mutex::new(None);
     let frame = crate::frame::current();
-    {
+    let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    if census.is_none() {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if last.is_some_and(|l| frame < l + SCAN_EVERY) {
             return;
         }
         *last = Some(frame);
+        *census = Some((frame, 0, Scan::default()));
     }
+    let Some((began, at, scan)) = census.as_mut() else {
+        return;
+    };
     let started = std::time::Instant::now();
-    let mut scan = Scan::default();
     const CHUNK: u32 = 1 << 14;
     let mut bytes = vec![0u8; (CHUNK * 32) as usize];
     let mut unread = 0u32;
-    let mut at = count;
-    while at < title {
-        let n = CHUNK.min(title - at);
+    let end = title.min(at.saturating_add(CENSUS_CHUNK));
+    while *at < end {
+        let n = CHUNK.min(end - *at);
         let buf = &mut bytes[..(n * 32) as usize];
-        let from = start + u64::from(at) * step;
+        let from = start + u64::from(*at) * step;
         if !crate::host::read_into(from as *const u8, buf) {
             unread += n;
-            at += n;
+            *at += n;
             continue;
         }
         for (k, record) in buf.chunks_exact(32).enumerate() {
@@ -335,10 +493,16 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
             let [tag, i, generation] = [word(0), word(1), word(2)];
             let tagged = tag == super::super::VIEW_TAG;
             let live = tagged && super::super::view_at(i, generation).is_some();
-            scan.add(at + k as u32, tagged, live, null);
+            scan.add(*at + k as u32, tagged, live, count, null);
         }
-        at += n;
+        *at += n;
     }
+    if *at < title {
+        return;
+    }
+    let (began, scan) = (*began, std::mem::take(scan));
+    *census = None;
+    drop(census);
     let blocks: Vec<String> = scan
         .blocks
         .iter()
@@ -355,15 +519,20 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
         WRITTEN_RANGE[0].swap(u32::MAX, Relaxed),
         WRITTEN_RANGE[1].swap(0, Relaxed),
     );
+    let peak_ever = super::heap_remap::PEAK_TAKEN[1].load(Relaxed);
     tracing::warn!(
         frame,
+        census_frames = frame - began,
         host_title_slots = count,
         title_slots = title,
         null,
         switch_on = on(),
+        live_total = scan.live_total(),
+        live_own = scan.live_own,
         records = scan.records,
         live = scan.live,
         live_in_dynamic = scan.live_in_dynamic,
+        fits_packed = fits(scan.live_total(), peak_ever, null),
         lowest_live = ?scan.lowest_live,
         highest_live = ?scan.highest_live,
         sample = ?scan.sample,
@@ -375,7 +544,7 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
         written_slots_since = slots,
         written_range = ?(pages != 0).then_some(written_range),
         dynamic_peak = super::heap_remap::PEAK_TAKEN[0].swap(0, Relaxed),
-        dynamic_peak_ever = super::heap_remap::PEAK_TAKEN[1].load(Relaxed),
+        dynamic_peak_ever = peak_ever,
         ms = started.elapsed().as_millis() as u64,
         "heap cap: title slots past the host heap"
     );
@@ -453,7 +622,9 @@ mod tests {
         assert_eq!(parse(Some("1")), 1);
         assert_eq!(parse(Some(" 2 ")), 2);
         assert_eq!(parse(Some("3")), 3);
-        assert_eq!(parse(Some("9")), 3);
+        assert_eq!(parse(Some("4")), 4);
+        assert_eq!(parse(Some("5")), 5);
+        assert_eq!(parse(Some("9")), 5);
     }
 
     #[test]
@@ -508,13 +679,50 @@ mod tests {
     }
 
     #[test]
+    fn the_census_says_whether_every_live_view_fits_packed() {
+        // R2: some 346,000 live past the host's own slots; with as many below, 2^18 dynamic
+        assert!(fits(692_000, 262_144, NULL));
+        assert!(!fits(800_000, 262_144, NULL));
+        assert!(fits(999_998 - 100_000, 100_000, NULL));
+        assert!(!fits(999_998 - 100_000 + 1, 100_000, NULL));
+    }
+
+    #[test]
+    fn heap_cap_4_lays_out_identity_packed_and_dynamic_slots() {
+        // defaults: 500,000 own, 2^18 dynamic, the rest packed
+        let keep = dynamic_keep_of(NULL, None);
+        assert_eq!(keep, 1 << 18);
+        let identity = identity_of(NULL, keep, None);
+        assert_eq!(identity, 500_000);
+        let extra = NULL - identity;
+        assert_eq!(title_null_of(NULL, extra, UNCAPPED_NULL), Some(500_000));
+        // reserve(): the null slot and the packed ones, the dynamic ones left
+        let reserved = extra - keep;
+        assert_eq!(reserved, 1 + 237_854);
+        assert_eq!(extra - reserved, keep);
+        // asked values stay sane
+        assert_eq!(dynamic_keep_of(NULL, Some(1)), 1 << 16);
+        assert_eq!(dynamic_keep_of(NULL, Some(900_000)), NULL / 2);
+        assert_eq!(identity_of(NULL, keep, Some(900_000)), NULL - keep - 1);
+        assert_eq!(identity_of(NULL, keep, Some(0)), 1);
+    }
+
+    #[test]
     fn a_scan_counts_live_records_and_where_they_fall() {
         let mut scan = Scan::default();
-        scan.add(737_900, false, false, NULL);
-        scan.add(898_339, true, false, NULL);
-        scan.add(938_783, true, true, NULL);
-        scan.add(1_100_000, true, true, NULL);
-        assert_eq!(scan.records, 2 + 1);
+        let own = 737_855;
+        scan.add(737_900, false, false, own, NULL);
+        scan.add(898_339, true, false, own, NULL);
+        scan.add(938_783, true, true, own, NULL);
+        scan.add(1_100_000, true, true, own, NULL);
+        scan.add(5, true, true, own, NULL);
+        scan.add(6, true, false, own, NULL);
+        scan.add(70_000, true, true, own, NULL);
+        assert_eq!(scan.live_own, 2);
+        assert_eq!(scan.live_total(), 4);
+        assert_eq!(scan.blocks.get(&0), Some(&1));
+        assert_eq!(scan.blocks.get(&1), Some(&1));
+        assert_eq!(scan.records, 3);
         assert_eq!(scan.live, 2);
         assert_eq!(scan.live_in_dynamic, 1);
         assert_eq!(scan.lowest_live, Some(938_783));

@@ -6666,6 +6666,21 @@ impl<'a> Lower<'a> {
     /// select: no branch on the common path.
     fn title_index(&mut self, index: V) -> V {
         let c = self.cur;
+        let i32t = self.s.t.i32;
+        // (`VICTORY_HEAP_CAP=4`) The whole heap through the table: one load, nothing else.
+        if super::shader::title_remap_full() {
+            let last = self.s.m.i32(super::shader::FULL_REMAP - 1);
+            let k = self
+                .s
+                .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            self.s.m.tag(k, Tag::Clamp);
+            let entry = self.remap_entry(k);
+            let fault = super::shader::title_fault_slot();
+            if fault == 0 {
+                return entry;
+            }
+            return self.fault_note(k, entry, fault);
+        }
         let limit = super::shader::title_view_limit();
         let len = super::shader::title_remap_len();
         if limit == 0 || len == 0 {
@@ -6674,11 +6689,55 @@ impl<'a> Lower<'a> {
         let base = self.s.m.i32(limit);
         let past = self.s.m.bin(c, Bin::Sub, index, base);
         let last = self.s.m.i32(len);
-        let i32t = self.s.t.i32;
         let k = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[past, last]);
         self.s.m.tag(k, Tag::Clamp);
+        let remapped = self.remap_entry(k);
+        let below = self.s.m.cmp(c, pred::IULT, index, base);
+        self.s.m.select(c, below, index, remapped)
+    }
+
+    /// (heapcap, `VICTORY_HEAP_CAP=5`) The host slot of whole-heap table
+    /// entry `entry` (title slot `k`): its low 31 bits. With `FAULT_FLAG` set
+    /// the title slot is noted in the fault buffer (the raw UAV at host slot
+    /// `fault`); without, the store's offset is past the buffer and the
+    /// store is dropped. No branch.
+    fn fault_note(&mut self, k: V, entry: V, fault: u32) -> V {
+        use super::shader::{FAULT_DWORDS, FAULT_FLAG};
+        let c = self.cur;
+        let low = self.s.m.i32(!FAULT_FLAG);
+        let slot = self.s.m.bin(c, Bin::And, entry, low);
+        let zero = self.s.m.i32(0);
+        let asked = self.s.m.cmp(c, pred::SLT, entry, zero);
+        let places = self.s.m.i32(FAULT_DWORDS - 1);
+        let place = self.s.m.bin(c, Bin::URem, k, places);
+        let one = self.s.m.i32(1);
+        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, place, two);
+        let past = self.s.m.i32(0xFFFF_FFF0);
+        let byte = self.s.m.select(c, asked, byte, past);
+        let at = self.s.m.i32(fault);
+        let h = self.s.heap_handle(c, at, false, false, (0x100b, 0));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, byte, iu, k, iu, iu, iu, mask, align],
+        );
+        slot
+    }
+
+    /// (heapcap) Dword `k` of the remap table (`SLOT_REMAP`), in the current block.
+    fn remap_entry(&mut self, k: V) -> V {
+        let c = self.cur;
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, k, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_REMAP);
@@ -6694,9 +6753,7 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let remapped = self.as_int(f);
-        let below = self.s.m.cmp(c, pred::IULT, index, base);
-        self.s.m.select(c, below, index, remapped)
+        self.as_int(f)
     }
 
     /// The heap index of a descriptor that may differ between lanes,

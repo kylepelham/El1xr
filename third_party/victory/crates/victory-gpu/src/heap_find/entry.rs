@@ -6,7 +6,8 @@
 //! table at a per-draw offset and samples `ResourceDescriptorHeap[index]`
 //! (heap base 0, bits 27-31 of the word dropped). Here:
 //! - a word whose low 27 bits ([`super::refs::INDEX_BITS`]) name a found
-//!   slot counts as a hit too (flags in the high bits);
+//!   slot counts as a hit too (flags in the high bits; round 11: the low
+//!   24 bits, as the forward material shaders keep them);
 //! - the first [`MOST_ENTRIES`] buffer words found naming a found slot are
 //!   entries: `heap find: entry found` (address, buffer, the words around
 //!   it), then every frame the word is read again and `heap find: entry
@@ -20,6 +21,13 @@
 //!   record holds the entry, i.e. the phone screen's draw;
 //! - `heap find: entry readers` after each walk counts the readers and
 //!   those with a near number.
+//! - (round 11) Forward material shaders (`TL_PS_*PBR_MATERIAL*`) do not
+//!   bind their material buffer in a table: they take it from the heap at
+//!   slot `(b0[2].x + 864) >> 5` (other buffers at other offsets, some from
+//!   `b0[2].y`), so the refs search never read it. With the switch, each
+//!   draw's `b0` dwords 8 and 9 are heap byte offsets: the buffer views in
+//!   the [`GLOBAL_SLOTS`] slots from each (once a frame per base) are
+//!   searched too (`ref global b0 dword <d> base <b> +<k> slot <s> ...`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -31,12 +39,16 @@ static ENTRY: Live = Live::new("VICTORY_HEAP_FIND_ENTRY", |v| {
 });
 
 /// Entries watched at most.
-const MOST_ENTRIES: usize = 4;
+const MOST_ENTRIES: usize = 16;
 /// `heap find: entry changed` lines of a run at most.
 const MOST_CHANGE_LINES: u32 = 300;
 /// A number this many bytes or fewer before an entry may be the record's
 /// start (a material record is some dwords long).
 pub(crate) const NEAR_BYTES: u64 = 1024;
+/// A forward material record's bytes (round 11: the TL material shaders
+/// pick record `id` at `id * 512`); an entry `in_record` 12 or 48 sits
+/// where they read a texture index.
+const RECORD_BYTES: u64 = 512;
 /// Words logged on each side of an entry when it is found.
 const AROUND: u64 = 8;
 /// Bytes of a root view or constant buffer looked at for near numbers.
@@ -59,6 +71,35 @@ pub(crate) struct Entry {
 }
 
 static ENTRIES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+/// The heap bases of a frame whose buffers were searched: (frame, bases).
+static BASES: Mutex<(u64, Vec<u32>)> = Mutex::new((u64::MAX, Vec::new()));
+
+/// Heap slots past a base whose buffers are searched (round 11): the
+/// forward material shaders reach slots up to `(base + 5664) >> 5`.
+pub(crate) const GLOBAL_SLOTS: u32 = 192;
+/// The `b0` dwords a forward material shader adds its heap offsets to:
+/// register 2's x and y (`cbufferLoadLegacy(b0, 2)`, then `+ k`, `>> 5`).
+pub(crate) const BASE_DWORDS: [usize; 2] = [8, 9];
+
+/// Heap slots from a base byte offset: the base's slot and the next
+/// [`GLOBAL_SLOTS`], those under `count`.
+pub(crate) fn base_slots(base: u32, count: u32) -> std::ops::Range<u32> {
+    let first = base / super::SLOT_BYTES as u32;
+    first.min(count)..first.saturating_add(GLOBAL_SLOTS).min(count)
+}
+
+/// Whether `base` is first seen this frame (its buffers then searched).
+pub(crate) fn first_base(frame: u64, base: u32) -> bool {
+    let mut b = BASES.lock().unwrap_or_else(|p| p.into_inner());
+    if b.0 != frame {
+        *b = (frame, Vec::new());
+    }
+    if b.1.contains(&base) {
+        return false;
+    }
+    b.1.push(base);
+    true
+}
 static CHANGE_LINES: AtomicU32 = AtomicU32::new(0);
 static WATCHED: AtomicU64 = AtomicU64::new(u64::MAX);
 static READERS: AtomicU32 = AtomicU32::new(0);
@@ -124,6 +165,9 @@ pub(crate) fn found(buffer: u64, len: u64, at: usize, slot: u32, what: &str) {
         dword = at,
         raw = format_args!("{raw:#x}"),
         low_bits = format_args!("{:#x}", raw & super::refs::INDEX_BITS),
+        flags = format_args!("{:#x}", raw >> 24),
+        record = (address - buffer) / RECORD_BYTES,
+        in_record = (address - buffer) % RECORD_BYTES,
         slot,
         what,
         around_from_dword = (from - buffer) / 4,
@@ -260,6 +304,19 @@ mod tests {
         assert_eq!(nearest(&[51_944, 12_986], off), None, "past the entry");
         assert_eq!(nearest(&[50_000], off), None, "too far before it");
         assert_eq!(nearest(&[0], 0), None);
+    }
+
+    /// Round 11: a base reaches its own slot and the next 192, never past
+    /// the heap; each base is searched once a frame.
+    #[test]
+    fn heap_bases_reach_their_slots_once_a_frame() {
+        assert_eq!(base_slots(32 * 1000, 1_245_184), 1000..1192);
+        assert_eq!(base_slots(32 * 1_245_100, 1_245_184), 1_245_100..1_245_184);
+        assert_eq!(base_slots(u32::MAX, 10), 10..10);
+        assert!(first_base(7, 64));
+        assert!(!first_base(7, 64));
+        assert!(first_base(7, 96));
+        assert!(first_base(8, 64), "a new frame");
     }
 
     /// A word that keeps the slot under flags still names it.

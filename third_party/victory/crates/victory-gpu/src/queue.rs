@@ -1198,6 +1198,9 @@ extern "system" fn present(
             while later.pending {
                 later = LATER.1.wait(later).unwrap_or_else(|e| e.into_inner());
             }
+            // (texflicker #96) The last present has run: what the title recorded since is
+            // this frame's (`VICTORY_FLICKER_CATCH_TITLE_CUT`).
+            crate::flicker_catch::title_presents();
             later.pending = true;
             let asked = std::time::Instant::now();
             later.job = Some(Box::new(move || present_now(named, Some(asked))));
@@ -1214,6 +1217,8 @@ extern "system" fn present(
         }
         return S_OK;
     }
+    #[cfg(windows)]
+    crate::flicker_catch::title_presents();
     present_now(named, None);
     S_OK
 }

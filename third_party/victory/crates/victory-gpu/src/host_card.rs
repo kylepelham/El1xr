@@ -256,11 +256,12 @@ impl Host {
                             },
                             ..Default::default()
                         })?;
-                // A new buffer is zeroes: the count starts at 0, as
-                // `SNAP_DONE` does.
+                // The count starts at 0, as `SNAP_DONE` does: written, a
+                // new buffer is only "almost always" zeros (`zero_fill`).
                 let buffer = self
                     .uav_buffer(SNAP_AT + u64::from(slots) * SNAP_SLOT)
                     .ok_or_else(windows::core::Error::empty)?;
+                crate::zero_fill::zero_buffer(&self.device, &buffer, SNAP_AT)?;
                 name(&buffer, || "card compare, pieces kept for the fetch".into());
                 Ok(CardSnap {
                     root,

@@ -76,6 +76,8 @@ mod bake_replay;
 mod bake_spread;
 #[cfg(windows)]
 mod bind_hash;
+#[cfg(windows)]
+mod root_memo;
 mod table_prof;
 #[cfg(windows)]
 mod bake_watch;
@@ -237,8 +239,11 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod shader_pack;
+#[cfg(windows)]
 mod wave_more;
 mod zero_out;
+mod zero_fill;
 #[cfg(windows)]
 mod face_watch;
 #[cfg(windows)]

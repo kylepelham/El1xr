@@ -163,3 +163,225 @@ fn the_glass_trace_spliced_translates_and_validates() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
 }
+
+/// A wave32 program that runs the native arm alone: each thread's record
+/// (direction, the six origin halves, whether it is an L1/L3 lane) into the
+/// registers the arm reads (`s3` from that flag), `s53` the user-data dword 2
+/// (`CB 0x7c8`),
+/// then the arm's results stored at 64 bytes a thread: `v40 v36 v41 v26`,
+/// `v25 v35 v23 v24`, `v27 v21`.
+fn arm_program() -> NativeProgram {
+    use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+    let mut w = vec![
+        0xbe85_0380, // s_mov_b32 s5, 0
+        0xf408_0202,
+        0xfa00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xf408_0302,
+        0xfa00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x3428_0086, // v_lshlrev_b32 v20, 6, v0
+        0xe038_1000,
+        0x8002_3c14, // buffer_load_dwordx4 v[60:63], v20, s[8:11], 0 offen
+        0xe038_1010,
+        0x8002_4014, // ... v[64:67] offset:16
+        0xe038_1020,
+        0x8002_4414, // ... v[68:71] offset:32
+        0xbf8c_3f70, // s_waitcnt vmcnt(0)
+        s_mov(S53, 2),
+    ];
+    // s3: the lanes whose record word 9 is not 0, as a compare makes it.
+    w.push(vopc(V_CMP_NE_U32, ZERO, 69));
+    w.push(s_mov(S3, VCC_LO));
+    for (dst, src) in [(0, 60), (7, 61), (9, 62), (31, 63), (32, 64), (39, 65), (37, 66), (30, 67), (33, 68)] {
+        w.push(v_mov(dst, v(src)));
+    }
+    arm(&mut w);
+    for (k, r) in [40, 36, 41, 26, 25, 35, 23, 24, 27, 21, 34, 22].into_iter().enumerate() {
+        w.push(v_mov(119 + k as u8, v(r)));
+    }
+    w.extend([
+        0xe078_1000,
+        0x8003_7714, // buffer_store_dwordx4 v[119:122], v20, s[12:15], 0 offen
+        0xe078_1010,
+        0x8003_7b14, // ... v[123:126] offset:16
+        0xe078_1020,
+        0x8003_7f14, // ... v[127:130] offset:32
+        0xbf81_0000, // s_endpgm
+    ]);
+    let table = |kind, at| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: at,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 131,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// The two host top levels: `t354` (near, [`SLOT_TLAS_NEAR`]) one small
+/// triangle at z = 5, contribution 20; `t355` (far, [`SLOT_TLAS`]) a large
+/// one at z = 8 as its second instance, contribution 40.
+fn arm_scenes() -> (super::super::host_tlas::Scene, super::super::host_tlas::Scene) {
+    use super::super::host_tlas::{Instance, Scene};
+    let near = Scene {
+        geometries: vec![(vec![[[-1.0, -1.0, 5.0], [1.0, -1.0, 5.0], [-1.0, 1.0, 5.0]]], true)],
+        instances: vec![Instance { offset: [0.0; 3], id: 1, contribution: 20, mask: 0xff }],
+    };
+    let far = Scene {
+        geometries: vec![(vec![[[-50.0, -50.0, 8.0], [150.0, -50.0, 8.0], [-50.0, 150.0, 8.0]]], true)],
+        instances: vec![
+            Instance { offset: [1000.0, 0.0, 0.0], id: 2, contribution: 30, mask: 0xff },
+            Instance { offset: [0.0; 3], id: 3, contribution: 40, mask: 0xff },
+        ],
+    };
+    (near, far)
+}
+
+/// The native arm on the card against both host top levels: an `s3` lane
+/// takes `t355` (and `v27`), another takes `t354`, and on its miss `t355`
+/// only when `CB 0x7c8 > 0`; the result registers hold the hit or the
+/// title's miss values, `v21` 31.
+#[test]
+fn the_native_arm_picks_its_top_level_per_lane_on_the_card() {
+    use super::super::host::{Dispatch, Host, Root, Stride, View};
+    use super::super::shader::{SLOT_TLAS, SLOT_TLAS_NEAR};
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !super::super::host_tlas::supported(&host.device) {
+        eprintln!("no ray tracing tier 1.1; skipped");
+        return;
+    }
+    let native = arm_program();
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = crate::structure::structure(&p).expect("structure");
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    assert_eq!(res.bvh.len(), 4);
+    let io = crate::io::raise(&p, &native).expect("io");
+    let out = super::super::lower::lower(&super::super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("the arm lowers");
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        let mut copy = out.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let shader = super::super::HostShader {
+        stage: HwStage::Cs,
+        dxil: out.dxil,
+        user_data: out.user_data,
+        samplers: out.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: out.root_cbvs,
+        root_srvs: out.root_srvs,
+        root_uavs: out.root_uavs,
+        root_indexed_views: res.root_indexed_views.clone(),
+        half_views: out.half_views,
+    };
+    assert!(shader.root_cbvs.is_empty() && shader.root_uavs.is_empty());
+    assert_eq!(shader.root_srvs.iter().copied().collect::<std::collections::BTreeSet<_>>(), [SLOT_TLAS_NEAR, SLOT_TLAS].into());
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    // Threads: (in s3, x, y, direction z).
+    let lanes: [(bool, f32, f32, f32); 6] = [
+        (true, -0.5, -0.5, 1.0),
+        (false, -0.5, -0.5, 1.0),
+        (false, 0.8, 0.8, 1.0),
+        (true, 0.8, 0.8, 1.0),
+        (false, 0.0, 0.0, -1.0),
+        (true, 0.0, 0.0, -1.0),
+    ];
+    let mut record = vec![0u32; 16 * 32];
+    for t in 0..32 {
+        let (s3, x, y, dz) = lanes[t.min(lanes.len() - 1)];
+        let r = &mut record[16 * t..];
+        // Direction, then origin halves: v31 + v32, v39 + v37, v30 + v33.
+        for (k, f) in [0.0, 0.0, dz, x - 1.0, 1.0, y - 2.0, 2.0, -3.0, 3.0].into_iter().enumerate() {
+            r[k] = f32::to_bits(f);
+        }
+        r[9] = u32::from(s3);
+    }
+    let f = f32::to_bits;
+    let miss = [0, f(-1.0), 0, 0, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 0, 31];
+    let near = [1, f(5.0), f(0.25), f(0.25), 0, 0, 0, 20, 0, 31];
+    let far = |b: f32, s3: bool| [1, f(8.0), f(b), f(b), 1, 0, 0, 40, u32::from(s3), 31];
+    for cb in [1.0f32, -1.0] {
+        let mut user = vec![0u32; shader.user_data_dwords() as usize];
+        user[2] = cb.to_bits();
+        let (n, fa) = arm_scenes();
+        let got = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(user)),
+                        (1, Root::Tlas(Some(n))),
+                        (2, Root::Tlas(Some(fa))),
+                    ],
+                    views: &[View::Buffer { data: &record, stride: Stride::Raw }, View::RawUav(16 * 32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let want = [
+            far(0.2475, true),
+            near,
+            if cb > 0.0 { far(0.254, false) } else { miss },
+            far(0.254, true),
+            miss,
+            miss,
+        ];
+        for (t, want) in want.iter().enumerate() {
+            let got = &got[0][16 * t..16 * t + 12];
+            let floats = [1, 2, 3];
+            let same = (0..10).all(|k| {
+                if floats.contains(&k) {
+                    (f32::from_bits(got[k]) - f32::from_bits(want[k])).abs() < 1e-4
+                } else {
+                    got[k] == want[k]
+                }
+            });
+            assert!(same, "CB {cb}, thread {t}: got {got:x?}, want {want:x?}");
+            assert_eq!(&got[10..12], &[0, 0], "v34, v22");
+        }
+    }
+}

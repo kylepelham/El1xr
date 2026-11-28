@@ -22,6 +22,17 @@
 //! black frame with no good frame before it (boot) is shown as it is. Not
 //! with a second plane (its UI over a black game plane would sit over a
 //! stale one).
+//!
+//! (texflicker, #96) `VICTORY_HOLD_DARK_FRAME=N` (live; off unless set; with
+//! `VICTORY_HOLD_LAST_FRAME`'s pass): a present that is dark but not black
+//! (fewer than one texel in [`DARK_SHARE`] brighter than 20/255 in any
+//! colour: a game frame drawn black under the title's subtitles) shows the
+//! last good frame too, at most `N` in a row (1 to 8). Part R2 caught two
+//! such frames at the same cutscene cut in two of three launches (the
+//! diner, "leche caliente": 0.3 % and 0 % of texels above 16/255, lit
+//! frames 11-88 %). From the `N`+1-th dark frame in a row the dark frames
+//! are shown and kept, so a scene that is really that dark (a fade) comes
+//! `N` frames late and is never held for long.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -40,25 +51,35 @@ const VIEWS: u32 = 64;
 /// Read-backs of the counters in flight.
 const RING: usize = 8;
 /// Bytes of the state buffer: lit (u64), hold (u64), kept, run, held,
-/// lit frames, black shown.
+/// lit frames, black shown, dark held, bright texels.
 const STATE_BYTES: u64 = 64;
 const AT_LIT: u64 = 0;
 const AT_HOLD: u64 = 8;
 const AT_COUNTS: u64 = 24;
 /// The scan's group side.
 const SIDE: u32 = 16;
+/// Dark (`VICTORY_HOLD_DARK_FRAME`): fewer than one texel in this many
+/// brighter than [`DARK_LEVEL`]. Kept in the shader's `decide`.
+pub(crate) const DARK_SHARE: u32 = 50;
+/// Dark: the colour level, of 255, a bright texel is above (display
+/// values; formats read as linear light compare against its 2.2 power).
+pub(crate) const DARK_LEVEL: u32 = 20;
+/// The dark frames held in a row at most, whatever is asked.
+const DARK_MOST: u32 = 8;
 
 const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants = 4, b0), UAV(u0), DescriptorTable(SRV(t0))"
-cbuffer Params : register(b0) { uint width; uint height; uint most; uint fresh; };
+#define RS "RootConstants(num32BitConstants = 8, b0), UAV(u0), DescriptorTable(SRV(t0))"
+cbuffer Params : register(b0) { uint width; uint height; uint most; uint fresh; uint dark_most; uint linear_light; uint level; uint share; };
 Texture2D<float4> shown : register(t0);
 RWByteAddressBuffer state : register(u0);
 groupshared uint group_lit;
+groupshared uint group_bright;
 
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void begin() {
     state.Store2(0, uint2(0, 0));
+    state.Store(40, 0);
     if (fresh != 0) {
         state.Store2(16, uint2(0, 0));
     }
@@ -69,14 +90,29 @@ void begin() {
 void scan(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex) {
     if (index == 0) {
         group_lit = 0;
+        group_bright = 0;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (id.x < width && id.y < height && any(shown.Load(int3(id.xy, 0)).rgb != 0.0)) {
-        group_lit = 1;
+    if (id.x < width && id.y < height) {
+        float3 c = shown.Load(int3(id.xy, 0)).rgb;
+        if (any(c != 0.0)) {
+            group_lit = 1;
+        }
+        float bright = level / 255.0;
+        if (linear_light != 0) {
+            bright = pow(bright, 2.2);
+        }
+        if (dark_most != 0 && max(max(c.r, c.g), c.b) > bright) {
+            InterlockedAdd(group_bright, 1);
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     if (index == 0 && group_lit != 0) {
         state.Store(0, 1);
+    }
+    if (index == 0 && group_bright != 0) {
+        uint before;
+        state.InterlockedAdd(40, group_bright, before);
     }
 }
 
@@ -87,9 +123,18 @@ void decide() {
     uint kept = state.Load(16);
     uint run = state.Load(20);
     uint hold = 0;
-    if (lit != 0) {
+    bool dark = lit != 0 && dark_most != 0 && state.Load(40) * share < width * height;
+    if (lit != 0 && !dark) {
         kept = 1;
         run = 0;
+        state.Store(28, state.Load(28) + 1);
+    } else if (dark && kept != 0 && run < dark_most) {
+        hold = 1;
+        run += 1;
+        state.Store(24, state.Load(24) + 1);
+        state.Store(36, state.Load(36) + 1);
+    } else if (dark) {
+        kept = 1;
         state.Store(28, state.Load(28) + 1);
     } else if (kept != 0 && run < most) {
         hold = 1;
@@ -98,6 +143,8 @@ void decide() {
     } else {
         state.Store(32, state.Load(32) + 1);
     }
+    // What is shown from the texture and not black is kept.
+    state.Store(0, hold == 0 && lit != 0 ? 1 : 0);
     state.Store2(8, uint2(hold, 0));
     state.Store2(16, uint2(kept, run));
 }
@@ -107,6 +154,34 @@ void decide() {
 /// present the pass did not see is forgotten.
 static MOST: victory_core::settings::Live =
     victory_core::settings::Live::new("VICTORY_HOLD_LAST_FRAME", |v| u64::from(parse(v)));
+
+/// `VICTORY_HOLD_DARK_FRAME`: the dark frames held in a row at most; 0: off.
+pub(crate) fn dark_most() -> u32 {
+    static DARK: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_HOLD_DARK_FRAME", |v| u64::from(parse_dark(v)));
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let most = DARK.get() as u32;
+    if LOGGED.swap(most, Relaxed) != most && most > 0 {
+        tracing::info!(
+            most,
+            share = DARK_SHARE,
+            level = DARK_LEVEL,
+            "hold dark frame: a present with fewer than one texel in `share` brighter than `level`/255 shows the last good frame, at most this many in a row (VICTORY_HOLD_DARK_FRAME; with VICTORY_HOLD_LAST_FRAME)"
+        );
+    }
+    most
+}
+
+fn parse_dark(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(0, |n| n.min(DARK_MOST))
+}
+
+/// Whether a texture of `format` (a view format) is read as linear light.
+fn linear_light(format: DXGI_FORMAT) -> bool {
+    matches!(format.0, 10 | 29 | 91)
+}
 
 /// The most frames held in a row; 0: off.
 pub(crate) fn most() -> u32 {
@@ -161,6 +236,8 @@ enum Slot {
 /// the counters' read-backs.
 pub(crate) struct Hold {
     most: u32,
+    /// `VICTORY_HOLD_DARK_FRAME`'s most in a row; 0: dark frames are shown.
+    dark: u32,
     root: ID3D12RootSignature,
     begin: ID3D12PipelineState,
     scan: ID3D12PipelineState,
@@ -174,8 +251,8 @@ pub(crate) struct Hold {
     /// The last good frame and the description it was made for.
     kept: Option<(ID3D12Resource, D3D12_RESOURCE_DESC)>,
     ring: Vec<(ID3D12Resource, Slot)>,
-    /// The counters last read: held, lit, black shown.
-    counts: [u32; 3],
+    /// The counters last read: held, lit (kept), black shown, dark held.
+    counts: [u32; 4],
     /// The kept frame is not the last present's (the pass missed one).
     stale: bool,
 }
@@ -232,6 +309,7 @@ impl Hold {
             }
             Ok(Hold {
                 most,
+                dark: 0,
                 root,
                 begin,
                 scan,
@@ -243,7 +321,7 @@ impl Hold {
                 used: false,
                 kept: None,
                 ring,
-                counts: [0; 3],
+                counts: [0; 4],
                 stale: false,
             })
         }
@@ -320,8 +398,17 @@ impl Hold {
             )]);
             list.SetComputeRootSignature(&self.root);
             list.SetDescriptorHeaps(&[Some(self.views.clone())]);
-            let constants = [width, height, self.most, u32::from(fresh)];
-            list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            let constants = [
+                width,
+                height,
+                self.most,
+                u32::from(fresh),
+                self.dark,
+                u32::from(linear_light(format)),
+                DARK_LEVEL,
+                DARK_SHARE,
+            ];
+            list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
             list.SetComputeRootUnorderedAccessView(1, self.state.GetGPUVirtualAddress());
             list.SetComputeRootDescriptorTable(2, gpu);
             list.SetPipelineState(&self.begin);
@@ -366,7 +453,7 @@ impl Hold {
             )]);
             let read = self.ring.iter().position(|(_, s)| *s == Slot::Free);
             if let Some(i) = read {
-                list.CopyBufferRegion(&self.ring[i].0, 0, &self.state, AT_COUNTS, 12);
+                list.CopyBufferRegion(&self.ring[i].0, 0, &self.state, AT_COUNTS, 16);
                 self.ring[i].1 = Slot::Recorded;
             }
             Some(read)
@@ -400,8 +487,9 @@ impl Hold {
         }
     }
 
-    /// The counters last read: frames held, lit, black shown.
-    pub(crate) fn counts(&self) -> [u32; 3] {
+    /// The counters last read: frames held, lit (kept), black shown, dark
+    /// frames held (also in the first).
+    pub(crate) fn counts(&self) -> [u32; 4] {
         self.counts
     }
 
@@ -491,15 +579,15 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// The three counters of a read-back the card has run.
-fn read(buffer: &ID3D12Resource) -> Option<[u32; 3]> {
+/// The four counters of a read-back the card has run.
+fn read(buffer: &ID3D12Resource) -> Option<[u32; 4]> {
     let mut at = std::ptr::null_mut();
-    let range = D3D12_RANGE { Begin: 0, End: 12 };
+    let range = D3D12_RANGE { Begin: 0, End: 16 };
     // SAFETY: a read-back buffer the card has finished writing.
     unsafe { buffer.Map(0, Some(&range), Some(&mut at)) }.ok()?;
-    let mut counts = [0u32; 3];
-    // SAFETY: the mapped buffer holds at least 12 bytes.
-    unsafe { std::ptr::copy_nonoverlapping(at.cast::<u32>(), counts.as_mut_ptr(), 3) };
+    let mut counts = [0u32; 4];
+    // SAFETY: the mapped buffer holds at least 16 bytes.
+    unsafe { std::ptr::copy_nonoverlapping(at.cast::<u32>(), counts.as_mut_ptr(), 4) };
     // SAFETY: mapped above; nothing written.
     unsafe { buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
     Some(counts)
@@ -531,6 +619,7 @@ pub(crate) fn record(
         })
         .as_mut()?;
     hold.most = most;
+    hold.dark = dark_most();
     // A present went by without the pass (off, or a second plane).
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::queue::presented();
@@ -558,13 +647,24 @@ pub(crate) fn sent(slot: Option<usize>, flown: u64) {
 
 /// Logs frames held since the last read (the first 64 times), and the
 /// counters every 300 presents.
-fn note(before: [u32; 3], now: [u32; 3]) {
+fn note(before: [u32; 4], now: [u32; 4]) {
     static LINES: AtomicU64 = AtomicU64::new(0);
+    static DARK_LINES: AtomicU64 = AtomicU64::new(0);
     static PRESENTS: AtomicU64 = AtomicU64::new(0);
-    let [held, lit, black] = now;
-    if held > before[0] && LINES.fetch_add(1, Relaxed) < 64 {
+    let [held, lit, black, dark] = now;
+    if dark > before[3] && DARK_LINES.fetch_add(1, Relaxed) < 256 {
         tracing::info!(
-            held_now = held - before[0],
+            held_now = dark - before[3],
+            dark_held = dark,
+            presents = crate::queue::presented(),
+            "hold dark frame: dark presents showed the last good frame (VICTORY_HOLD_DARK_FRAME; counted a few presents after theirs)"
+        );
+    }
+    let black_held = held.saturating_sub(dark);
+    let black_before = before[0].saturating_sub(before[3]);
+    if black_held > black_before && LINES.fetch_add(1, Relaxed) < 64 {
+        tracing::info!(
+            held_now = black_held - black_before,
             held,
             lit,
             black_shown = black,
@@ -576,6 +676,7 @@ fn note(before: [u32; 3], now: [u32; 3]) {
             held,
             lit,
             black_shown = black,
+            dark_held = dark,
             "hold last frame: presents so far (held: the last good frame shown again; black_shown: black with nothing to hold or past the most in a row)"
         );
     }

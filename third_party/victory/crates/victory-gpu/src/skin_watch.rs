@@ -109,31 +109,88 @@ static BOOK: Mutex<Book> = Mutex::new(Book {
 
 /// Read-backs taken this frame, by kind.
 static TAKEN: Mutex<(u64, Vec<&'static str>)> = Mutex::new((u64::MAX, Vec::new()));
-/// Output read-backs per kind a frame at most.
-const OUTPUTS_A_FRAME: usize = 2;
+/// Output read-backs a frame at most: every skin lighting draw (6 a frame in the diner: the
+/// plain, no-sun, wetness and glints variants each light other tiles), the first resolve draws.
+fn outputs_a_frame(kind: &str) -> usize {
+    if kind == LIGHTING { 8 } else { 4 }
+}
+/// Rows read of a target, spread over its height, each its whole width (at most
+/// [`ROW_TEXELS`]): batch 5 part R2 read 8 rows of the middle 256 texels and saw skin in 63
+/// frames of 1,147.
+pub(crate) const ROWS: u32 = 8;
+pub(crate) const ROW_TEXELS: u32 = 4096;
+/// Slices of a volume read (the light-range volume has 13).
+pub(crate) const SLICES: u32 = 16;
+
+/// What the tiled lighting's light-range volume says of the tiles read: each texel holds the
+/// first light index (low 16 bits) and the last (high 16 bits) of its tile's lights of one
+/// kind, `0xffffffff` for none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ranges {
+    /// Tiles without lights.
+    pub(crate) none: u32,
+    /// The most lights one tile loops over.
+    pub(crate) widest: u32,
+    /// Ranges whose last light comes before the first: not written by the light loop.
+    pub(crate) bad: u32,
+}
+
+pub(crate) fn light_ranges(bytes: &[u8]) -> Ranges {
+    let mut r = Ranges::default();
+    for t in bytes.chunks_exact(4) {
+        let v = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+        if v == u32::MAX {
+            r.none += 1;
+            continue;
+        }
+        let (first, last) = (v & 0xffff, v >> 16);
+        if last < first {
+            r.bad += 1;
+        } else {
+            r.widest = r.widest.max(last - first + 1);
+        }
+    }
+    r
+}
+
+/// The rows to read of a `size` target inside `rect` (x, y, w, h; all of it when empty): each
+/// as (x, y, texels).
+pub(crate) fn rows(rect: [u32; 4], size: [u32; 2]) -> Vec<(u32, u32, u32)> {
+    let [x, y, w, h] = crate::bake_check::clip(rect, size);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let n = ROWS.min(h);
+    let texels = w.min(ROW_TEXELS);
+    (0..n)
+        .map(|k| (x, y + (h * (2 * k + 1)) / (2 * n), texels))
+        .collect()
+}
 /// Read-back lines in all at most.
 const MAX_LINES: u64 = 20_000;
 static LINES: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a read-back of `kind` is taken now in `frame` (it counts as taken).
-pub(crate) fn take(frame: u64, kind: &'static str, most: usize) -> bool {
+/// Whether a read-back of `kind` is taken now in `frame` (it counts as taken): its index
+/// among those of its kind this frame.
+pub(crate) fn take(frame: u64, kind: &'static str, most: usize) -> Option<usize> {
     if !reads_this_frame(frame) || LINES.load(Relaxed) >= MAX_LINES {
-        return false;
+        return None;
     }
     let mut t = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
     if t.0 != frame {
         *t = (frame, Vec::new());
     }
-    if t.1.iter().filter(|&&k| k == kind).count() >= most {
-        return false;
+    let taken = t.1.iter().filter(|&&k| k == kind).count();
+    if taken >= most {
+        return None;
     }
     t.1.push(kind);
-    true
+    Some(taken)
 }
 
-/// Output read-backs of `kind` a frame.
-pub(crate) fn take_output(frame: u64, kind: &'static str) -> bool {
-    take(frame, kind, OUTPUTS_A_FRAME)
+/// Output read-backs of `kind` a frame: the draw's index among them.
+pub(crate) fn take_output(frame: u64, kind: &'static str) -> Option<usize> {
+    take(frame, kind, outputs_a_frame(kind))
 }
 
 /// A draw or dispatch of pass `kind` ran (`ran`) or was dropped for `why`, in `frame`; `bound`
@@ -274,49 +331,94 @@ pub(crate) fn zeros(bytes: &[u8], texel: usize) -> (u32, u32) {
     })
 }
 
-/// An output read-back landed: what draw `kind` (pixel shader `pixel`) of `frame` changed in
-/// the rows of its first target.
-pub(crate) fn output_landed(
-    frame: u64,
-    kind: &str,
-    pixel: &str,
-    target: &str,
-    c: Change,
-    rgb: Option<[u8; 3]>,
-) {
+/// One output read-back: draw `index` of `kind` in `frame`, pixel shader `pixel`, whether it
+/// blends (adds) into its target.
+#[derive(Clone, Debug)]
+pub(crate) struct Output {
+    pub(crate) frame: u64,
+    pub(crate) kind: &'static str,
+    pub(crate) index: usize,
+    pub(crate) pixel: String,
+    pub(crate) blended: bool,
+}
+
+/// Verdicts by (kind, draw index, pixel shader, verdict) since the last summary, and the frame
+/// span they cover.
+type Tally = BTreeMap<(&'static str, usize, String, &'static str), u64>;
+static TALLY: Mutex<(u64, Tally)> = Mutex::new((u64::MAX, BTreeMap::new()));
+/// Frames between `skin watch: outputs` summaries.
+const SUMMARY_EVERY: u64 = 300;
+
+/// An output read-back landed: what the draw changed in the rows of its first target. A line
+/// for a draw that changed something; the rest counted in a summary every [`SUMMARY_EVERY`]
+/// frames.
+pub(crate) fn output_landed(o: &Output, target: &str, c: Change, rgb: Option<[u8; 3]>) {
+    let verdict = verdict(c, o.blended);
+    if let Some(summary) = tally(o, verdict) {
+        tracing::info!(counts = %summary, "skin watch: outputs");
+    }
+    if c.changed == 0 {
+        return;
+    }
     LINES.fetch_add(1, Relaxed);
     let changed_rgb = rgb.map_or_else(|| "-".to_owned(), |[r, g, b]| format!("{r}/{g}/{b}"));
     tracing::info!(
         changed_rgb,
-        frame,
-        kind,
-        pixel,
+        frame = o.frame,
+        kind = o.kind,
+        draw = o.index,
+        pixel = %o.pixel,
+        blended = o.blended,
         target,
         texels = c.texels,
         changed = c.changed,
         changed_black = c.changed_black,
         black_after = c.black_after,
-        verdict = verdict(c),
+        verdict,
         "skin watch: output"
     );
 }
 
-/// `lit_nothing` (no texel changed), `wrote_black` (every changed texel black), `lit`, or
-/// `unread`.
-pub(crate) fn verdict(c: Change) -> &'static str {
+/// Counts `verdict` for `o`; the summary of what was counted when a new span of
+/// [`SUMMARY_EVERY`] frames starts.
+fn tally(o: &Output, verdict: &'static str) -> Option<String> {
+    let mut t = TALLY.lock().unwrap_or_else(|e| e.into_inner());
+    let span = o.frame / SUMMARY_EVERY;
+    let summary = (t.0 != span && t.0 != u64::MAX && !t.1.is_empty()).then(|| summary(&t.1));
+    if t.0 != span {
+        *t = (span, BTreeMap::new());
+    }
+    *t.1.entry((o.kind, o.index, o.pixel.clone(), verdict)).or_default() += 1;
+    summary
+}
+
+/// `kind#index/pixel:verdict=count` per entry.
+pub(crate) fn summary(t: &Tally) -> String {
+    t.iter()
+        .map(|((kind, index, pixel, verdict), n)| format!("{kind}#{index}/{pixel}:{verdict}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `lit_nothing` (no texel changed: the draw covered none of the rows read), `wrote_black`
+/// (every changed texel black), `added_dark` (a draw that adds into its target, every changed
+/// texel still black: it added little to a dark texel, as in shade or a fade; batch 5 part R2's
+/// three resolve `wrote_black` at f680, f1533, f1535), `lit`, or `unread`.
+pub(crate) fn verdict(c: Change, blended: bool) -> &'static str {
     if c.texels == 0 {
         "unread"
     } else if c.changed == 0 {
         "lit_nothing"
     } else if c.changed_black == c.changed {
-        "wrote_black"
+        if blended { "added_dark" } else { "wrote_black" }
     } else {
         "lit"
     }
 }
 
 /// An input read-back landed: of the first skin lighting draw of `frame`, its probe `input`
-/// (`atlas` or `layers`): format, size, texels read and those all zero.
+/// (`atlas` or `layers`): format, size, texels read and those all zero; or why it was not read
+/// (`no_table`, `no_view`, `no_copy`, `unreadable`).
 pub(crate) fn input_landed(frame: u64, input: &str, shape: &str, (texels, zero): (u32, u32)) {
     LINES.fetch_add(1, Relaxed);
     tracing::info!(frame, input, shape, texels, zero, "skin watch: probe input");
@@ -410,14 +512,15 @@ mod tests {
                 black_after: 1
             }
         );
-        assert_eq!(verdict(c), "lit_nothing");
+        assert_eq!(verdict(c, false), "lit_nothing");
         let after = [0u8, 0, 0, 0, 5, 5];
         let c = change(&before, &after, 2, black);
         assert_eq!((c.changed, c.changed_black, c.black_after), (1, 1, 2));
-        assert_eq!(verdict(c), "wrote_black");
+        assert_eq!(verdict(c, false), "wrote_black");
+        assert_eq!(verdict(c, true), "added_dark", "an additive draw cannot darken");
         let lit = [9u8, 9, 7, 7, 5, 5];
-        assert_eq!(verdict(change(&before, &lit, 2, black)), "lit");
-        assert_eq!(verdict(Change::default()), "unread");
+        assert_eq!(verdict(change(&before, &lit, 2, black), true), "lit");
+        assert_eq!(verdict(Change::default(), false), "unread");
     }
 
     /// R8G8B8A8_UNORM (28): the mean of the changed texels only.
@@ -428,6 +531,47 @@ mod tests {
         assert_eq!(changed_rgb(&before, &after, 4, 28), Some([150, 20, 10]));
         assert_eq!(changed_rgb(&before, &before, 4, 28), None);
         assert_eq!(changed_rgb(&before, &after, 0, 28), None);
+    }
+
+    /// No lights, one tile with lights 3 to 7, and a range no light loop writes.
+    #[test]
+    fn light_ranges_are_read() {
+        let mut bytes = Vec::new();
+        for v in [u32::MAX, 3 | 7 << 16, 9 | 2 << 16, 0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(light_ranges(&bytes), Ranges { none: 1, widest: 5, bad: 1 });
+    }
+
+    /// Whole rows, spread over the height.
+    #[test]
+    fn rows_span_the_target_width() {
+        assert_eq!(
+            rows([0; 4], [2560, 1440]),
+            (0..8).map(|k| (0, 90 + 180 * k, 2560)).collect::<Vec<_>>()
+        );
+        assert_eq!(rows([0, 0, 320, 4], [320, 180]).len(), 4);
+        assert_eq!(rows([0; 4], [8192, 8]).first(), Some(&(0, 0, ROW_TEXELS)));
+    }
+
+    /// The summary counts verdicts per draw and comes out when a new span of frames starts.
+    #[test]
+    fn verdicts_are_summed_per_span() {
+        let o = |frame, index| Output {
+            frame,
+            kind: LIGHTING,
+            index,
+            pixel: "677ea27c05f1a634".to_owned(),
+            blended: false,
+        };
+        let base = 9_000 * SUMMARY_EVERY;
+        assert_eq!(tally(&o(base, 0), "lit_nothing"), None);
+        assert_eq!(tally(&o(base + 1, 0), "lit_nothing"), None);
+        assert_eq!(tally(&o(base + 1, 2), "lit"), None);
+        assert_eq!(
+            tally(&o(base + SUMMARY_EVERY, 0), "lit").as_deref(),
+            Some("skin_light#0/677ea27c05f1a634:lit_nothing=2 skin_light#2/677ea27c05f1a634:lit=1")
+        );
     }
 
     #[test]
@@ -442,7 +586,8 @@ mod tests {
         assert_eq!(zeros(&[1, 2], 0), (0, 0));
     }
 
-    /// Read-backs: at most two outputs of a kind a frame, none on frames `N` skips.
+    /// Read-backs: at most 8 skin lighting and 4 resolve outputs a frame, each with its index;
+    /// none on frames `N` skips.
     #[test]
     fn read_backs_are_capped_a_frame() {
         let _ = victory_core::settings::check_live("VICTORY_SKIN_WATCH", "1", on, false, true);
@@ -450,15 +595,12 @@ mod tests {
             "VICTORY_SKIN_WATCH",
             "1",
             || {
-                (
-                    take_output(7_000_001, LIGHTING),
-                    take_output(7_000_001, LIGHTING),
-                    take_output(7_000_001, LIGHTING),
-                    take_output(7_000_001, RESOLVE),
-                )
+                let lit: Vec<_> = (0..9).map(|_| take_output(7_000_001, LIGHTING)).collect();
+                let resolve: Vec<_> = (0..5).map(|_| take_output(7_000_001, RESOLVE)).collect();
+                (lit[0], lit[7], lit[8], resolve[3], resolve[4])
             },
-            (false, false, false, false),
-            (true, true, false, true),
+            (None, None, None, None, None),
+            (Some(0), Some(7), None, Some(3), None),
         );
         victory_core::settings::check_live(
             "VICTORY_SKIN_WATCH",

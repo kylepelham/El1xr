@@ -23,7 +23,9 @@
 //! also matches without `VICTORY_NATIVE_RT_BIND` and keeps the glass
 //! dispatch's two host top levels for its root SRVs
 //! (`victory_shader::emit::SLOT_TLAS`, `SLOT_TLAS_NEAR`): what [`dispatch`]
-//! returns.
+//! returns. `VICTORY_NATIVE_SHADOW=1` does the same for the shadow traces the
+//! shadow splice knows (`victory_shader::emit::SHADOW_TRACES`): their one
+//! structure view's host top level, for `SLOT_TLAS` (counted as `shadow_*`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,13 +33,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::descriptor::View;
 use crate::object::This;
 
-/// Whether dispatches are matched (`VICTORY_NATIVE_RT_BIND=1`, or
-/// `VICTORY_NATIVE_GLASS=1`).
+/// Whether dispatches are matched (`VICTORY_NATIVE_RT_BIND=1`,
+/// `VICTORY_NATIVE_GLASS=1` or `VICTORY_NATIVE_SHADOW=1`).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_NATIVE_RT_BIND").is_some_and(|v| v == "1")
             || victory_shader::emit::native_glass()
+            || victory_shader::emit::native_shadow()
     })
 }
 
@@ -75,8 +78,8 @@ enum Found {
 }
 
 /// Counts since the last summary: [glass `t355`, glass `t354`, other
-/// VBuffer, other traces] × [host, no host, no view].
-static COUNTS: [[AtomicU64; 3]; 4] = [const { [const { AtomicU64::new(0) }; 3] }; 4];
+/// VBuffer, other traces, shadow traces] × [host, no host, no view].
+static COUNTS: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
 
 /// The first title addresses that found no host top level (a few, for the
 /// log: whether they are near what was built tells a wrong key from a
@@ -109,8 +112,9 @@ fn classify(address: Option<u64>, host: impl Fn(u64) -> Option<u64>) -> Found {
 /// A dispatch of `this` (one hook in `crate::draw`); `table(slot)` gives
 /// the first descriptor of the table bound at compute root parameter `slot`.
 /// For the glass trace with both structures matched: their host top levels
-/// (`t355`, `t354`), for root SRVs (`SLOT_TLAS`, `SLOT_TLAS_NEAR`); `None`
-/// otherwise, when the dispatch takes the title's own walk.
+/// (`t355`, `t354`), for root SRVs (`SLOT_TLAS`, `SLOT_TLAS_NEAR`); for a
+/// known shadow trace with its structure matched: its host top level in both;
+/// `None` otherwise, when the dispatch takes the title's own walk.
 pub(crate) fn dispatch(
     this: This,
     alpha: bool,
@@ -119,15 +123,16 @@ pub(crate) fn dispatch(
     if !on() {
         return None;
     }
-    let (vbuffer, glass, views) = crate::pipeline::ray_views(this)?;
+    use crate::pipeline::Walks;
+    let (kind, views) = crate::pipeline::ray_views(this)?;
+    let glass = kind == Walks::Glass;
     let view = |slot: u8, dword: u32| crate::descriptor::view(table(slot)? + u64::from(dword) * 4);
     let mut matched = [0u64; 2];
-    let walks: &[(Option<u32>, usize)] = if glass {
-        &[(Some(GLASS_FAR), 0), (Some(GLASS_NEAR), 1)]
-    } else if vbuffer {
-        &[(None, 2)]
-    } else {
-        &[(None, 3)]
+    let walks: &[(Option<u32>, usize)] = match kind {
+        Walks::Glass => &[(Some(GLASS_FAR), 0), (Some(GLASS_NEAR), 1)],
+        Walks::VBuffer => &[(None, 2)],
+        Walks::Trace => &[(None, 3)],
+        Walks::Shadow => &[(None, 4)],
     };
     for &(register, row) in walks {
         let address = find_structure(&views, register, view);
@@ -149,13 +154,15 @@ pub(crate) fn dispatch(
         if row < 2 {
             matched[row] = host.unwrap_or(0);
         }
+        if row == 4 {
+            matched = [host.unwrap_or(0); 2];
+        }
         COUNTS[row][found as usize].fetch_add(1, Ordering::Relaxed);
     }
     summary();
-    if glass {
-        both(matched)
-    } else {
-        None
+    match kind {
+        Walks::Glass | Walks::Shadow => both(matched),
+        Walks::VBuffer | Walks::Trace => None,
     }
 }
 
@@ -176,7 +183,7 @@ fn summary() {
     let take = |row: usize| -> [u64; 3] {
         std::array::from_fn(|i| COUNTS[row][i].swap(0, Ordering::Relaxed))
     };
-    let [glass, near, vbuffer, trace] = [take(0), take(1), take(2), take(3)];
+    let [glass, near, vbuffer, trace, shadow] = [take(0), take(1), take(2), take(3), take(4)];
     tracing::info!(
         glass_host = glass[0],
         glass_fallback = glass[1] + glass[2],
@@ -189,6 +196,9 @@ fn summary() {
         trace_host = trace[0],
         trace_fallback = trace[1] + trace[2],
         trace_no_view = trace[2],
+        shadow_host = shadow[0],
+        shadow_fallback = shadow[1] + shadow[2],
+        shadow_no_view = shadow[2],
         tops_kept = crate::native_rt::tops_kept(),
         "native rt bind: trace dispatches in the last 5 s (host: a host top level is there; fallback: the title's program)"
     );

@@ -648,23 +648,39 @@ pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
     pipeline(this).pre_pass
 }
 
+/// Which walks of the ray-tracing structures a program makes ([`ray_views`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walks {
+    /// The glass trace ([`GLASS_TRACE`]).
+    Glass,
+    /// A shadow trace the shadow splice knows (`victory_shader::emit::SHADOW_TRACES`).
+    Shadow,
+    /// Another `CS_RaytraceVBuffer*`.
+    VBuffer,
+    /// Another BVH trace (`RayOnly::Trace`).
+    Trace,
+}
+
 /// For a program that walks the ray-tracing structures (`RayOnly::Trace`,
-/// `RayOnly::VBuffer`): whether it is a `CS_RaytraceVBuffer*`, whether it
-/// is the glass one ([`GLASS_TRACE`]), and the buffer views it reads from
-/// tables as (root parameter, dword in the table, register) (`crate::rt_bind`).
+/// `RayOnly::VBuffer`, a known shadow trace): which ([`Walks`]), and the buffer views it reads
+/// from tables as (root parameter, dword in the table, register) (`crate::rt_bind`).
 /// `None` for any other program.
 #[cfg(windows)]
-pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32, u32)>)> {
+pub(crate) fn ray_views(this: This) -> Option<(Walks, Vec<(u8, u32, u32)>)> {
     if this.is_null() {
         return None;
     }
     let p = pipeline(this);
-    let vbuffer = match p.rt_only {
-        RayOnly::VBuffer => true,
-        RayOnly::Trace => false,
+    let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
+    let shadow = victory_shader::emit::SHADOW_TRACES.iter().any(|h| shader.hash.starts_with(h));
+    let walks = match p.rt_only {
+        _ if shader.hash.starts_with(GLASS_TRACE) => Walks::Glass,
+        _ if shadow => Walks::Shadow,
+        RayOnly::VBuffer => Walks::VBuffer,
+        RayOnly::Trace => Walks::Trace,
         _ => return None,
     };
-    let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
     let views = shader
         .translated()?
         .used
@@ -672,7 +688,7 @@ pub(crate) fn ray_views(this: This) -> Option<(bool, bool, Vec<(u8, u32, u32)>)>
         .filter(|u| u.kind == victory_shader::ResourceType::Srv && u.root == victory_shader::RootType::Table && u.dwords == 4)
         .map(|u| (u.slot, u.table_offset_dwords, u.lower_bound))
         .collect();
-    Some((vbuffer, shader.hash.starts_with(GLASS_TRACE), views))
+    Some((walks, views))
 }
 
 /// `CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar`: the trace

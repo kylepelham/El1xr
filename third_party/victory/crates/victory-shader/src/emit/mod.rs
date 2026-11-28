@@ -87,7 +87,9 @@ mod bitcode;
 mod container;
 pub mod glass_record;
 pub(crate) mod glass_splice;
+pub(crate) mod shadow_splice;
 mod glass_patch;
+mod shadow_patch;
 mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
@@ -99,6 +101,8 @@ mod intersect_tests;
 mod glass_splice_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+pub mod host_tlas;
 mod idiom;
 mod link;
 mod null_view_size;
@@ -147,6 +151,8 @@ pub use lower::set_host_max_wave;
 pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
+pub use shadow_splice::native_shadow;
+pub use shadow_patch::SHADOW_TRACES;
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;
@@ -155,7 +161,8 @@ pub use shader::{
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_GLASS_NATIVE, USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_title_view_limit, set_view_heap_limit,
     title_view_limit, view_heap_limit, REMAP_BASE, REMAP_LEN, SLOT_REMAP, set_title_remap_len,
-    title_remap_len,
+    title_remap_len, FULL_REMAP, set_title_remap_full, title_remap_full, FAULT_DWORDS, FAULT_FLAG,
+    set_title_fault_slot, title_fault_slot,
 };
 pub use lower::thread_limit::on as dispatchx_mask;
 
@@ -280,6 +287,13 @@ pub fn translation_fingerprint() -> Vec<u8> {
     if shader::title_view_limit() != 0 {
         out.extend_from_slice(b"title_view_limit");
         out.extend_from_slice(&shader::title_view_limit().to_le_bytes());
+    }
+    if shader::title_remap_full() {
+        out.extend_from_slice(b"title_remap_full");
+        if shader::title_fault_slot() != 0 {
+            out.extend_from_slice(b"title_fault_slot");
+            out.extend_from_slice(&shader::title_fault_slot().to_le_bytes());
+        }
     }
     if shader::title_remap_len() != 0 {
         out.extend_from_slice(b"title_remap_len");
@@ -420,6 +434,9 @@ fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// Returns whether the program changed.
 pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
     if glass_splice::native_glass() && glass_patch::rewrite(&c.digest, native) {
+        return true;
+    }
+    if shadow_splice::native_shadow() && shadow_patch::rewrite(&c.digest, native) {
         return true;
     }
     lower::host_max_wave() == 32

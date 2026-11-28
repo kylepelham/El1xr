@@ -5,13 +5,19 @@
 //! With the ray-tracing structure builder off and `VICTORY_BVH_NO_HIT=1` the stand-in raises
 //! only the resolved diffuse light (`crate::ambient_places` `LIGHT`). The skin lighting shaders
 //! (`MATERIAL_SHEEN_ANISOTROPY_SSS` materials) also read the screen probes' radiance atlas
-//! ([`ATLAS`], R32_UINT holding R9G9B9E5) and the probes' 13-layer array ([`LAYERS`]), which
-//! only the traced passes write: skin is black while eyes, lip gloss and hair (which read the
-//! resolved light) stay lit. Here both are set to one value before the first skin draw of a
-//! frame that reads them: the room's slow mean the stand-in keeps (times its share), or its
-//! constant (`VICTORY_AMBIENT=constant:<level>`). The atlas takes it everywhere; the layers
-//! as `VICTORY_SKIN_LAYERS` says (`first`, the default: layer 0 alone, the others 0; `all`;
-//! `off`: left).
+//! ([`ATLAS`], R32_UINT holding R9G9B9E5), which only the traced passes write: skin is black
+//! while eyes, lip gloss and hair (which read the resolved light) stay lit. Here it is set to
+//! one value before the first skin draw of a frame that reads it: the room's slow mean the
+//! stand-in keeps (times its share), or its constant (`VICTORY_AMBIENT=constant:<level>`).
+//!
+//! [`LAYERS`] is not a probe input in this title: it is the tiled lighting's light-range volume
+//! (320x180x13 R32_UINT, a texel per 8x8 screen tile, a slice per kind of light, first light
+//! index in the low 16 bits and last in the high, `0xffffffff` for none), written each frame by
+//! `CS_PrescalarizeLightLoop` (11eeb27c2d15980d) and read by all 180 tiled lighting pixel
+//! shaders. Filling it gave every tile the light range of the ambient value's bits (slice 0)
+//! or light 0 (the others), for skin and every material drawn after it. It is left alone
+//! unless `VICTORY_SKIN_LAYERS=first|all` asks for LNX's fill (`off`, the default since
+//! blackface round 18: left).
 //!
 //! LNX's `VICTORY_SKIN_AT_DRAW=0` (fill at the next light resolve instead: skin stayed black)
 //! and `VICTORY_SKIN_WIDE=1` (the player's `SKIN` materials too: see-through) are not ported.
@@ -22,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The radiance atlas skin reads: root parameter and dword in its table (an SRV).
 pub(crate) const ATLAS: (u8, u32) = (0, 968);
-/// The probes' layer array (or volume) skin reads beside it.
+/// The tiled lighting's light-range volume (not a probe input: see the module's text).
 pub(crate) const LAYERS: (u8, u32) = (1, 80);
 
 /// The programs whose pixel stages are skin's lighting.
@@ -39,13 +45,13 @@ pub(crate) fn on() -> bool {
 /// What the layers take: `Some(first_only)`, or `None` (left as they are).
 fn parse_layers(set: &str) -> Option<bool> {
     match set.trim() {
-        "off" => None,
+        "first" => Some(true),
         "all" => Some(false),
-        _ => Some(true),
+        _ => None,
     }
 }
 
-/// `VICTORY_SKIN_LAYERS=first|all|off` (`first` when unset).
+/// `VICTORY_SKIN_LAYERS=first|all|off` (`off` when unset).
 pub(crate) fn layers() -> Option<bool> {
     static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     *SET.get_or_init(|| parse_layers(&std::env::var("VICTORY_SKIN_LAYERS").unwrap_or_default()))
@@ -452,7 +458,7 @@ mod tests {
 
     #[test]
     fn layer_settings() {
-        assert_eq!(parse_layers(""), Some(true));
+        assert_eq!(parse_layers(""), None, "the light-range volume is left alone");
         assert_eq!(parse_layers("first"), Some(true));
         assert_eq!(parse_layers(" all "), Some(false));
         assert_eq!(parse_layers("off"), None);
