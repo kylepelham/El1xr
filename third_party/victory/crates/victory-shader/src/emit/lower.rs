@@ -160,16 +160,21 @@ mod lds_first;
 mod code_table;
 /// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
 #[path = "isa_fixes.rs"]
-pub(super) mod isa_fixes;
+pub(crate) mod isa_fixes;
 /// Normalized fields to the nearest float, tbuffer d16 packing (two of the fixes' switches).
 #[path = "isa_bundle.rs"]
 mod isa_bundle;
 /// Compute samples' implicit level from the lane quads (`VICTORY_COMPUTE_QUAD_LOD=1`).
 #[path = "quad_lod.rs"]
 mod quad_lod;
+/// Loops whose count the code fixes run to their end (`VICTORY_FIXED_TRIPS=1`).
+#[path = "trips.rs"]
+mod trips;
 /// The lanes past a `DispatchX` thread count store nothing (`VICTORY_DISPATCHX_MASK=1`).
 #[path = "thread_limit.rs"]
 pub(super) mod thread_limit;
+#[path = "loop_keep.rs"]
+pub(super) mod loop_keep;
 
 type Why = &'static str;
 
@@ -505,11 +510,16 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Back edges per entry of the loops whose count the code fixes ([`trips`], by IR header;
+    /// empty unless `VICTORY_FIXED_TRIPS=1`): their limit is that count.
+    trips: HashMap<usize, u32>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loops closed by a plain jump, by header, with their blocks ([`loop_keep`]).
+    jump_loops: Option<Vec<(usize, Vec<bool>)>>,
     /// Per-wave half-meet state ([`half_meet`]).
     meet: half_meet::HalfMeet,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
@@ -1496,11 +1506,13 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            trips: HashMap::new(),
             traces: p
                 .blocks
                 .iter()
                 .any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            jump_loops: None,
             meet,
             twin: paired.then(Box::default),
             upper: false,
@@ -2322,6 +2334,9 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.new_block()
             });
+        }
+        if isa_fixes::Fix::FixedTrips.on() {
+            self.trips = trips::trips(p, &self.rpo);
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
@@ -8318,6 +8333,8 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // (`VICTORY_LOOP_KEEP`) A loop closed by a plain jump leaves here at its limit.
+                let cond = self.keep_exit(b, taken, not_taken, cond);
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -8381,13 +8398,9 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
+        // (`VICTORY_LOOP_ROOM` raises them, `loop_keep`.)
+        let limit = self.loop_cap();
+        let limit = trips::counted_limit(limit, super::loop_limit(), self.trips.get(&to).copied());
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)

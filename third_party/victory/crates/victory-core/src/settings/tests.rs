@@ -99,6 +99,8 @@ fn switches_in_the_shader_cache_key_are_retranslate() {
         "VICTORY_HALF_VIEWS_OFF",
         "VICTORY_F16_ROUND_MODE",
         "VICTORY_DIV_INF_ZERO",
+        "VICTORY_LOOP_KEEP",
+        "VICTORY_LOOP_ROOM",
         "VICTORY_RT_MISS_SKY",
         "VICTORY_RT_GLASS_SKY",
     ] {

@@ -3057,3 +3057,154 @@ fn f16_results_round_as_the_mode_says() {
         });
     }
 }
+
+/// `VICTORY_FIXED_TRIPS=1`: a loop whose count the code fixes runs to its end, past the
+/// compute stage's loop limit (4,096): 8,192 trips of `v0 += 1` store 8,192. Off, the loop is
+/// cut at the limit and the lane leaves without its store. (DexNom/VIctory PR #137.)
+#[test]
+fn a_counted_loop_past_the_stage_limit_runs_to_its_end() {
+    use lower::isa_fixes::Fix;
+    const TRIPS: u32 = 8192;
+    let body = [
+        vop1(0x001, 0, 128),   // v_mov_b32 v0, 0
+        0xBE86_03FF,           // s_mov_b32 s6, TRIPS
+        TRIPS,
+        0x4A00_0081,           // loop: v_add_nc_u32 v0, 1, v0
+        sop2(0x01, 6, 6, 129), // s_sub_u32 s6, s6, 1
+        0xBF07_8006,           // s_cmp_lg_u32 s6, 0
+        0xBF85_FFFC,           // s_cbranch_scc1 loop
+    ];
+    for fixed in [true, false] {
+        let shader = build_cs_with(Fix::FixedTrips, fixed, &body, 1);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            if fixed {
+                assert_eq!(got, TRIPS, "{backend}: trips of a loop counted to {TRIPS}");
+            } else {
+                assert_ne!(got, TRIPS, "{backend}: off, the loop is cut at the stage limit");
+            }
+        });
+    }
+}
+
+/// `VICTORY_WREXEC_SCC=1`: the console compiler's waterfall loop (run the lanes holding the
+/// first lane's value, drop them, repeat) is left once `s_andn2_wrexec` leaves no lane, so the
+/// SCC it wrote is 0 after the loop and an `s_cselect` there picks its second source. Off, the
+/// program is refused (a lane mask read as data). (Marvisak/VIctory PR #3016.)
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_false() {
+    use lower::isa_fixes::Fix;
+    let body = |key: u8| {
+        [
+            s_mov_b32(20, 126),                         // s20 = exec_lo
+            s_mov_b32(21, 126),                         // s21 = exec_lo
+            vop1(0x002, 22, vgpr(key)),                 // loop: v_readfirstlane_b32 s22, v<key>
+            0x7C00_0000 | 0xD2 << 17 | (key as u32) << 9 | 22, // v_cmpx_eq_u32 s22, v<key>
+            0xBE95_4715,                                // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFFC,                                // s_cbranch_execnz -> loop
+            s_mov_b32(126, 20),                         // exec_lo = s20
+            sop2(0x0A, 23, 1, 2),                       // s_cselect_b32 s23, s1, s2
+            vop1(0x001, 0, sgpr(23)),                   // v0 = s23
+        ]
+    };
+    lower::isa_fixes::set_for_test(Fix::WrexecScc, Some(false));
+    let off = std::panic::catch_unwind(|| build_cs(&body(1), 1, 0));
+    lower::isa_fixes::set_for_test(Fix::WrexecScc, None);
+    assert!(off.is_err(), "off: refused as a lane mask read as data");
+    let shader = build_cs_with(Fix::WrexecScc, true, &body(1), 1);
+    run_cases(&shader, &[[3, 1, 2, 0], [0, 7, 9, 0]], |backend, _, inputs, got| {
+        assert_eq!(got, inputs[2], "{backend}");
+    });
+    // 32 lanes keyed `lane & s0` (1, 2, 8 or 32 distinct keys): that many passes first.
+    let mut many = vop3(0x11B, 5, sgpr(0), vgpr(0), 0).to_vec(); // v_and_b32 v5, s0, v0
+    many.extend(body(5));
+    let shader = build_cs_with(Fix::WrexecScc, true, &many, 32);
+    let cases = [0u32, 1, 7, 31].map(|m| [m, 5, 6, 0]);
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, inputs[2], "{backend}: case {i}");
+    });
+}
+
+const U32_CLAMP_CASES: [[u32; 4]; 10] = [
+    [u32::MAX, 1, 0, 0],
+    [0, 1, 0, 0],
+    [1, 0, 0, 0],
+    [u32::MAX, 0, 1, 0],
+    [u32::MAX - 1, 0, 1, 0],
+    [u32::MAX, u32::MAX, 1, 0],
+    [9, 9, 1, 0],
+    [10, 9, 1, 0],
+    [9, 10, 1, 0],
+    [8, 5, 0, 0],
+];
+
+/// The exact integer result (RDNA 2 ISA 6.5: clamp it to its range; the carry or borrow
+/// from before the saturation).
+fn exact_u32_add_sub(name: &str, a: u32, b: u32, cin: u32) -> i64 {
+    let (a, b, cin) = (i64::from(a), i64::from(b), i64::from(cin));
+    if name.starts_with("v_add") {
+        a + b + cin
+    } else if name.starts_with("v_subrev") {
+        b - a - cin
+    } else {
+        a - b - cin
+    }
+}
+
+/// `VICTORY_U32_CLAMP=1`: clamped unsigned VOP3 add/sub saturate (off: refused as integer
+/// output modifiers). (LooperSalty/AnyXboxX `ca0c86b9d2`, Marvisak/VIctory PR #1398.)
+#[test]
+fn clamped_u32_add_sub_saturates_and_keeps_the_carry() {
+    use lower::isa_fixes::Fix;
+    lower::isa_fixes::set_for_test(Fix::U32Clamp, Some(false));
+    let off = std::panic::catch_unwind(|| {
+        build_cs(&vop3_mod(0x125, 0, vgpr(1), vgpr(2), 0x80, 0, 0, 0, true), 1, 0)
+    });
+    lower::isa_fixes::set_for_test(Fix::U32Clamp, None);
+    assert!(off.is_err(), "off: refused");
+    for (op, name) in [(0x125, "v_add_nc_u32"), (0x126, "v_sub_nc_u32"), (0x127, "v_subrev_nc_u32")] {
+        let body = vop3_mod(op, 0, vgpr(1), vgpr(2), 0x80, 0, 0, 0, true);
+        let shader = build_cs_with(Fix::U32Clamp, true, &body, 1);
+        run_cases(&shader, &U32_CLAMP_CASES, |backend, _, [a, b, _, _], got| {
+            let want = exact_u32_add_sub(name, a, b, 0).clamp(0, i64::from(u32::MAX)) as u32;
+            assert_eq!(got, want, "{backend}: {name} on {a:#x}, {b:#x}");
+        });
+    }
+    for (op, name) in [
+        (0x30f, "v_add_co_u32"),
+        (0x310, "v_sub_co_u32"),
+        (0x319, "v_subrev_co_u32"),
+        (0x128, "v_add_co_ci_u32"),
+        (0x129, "v_sub_co_ci_u32"),
+        (0x12a, "v_subrev_co_ci_u32"),
+    ] {
+        let with_cin = name.contains("_ci_");
+        let mut body = Vec::new();
+        if with_cin {
+            // v_cmp_eq_u32 vcc_lo, 1, v3 sets this lane's carry-in bit.
+            body.extend(vop3(0x0c2, 106, 0x81, vgpr(3), 0x80));
+        }
+        let src2 = if with_cin { sgpr(106) } else { 0x80 };
+        let [lo, hi] = vop3_mod(op, 0, vgpr(1), vgpr(2), src2, 0, 0, 0, true);
+        body.extend([lo | (6 << 8), hi]); // VOP3B SDST = s6
+        let result = build_cs_with(Fix::U32Clamp, true, &body, 1);
+        // v_cndmask_b32 v0, 0, 1, s6 reads the carry or borrow bit.
+        body.extend(vop3(0x101, 0, 0x80, 0x81, sgpr(6)));
+        let carry = build_cs_with(Fix::U32Clamp, true, &body, 1);
+        for (shader, read_carry) in [(&result, false), (&carry, true)] {
+            run_cases(shader, &U32_CLAMP_CASES, |backend, _, [a, b, k, _], got| {
+                let cin = if with_cin { k } else { 0 };
+                let total = exact_u32_add_sub(name, a, b, cin);
+                let sat = total.clamp(0, i64::from(u32::MAX));
+                let want = if read_carry { u32::from(total != sat) } else { sat as u32 };
+                assert_eq!(got, want, "{backend}: {name} on {a:#x}, {b:#x}, carry in {cin}, read carry {read_carry}");
+            });
+        }
+    }
+    let cases = [[u32::MAX, 1, 0, 0], [u32::MAX, 0, 1, 0], [u32::MAX; 4], [u32::MAX - 2, 1, 1, 0], [2, 3, 4, 0]];
+    let body = vop3_mod(0x36d, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0, 0, true);
+    let shader = build_cs_with(Fix::U32Clamp, true, &body, 1);
+    run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+        let want = (u64::from(a) + u64::from(b) + u64::from(c)).min(u64::from(u32::MAX)) as u32;
+        assert_eq!(got, want, "{backend}: v_add3_u32 on {a:#x}, {b:#x}, {c:#x}");
+    });
+}

@@ -108,6 +108,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none() {
         h.update(b"VICTORY_WAVE_WIDE_ONLY=last");
     }
+    if wide_lock() {
+        h.update(b"VICTORY_WIDE_LOCK=1");
+    }
     if wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0") {
         h.update(b"VICTORY_WAVE_PAIRS_ONLY=1");
     }
@@ -369,9 +372,14 @@ fn translate_container(
     wave_wide: bool,
     wave_pairs: bool,
 ) -> Result<HostShader, String> {
-    let need_wide = wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none();
-    let need_pairs = wave_pairs && std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0");
-    if need_wide || need_pairs {
+    let take_write = takes_the_override_lock(
+        wave_wide,
+        wave_pairs,
+        std::env::var_os("VICTORY_WAVE_WIDE").is_none(),
+        std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "0"),
+        wide_lock(),
+    );
+    if take_write {
         let _guard = WAVE_WIDE_ENV.write().unwrap_or_else(|e| e.into_inner());
         let set_wide = wave_wide && std::env::var_os("VICTORY_WAVE_WIDE").is_none();
         let set_pairs =
@@ -409,6 +417,31 @@ fn translate_container(
     }
     let _guard = WAVE_WIDE_ENV.read().unwrap_or_else(|e| e.into_inner());
     victory_shader::emit::translate(container).map_err(|e| e.to_string())
+}
+
+/// `VICTORY_WIDE_LOCK=1`: whether a container gets its override is decided under
+/// [`WAVE_WIDE_ENV`]'s write lock. Without it, the environment is read before the lock: while
+/// another listed container's translation has `VICTORY_WAVE_WIDE=last` (or
+/// `VICTORY_WAVE_PAIRS=1`) set, a listed container reads the override as the user's own, skips
+/// it, and is translated after it is undone, in the plain form, and cached under its listed key.
+/// Offline (`translate --warm` of the three water hashes, `VICTORY_WATER_WIDE=1`, 4 threads),
+/// five runs gave four different sets.
+fn wide_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_LOCK").is_some_and(|v| v == "1"))
+}
+
+/// Whether [`translate_container`] takes the write lock to set an override (it checks the
+/// environment again under it). `wide_unset`/`pairs_zero`: the environment as read before
+/// the lock; `lock_first` ([`wide_lock`]): a listed container always takes it.
+fn takes_the_override_lock(
+    wave_wide: bool,
+    wave_pairs: bool,
+    wide_unset: bool,
+    pairs_zero: bool,
+    lock_first: bool,
+) -> bool {
+    wave_wide && (lock_first || wide_unset) || wave_pairs && (lock_first || pairs_zero)
 }
 
 /// What names a container that did not translate, for the list of them pipelines from pieces
@@ -797,6 +830,23 @@ pub(crate) mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// `VICTORY_WIDE_LOCK=1`: a listed container that reads another translation's override
+    /// before the lock still takes the lock (off: it skips its own override).
+    #[test]
+    fn a_listed_container_takes_the_override_lock_whatever_it_read_before() {
+        // (wide listed, pairs listed, wide unset, pairs 0) as read while another thread
+        // has VICTORY_WAVE_WIDE=last and VICTORY_WAVE_PAIRS=1 set
+        assert!(!takes_the_override_lock(true, false, false, false, false));
+        assert!(!takes_the_override_lock(false, true, false, false, false));
+        assert!(takes_the_override_lock(true, false, false, false, true));
+        assert!(takes_the_override_lock(false, true, false, false, true));
+        // not listed: no lock either way
+        assert!(!takes_the_override_lock(false, false, true, true, true));
+        // nothing set by anyone: as before
+        assert!(takes_the_override_lock(true, false, true, true, false));
+        assert!(takes_the_override_lock(false, true, true, true, false));
     }
 
     #[test]

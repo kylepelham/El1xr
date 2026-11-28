@@ -38,6 +38,14 @@
 //! the uploads of what the prepare threads made ready, hands the rest of the queue to them (the
 //! loading drain passes of the next frames record it, as in the world) and stops at the frame's
 //! cap. A bake whose own inputs are not read (`unread`) is not spread: all due, as before.
+//!
+//! `VICTORY_BAKE_SPREAD_FRAME=1` (#16, live, with `BAKE_SPREAD`): in the world too, every spread
+//! bake pass of a frame together stops at `BAKE_SPREAD`'s cap (N ms, 80 at `1`), as loading ones
+//! do. Part U (`train_b5u_load/03_lc`, `BAKE_SPREAD=12`): the cap was each pass's, and a frame
+//! held up to 12 spread passes (`bake spread frame ... passes=11 ... us=44609`, `passes=8 ...
+//! us=53215`; max 66 ms against 12): 87 frames of 9-66 ms, 1.74 s in all, 29,633 slots handed.
+//! With the frame's cap, once a frame's passes spent it the later passes make their own slots
+//! only and fetch no other due slots (none handed).
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
@@ -73,6 +81,28 @@ pub(crate) fn mode_for(world: bool, world_mode: u64, load_value: u64) -> u64 {
     if world { world_mode } else { load_cap(load_value) }
 }
 
+/// Live: read at each world bake pass.
+pub(crate) static FRAME_CAP: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_BAKE_SPREAD_FRAME");
+
+/// What a spread pass (`spread`) of `frame` with spread `mode` ([`mode_for`]) has left of its
+/// frame's cap: while loading always (`mode` is the cap), in the world with `frame_cap`
+/// (`BAKE_SPREAD`'s N ms, [`LOAD_CAP_MS`] at `1`). `None`: not capped by the frame.
+pub(crate) fn frame_left_for(spread: bool, world: bool, frame_cap: bool, frame: u64, mode: u64) -> Option<Duration> {
+    if !spread {
+        return None;
+    }
+    if !world {
+        return Some(load_left(frame, mode));
+    }
+    frame_cap.then(|| load_left(frame, load_cap(mode)))
+}
+
+/// [`frame_left_for`] with `VICTORY_BAKE_SPREAD_FRAME` as it is now.
+pub(crate) fn frame_left(spread: bool, world: bool, frame: u64, mode: u64) -> Option<Duration> {
+    frame_left_for(spread, world, FRAME_CAP.get_bool(), frame, mode)
+}
+
 /// [`mode_for`] with the switches as they are now.
 pub(crate) fn mode_now(world: bool) -> u64 {
     mode_for(world, mode(), LOAD_SPREAD.get())
@@ -104,13 +134,13 @@ pub(crate) fn load_left(frame: u64, cap_ms: u64) -> Duration {
     left_in_frame(cap_ms, load_spent(frame))
 }
 
-/// A loading bake pass of `frame` took `us`.
-pub(crate) fn load_took(frame: u64, us: u64) {
+/// A frame-capped bake pass of `frame` took `us` (`loading`: before the world).
+pub(crate) fn frame_took(frame: u64, us: u64, loading: bool) {
     if LOAD_FRAME.swap(frame, Relaxed) != frame {
         LOAD_US.store(0, Relaxed);
     }
     LOAD_US.fetch_add(us, Relaxed);
-    add(C::LoadPasses, 1);
+    add(if loading { C::LoadPasses } else { C::FramePasses }, 1);
 }
 
 /// The pass's time for its slots after the bake threads took `took` of `budget` (capped at
@@ -152,9 +182,11 @@ pub(crate) enum C {
     Us,
     /// Of `passes`, loading ones (`VICTORY_BAKE_LOAD_SPREAD`).
     LoadPasses,
+    /// Of `passes`, world ones under the frame's cap (`VICTORY_BAKE_SPREAD_FRAME`).
+    FramePasses,
 }
-const N: usize = 7;
-const NAMES: [&str; N] = ["passes", "pinned", "handed", "stopped", "ahead_us", "us", "load_passes"];
+const N: usize = 8;
+const NAMES: [&str; N] = ["passes", "pinned", "handed", "stopped", "ahead_us", "us", "load_passes", "frame_passes"];
 static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static FRAME: AtomicU64 = AtomicU64::new(0);
 static LINES: AtomicU64 = AtomicU64::new(0);
@@ -220,12 +252,41 @@ mod tests {
         assert_eq!(left_in_frame(80, 95_000), ms(0));
         let frame = 1 << 40;
         assert_eq!(load_left(frame, 80), ms(80));
-        load_took(frame, 30_000);
-        load_took(frame, 20_000);
+        frame_took(frame, 30_000, true);
+        frame_took(frame, 20_000, true);
         assert_eq!(load_left(frame, 80), ms(30));
         assert_eq!(load_left(frame + 1, 80), ms(80), "a new frame");
-        load_took(frame + 1, 5_000);
+        frame_took(frame + 1, 5_000, true);
         assert_eq!(load_left(frame + 1, 80), ms(75));
+    }
+
+    /// Part U 03_lc: a world frame of 11 spread passes took 45 ms at `BAKE_SPREAD=12`, each
+    /// pass with its own 12 ms. With `BAKE_SPREAD_FRAME` the passes of a world frame share the
+    /// cap (N ms, 80 at 1); without it a world pass is not capped by its frame; loading passes
+    /// always are.
+    #[test]
+    fn a_world_frames_spread_passes_share_the_cap() {
+        let ms = Duration::from_millis;
+        let frame = 3 << 40;
+        assert_eq!(frame_left_for(false, true, true, frame, 12), None, "not spread");
+        assert_eq!(frame_left_for(true, true, false, frame, 12), None, "world, switch off");
+        assert_eq!(frame_left_for(true, true, true, frame, 12), Some(ms(12)));
+        assert_eq!(frame_left_for(true, true, true, frame, 1), Some(ms(LOAD_CAP_MS)), "1: 80 ms");
+        assert_eq!(frame_left_for(true, false, false, frame, 80), Some(ms(80)), "loading");
+        let mut left = Vec::new();
+        for _ in 0..11 {
+            let now = frame_left_for(true, true, true, frame, 12).unwrap();
+            left.push(now);
+            frame_took(frame, 4_000, false);
+        }
+        assert_eq!(&left[..4], &[ms(12), ms(8), ms(4), ms(0)]);
+        assert!(left[3..].iter().all(|l| l.is_zero()), "the later passes get none");
+        assert_eq!(frame_left_for(true, true, true, frame + 1, 12), Some(ms(12)), "a new frame");
+    }
+
+    #[test]
+    fn the_frame_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_BAKE_SPREAD_FRAME", "1", || FRAME_CAP.get_bool(), false, true);
     }
 
     #[test]
@@ -278,8 +339,8 @@ mod tests {
     #[test]
     fn the_line_names_every_count() {
         assert_eq!(
-            line(&[2, 7, 300, 1, 900, 41000, 1]),
-            "passes=2 pinned=7 handed=300 stopped=1 ahead_us=900 us=41000 load_passes=1"
+            line(&[2, 7, 300, 1, 900, 41000, 1, 0]),
+            "passes=2 pinned=7 handed=300 stopped=1 ahead_us=900 us=41000 load_passes=1 frame_passes=0"
         );
     }
 }

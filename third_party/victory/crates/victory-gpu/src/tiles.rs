@@ -56,6 +56,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::host;
 
+pub(crate) mod ahead;
+
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
@@ -173,9 +175,29 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(index) = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count)) {
-        return allocate(pool[index].as_mut()?, index);
+        let out = allocate(pool[index].as_mut()?, index);
+        ahead::low(free_tiles(&pool));
+        return out;
     }
     drop(pool);
+    let made = make_heap(device)?;
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(index) = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count)) {
+        let out = allocate(pool[index].as_mut()?, index);
+        drop(pool);
+        drop(made);
+        return out;
+    }
+    let index = insert(&mut pool, made);
+    let out = allocate(pool[index].as_mut()?, index);
+    ahead::low(free_tiles(&pool));
+    out
+}
+
+/// A heap for the pool: 64 MiB of the card's memory. `None` if the host
+/// refused it.
+fn make_heap(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let began = std::time::Instant::now();
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: u64::from(HEAP_TILES) * TILE,
         Properties: D3D12_HEAP_PROPERTIES {
@@ -191,20 +213,18 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
         return None;
     }
-    let made = made?;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(index) = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count)) {
-        let out = allocate(pool[index].as_mut()?, index);
-        drop(pool);
-        drop(made);
-        return out;
-    }
+    ahead::heap_made(began);
+    made
+}
+
+/// `made` joins the pool with every tile free: its place.
+fn insert(pool: &mut Vec<Option<Heap>>, made: ID3D12Heap) -> usize {
     let fresh = Heap {
         heap: made,
         free: vec![(0, HEAP_TILES)],
     };
     STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-    let index = match pool.iter().position(Option::is_none) {
+    match pool.iter().position(Option::is_none) {
         Some(index) => {
             pool[index] = Some(fresh);
             index
@@ -213,8 +233,12 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             pool.push(Some(fresh));
             pool.len() - 1
         }
-    };
-    allocate(pool[index].as_mut()?, index)
+    }
+}
+
+/// The free tiles of every heap of the pool.
+fn free_tiles(pool: &[Option<Heap>]) -> u64 {
+    pool.iter().flatten().map(|h| u64::from(h.free_tiles())).sum()
 }
 
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
@@ -253,6 +277,10 @@ struct Given {
     packed: bool,
     /// The runs taken: the heap's place, first tile, tiles.
     runs: Vec<(usize, u32, u32)>,
+    /// (`VICTORY_TILES_AHEAD`) Levels given tiles ahead of their upload
+    /// ([`Tiled::ahead`]) and not written since: no view shows them, and a
+    /// card write zeroes them first ([`Tiled::claim`]).
+    fresh: u32,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -336,6 +364,7 @@ impl Tiled {
                 levels: vec![false; standard.len()],
                 packed: false,
                 runs: Vec::new(),
+                fresh: 0,
             }),
             standard,
             packed: packed_tiles,
@@ -382,6 +411,8 @@ impl Tiled {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
+        // The upload writes them whole: given ahead, they are written now.
+        given.fresh = self.written(given.fresh, held);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
@@ -432,6 +463,7 @@ impl Tiled {
         if backed != 0 {
             self.card.fetch_or(backed, Ordering::Relaxed);
         }
+        given.fresh = self.written(given.fresh, backed);
         if without != 0 {
             self.unclaim(without);
         }
@@ -456,8 +488,69 @@ impl Tiled {
     /// zeros before the card's own write, so that what the write does not
     /// cover is not what the tiles' last owner left.
     pub(crate) fn claim(&self, levels: u32) -> u32 {
-        let fresh = self.without(levels);
+        let fresh = self.unwritten(levels);
         fresh & !self.claimed.fetch_or(fresh, Ordering::Relaxed)
+    }
+
+    /// Of `levels`, the ones without tiles, and the ones whose tiles were
+    /// given ahead and not written yet (they hold what their last owner
+    /// left, as new tiles do).
+    fn unwritten(&self, levels: u32) -> u32 {
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        (self.without_locked(&given, levels) | given.fresh) & levels
+    }
+
+    /// `fresh` once a list wrote `levels` whole (with every level the card
+    /// packs together, if it wrote one of them).
+    fn written(&self, fresh: u32, levels: u32) -> u32 {
+        let wrote = self.expand(levels);
+        if fresh & wrote != 0 {
+            ahead::found(u64::from((fresh & wrote).count_ones()));
+        }
+        fresh & !wrote
+    }
+
+    /// `levels` with every level the card packs together when it names one
+    /// of them.
+    fn expand(&self, levels: u32) -> u32 {
+        let packed = self.with_level(self.standard.len() as u32);
+        if levels & packed != 0 { levels | packed } else { levels }
+    }
+
+    /// (`VICTORY_TILES_AHEAD=1`) On the thread that made the texture ready,
+    /// before any list uploads it: tiles for the held levels `held` that
+    /// have none, while `room` (the card has room for more host copies).
+    /// They are noted unwritten (`Given::fresh`) until the list that
+    /// uploads them is submitted ([`Tiled::uploaded`]) or the card writes
+    /// them ([`Tiled::card_wrote`]); until then no view shows them. The call
+    /// returns before the texture is filed ready, so the mapping is ahead
+    /// of its upload on the queue. The levels given.
+    pub(crate) fn ahead(&self, texture: &ID3D12Resource, held: u32, room: bool) -> u32 {
+        match host() {
+            Some(host) => self.ahead_on(host.queue(), &host.device, texture, held, room),
+            None => 0,
+        }
+    }
+
+    /// [`Tiled::ahead`] on a queue and a device.
+    pub(crate) fn ahead_on(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+    ) -> u32 {
+        if !room {
+            ahead::no_room();
+            return 0;
+        }
+        let held = held & self.every_level();
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let mapped = ahead::on_ahead(|| self.map_locked(&mut given, queue, device, texture, held));
+        given.fresh |= mapped;
+        ahead::given(u64::from(mapped.count_ones()));
+        mapped
     }
 
     /// Gives up the claim on `levels` ([`Tiled::claim`]): the zeros of the
@@ -524,8 +617,21 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
-        let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        self.map_locked(given, queue, device, texture, named & may);
+        self.shown_locked(given, named)
+    }
+
+    /// Tiles for the levels of `levels` that have none (the packed ones
+    /// together): the levels given, a bit each.
+    fn map_locked(
+        &self,
+        given: &mut Given,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        levels: u32,
+    ) -> u32 {
+        let now = |level: u32| level < 32 && levels & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
@@ -595,8 +701,11 @@ impl Tiled {
         }
         // After the lists handed to the thread that sends (`VICTORY_SEND_THREAD`).
         if !batches.is_empty() {
+            let began = std::time::Instant::now();
             crate::host::send_thread::wait_idle();
+            ahead::waited(began);
         }
+        let mut mapped = 0u32;
         for (_, mut batch) in batches {
             given.runs.reserve(batch.runs.len());
             let began = std::time::Instant::now();
@@ -621,11 +730,18 @@ impl Tiled {
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            ahead::mapped(began);
             let mapped_levels = batch.levels.len() as u64;
             for level in batch.levels.drain(..) {
                 match level {
-                    Some(level) => given.levels[level] = true,
-                    None => given.packed = true,
+                    Some(level) => {
+                        given.levels[level] = true;
+                        mapped |= 1 << level;
+                    }
+                    None => {
+                        given.packed = true;
+                        mapped |= self.with_level(first_packed);
+                    }
                 }
             }
             let index = batch.index;
@@ -635,12 +751,22 @@ impl Tiled {
             STATS[2].fetch_add(u64::from(batch.total_tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(mapped_levels, Ordering::Relaxed);
         }
+        mapped
+    }
+
+    /// The first level a view may show, told anew from the levels `named`
+    /// (the title's or the card's own): the first of them that has tiles
+    /// and was written since they were given. Whether it changed.
+    fn shown_locked(&self, given: &Given, named: u32) -> bool {
+        let has = |level: u32| level < 32 && named & (1 << level) != 0;
+        let first_packed = self.standard.len() as u32;
         let with_tiles = |level: u32| {
-            if level < first_packed {
+            let given_tiles = if level < first_packed {
                 given.levels[level as usize]
             } else {
                 given.packed
-            }
+            };
+            given_tiles && given.fresh & (1 << level) == 0
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
         self.shown.swap(shown, Ordering::Relaxed) != shown
@@ -766,6 +892,7 @@ pub(crate) fn status() {
         s[9],
         s[10],
     );
+    ahead::line();
 }
 
 /// On the card, without the title: what levels on demand relies on, with
@@ -1487,6 +1614,40 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    /// (viii, worldstream `VICTORY_TILES_AHEAD`) Levels given ahead of the
+    /// list that uploads them: nothing shown and a card write would zero
+    /// them, until the upload's claim at the submission, which makes no
+    /// mapping call; then they read back as uploaded. Without room nothing
+    /// is given ahead.
+    fn levels_given_ahead(rig: &mut Rig) {
+        rig.step = "step 8, levels given ahead of their upload";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        let layout = rig.footprints(&desc);
+        let held = from_level(2);
+        let given = tiled.ahead_on(&rig.queue, &rig.device, &texture, held, true);
+        rig.check("tiles given ahead");
+        assert!(given != 0 && given & !tiled.expand(held) == 0, "given ahead {given:#b} of held {held:#b}");
+        assert_eq!(tiled.first_shown(), None, "nothing shown before the upload");
+        assert_eq!(tiled.claim(1 << 2), 1 << 2, "a card write zeroes a level given ahead first");
+        tiled.unclaim(1 << 2);
+        let calls = STATS[6].load(Ordering::Relaxed);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, held, true);
+        rig.check("the upload's claim");
+        assert_eq!(STATS[6].load(Ordering::Relaxed), calls, "no mapping call at the submission");
+        assert!(changed && !waiting, "changed {changed}, waiting {waiting}");
+        assert_eq!(tiled.first_shown(), Some(2));
+        let upload = rig.filled(&layout, |level| level as u8 + 1);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        for (level, bytes) in read.iter().enumerate() {
+            let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
+            assert!(all(bytes, want), "given ahead: level {level} reads {bytes:?}, wanted {want}");
+        }
+        let (other, other_tiles) = rig.reserved(&desc);
+        assert_eq!(other_tiles.ahead_on(&rig.queue, &rig.device, &other, held, false), 0);
+        assert_eq!(other_tiles.given_bytes(), 0, "without room nothing is given ahead");
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1503,6 +1664,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        levels_given_ahead(&mut rig);
         for (min_lod, expected) in [(0.0, [32, 0]), (3.0, [64, 64])] {
             let Some(read) = sample_resident_views(&mut rig, min_lod) else {
                 eprintln!("the view test's shader or objects could not be made; that part was skipped");
@@ -1620,6 +1782,7 @@ void look() {
                 levels: vec![false, false],
                 packed: false,
                 runs: Vec::new(),
+                fresh: 0,
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
