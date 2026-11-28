@@ -91,8 +91,8 @@ pub(crate) mod shadow_splice;
 mod div_zero;
 mod glass_patch;
 mod shadow_patch;
-#[cfg(test)]
 mod walk_find;
+mod walk_splice;
 mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
@@ -158,6 +158,7 @@ pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
 pub use shadow_splice::native_shadow;
+pub use walk_splice::{native_shadow_auto, shadow_auto_binding};
 pub use shadow_patch::{ShadowBinding, shadow_binding};
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
@@ -452,6 +453,9 @@ pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
         return true;
     }
     if shadow_splice::native_shadow() && shadow_patch::rewrite(&c.digest, native) {
+        return true;
+    }
+    if walk_splice::native_shadow_auto() && walk_splice::rewrite(native) {
         return true;
     }
     lower::host_max_wave() == 32

@@ -176,7 +176,7 @@ fn read_rows(
 
 impl State {
     /// The watched pass the bound pipeline is part of, if any.
-    fn skin_watch_kind(&self, compute: bool) -> Option<&'static str> {
+    pub(super) fn skin_watch_kind(&self, compute: bool) -> Option<&'static str> {
         let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
         if p.compute != compute {
             return None;

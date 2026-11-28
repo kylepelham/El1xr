@@ -4620,23 +4620,26 @@ fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element
 fn buffer_srv(
     address: u64,
     len: u64,
-    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     buffer_view: bool,
 ) -> Option<(Kept, Option<BufferCopy>)> {
+    let (whole, own) = buffer_srv_copies(address, len, &desc, buffer_view)?;
+    buffer_srv_on(whole, own, address, len, desc, at)
+}
+
+/// The host copies buffer shader view `desc` of title memory at `address`
+/// (`len` bytes) shows, made now if they are not there: its buffer's copy,
+/// and the copy of the view's own bytes with where they start and how many
+/// (`own_bytes`), if it has one.
+pub(super) fn buffer_srv_copies(
+    address: u64,
+    len: u64,
+    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    buffer_view: bool,
+) -> Option<BufferSrvCopies> {
     let whole = crate::shadow::find(address, len)?;
     let offset = whole.offset(address);
-    // The title range the view reads ([`buffer_range`]): what `buffer_copy`
-    // reports the copy of a made slot with.
-    // SAFETY: a buffer view's union member.
-    let range = {
-        let b = unsafe { desc.Anonymous.Buffer };
-        let element = element_size(&desc);
-        (
-            address + b.FirstElement * element,
-            u64::from(b.NumElements) * element,
-        )
-    };
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
     let own = buffer_view.then_some(()).and_then(|()| {
@@ -4658,6 +4661,63 @@ fn buffer_srv(
             crate::shadow::exact(start, bytes).map(|own| (own, start, bytes))
         })
     });
+    Some((whole, own))
+}
+
+/// What buffer shader view `view` is made from, as [`make`] makes it: the
+/// title address and length it reads, its description, and whether it is
+/// of dimension buffer. `None` for every other view.
+pub(super) fn buffer_srv_args(
+    view: &View,
+) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC, bool)> {
+    // Buffer views: dimension 1 (`buffer_fields`); a buffer resource.
+    const BUFFER: u32 = 1;
+    match view {
+        // (A buffer object has no host copy of its own: `make` comes here.)
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len, srv_desc(desc), desc[1] == BUFFER))
+        }
+        View::Placed(false, resource, desc) if resource[0] == BUFFER => {
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            if len == 0 {
+                return None;
+            }
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            Some((address, len, srv_desc(words), true))
+        }
+        _ => None,
+    }
+}
+
+/// The host copies of a buffer shader view ([`buffer_srv_copies`]).
+pub(super) type BufferSrvCopies = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+);
+
+/// [`buffer_srv`] on the copies [`buffer_srv_copies`] gave.
+pub(super) fn buffer_srv_on(
+    whole: std::sync::Arc<crate::shadow::Shadow>,
+    own: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    address: u64,
+    len: u64,
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<(Kept, Option<BufferCopy>)> {
+    let offset = whole.offset(address);
+    // The title range the view reads ([`buffer_range`]): what `buffer_copy`
+    // reports the copy of a made slot with.
+    // SAFETY: a buffer view's union member.
+    let range = {
+        let b = unsafe { desc.Anonymous.Buffer };
+        let element = element_size(&desc);
+        (
+            address + b.FirstElement * element,
+            u64::from(b.NumElements) * element,
+        )
+    };
     let (shadow, offset, own_copy) = match own {
         Some((own, start, bytes)) => {
             desc.Anonymous.Buffer.FirstElement = 0;
