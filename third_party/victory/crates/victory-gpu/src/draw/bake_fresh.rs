@@ -88,9 +88,15 @@ impl State {
         seen: &[(u32, Fresh)],
     ) {
         let heap_id = std::ptr::from_ref(heap) as usize;
+        let held_null = crate::bake_fresh::HELD_NULL.get_bool();
+        let frame = crate::frame::current();
         let mut nulls: Vec<u32> = seen
             .iter()
-            .filter(|&&(_, f)| f == Fresh::StaleNull)
+            .filter(|&&(slot, f)| {
+                let shows_null =
+                    held_null && f == Fresh::Queued && host.slot_check(slot, frame).0 == 0;
+                crate::bake_fresh::publishes(f, held_null, shows_null)
+            })
             .map(|&(slot, _)| slot)
             .collect();
         nulls.sort_unstable();

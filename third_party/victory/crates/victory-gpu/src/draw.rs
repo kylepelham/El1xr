@@ -3207,6 +3207,16 @@ impl State {
             }
             None => 0,
         };
+        // (`VICTORY_BAKE_SPREAD`) In the world, a bake pass hands all but the bake's own textures
+        // to the prepare threads and checks its time before each slot.
+        let spread_mode = crate::bake_spread::mode();
+        let spread = crate::bake_spread::spreads(
+            spread_mode,
+            PASS_BUDGET.get().is_some_and(|(_, _, now)| now),
+            bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
+            crate::load_rate::in_world(),
+            crate::texture::prepare::threads(),
+        );
         // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
         if !only && crate::material_demand::on() {
             let wanted = host.texture_slots_pick(&crate::material_demand::take());
@@ -3329,7 +3339,7 @@ impl State {
         // ones they made ready. Not for a bake draw's run, whose textures
         // must be there now. Without the switch: as before.
         let prepare = crate::texture::prepare::threads() > 0
-            && !PASS_BUDGET.get().is_some_and(|(_, _, now)| now);
+            && (spread || !PASS_BUDGET.get().is_some_and(|(_, _, now)| now));
         // What this pass recorded uploads of, by resource and first mip
         // (with `prepare`: a second view of one goes the old way, to `uploaded`).
         let mut recorded = std::collections::HashSet::new();
@@ -3338,7 +3348,10 @@ impl State {
         let [mut looked, mut handed, mut waited, mut uploads] = [0u64; 4];
         let ready_count = if prepare {
             crate::texture::prepare::prune();
-            let (ready_count, skipped_waiting) = crate::texture::prepare::prioritize_due(&mut due);
+            // (The bake's own slots stay first; `pinned` is 0 unless spread.)
+            let mut rest = due.split_off(pinned);
+            let (ready_count, skipped_waiting) = crate::texture::prepare::prioritize_due(&mut rest);
+            due.append(&mut rest);
             waited += skipped_waiting;
             looked += skipped_waiting;
             ready_count
@@ -3355,7 +3368,15 @@ impl State {
         // (bootfast) `VICTORY_BAKE_PARALLEL=N`: a bake draw's run makes its
         // textures' host copies on N threads first (`crate::bake_ahead`).
         let mut budget = budget;
-        if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
+        if spread {
+            let ahead = std::time::Instant::now();
+            if room {
+                crate::bake_ahead::host_copies_of(heap, &due[..pinned], budget, 2);
+            }
+            let took = ahead.elapsed();
+            crate::bake_spread::add(crate::bake_spread::C::AheadUs, took.as_micros() as u64);
+            budget = crate::bake_spread::budget_left(spread_mode, budget, took);
+        } else if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
             let ahead = std::time::Instant::now();
             crate::bake_ahead::host_copies(heap, &due, budget);
             budget = crate::bake_ahead::left_after(budget, ahead.elapsed());
@@ -3374,17 +3395,23 @@ impl State {
         for (i, (index, write)) in due.into_iter().enumerate() {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
-            let is_ready = prepare && i < ready_count;
+            let is_ready = prepare && i >= pinned && i - pinned < ready_count;
             // All ready-prepared textures sit at `0..ready_count`; once the
             // prepare budget is full there is nothing more to hand out.
             if !is_ready && full {
                 break;
             }
-            let slot_budget = if is_ready { ready_budget } else { budget };
-            if bake_pass::stops_at(
+            let slot_budget = if is_ready && !spread { ready_budget } else { budget };
+            let bytes_spent = SPENT.load(Ordering::Relaxed) >= bytes_at_most;
+            if spread {
+                if crate::bake_spread::stops_before(i, pinned, bytes_spent, slot_budget, || began.elapsed()) {
+                    crate::bake_spread::add(crate::bake_spread::C::Stopped, 1);
+                    break;
+                }
+            } else if bake_pass::stops_at(
                 i,
                 pinned,
-                SPENT.load(Ordering::Relaxed) >= bytes_at_most,
+                bytes_spent,
                 uploaded_this_pass,
                 checked,
                 slot_budget,
@@ -3505,6 +3532,7 @@ impl State {
             // and the slot stays due; the next pass that finds it ready
             // records its upload below, as before.
             if prepare
+                && i >= pinned
                 && let Some(seen) = heap.handle(index).and_then(crate::descriptor::view)
                 && let Some(View::Shader(resource, _)) =
                     crate::descriptor::host::placed_texture(&seen).or_else(|| Some(seen.clone()))
@@ -3699,6 +3727,13 @@ impl State {
             }
         }
         laps.lap(Laps::REST);
+        if spread {
+            use crate::bake_spread::{C, add};
+            add(C::Passes, 1);
+            add(C::Pinned, pinned as u64);
+            add(C::Handed, handed);
+            add(C::Us, entered.elapsed().as_micros() as u64);
+        }
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
         let [made, made_us] = crate::resource::made_here();
         let staged_now = crate::texture::staged_here();

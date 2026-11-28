@@ -154,6 +154,18 @@ const STAGE_AHEAD_MOST: u64 = 512 << 20;
 /// made ready too.
 #[cfg(windows)]
 pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], budget: Duration) {
+    host_copies_of(heap, due, budget, AT_LEAST);
+}
+
+/// [`host_copies`] when at least `at_least` are to be made (`VICTORY_BAKE_SPREAD`: a bake's own
+/// few textures, from 2).
+#[cfg(windows)]
+pub(crate) fn host_copies_of(
+    heap: &crate::descriptor::Heap,
+    due: &[(u32, u64)],
+    budget: Duration,
+    at_least: usize,
+) {
     let threads = threads();
     if threads == 0 {
         return;
@@ -200,7 +212,7 @@ pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], bu
             todo.push((resource as usize, first));
         }
     }
-    if todo.len() < AT_LEAST {
+    if todo.len() < at_least.max(2) {
         return;
     }
     // Kept alive while the threads make them: the title may release one

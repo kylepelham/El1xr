@@ -19,6 +19,12 @@
 //! list has run (`VICTORY_SHOW_AFTER`): such a bake, and one whose input is still unmapped or
 //! queued, is counted `incomplete` and named in a line (what `VICTORY_BAKE_REPLAY` would redraw).
 //!
+//! `VICTORY_BAKE_HELD_NULL=1` (with this switch): a slot that was still queued, that the bake's
+//! own pass uploaded now, and whose host slot still shows null is shown at once as well, as a
+//! stale null one is. Without it `VICTORY_SHOW_AFTER` holds its new view until the list has run,
+//! so the bake reads zeros from it: part H/I `bake check` inputs `null+held_here` (b5h 51 of the
+//! bad slots read). Nothing valid is replaced: the slot showed nothing.
+//!
 //! `VICTORY_BAKE_ROOM=1` (the idea of TheSmurphilicious `1e59516195`): a bake's own input that
 //! needs a new host copy while the card is past its room line (`crate::resource::room`) is made
 //! all the same while the system's budget for the card is not used up. Off: refused (counted as
@@ -34,8 +40,23 @@ pub(crate) static FRESH: victory_core::settings::Live =
 pub(crate) static ROOM: victory_core::settings::Live =
     victory_core::settings::Live::flag("VICTORY_BAKE_ROOM");
 
+/// Live: read after each bake draw's passes.
+pub(crate) static HELD_NULL: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_BAKE_HELD_NULL");
+
 pub(crate) fn on() -> bool {
     FRESH.get_bool()
+}
+
+/// Whether a bake input's held show is shown before the draw: one that showed null before the
+/// pass, and with `held_null` (`VICTORY_BAKE_HELD_NULL`) one taken from the queue whose host slot
+/// still shows null after it (`shows_null`).
+pub(crate) fn publishes(before: Fresh, held_null: bool, shows_null: bool) -> bool {
+    match before {
+        Fresh::StaleNull => true,
+        Fresh::Queued => held_null && shows_null,
+        _ => false,
+    }
 }
 
 /// What a bake input slot is before the bake's own pass.
@@ -371,6 +392,25 @@ mod tests {
         for a in [After::Held, After::Left, After::Unmapped] {
             assert!(a.incomplete(), "{a:?}");
         }
+    }
+
+    /// Part H/I: `null+held_here` inputs were queued slots the bake's own pass uploaded, shown only
+    /// after the list ran. With the switch they are shown before the draw, like stale nulls;
+    /// a queued slot showing a texture keeps it (`VICTORY_BAKE_PUBLISH` blackened faces that way).
+    #[test]
+    fn a_held_null_input_is_shown_before_the_bake_only_with_the_switch() {
+        assert!(publishes(Fresh::StaleNull, false, false));
+        assert!(!publishes(Fresh::Queued, false, true), "off: held until the list ran");
+        assert!(publishes(Fresh::Queued, true, true));
+        assert!(!publishes(Fresh::Queued, true, false), "it shows a texture: kept");
+        for f in [Fresh::StaleOther, Fresh::OtherBytes, Fresh::Ok, Fresh::Unmapped, Fresh::NotTexture] {
+            assert!(!publishes(f, true, true), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn held_null_is_live() {
+        victory_core::settings::check_live("VICTORY_BAKE_HELD_NULL", "1", || HELD_NULL.get_bool(), false, true);
     }
 
     /// `VICTORY_BAKE_ROOM`: past the room line only while the card is under the system's budget.
