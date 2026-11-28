@@ -7019,6 +7019,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    read_sparse_with(src, dst, len, sparse_zero::on());
+}
+
+/// [`read_sparse`]; `safe_zero`: the zeros for what is not there go only
+/// where the destination is committed (`VICTORY_SPARSE_ZERO_SAFE`).
+fn read_sparse_with(src: *const u8, dst: *mut u8, len: usize, safe_zero: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -7041,8 +7047,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            if safe_zero {
+                sparse_zero::zero(to, n);
+            } else {
+                // SAFETY: this path is only used with a writable host destination.
+                unsafe { to.write_bytes(0, n) };
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
@@ -7062,8 +7072,12 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if sparse_zero::on() {
+                        sparse_zero::zero(to, n);
+                    } else {
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
@@ -9193,6 +9207,8 @@ mod run_split;
 mod run_wait;
 #[path = "host_ask.rs"]
 mod ask;
+#[path = "host_sparse_zero.rs"]
+mod sparse_zero;
 use step_reads::blocked_by;
 
 #[cfg(test)]
