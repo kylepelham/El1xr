@@ -842,6 +842,7 @@ pub(crate) fn take_dropped() -> u64 {
         );
     }
     crate::drop_why::line(crate::queue::frame_count());
+    crate::pieces_diag::line(crate::queue::frame_count());
     crate::indirect_fit::line(crate::queue::frame_count());
     DROPPED.swap(0, Ordering::Relaxed)
 }
@@ -3459,7 +3460,8 @@ impl State {
                 // (Neptune) Nor a slot whose texture a prepare thread made
                 // ready (its host copy made while the card had room).
                 let prepared = is_ready;
-                if !has_its_texture && !prepared {
+                // (`VICTORY_BAKE_ROOM=1`: a bake draw's own input is made all the same.)
+                if !has_its_texture && !prepared && !crate::bake_fresh::room_lets(i < pinned) {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -5834,6 +5836,7 @@ mod reflect_views;
 
 mod bake_pass;
 mod bake_check;
+mod bake_fresh;
 mod bake_publish;
 mod material_pass;
 mod skin_views;

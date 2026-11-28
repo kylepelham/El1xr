@@ -229,7 +229,8 @@ fn main() -> Result<()> {
     let settings = victory_core::settings::init();
     // (El1xr) `VICTORY_RESOLUTION` / `VICTORY_UPSCALE_QUALITY`: the output size and upscaler
     // quality as the switches that do them, into the environment too; nothing without them.
-    let from_file = settings.applied.iter().cloned().collect();
+    // The file's values (also when the launcher copied them) give way to the plan.
+    let from_file = victory_core::settings::from_file();
     let render_plan = victory_core::render_plan::derive_env(&from_file, victory_gpu::menu::primary_display_size);
     // `VICTORY_HEAP_COUNT=1`: the Rust heap's live bytes for the resident line (off: it slowed loading).
     victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_some_and(|v| v == "1"));

@@ -55,6 +55,10 @@ mod boot_prof;
 #[cfg(windows)]
 mod bake_check;
 #[cfg(windows)]
+mod bake_fresh;
+#[cfg(windows)]
+mod bake_name;
+#[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]
 mod bake_publish;
@@ -72,6 +76,8 @@ mod hang_watch;
 mod raw_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pieces_diag;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -156,6 +162,8 @@ mod primitive;
 mod heap_pass;
 pub mod query;
 pub mod queue;
+/// (mandy 6e80eb8648) `VICTORY_ALIAS_LATER=1`: page-mapping copies mapped behind the title's call.
+pub mod alias_later;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

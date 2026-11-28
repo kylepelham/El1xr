@@ -339,7 +339,9 @@ impl Selftest {
         match self.target(d) {
             Ok((row, name)) => {
                 let from = model.get(name).unwrap_or_default();
-                steps.extend((0..row).map(|_| Step::Press(Key::Down)));
+                let display = super::state::rows(model, Tab::DISPLAY, d.menu.expert);
+                let downs = super::state::downs_to(&display, row);
+                steps.extend((0..downs).map(|_| Step::Press(Key::Down)));
                 steps.push(Step::Selected { row, name });
                 steps.push(Step::Press(Key::Right));
                 steps.push(Step::Changed {
@@ -353,7 +355,7 @@ impl Selftest {
                 )));
                 steps.push(Step::Press(Key::Left));
                 steps.push(Step::Restored { name, from });
-                steps.extend((0..row).map(|_| Step::Press(Key::Up)));
+                steps.extend((0..downs).map(|_| Step::Press(Key::Up)));
             }
             Err(why) => steps.push(Step::Note(why)),
         }

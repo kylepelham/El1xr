@@ -69,6 +69,9 @@ pub(crate) struct Shader {
     /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
     #[cfg(windows)]
     skin: OnceLock<bool>,
+    /// The decoration bake family its container names (`crate::bake_name`), looked up on first asking.
+    #[cfg(windows)]
+    bake: OnceLock<Option<crate::bake_name::Kind>>,
 }
 
 impl Shader {
@@ -84,6 +87,12 @@ impl Shader {
     #[cfg(windows)]
     pub(crate) fn skin(&self) -> bool {
         *self.skin.get_or_init(|| self.stage == "pixel" && crate::skin_fill::skin_program(&self.container))
+    }
+
+    /// The decoration bake family its container names (`crate::bake_name`).
+    #[cfg(windows)]
+    pub(crate) fn bake_kind(&self) -> Option<crate::bake_name::Kind> {
+        *self.bake.get_or_init(|| crate::bake_name::kind_of(&self.container))
     }
 }
 
@@ -185,6 +194,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 skin: OnceLock::new(),
+                #[cfg(windows)]
+                bake: OnceLock::new(),
             })
         })
         .clone()
@@ -207,6 +218,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
             .flatten(),
         translated: OnceLock::new(),
         skin: OnceLock::new(),
+        bake: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)

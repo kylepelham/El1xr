@@ -1,14 +1,15 @@
 //! (El1xr) Draws the menu into a premultiplied bitmap: GDI rasterises the glyphs (as the overlay
 //! does), everything else is flat fills. Style per `planning/style.md`: a flat night-purple panel,
-//! plain text for status and values, a quiet row background for the selection, and the sunset
-//! accent only under the active tab and on the focused value's arrows.
+//! plain text for status and values, a quiet row background for the selection, section titles as
+//! small capitals over a hairline, and the sunset accent only under the active tab and on the
+//! focused value's arrows.
 
 use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Graphics::Gdi::*;
 
 use super::layout::{Layout, Rect};
 use super::model::{Apply, Kind, MenuModel};
-use super::state::{Menu, Row, shown};
+use super::state::{Menu, Row, selectable, shown};
 use crate::pixels::Bitmap;
 
 const PANEL: [u8; 3] = [0x16, 0x0d, 0x2b];
@@ -374,31 +375,42 @@ impl Painter {
                 fill(&mut bm, line, 0.0, 255, ACCENT);
             }
         }
-        // Restart notice: a flat band, a quiet label and the settings that wait.
+        // Restart notice: a flat band, a quiet label, the settings that wait with their new
+        // values, and whether they reached the settings file.
         if let Some(b) = l.banner {
             let pending = model.pending_restart();
             fill(&mut bm, b, px(4.0) as f32, 255, BANNER);
             let labels: Vec<String> = pending
                 .iter()
                 .map(|&n| {
-                    let label = victory_core::settings::info(n).map_or(n, |i| i.label);
+                    let info = victory_core::settings::info(n);
+                    let label = info.map_or(n, |i| i.label);
+                    let value = model.get(n).unwrap_or_default();
+                    let value = info.map_or(value.clone(), |i| shown(n, i.kind, &value));
                     match model.apply_of(n) {
-                        Apply::Retranslate => format!("{label} (rebuild)"),
-                        _ => label.to_string(),
+                        Apply::Retranslate => format!("{label}: {value} (shaders rebuilt)"),
+                        _ => format!("{label}: {value}"),
                     }
                 })
                 .collect();
-            let head = "RESTART NEEDED";
+            let head = "RESTART TO APPLY";
             t.mid(&mut bm, CAPS, head, b.x + px(16.0), b, RESTART);
+            let (kept, kept_rgb) = if menu.unsaved {
+                ("NOT SAVED", RESTART)
+            } else {
+                ("SAVED", DIM)
+            };
+            let kw = t.measure(CAPS, kept).0;
+            t.mid(&mut bm, CAPS, kept, b.right() - px(16.0) - kw, b, kept_rgb);
             let x = b.x + px(16.0) + t.measure(CAPS, head).0 + px(16.0);
-            let list = t.fit(HELP, &labels.join(", "), b.right() - px(16.0) - x);
+            let list = t.fit(HELP, &labels.join(",  "), b.right() - px(32.0) - kw - x);
             t.mid(&mut bm, HELP, &list, x, b, SOFT);
         }
         // Rows: the selection (and the hovered row, fainter) on a quiet flat background.
         let rows = menu.rows(model);
         for &(i, r) in &l.rows {
             let selected = i == menu.selected;
-            if selected || hover == Some(i) {
+            if (selected || hover == Some(i)) && selectable(&rows[i]) {
                 let a = if selected { 255 } else { 110 };
                 fill(&mut bm, r, px(4.0) as f32, a, ROW_SEL);
             }
@@ -458,7 +470,12 @@ impl Painter {
                 let info = model.infos()[i];
                 self.apply_class(bm, l.badge(r), model.apply_of(info.name));
                 let value = model.get(info.name).unwrap_or_default();
-                self.value(bm, l, l.value(r), info.name, info.kind, &value, selected);
+                // Unset: what it stands for (the size, the mode), in the quieter colour.
+                let (value, chosen) = match model.effective(info.name) {
+                    Some(e) if value.is_empty() => (e, false),
+                    _ => (value, true),
+                };
+                self.value(bm, l, l.value(r), info.name, info.kind, &value, selected, chosen);
                 let detail = model.detail(info.name);
                 let help = match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
                     (help, true) => help.to_string(),
@@ -486,6 +503,14 @@ impl Painter {
                     "Undo changes".into(),
                     "Every setting changed while running back to its launch value.".into(),
                 )
+            }
+            Row::Heading(title) => {
+                let title = title.to_uppercase();
+                let h = t.measure(CAPS, &title).1;
+                let line_y = r.bottom() - px(6.0);
+                t.draw(bm, CAPS, &title, x, line_y - px(5.0) - h, SOFT);
+                rule(bm, l, x, line_y, r.right() - px(12.0) - x, RULE);
+                return;
             }
         };
         // A row without help has its label centred.
@@ -554,6 +579,7 @@ impl Painter {
         kind: Kind,
         value: &str,
         selected: bool,
+        chosen: bool,
     ) {
         let t = &self.text;
         let s = shown(name, kind, value);
@@ -568,7 +594,7 @@ impl Painter {
         let rw = t.measure(VALUE, right).0;
         t.mid(bm, VALUE, right, v.right() - rw, v, arrow);
         t.mid(bm, VALUE, left, v.x + l.px(76.0), v, arrow);
-        let off = kind == Kind::Bool && value != "1";
+        let off = (kind == Kind::Bool && value != "1") || !chosen;
         let inner = Rect { x: v.x + l.px(76.0), w: v.right() - rw - v.x - l.px(76.0), ..v };
         let s = t.fit(VALUE, &s, inner.w - l.px(32.0));
         t.centre(bm, VALUE, &s, inner, if off { DIM } else { TEXT });
