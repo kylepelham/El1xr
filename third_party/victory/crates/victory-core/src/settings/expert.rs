@@ -216,6 +216,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_LOOKUP_CACHE", Apply::Restart),
     ("VICTORY_MAPPED_BY_PAGE", Apply::Restart),
     ("VICTORY_MAPPED_BY_VIEWS", Apply::Live),
+    ("VICTORY_MAPPED_HOLES", Apply::Live),
     ("VICTORY_MEET_POLLS", Apply::Retranslate),
     ("VICTORY_MEMORY_MAP", Apply::Restart),
     ("VICTORY_MENU_PNG_DIR", Apply::Restart),
