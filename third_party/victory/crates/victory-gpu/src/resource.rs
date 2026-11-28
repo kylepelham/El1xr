@@ -3711,6 +3711,19 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// (worldstream, `crate::texture::stream_ahead`) The resources of
+/// [`PLACED_TEXTURES`] whose memory meets `[start, end)`, with their address
+/// and description, `most` at most. They stay for the run, so what is named
+/// here stays alive.
+#[cfg(windows)]
+pub(crate) fn placed_textures_under(start: u64, end: u64, most: usize) -> Vec<(This, u64, [u32; 14])> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    crate::texture::stream_ahead::walk(&map, start, end, most, placed_bytes)
+        .into_iter()
+        .map(|(r, at, desc)| (r as This, at, desc))
+        .collect()
+}
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]

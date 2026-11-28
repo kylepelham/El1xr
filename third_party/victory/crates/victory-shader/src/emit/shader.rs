@@ -56,6 +56,16 @@ pub const SLOT_TLAS: u8 = 251;
 /// Root SRV `t<SLOT_TLAS_NEAR>`: a second host top level, for the glass
 /// trace's near walk (the title's `t354`; [`SLOT_TLAS`] holds its `t355`).
 pub const SLOT_TLAS_NEAR: u8 = 250;
+/// (heapcap, `VICTORY_HEAP_CAP=3`) The root SRV `t<SLOT_REMAP>` in [`ROOT_CBV_SPACE`]: dword `k`
+/// the host view slot of title view slot [`title_view_limit`]` + k` (that limit, a null slot,
+/// for one the host has none for), [`title_remap_len`] of them and one more, the null slot.
+/// The host binds the dwords from [`REMAP_BASE`] on of the [`SLOT_STRIDES`] buffer of the heap.
+pub const SLOT_REMAP: u8 = 249;
+/// (heapcap) Where the [`SLOT_REMAP`] dwords start in the [`SLOT_STRIDES`] buffer: past every
+/// slot a capped host heap has.
+pub const REMAP_BASE: u32 = 1 << 20;
+/// (heapcap) Title view slots the [`SLOT_REMAP`] table covers from [`title_view_limit`] on.
+pub const REMAP_LEN: u32 = SLOT_STRIDES_COUNT - REMAP_BASE - 1;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -154,6 +164,54 @@ pub fn set_view_heap_limit(null_slot: u32) {
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// (heapcap) `VICTORY_HEAP_CAP`: the first slot past the title's own slots on a host view heap
+/// capped below the title's size, kept null (0: none). The slots after it are the host's
+/// per-draw tables; a view index the title computes itself (root type `ResourceHeap`) at or past
+/// it would read one of those, so shaders translated while it is set read this slot instead.
+/// Indices a table gives (the host made the table) are left alone. Set by the host with
+/// [`set_view_heap_limit`]; part of the translation fingerprint when not 0.
+static TITLE_VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// (heapcap, `VICTORY_HEAP_CAP=3`) Title view indices at or past [`TITLE_VIEW_LIMIT`] read the
+/// host slot the [`SLOT_REMAP`] table gives, this many of them (0: none; they read the null slot).
+static TITLE_REMAP_LEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`title_view_limit`].
+    pub(crate) static TITLE_VIEW_LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// For a test's thread alone: [`title_remap_len`].
+    pub(crate) static TITLE_REMAP_LEN_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`TITLE_REMAP_LEN`]: `len` title slots past the limit read the remap table (0: none).
+pub fn set_title_remap_len(len: u32) {
+    TITLE_REMAP_LEN.store(len.min(REMAP_LEN), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`TITLE_REMAP_LEN`].
+pub fn title_remap_len() -> u32 {
+    #[cfg(test)]
+    if let Some(len) = TITLE_REMAP_LEN_HERE.get() {
+        return len;
+    }
+    TITLE_REMAP_LEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See [`TITLE_VIEW_LIMIT`]: `slot` is the null slot past the title's slots (0: none).
+pub fn set_title_view_limit(slot: u32) {
+    TITLE_VIEW_LIMIT.store(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`TITLE_VIEW_LIMIT`].
+pub fn title_view_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(slot) = TITLE_VIEW_LIMIT_HERE.get() {
+        return slot;
+    }
+    TITLE_VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -441,6 +499,20 @@ impl Shader {
             216,
             &[h, p],
         )
+    }
+
+    /// A view index the title computed itself (root type `ResourceHeap`),
+    /// clamped to [`title_view_limit`] when it is set.
+    pub(crate) fn title_view_index(&mut self, block: usize, index: V) -> V {
+        let limit = title_view_limit();
+        if limit == 0 {
+            return index;
+        }
+        let last = self.m.i32(limit);
+        let i32t = self.t.i32;
+        let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        v
     }
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when

@@ -148,13 +148,72 @@ fn left_of(budget: Duration, spent: Duration) -> Duration {
 /// (`crate::texture::prepare::prune`).
 const STAGE_AHEAD_MOST: u64 = 512 << 20;
 
+/// (worldstream, #26) `VICTORY_BAKE_STAGE_ALL=1|N`: before the world's first
+/// frame, a bake pass's threads (with `VICTORY_BAKE_STAGE_AHEAD`) make ready
+/// up to the pass's own bytes (`1`: its byte budget, 2 GiB for a bake) or N
+/// MiB (`N` >= 2), never less than [`STAGE_AHEAD_MOST`]; in the world, or
+/// unset or 0, [`STAGE_AHEAD_MOST`] as before.
+///
+/// While the title loads, the bake passes look at every due slot (8,145 and
+/// 10,244 in the first two of b5q) and the threads stopped staging at 512
+/// MiB (`staged_mb=521`, `440`, after 1,123 and 3,145 textures); everything
+/// past it the pass made ready itself on the recording thread, one texture
+/// after the other: frames 431-512 of 400-1,030 ms, nearly all "early/bake
+/// textures". The pass still records every upload before the draw (its
+/// byte budget and the bake's own textures first are unchanged), so the
+/// bake sees every input as before; only who makes them ready moves. The
+/// staging buffers the threads make are the ones the pass would have made
+/// and held in its list until the list ran, so the peak is the pass's bytes
+/// either way.
+fn stage_all() -> u64 {
+    static MODE: OnceLock<u64> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_stage_all(std::env::var("VICTORY_BAKE_STAGE_ALL").ok().as_deref());
+        if mode > 0 {
+            tracing::info!(
+                mode,
+                stage_ahead = stage_ahead(),
+                threads = threads(),
+                "bake passes while loading make all their textures ready on their threads (VICTORY_BAKE_STAGE_ALL)"
+            );
+        }
+        mode
+    })
+}
+
+fn parse_stage_all(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// The staging bytes a pass's threads make ready at most: switch `mode`
+/// ([`stage_all`]), in the world or not, the pass's byte budget `pass_bytes`.
+fn stage_most(mode: u64, world: bool, pass_bytes: u64) -> u64 {
+    match mode {
+        _ if world => STAGE_AHEAD_MOST,
+        0 => STAGE_AHEAD_MOST,
+        1 => pass_bytes.max(STAGE_AHEAD_MOST),
+        mb => mb.saturating_mul(1 << 20).max(STAGE_AHEAD_MOST),
+    }
+}
+
+/// Since the start, for [`stage_all`]'s line: passes it raised the cap of,
+/// of them the ones that reached it, and the bytes their threads staged.
+static STAGE_ALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Before a bake draw's pass over the heap's due slots `due` of `heap`:
 /// the host copies of their title textures not made yet, made on
 /// [`threads`] threads within `budget`; with [`stage_ahead`] the textures
 /// made ready too.
+/// `pass_bytes`: the pass's byte budget ([`stage_most`]).
 #[cfg(windows)]
-pub(crate) fn host_copies(heap: &crate::descriptor::Heap, due: &[(u32, u64)], budget: Duration) {
-    host_copies_of(heap, due, budget, AT_LEAST);
+pub(crate) fn host_copies(
+    heap: &crate::descriptor::Heap,
+    due: &[(u32, u64)],
+    budget: Duration,
+    pass_bytes: u64,
+) {
+    let most = stage_most(stage_all(), crate::load_rate::in_world(), pass_bytes);
+    host_copies_of(heap, due, budget, AT_LEAST, most);
 }
 
 /// [`host_copies`] when at least `at_least` are to be made (`VICTORY_BAKE_SPREAD`: a bake's own
@@ -165,6 +224,7 @@ pub(crate) fn host_copies_of(
     due: &[(u32, u64)],
     budget: Duration,
     at_least: usize,
+    stage_most: u64,
 ) {
     let threads = threads();
     if threads == 0 {
@@ -224,7 +284,7 @@ pub(crate) fn host_copies_of(
     let staged = AtomicU64::new(0);
     let made = run_all(&todo, threads, deadline, |&(r, first)| {
         let r = r as This;
-        if staging && staged.load(Relaxed) < STAGE_AHEAD_MOST {
+        if staging && staged.load(Relaxed) < stage_most {
             match crate::texture::prepare::make_ready_ahead(r, first) {
                 Some(bytes) => {
                     staged.fetch_add(bytes, Relaxed);
@@ -242,6 +302,25 @@ pub(crate) fn host_copies_of(
         crate::resource::let_go_kept(r as This);
     }
     let ms = began.elapsed().as_millis() as u64;
+    if staging && stage_most > STAGE_AHEAD_MOST {
+        let staged = staged.load(Relaxed);
+        let n = STAGE_ALL[0].fetch_add(1, Relaxed) + 1;
+        STAGE_ALL[1].fetch_add(u64::from(staged >= stage_most), Relaxed);
+        STAGE_ALL[2].fetch_add(staged, Relaxed);
+        if n.is_power_of_two() {
+            tracing::info!(
+                passes = n,
+                cap_mb = stage_most >> 20,
+                staged_mb = staged >> 20,
+                looked_for = todo.len(),
+                made,
+                ms,
+                at_the_cap = STAGE_ALL[1].load(Relaxed),
+                staged_mb_so_far = STAGE_ALL[2].load(Relaxed) >> 20,
+                "bake stage all (VICTORY_BAKE_STAGE_ALL): a loading bake pass's threads made ready past 512 MiB"
+            );
+        }
+    }
     let passes = STATS[0].fetch_add(1, Relaxed) + 1;
     STATS[1].fetch_add(made, Relaxed);
     STATS[2].fetch_add(todo.len() as u64, Relaxed);
@@ -323,6 +402,23 @@ mod tests {
         assert_eq!(left_in(1, true, budget, spent), ms(50));
         assert_eq!(left_in(2, false, budget, spent), ms(50));
         assert_eq!(left_in(2, true, budget, spent), budget);
+    }
+
+    /// (worldstream) While loading, the threads' staging cap is the pass's
+    /// bytes (or N MiB), never under 512 MiB; in the world or off, 512 MiB.
+    #[test]
+    fn stage_all_raises_the_cap_while_loading_only() {
+        let most = STAGE_AHEAD_MOST;
+        assert_eq!(parse_stage_all(None), 0);
+        assert_eq!(parse_stage_all(Some(" 1")), 1);
+        assert_eq!(parse_stage_all(Some("x")), 0);
+        assert_eq!(stage_most(0, false, 2 << 30), most);
+        assert_eq!(stage_most(1, false, 2 << 30), 2 << 30);
+        assert_eq!(stage_most(1, true, 2 << 30), most);
+        assert_eq!(stage_most(1, false, 64 << 20), most);
+        assert_eq!(stage_most(1024, false, 2 << 30), 1 << 30);
+        assert_eq!(stage_most(100, false, 2 << 30), most);
+        assert_eq!(stage_most(1024, true, 2 << 30), most);
     }
 
     /// Nothing is started past the deadline.

@@ -50,6 +50,8 @@ pub struct Layout {
     pub tabs: Vec<(Tab, Rect)>,
     pub banner: Option<Rect>,
     pub list: Rect,
+    /// Under the list: the selected row's whole description, over [`ABOUT_LINES`] lines at most.
+    pub about: Rect,
     /// The visible rows: index into the tab's rows, and the row's rectangle.
     pub rows: Vec<(usize, Rect)>,
     pub footer: Rect,
@@ -63,7 +65,7 @@ pub fn scale(frame_h: i32) -> f32 {
 }
 
 const PANEL_W: f32 = 1040.0;
-const PANEL_H: f32 = 700.0;
+const PANEL_H: f32 = 700.0 + ABOUT_H;
 const SHADOW: f32 = 28.0;
 const PAD: f32 = 28.0;
 const HEADER_H: f32 = 76.0;
@@ -74,6 +76,10 @@ const TAB_PAD_W: f32 = 26.0;
 const TAB_GAP: f32 = 4.0;
 const BANNER_H: f32 = 40.0;
 const FOOTER_H: f32 = 46.0;
+/// The description under the list: a hairline, then up to this many lines of help text.
+pub const ABOUT_LINES: usize = 4;
+const ABOUT_LINE_H: f32 = 19.0;
+const ABOUT_H: f32 = 14.0 + ABOUT_LINES as f32 * ABOUT_LINE_H;
 const ROW_H: f32 = 60.0;
 /// A section title's row.
 const HEADING_H: f32 = 34.0;
@@ -185,11 +191,17 @@ pub fn layout(
         w,
         h: px(FOOTER_H),
     };
+    let about = Rect {
+        x: panel.x + pad,
+        y: footer.y - px(ABOUT_H),
+        w: w - 2 * pad,
+        h: px(ABOUT_H),
+    };
     let list = Rect {
         x: panel.x + pad,
         y,
         w: w - 2 * pad,
-        h: (footer.y - px(6.0) - y).max(0),
+        h: (about.y - px(6.0) - y).max(0),
     };
     let row_h = px(ROW_H);
     // Counted as full rows, so a page with section titles always fits.
@@ -219,6 +231,7 @@ pub fn layout(
         tabs,
         banner,
         list,
+        about,
         rows,
         footer,
         visible,

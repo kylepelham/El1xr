@@ -119,6 +119,6 @@ def test_the_timer_ends_a_run_when_its_monitor_says_so(tmp_path, monkeypatch):
     )
     monitor = dev_early.Monitor(early=True, min_s=0, steady_s=20)
     t0 = time.monotonic()
-    timed_out, _ = dev.run_timed_victory([sys.executable, str(script)], tmp_path / "run.log", 60, monitor)
-    assert timed_out and monitor.ended["how"] == "early"
+    end = dev.run_timed_victory([sys.executable, str(script)], tmp_path / "run.log", 60, monitor)
+    assert end.timed_out and monitor.ended["how"] == "early"
     assert time.monotonic() - t0 < 30

@@ -45,6 +45,7 @@ impl Drop for Reset {
     fn drop(&mut self) {
         DIRTY4K_IN_TEST.set(u8::MAX);
         super::super::holes::KEPT_FORCED.set(None);
+        super::super::hole_marks::FORCED.set(None);
         NOTE_ONCE_FORCED.set(None);
         PUBLISH_TRY_FORCED.set(None);
         super::super::guard4k::STAMP_FRESH_FORCED.set(None);
@@ -646,6 +647,63 @@ fn kept_holes_tell_the_same_pages_with_fewer_queries() {
     assert!(queries[1] * 2 < queries[0], "queries off {} vs kept {}", queries[0], queries[1]);
 }
 
+/// (#88) `VICTORY_GUARD_HOLE_MARKS=1|2`: the same writes over a view with holes tell the same
+/// pages as with the switch off, with far fewer `VirtualQuery`s; a block of a marked hole
+/// committed (and told) is guarded and its writes told in the same frame; a hole a commit was
+/// not told of is still seen at the next frame.
+#[test]
+fn marked_holes_tell_the_same_pages_with_fewer_queries() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    use super::super::BLOCK;
+    let _reset = Reset;
+    super::super::PORT_GUARD_IN_TEST.set(true);
+    let mut told = Vec::new();
+    let mut queries = Vec::new();
+    for mode in [0, 1, 2] {
+        super::super::hole_marks::FORCED.set(Some(mode));
+        // Holes [2, 5), [7, 12) and [14, 20) between committed blocks.
+        let view = holed_view(22, &[0..2, 5..7, 12..14, 20..22]);
+        let (mut since, _) = view.refresh(0);
+        let before = super::super::tests::syscall_counts().1;
+        let mut pages = Vec::new();
+        for round in 0..24u8 {
+            for b in [0, 5, 12, 13, 21] {
+                if (b + round as usize) % 3 != 0 {
+                    view.write(b, round);
+                }
+            }
+            let (asked, p) = view.refresh(since);
+            since = asked;
+            pages.push(p);
+        }
+        queries.push(super::super::tests::syscall_counts().1 - before);
+        // Commit a block of the hole [7, 12), as `XMemVirtualAlloc` does, and write it.
+        let at = view.at + 9 * BLOCK;
+        // SAFETY: inside our reserved view.
+        assert!(!unsafe { VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        crate::title_pages_committed(at, BLOCK);
+        let (asked, _) = view.refresh(since);
+        view.write(9, 7);
+        let (asked, p) = view.refresh(asked);
+        assert!(p.contains(&(9 * BLOCK / PAGE)), "mode={mode}: the committed block's write was told: {p:?}");
+        pages.push(p);
+        // Commit a block of the hole [14, 20) without telling: seen once the frame is over.
+        let at = view.at + 16 * BLOCK;
+        // SAFETY: inside our reserved view.
+        assert!(!unsafe { VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        super::super::hole_marks::next_frame_for_test();
+        let (asked, _) = view.refresh(asked);
+        view.write(16, 9);
+        let (_, p) = view.refresh(asked);
+        assert!(p.contains(&(16 * BLOCK / PAGE)), "mode={mode}: an untold commit is seen the next frame: {p:?}");
+        pages.push(p);
+        told.push(pages);
+    }
+    assert_eq!(told[0], told[1], "=1: the same pages told");
+    assert_eq!(told[0], told[2], "=2: the same pages told");
+    assert!(queries[1] * 2 < queries[0], "queries off {} vs marks {}", queries[0], queries[1]);
+}
+
 /// The kept-holes table: a run is kept for its frame, never when free, never when the runtime
 /// told of a change while it was asked about, and forgotten where told.
 #[test]
@@ -683,53 +741,78 @@ fn kept_holes_follow_frames_and_what_is_told() {
     assert_eq!(asked, 7);
 }
 
-/// (#88) 16 threads checking one view with holes, as the refresh threads of a flush do: a
-/// check's time and its `VirtualQuery`s, `VICTORY_GUARD_HOLES_KEPT` off and on, alternated.
+/// (#88) 16 threads checking one view with holes, as the refresh threads of a flush do, while
+/// another thread tells of commits elsewhere as the title's host heap does (`xmem`, thousands a
+/// frame): a check's time and its `VirtualQuery`s with the switches off, `VICTORY_GUARD_HOLES_KEPT`
+/// and `VICTORY_GUARD_HOLE_MARKS=1`, alternated.
 /// `cargo test --release -p victory-gpu --lib bench_holes_kept -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn bench_holes_kept() {
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     const THREADS: usize = 16;
     const CHECKS: usize = 2000;
     let _reset = Reset;
     // Committed blocks between holes, as streamed buffers lie: 6 holes in 32 blocks.
     let view = holed_view(32, &[0..2, 5..8, 11..12, 15..20, 24..25, 28..29, 31..32]);
+    let elsewhere = reserve(64);
     for round in 0..4 {
-        for kept in [false, true] {
+        for (name, kept, marks) in [("off", false, 0), ("kept", true, 0), ("marks", false, 1)] {
             let busy = AtomicU64::new(0);
             let queries = AtomicU64::new(0);
-            let start = Barrier::new(THREADS);
+            let start = Barrier::new(THREADS + 1);
+            let done = AtomicBool::new(false);
+            // Frames go by as in the game (here one every 2 ms), and the marks and kept runs with them.
+            let frame = AtomicU64::new(round * 1000);
             let wall = std::time::Instant::now();
             std::thread::scope(|s| {
-                for t in 0..THREADS {
-                    let (view, busy, queries, start) = (&view, &busy, &queries, &start);
-                    s.spawn(move || {
-                        super::super::PORT_GUARD_IN_TEST.set(true);
-                        super::super::holes::KEPT_FORCED.set(Some(kept));
-                        start.wait();
-                        let q = super::super::tests::syscall_counts().1;
-                        let t0 = std::time::Instant::now();
-                        for i in 0..CHECKS {
-                            // A write now and then, so checks walk as well as settle early.
-                            if i % 64 == t % 64 {
-                                view.write([0, 5, 15][t % 3], i as u8);
-                            }
-                            let _ = super::super::writes(view.at, view.at + view.len, true);
+                let (start, done, frame) = (&start, &done, &frame);
+                s.spawn(move || {
+                    start.wait();
+                    let (mut i, began) = (0usize, std::time::Instant::now());
+                    while !done.load(Relaxed) {
+                        crate::title_pages_committed(elsewhere + (i % 64) * PAGE, 4096);
+                        i += 1;
+                        if i % 8 == 0 {
+                            frame.store(round * 1000 + began.elapsed().as_millis() as u64 / 2, Relaxed);
+                            std::thread::yield_now();
                         }
-                        busy.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-                        queries.fetch_add(super::super::tests::syscall_counts().1 - q, Relaxed);
-                    });
-                }
+                    }
+                });
+                std::thread::scope(|s| {
+                    for t in 0..THREADS {
+                        let (view, busy, queries) = (&view, &busy, &queries);
+                        s.spawn(move || {
+                            super::super::PORT_GUARD_IN_TEST.set(true);
+                            super::super::holes::KEPT_FORCED.set(Some(kept));
+                            super::super::hole_marks::FORCED.set(Some(marks));
+                            start.wait();
+                            let q = super::super::tests::syscall_counts().1;
+                            let t0 = std::time::Instant::now();
+                            for i in 0..CHECKS {
+                                // A write now and then, so checks walk as well as settle early.
+                                if i % 64 == t % 64 {
+                                    view.write([0, 5, 15][t % 3], i as u8);
+                                }
+                                super::super::hole_marks::frames_on_for_test(frame.load(Relaxed));
+                                let _ = super::super::writes(view.at, view.at + view.len, true);
+                            }
+                            busy.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                            queries.fetch_add(super::super::tests::syscall_counts().1 - q, Relaxed);
+                        });
+                    }
+                });
+                done.store(true, Relaxed);
             });
             let checks = (THREADS * CHECKS) as f64;
             eprintln!(
-                "round {round} kept={kept}: {:.2} us a check, {:.2} queries a check, wall {:.1} ms",
+                "round {round} {name}: {:.2} us a check, {:.2} queries a check, wall {:.1} ms",
                 busy.load(Relaxed) as f64 / (checks * 1000.0),
                 queries.load(Relaxed) as f64 / checks,
                 wall.elapsed().as_secs_f64() * 1000.0
             );
         }
     }
+    release(elsewhere, 64);
 }

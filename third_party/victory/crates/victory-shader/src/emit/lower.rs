@@ -6646,6 +6646,48 @@ impl<'a> Lower<'a> {
         Ok(Some(v))
     }
 
+    /// (heapcap) A view index the title computed itself (root type
+    /// `ResourceHeap`), in the current block: as it is below
+    /// `title_view_limit`; at or past it, clamped to that limit (a null
+    /// slot), or with `title_remap_len` set the host slot the remap table
+    /// (`SLOT_REMAP`) gives. The table is read whatever the index (one
+    /// dword, the same for every index below the limit), the choice is a
+    /// select: no branch on the common path.
+    fn title_index(&mut self, index: V) -> V {
+        let c = self.cur;
+        let limit = super::shader::title_view_limit();
+        let len = super::shader::title_remap_len();
+        if limit == 0 || len == 0 {
+            return self.s.title_view_index(c, index);
+        }
+        let base = self.s.m.i32(limit);
+        let past = self.s.m.bin(c, Bin::Sub, index, base);
+        let last = self.s.m.i32(len);
+        let i32t = self.s.t.i32;
+        let k = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[past, last]);
+        self.s.m.tag(k, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, k, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_REMAP);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        let remapped = self.as_int(f);
+        let below = self.s.m.cmp(c, pred::IULT, index, base);
+        self.s.m.select(c, below, index, remapped)
+    }
+
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
@@ -6722,7 +6764,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -6752,7 +6795,12 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(if root == Some(RootType::ResourceHeap) && !sampler {
+            self.title_index(index)
+        } else {
+            index
+        })
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -6762,7 +6810,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -6792,7 +6841,12 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(if root == Some(RootType::ResourceHeap) && !sampler {
+            self.title_index(index)
+        } else {
+            index
+        })
     }
 
     fn integer(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {

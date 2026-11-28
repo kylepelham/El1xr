@@ -438,6 +438,7 @@ def test_a_train_run_holds_the_gpu_lock_and_quiets_builds_as_train(tmp_path, mon
     def fake_run(cmd, log_path, seconds, monitor=None):
         events.append(("run", seconds))
         log_path.write_text("", encoding="utf-8")
+        return dev.RunEnd(True, 0)
 
     no_game(dev, monkeypatch)
     monkeypatch.setattr(dev, "_quiet", fake_quiet)

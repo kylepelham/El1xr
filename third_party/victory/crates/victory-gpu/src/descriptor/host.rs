@@ -17,11 +17,14 @@ use crate::host::host;
 mod buffer_format;
 mod copy_first;
 mod flicker;
+pub(crate) mod heap_cap;
+mod heap_remap;
 mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
 mod list_views;
+pub(crate) mod mirror_known;
 pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
@@ -1490,6 +1493,7 @@ pub(crate) fn probe_view_limit() {
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
+        heap_cap::tell_translator(views - 1);
     });
 }
 
@@ -1624,7 +1628,8 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // The null slot every index past the heap reads is the heap's last,
         // past the dynamic slots (`probe_view_limit`): all of them are free.
-        let taken = DynamicBits::new(extra as usize);
+        let mut taken = DynamicBits::new(extra as usize);
+        let reserved = heap_cap::reserve(&mut taken, sampler, count, extra);
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -1670,7 +1675,7 @@ impl HostHeap {
             released: Condvar::new(),
             timed_out_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             timed_out_min: std::sync::atomic::AtomicU32::new(u32::MAX),
-            free: std::sync::atomic::AtomicU32::new(extra),
+            free: std::sync::atomic::AtomicU32::new(extra - reserved),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1713,6 +1718,7 @@ impl HostHeap {
             "host descriptor heap made null"
         );
         heap_notices::born(h.id, h.sampler);
+        heap_remap::born(&h);
         Some(h)
     }
 
@@ -1887,6 +1893,7 @@ impl HostHeap {
         taken.set_taken(first, n);
         self.free
             .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        heap_cap::note_free(self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -3584,6 +3591,24 @@ impl HostHeap {
             .map(|(view, _)| view)
     }
 
+    /// [`HostHeap::mirror`] for a draw, for a caller that has just looked up a view at `handle`
+    /// and does not want it back (`State::tables`, the title's own slot of a texture a table
+    /// reads). With `VICTORY_MIRROR_KNOWN=1` a slot that already shows the record's view is left
+    /// as it is without looking the view up a second time ([`mirror_known::shows`]); everything
+    /// else goes to `mirror` as before.
+    pub(crate) fn mirror_known(&self, index: u32, handle: u64) {
+        if mirror_known::on() && index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let shown = self.made_too[index as usize].load(std::sync::atomic::Ordering::Acquire);
+            if mirror_known::shows(record, shown) {
+                mirror_known::skipped();
+                return;
+            }
+        }
+        let _ = self.mirror(index, handle, true);
+    }
+
     /// [`HostHeap::mirror`] for the pass over slots whose buffer view was
     /// written (`heap_buffers` in the draw code): a slot it mirrors is not
     /// handed back to the pass as changed, which made it look at every
@@ -3602,6 +3627,7 @@ impl HostHeap {
         if index < self.count {
             return true;
         }
+        heap_cap::made_past(index, self.count, for_draw);
         // Diagnostic (NVIDIA heap cap): the highest title slot past the
         // host heap seen so far.
         static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

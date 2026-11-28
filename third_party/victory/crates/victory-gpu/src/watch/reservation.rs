@@ -9,6 +9,8 @@ static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(super) mod outside;
 /// (worldstream) `VICTORY_HOT_SKIP=1`: ranges rewritten whole answered without the kernel.
 mod hot;
+/// (critpath) `VICTORY_ASK_QUIET_SKIP=<askings>`: ranges found clean lately answered from the journal.
+pub(super) mod quiet;
 
 pub(super) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -35,6 +37,7 @@ pub(super) fn count_kernel(pages: usize) {
 pub(crate) fn line(frames: f64) {
     super::ask_split::line(frames);
     hot::line(frames);
+    quiet::line(frames);
     super::look_skip::line(frames);
     if stats() && frames > 0.0 {
         let _journal = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
@@ -271,7 +274,11 @@ fn ask_timed(ranges: &[(usize, usize)], started: std::time::Instant) {
 /// so every still-active view sees it. The regular guard and next-query
 /// paths are unchanged. Called only after the actual write completed.
 pub(super) fn completed_write(at: usize, len: usize) {
-    if !enabled() || len == 0 || !ask_once_active() {
+    if !enabled() || len == 0 {
+        return;
+    }
+    quiet::forget(at, len);
+    if !ask_once_active() {
         return;
     }
     let first = at / PAGE;
@@ -321,14 +328,19 @@ fn run(j: &mut Journal, pieces: &[(usize, usize)]) {
     j.ordered = true;
     j.kept = !pieces.is_empty();
     let hot = hot::Round::begin();
+    let quiet = quiet::Round::begin();
     j.ahead = plan(pieces, |first, last| {
         if let Some(all) = hot.skipping(first, last) {
             note_kernel_batch(&all, j.ahead_asked);
             return true;
         }
+        if quiet.skipping(first, last) {
+            return true;
+        }
         let found = ask_kernel_found(j, first, last);
         if let Some(found) = found {
             hot.judge(first, last, found);
+            quiet.judge(first, last, &j.found[..found]);
         }
         found.is_some()
     });

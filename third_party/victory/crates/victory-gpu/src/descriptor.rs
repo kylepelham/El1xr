@@ -20,6 +20,8 @@ pub(crate) mod host;
 mod sync_in_place;
 #[cfg(windows)]
 mod tabled_all;
+#[cfg(windows)]
+pub(crate) mod views_once;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -235,6 +237,10 @@ pub(crate) fn sync_heaps() {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
         let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) {
+            let null = victory_shader::emit::view_heap_limit();
+            host::heap_cap::watch(start, u64::from(step), host, heap.desc.count, null);
+        }
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -257,6 +263,7 @@ pub(crate) fn sync_heaps() {
         if let Some(retries) = &mut retries {
             retries.include_due(crate::frame::current(), start as usize, end as usize, &mut ranges);
         }
+        host::heap_cap::note_writes(&ranges, start, step, host.count(), heap.desc.count);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -1243,7 +1250,7 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::table_prof::timed_read(|| VIEWS.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
@@ -1552,14 +1559,24 @@ pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
+    view_with(i, generation, &mut None)
+}
+
+/// [`view_at`] with the lookup lock's read side taken into `held` if needed and kept there
+/// (`views_once`: one hold for a table's slots).
+fn view_with(
+    i: u32,
+    generation: u32,
+    held: &mut Option<std::sync::RwLockReadGuard<'static, Views>>,
+) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
+            let views = held.get_or_insert_with(views_read);
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => held.get_or_insert_with(views_read).placed_of(i, generation),
         _ => None,
     }
 }

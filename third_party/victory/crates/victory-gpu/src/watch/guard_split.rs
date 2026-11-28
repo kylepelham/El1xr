@@ -162,6 +162,7 @@ pub(super) fn log(frames: f64) {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|a| a.swap(0, Relaxed)).collect();
+    let marks = super::hole_marks::STATS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
     let ms = |p: S| s[p as usize] as f64 / (frames * 1000.0);
     let per = |p: S| s[p as usize] as f64 / frames;
     let mut excl = String::new();
@@ -186,7 +187,8 @@ pub(super) fn log(frames: f64) {
         "guard path split per frame (VICTORY_FLUSH_PROF, VICTORY_GUARD_NOTE_ONCE={}): \
          shared lock {:.0} holds, {:.2} ms waiting; checks before the walk {:.2} ms ({:.0} calls, \
          {:.0} answered there; their hole queries {:.0} in {:.2} ms; holes kept {:.0}, \
-         VICTORY_GUARD_HOLES_KEPT={}); \
+         VICTORY_GUARD_HOLES_KEPT={}; hole marks {:.0} answered, {:.0} queries, {:.0} runs marked, \
+         {:.0} free left unmarked, {:.0} lost to a commit told meanwhile, VICTORY_GUARD_HOLE_MARKS={}); \
          walk {:.2} ms (alias lookups {:.2} ms; its VirtualProtects are the split line's); \
          noting after it {:.2} ms (publish {:.2} ms, {:.1} blocks left unpublished, \
          VICTORY_GUARD_PUBLISH_TRY={}); VirtualQuery {:.0} in {:.2} ms (all threads); \
@@ -203,6 +205,12 @@ pub(super) fn log(frames: f64) {
         ms(S::PreHoleNs) / 1000.0,
         super::holes::KEPT_HITS.swap(0, Relaxed) as f64 / frames,
         u8::from(super::holes::kept_on()),
+        marks[0],
+        marks[1],
+        marks[2],
+        marks[3],
+        marks[4],
+        super::hole_marks::mode(),
         ms(S::WalkUs),
         ms(S::AliasUs),
         ms(S::NoteUs),

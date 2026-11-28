@@ -172,6 +172,10 @@ pub(crate) fn wait(
     if !candidate(t) {
         return false;
     }
+    // (El1xr) `VICTORY_STAGING_HOLD_MS` let its staging buffer go: never a null slot for it.
+    if crate::staging_hold::reads_as_is(resource as usize, t.filled) {
+        return false;
+    }
     if reads_filled(t, crate::texture::prepare::prune_safe()) {
         STATS[3].fetch_add(1, Relaxed);
         crate::flicker_catch::count(crate::flicker_catch::Kind::TableKeptFilled);

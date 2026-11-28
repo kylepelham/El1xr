@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use super::queue::{Call, Outcome, Queue, Script};
+use super::{finder, teleport};
 use crate::menu::model::{Applied, Apply, Info, Kind, MenuModel, SetError};
 
 /// What an option does.
@@ -82,6 +83,9 @@ pub const HOLD: &[&str] = &[
     "off", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
     "16", "17", "18", "19", "20", "21", "22", "23",
 ];
+
+/// The finders' one value: a button that starts (or restarts) them; the row shows their progress.
+pub const RUN: &[&str] = &["run"];
 
 /// The hour the clock is held at (`-1`: no hold). The game-thread hook sets the clock to it on
 /// every tick, so the title's own scripts (the prologue puts 7:30 back within 10 s) cannot move it.
@@ -162,7 +166,9 @@ fn clock_time(v: &str) -> Vec<u64> {
 
 // Rows in menu order: per tab, what works first. `verified`: batch 5 part I read the clock (12:00,
 // 8:00, 7:30 as the prologue sets it), the frame rate (60 while loading, 30 in game) and set the
-// hour (read 3 right after; the prologue's script put 7:30 back within 10 s, hence the hold).
+// hour (read 3 right after; the prologue's script put 7:30 back within 10 s, hence the hold);
+// batch 5 item 5 held the clock at 3 to the end and read a constant player handle and a position
+// that moved with the scene.
 pub const OPTIONS: &[Opt] = &[
     Opt {
         info: info(
@@ -215,7 +221,7 @@ pub const OPTIONS: &[Opt] = &[
         info: info(
             "MOD_CLOCK_HOLD",
             "World",
-            "Hold hour (unverified)",
+            "Hold hour",
             "Sets the clock to this hour on every game tick, so scripts cannot move it. Off lets the \
              clock run again.",
             Kind::Choice(HOLD),
@@ -224,13 +230,13 @@ pub const OPTIONS: &[Opt] = &[
             get: hold_get,
             set: hold_set,
         },
-        verified: false,
+        verified: true,
     },
     Opt {
         info: info(
             "MOD_PLAYER_COORDS",
             "Player",
-            "Position (unverified)",
+            "Position",
             "The player's x y z: the player ped's handle, then that entity's coordinates.",
             Kind::Text,
         ),
@@ -240,13 +246,13 @@ pub const OPTIONS: &[Opt] = &[
             script: Some(player_coords),
             show: show_xyz,
         },
-        verified: false,
+        verified: true,
     },
     Opt {
         info: info(
             "MOD_PLAYER_PED",
             "Player",
-            "Player ped handle (unverified)",
+            "Player ped handle",
             "The player ped's 128-bit entity handle; stays the same while the player does.",
             Kind::Text,
         ),
@@ -255,6 +261,131 @@ pub const OPTIONS: &[Opt] = &[
             args: &[],
             script: None,
             show: show_handle,
+        },
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_NATIVE",
+            "Teleport",
+            "Teleport native",
+            "The native the teleport rows call: found in game by Find teleport, or named by \
+             VICTORY_MOD_MENU_TP_NATIVE.",
+            Kind::Text,
+        ),
+        effect: Effect::Status(teleport::native_status),
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_LAST",
+            "Teleport",
+            "Last teleport",
+            "What the last save or teleport did, with the position read back after it.",
+            Kind::Text,
+        ),
+        effect: Effect::Status(teleport::last_get),
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_SAVE_1",
+            "Teleport",
+            "Save spot 1 (unverified)",
+            "Saves where the player stands as spot 1 (kept until the game closes). Shows the spot.",
+            Kind::Choice(teleport::SAVE),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_1,
+            set: teleport::save_1,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_SAVE_2",
+            "Teleport",
+            "Save spot 2 (unverified)",
+            "Saves where the player stands as spot 2 (kept until the game closes). Shows the spot.",
+            Kind::Choice(teleport::SAVE),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_2,
+            set: teleport::save_2,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_SAVE_3",
+            "Teleport",
+            "Save spot 3 (unverified)",
+            "Saves where the player stands as spot 3 (kept until the game closes). Shows the spot.",
+            Kind::Choice(teleport::SAVE),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_3,
+            set: teleport::save_3,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_GOTO_1",
+            "Teleport",
+            "Go to spot 1 (unverified)",
+            "Moves the player to spot 1 through the teleport native and reads the position back \
+             (Last teleport shows how close it landed).",
+            Kind::Choice(teleport::GO),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_1,
+            set: teleport::goto_1,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_GOTO_2",
+            "Teleport",
+            "Go to spot 2 (unverified)",
+            "Moves the player to spot 2 through the teleport native and reads the position back \
+             (Last teleport shows how close it landed).",
+            Kind::Choice(teleport::GO),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_2,
+            set: teleport::goto_2,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_GOTO_3",
+            "Teleport",
+            "Go to spot 3 (unverified)",
+            "Moves the player to spot 3 through the teleport native and reads the position back \
+             (Last teleport shows how close it landed).",
+            Kind::Choice(teleport::GO),
+        ),
+        effect: Effect::Own {
+            get: teleport::spot_3,
+            set: teleport::goto_3,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_TP_FIND",
+            "Teleport",
+            "Find teleport (unverified)",
+            "Tries each candidate native on the player with a spot 3 m away and keeps the first \
+             that lands the player there, then moves the player back. Logged line by line.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::tp_get,
+            set: finder::tp_set,
         },
         verified: false,
     },
@@ -296,6 +427,21 @@ pub const OPTIONS: &[Opt] = &[
             show: show_int,
         },
         verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_GET_SWEEP",
+            "Status",
+            "Getter sweep (unverified)",
+            "Logs every candidate getter's value for the player (health, armour and wanted level \
+             are among them), then 60 s later the ones that changed. For mapping, not play.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::get_get,
+            set: finder::get_set,
+        },
+        verified: false,
     },
 ];
 
@@ -540,7 +686,11 @@ mod tests {
             panic!("a set row")
         };
         assert_eq!(hash, NATIVE_SET_CLOCK_TIME);
-        assert_eq!(args("13"), vec![13, 0, 0, 0], "hour, minute 0, second 0, flag 0");
+        assert_eq!(
+            args("13"),
+            vec![13, 0, 0, 0],
+            "hour, minute 0, second 0, flag 0"
+        );
         assert!(victory_core::settings::valid(set.info.kind, "0"));
         assert!(!victory_core::settings::valid(set.info.kind, "24"));
         let t = Trainer::new(OPTIONS, queue());
@@ -549,6 +699,7 @@ mod tests {
             vec![
                 Tab::Group("World"),
                 Tab::Group("Player"),
+                Tab::Group("Teleport"),
                 Tab::Group("Status")
             ],
             "opens on the clock, which works"
@@ -565,6 +716,32 @@ mod tests {
                 o.info.group
             );
         }
+    }
+
+    #[test]
+    fn teleport_rows_are_buttons_that_queue_their_spot_on_the_game_thread() {
+        use crate::menu::state::step_value;
+        let mut t = Trainer::new(OPTIONS, queue());
+        let save = OPTIONS.iter().find(|o| o.info.name == "MOD_TP_SAVE_2").unwrap();
+        let shown = t.get("MOD_TP_SAVE_2").unwrap();
+        assert_eq!(shown, "empty", "the row shows the spot");
+        assert_eq!(
+            step_value(save.info.name, save.info.kind, &shown, 1).as_deref(),
+            Some("save"),
+            "each press is a change, so each press saves"
+        );
+        assert_eq!(t.set("MOD_TP_SAVE_2", "save"), Ok(Applied::Now));
+        assert_eq!(t.set("MOD_TP_GOTO_3", "go"), Ok(Applied::Now));
+        assert_eq!(t.set("MOD_TP_FIND", "run"), Ok(Applied::Now));
+        assert!(t.get("MOD_TP_FIND").unwrap().starts_with("trying 1/"));
+        finder::tp_set("off");
+        let mut seen = Vec::new();
+        super::super::QUEUE.drain(|c| {
+            seen.push((c.name, c.args.clone()));
+            None
+        });
+        assert!(seen.contains(&("tp save", vec![2])), "{seen:?}");
+        assert!(seen.contains(&("tp goto", vec![3])), "{seen:?}");
     }
 
     #[test]
@@ -635,7 +812,7 @@ mod tests {
             "no ped, no read"
         );
         assert!(
-            working_status().starts_with("4 of 7 confirmed"),
+            working_status().starts_with("7 of 15 confirmed"),
             "{}",
             working_status()
         );

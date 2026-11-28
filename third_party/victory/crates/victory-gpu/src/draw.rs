@@ -585,10 +585,12 @@ pub(crate) struct State {
     /// avoid per-draw heap allocations.
     scratch_made: Vec<(u8, u32)>,
     scratch_selected: Vec<u32>,
+    /// (`VICTORY_TABLE_VIEWS_ONCE`) The views of the table being made, looked up together.
+    table_views: crate::descriptor::views_once::TableViews,
     scratch_textures: Vec<usize>,
     /// Tables made afresh in this list: (table, slot count, contents) → (first
     /// dynamic slot, scratch CBV epoch if backed by scratch constants).
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Option<u64>)>,
+    fresh_tables: crate::bind_hash::Map<(u64, u32, u64), (u32, Option<u64>)>,
     /// This recording of the list, for the views its fresh tables hold
     /// (`VICTORY_LIST_VIEWS`, `HostHeap::make_listed`; 0: none yet).
     recording: u64,
@@ -596,12 +598,12 @@ pub(crate) struct State {
     /// (`readable`) with nothing to do again while the host list's count of state
     /// changes stands: the host list, that count, and the textures the table shows.
     /// A draw that only tests its depth target and reads it too is not among them.
-    ready_tables: std::collections::HashMap<(u64, u32, u64), (usize, u64, Vec<usize>)>,
+    ready_tables: crate::bind_hash::Map<(u64, u32, u64), (usize, u64, Vec<usize>)>,
     /// (Neptune) The tables (address, slot count, contents) this list has seen, with tables
     /// told apart by their contents alone (`tables_by_content`): one at a new address whose
     /// contents another had takes that one's host slots, and only its own title slots'
     /// notes are made here.
-    seen_tables: std::collections::HashSet<(u64, u32, u64)>,
+    seen_tables: crate::bind_hash::Set<(u64, u32, u64)>,
     /// The dynamic slots the list holds: title heap, host heap identity,
     /// first, count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
@@ -609,9 +611,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: crate::bind_hash::Map<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::bind_hash::Map<(usize, u64), RootSlot>,
     /// The tables the last bind made afresh for a program the stand-in for
     /// the indirect light follows (`crate::ambient`): root parameter, bytes
     /// into the view heap.
@@ -970,6 +972,8 @@ impl Drop for BindLap {
 
 /// With the frame line: [`BIND_NS`] per frame over `frames`, taken.
 pub(crate) fn bind_split_line(frames: f64) {
+    crate::table_prof::line(frames);
+    crate::descriptor::host::mirror_known::line(frames);
     if !bind_split() {
         return;
     }
@@ -1252,6 +1256,7 @@ impl State {
             scratch_made,
             scratch_selected,
             scratch_textures,
+            table_views,
             fresh_tables,
             recording,
             ready_tables,
@@ -1315,6 +1320,7 @@ impl State {
         *host_ib_list_changes = 0;
         scratch_made.clear();
         scratch_selected.clear();
+        table_views.clear();
         scratch_textures.clear();
         fresh_tables.clear();
         if fresh_tables.capacity() > 4096 {
@@ -2245,6 +2251,23 @@ impl State {
                                 param,
                                 RootResource::Srv(m.directory),
                             );
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_REMAP {
+                        // (heapcap) Ours: the host slots of title view slots past the host heap's.
+                        let host = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host());
+                        match host.and_then(|h| crate::descriptor::host::heap_cap::remap_root(list, h)) {
+                            Some(gpu) => {
+                                self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+                            }
+                            None => once!("a shader reads the view remap table without a view heap"),
                         }
                         continue;
                     }
@@ -3376,14 +3399,14 @@ impl State {
         if spread {
             let ahead = std::time::Instant::now();
             if room {
-                crate::bake_ahead::host_copies_of(heap, &due[..pinned], budget, 2);
+                crate::bake_ahead::host_copies_of(heap, &due[..pinned], budget, 2, 512 << 20);
             }
             let took = ahead.elapsed();
             crate::bake_spread::add(crate::bake_spread::C::AheadUs, took.as_micros() as u64);
             budget = crate::bake_spread::budget_left(spread_mode, budget, took);
         } else if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
             let ahead = std::time::Instant::now();
-            crate::bake_ahead::host_copies(heap, &due, budget);
+            crate::bake_ahead::host_copies(heap, &due, budget, PASS_BUDGET.get().map_or(0, |b| b.1));
             budget = crate::bake_ahead::left_after(budget, ahead.elapsed());
         }
         let mut laps = Laps::new();
@@ -3393,10 +3416,10 @@ impl State {
         // Several slots can show the same texture from the same mip. The list
         // holds each upload even after its staging entry is removed. Reuse
         // it within this pass, where there are no intervening title copies.
-        let mut uploaded: std::collections::HashMap<
+        let mut uploaded: crate::bind_hash::Map<
             (usize, u32),
             Option<((u64, u64), u64, bool)>,
-        > = std::collections::HashMap::new();
+        > = crate::bind_hash::Map::default();
         for (i, (index, write)) in due.into_iter().enumerate() {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);
@@ -4615,6 +4638,7 @@ impl State {
             if let Some(&(first, epoch)) = self.fresh_tables.get(&key)
                 && epoch.is_none_or(|e| e == cbv_epoch)
             {
+                let prof = crate::table_prof::now();
                 if tables_by_content() && self.seen_tables.insert(here) {
                     // Another table's host slots; this one's own title slots are noted as
                     // its making would have noted them.
@@ -4635,7 +4659,7 @@ impl State {
                                 });
                                 host.texture_slot_tabled(title + k, kind.is_some());
                                 if kind.is_some() {
-                                    host.mirror(title + k, handle, true);
+                                    host.mirror_known(title + k, handle);
                                 }
                             }
                         }
@@ -4658,6 +4682,7 @@ impl State {
                             && (tested == 0 || !ready_textures.contains(&tested)) =>
                     {
                         TABLES[0].fetch_add(1, Ordering::Relaxed);
+                        crate::table_prof::done(crate::table_prof::P::Ready, prof);
                         made.push((slot, first * 32));
                         continue;
                     }
@@ -4688,12 +4713,26 @@ impl State {
                         textures.push(*resource);
                     }
                 };
+                let views = &mut self.table_views;
+                let looked = crate::table_prof::now();
+                // (Together only when the asks cover half the table or more.)
+                if (entries.len() + selected.len()) * 2 >= n as usize {
+                    views.fill(table, n);
+                } else {
+                    views.clear();
+                }
+                crate::table_prof::part(crate::table_prof::P::Lookup, looked);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv)
                 {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    let looked = crate::table_prof::now();
+                    let view = views.get(handle);
+                    crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                    if let Some(view) = view {
                         note(u.kind, &view);
+                        let checked = crate::table_prof::now();
                         readable(list, u.kind, &view);
+                        crate::table_prof::part(crate::table_prof::P::Readable, checked);
                     }
                 }
                 for &k in &selected {
@@ -4701,13 +4740,19 @@ impl State {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
+                    let looked = crate::table_prof::now();
+                    let view = views.get(handle);
+                    crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                    if let Some(view) = view
                         && let Some(kind) = view_kind(&view)
                     {
                         note(kind, &view);
+                        let checked = crate::table_prof::now();
                         readable(list, kind, &view);
+                        crate::table_prof::part(crate::table_prof::P::Readable, checked);
                     }
                 }
+                views.clear();
                 if plain && (tested == 0 || !textures.contains(&tested)) {
                     let changes = list.changes.load(Ordering::Relaxed);
                     match self.ready_tables.entry(key) {
@@ -4730,6 +4775,7 @@ impl State {
                 } else {
                     self.ready_tables.remove(&key);
                 }
+                crate::table_prof::done(crate::table_prof::P::Again, prof);
                 made.push((slot, first * 32));
                 continue;
             }
@@ -4740,6 +4786,7 @@ impl State {
                 continue;
             };
             let mut scratch_epoch = None;
+            let prof = crate::table_prof::now();
             self.seen_tables.insert(here);
             TABLES[2].fetch_add(1, Ordering::Relaxed);
             TABLES[3].fetch_add(u64::from(n), Ordering::Relaxed);
@@ -4755,6 +4802,10 @@ impl State {
             let mut plain = ready_tables_on() && !group.has_uav;
             let mut deferred = false;
             textures.clear();
+            let views = &mut self.table_views;
+            let looked = crate::table_prof::now();
+            views.fill(table, n);
+            crate::table_prof::part(crate::table_prof::P::Lookup, looked);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -4765,7 +4816,10 @@ impl State {
                 if let Some(title) = title_first {
                     host.table_slot(title + k);
                 }
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let looked = crate::table_prof::now();
+                let view = views.get(table + u64::from(k) * 32);
+                crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                match view {
                     Some(View::Constant(address, size)) => {
                         let written = crate::port_cbv::written_level();
                         if written > 0
@@ -4873,6 +4927,7 @@ impl State {
                             deferred = true;
                             continue;
                         }
+                        let making = crate::table_prof::now();
                         match group
                             .has_half(k * 8)
                             .then(|| crate::descriptor::host::half_view(&view))
@@ -4892,6 +4947,7 @@ impl State {
                                 }
                             }
                         }
+                        crate::table_prof::part(crate::table_prof::P::Make, making);
                         let kind = entry.map(|u| u.kind).or_else(|| {
                             selected
                                 .binary_search(&k)
@@ -4915,7 +4971,9 @@ impl State {
                                 }
                             }
                             crate::table_defer::serving(title_first.map(|t| t + k));
+                            let checked = crate::table_prof::now();
                             readable(list, kind, &view);
+                            crate::table_prof::part(crate::table_prof::P::Readable, checked);
                             crate::table_defer::serving(None);
                         } else {
                             // Another shader sharing this table may read this slot, so do not
@@ -4930,10 +4988,12 @@ impl State {
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
+                            let titled = crate::table_prof::now();
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                                host.mirror_known(title + k, table + u64::from(k) * 32);
                             }
+                            crate::table_prof::part(crate::table_prof::P::Title, titled);
                         }
                     }
                     None => {
@@ -4944,6 +5004,7 @@ impl State {
                     }
                 }
             }
+            views.clear();
             if !deferred {
                 self.fresh_tables.insert(key, (first, scratch_epoch));
             }
@@ -4964,6 +5025,7 @@ impl State {
             } else {
                 self.ready_tables.remove(&key);
             }
+            crate::table_prof::done(crate::table_prof::P::Made, prof);
             made.push((slot, first * 32));
         }
         self.scratch_selected = selected;
