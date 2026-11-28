@@ -165,6 +165,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_SPLIT_AHEAD", "Clamps split indirect dispatches in the list prelude, not in place."),
     ("VICTORY_SPLIT_RAW", "Runs split indirect dispatches in one piece from the game's record."),
     ("VICTORY_STAGING_BLOCKS", "Takes staging buffers from shared upload blocks instead of making each."),
+    ("VICTORY_STAGING_FLIGHT_WAIT", "Detiles into a spare staging buffer while a copy may still read it."),
     ("VICTORY_STAGING_HOLD_MS", "How long an unused staging buffer is kept when memory is low, in ms."),
     ("VICTORY_STAGING_UNDER_FLIGHT", "Counts staging rewrites while a copy from them may still run."),
     ("VICTORY_STALE_ASIDE", "Checks title writes under flights' shader writes beside the walk."),
