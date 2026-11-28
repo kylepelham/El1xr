@@ -168,6 +168,7 @@ pub use shader::{
     title_view_limit, view_heap_limit, REMAP_BASE, REMAP_LEN, SLOT_REMAP, set_title_remap_len,
     title_remap_len, FULL_REMAP, set_title_remap_full, title_remap_full, FAULT_DWORDS, FAULT_FLAG,
     set_title_fault_slot, title_fault_slot, SLOT_VIEW_ADDRESSES, VIEW_ADDRESSES_COUNT,
+    LOOP_CAP_PROGRAMS, SLOT_LOOP_CAP, USER_LOOP_CAP_ID,
 };
 pub use lower::thread_limit::on as dispatchx_mask;
 pub use lower::heap_address::on as heap_view_address;

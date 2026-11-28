@@ -173,6 +173,8 @@ mod trips;
 pub(super) mod thread_limit;
 #[path = "loop_keep.rs"]
 pub(super) mod loop_keep;
+#[path = "loop_watch.rs"]
+pub(super) mod loop_watch;
 
 type Why = &'static str;
 
@@ -8333,10 +8335,14 @@ impl<'a> Lower<'a> {
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
+                // (`VICTORY_LOOP_CAP_WATCH`) An exit at the limit is counted on its way.
+                let [(t, from_t), (f, from_f)] = self.watch_exits(b, (taken, t), (not_taken, f));
+                for (to, via, watched) in [(taken, t, from_t), (not_taken, f, from_f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
+                        let from = if let Some(from) = watched {
+                            from
+                        } else if Some(via) == self.block[to] {
                             self.cur
                         } else {
                             via
@@ -8413,6 +8419,10 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        // (`VICTORY_LOOP_CAP_WATCH`) Counted before the discard: a helper lane writes nothing.
+        if loop_watch::on() {
+            self.cap_hit(a, loop_watch::ENDED);
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

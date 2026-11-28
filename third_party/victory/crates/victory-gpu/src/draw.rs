@@ -1894,6 +1894,10 @@ impl State {
         if kind == victory_shader::emit::USER_THREAD_LIMIT {
             return crate::rt_diag::thread_limit();
         }
+        // Per stage, set by `bind` (`Shader::loop_cap`).
+        if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+            return 0;
+        }
         // The spliced traces (glass, shadow) take their ray queries only with their host top
         // levels bound.
         if kind == victory_shader::emit::USER_GLASS_NATIVE {
@@ -2259,8 +2263,11 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                        values[u.index as usize] = if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+                            stage.shader.loop_cap()
+                        } else {
+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref())
+                        };
                         continue;
                     }
                     let fresh = made
@@ -2420,6 +2427,13 @@ impl State {
                     if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list)
                         && compute
                     {
+                        self.bind_resource(list, compute, param, RootResource::Uav(gpu));
+                    }
+                    continue;
+                }
+                if slot == victory_shader::emit::SLOT_LOOP_CAP {
+                    // Ours: where shaders count lanes stopped at a loop's limit.
+                    if let Some(gpu) = crate::loop_cap::bind() {
                         self.bind_resource(list, compute, param, RootResource::Uav(gpu));
                     }
                     continue;

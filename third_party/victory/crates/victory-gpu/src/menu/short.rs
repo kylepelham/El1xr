@@ -98,6 +98,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_LDS_UNIFORM_STRICT", "Stricter check before treating a shared-memory read as wave-uniform."),
     ("VICTORY_LOG", "Log filter, such as info or debug."),
     ("VICTORY_LOOPS_WAVE", "Translates wave64 compute loops so each host wave branches together."),
+    ("VICTORY_LOOP_CAP_WATCH", "Logs which translated programs stop loops at the iteration limit."),
     ("VICTORY_LOOP_KEEP", "Loops cut at the iteration limit keep their result, not discarding."),
     ("VICTORY_LOOP_ROOM", "Iteration limit of translated pixel, vertex and mesh loops."),
     ("VICTORY_MAP_THREADS_ALL", "Runs the remaining memory mapping calls on the mapping threads too."),
