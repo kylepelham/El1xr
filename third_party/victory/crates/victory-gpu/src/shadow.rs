@@ -7026,6 +7026,25 @@ impl Shadow {
         Some((card.staging.as_ref(), before, card.size))
     }
 
+    /// (`VICTORY_SEND_OWN`) Copies `len` bytes of a card copy's CPU side from
+    /// offset `at` to `dst`, under the side's stripe locks. False if it has
+    /// no CPU side or the bytes are not in it.
+    ///
+    /// # Safety
+    /// `dst` is valid for `len` bytes of writes.
+    pub(crate) unsafe fn card_side_take(&self, at: usize, len: usize, dst: *mut u8) -> bool {
+        let Some(card) = self.card.as_ref().filter(|c| c.staging.is_some()) else {
+            return false;
+        };
+        if at.checked_add(len).is_none_or(|end| end as u64 > card.size) {
+            return false;
+        }
+        let _side = card.lock_side(at, len);
+        // SAFETY: `data` maps the CPU side's `size` bytes; the caller's `dst`.
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(at).cast_const(), dst, len) };
+        true
+    }
+
     /// Shader writes are declared for a copy in the card's memory: makes
     /// its "before" twin with `make` (bytes to buffer) if it has none.
     /// Whether one was made now: the caller fills it, whole, from the

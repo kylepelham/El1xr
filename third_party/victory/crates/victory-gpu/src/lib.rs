@@ -177,6 +177,8 @@ mod hold_frame;
 mod flicker_catch;
 #[cfg(windows)]
 mod present_own;
+#[cfg(windows)]
+mod send_own;
 mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;
