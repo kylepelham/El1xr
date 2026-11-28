@@ -145,6 +145,7 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
         ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+            || crate::bake_name::extra(s)
     })
 }
 

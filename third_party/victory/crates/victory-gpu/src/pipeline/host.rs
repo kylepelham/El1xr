@@ -581,7 +581,10 @@ impl HostPipeline {
         let is_bake = compute.is_none()
             && bound
                 .iter()
-                .any(|s| crate::draw::BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+                .any(|s| {
+                    crate::draw::BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())
+                        || crate::bake_name::extra(&s.shader)
+                });
         // (fxceless/victory-fork b1d777a) The launch stage's parameters after the
         // translated stages' (five root words); without them if over the limit.
         let mut launch_roots = (mesh.is_some() && crate::launch::on()).then(|| launch::add_params(&mut params));

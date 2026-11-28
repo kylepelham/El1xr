@@ -3863,6 +3863,21 @@ impl HostHeap {
         (made, textures.slots.get(&index).map(|w| w.due <= frame))
     }
 
+    /// (`VICTORY_BAKE_FRESH`) Slot `index`'s memory and fingerprint at its last whole upload, and
+    /// whether it is live, while it is looked at again (None: not uploaded whole, or the looks
+    /// are over).
+    pub(crate) fn texture_slot_print(&self, index: u32) -> Option<((u64, u64), u64, bool)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.rechecks.get(&index).map(|r| (r.at, r.print, r.live))
+    }
+
+    /// (`VICTORY_BAKE_FRESH`) Slot `index` is due at `frame` as one written now.
+    pub(crate) fn texture_slot_refresh(&self, index: u32, frame: u64) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.changed(index, frame, frame);
+        self.note_slot(index, SLOT_IN_TEXTURES, true);
+    }
+
     /// What the queue of textures picked by index knows of title slot
     /// `index` at `frame`, in a few words (diagnostics, `VICTORY_BAKE_WHY`).
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
