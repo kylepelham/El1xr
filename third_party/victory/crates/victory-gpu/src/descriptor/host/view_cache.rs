@@ -23,6 +23,19 @@
 //!
 //! After fxceless/victory-fork PR #1484 (`VICTORY_TABLE_VIEW_CACHE`,
 //! KainanP), written for our `make`. Line: table views per frame.
+//!
+//! (entryhitch, #16) `VICTORY_TABLE_VIEW_CACHE_BUFFERS=1` (Live, off by
+//! default; on its own or with the texture switch): buffer shader views
+//! too, of buffer objects and of placed memory. Such a view is made on the
+//! host copies of title memory it reads (`buffer_srv_copies`: its buffer's,
+//! and the copy of its own bytes if it has one), and an entry is copied
+//! only while those copies are the same ones by number (`Shadow::id`, never
+//! given twice): a title buffer released and another made at the same
+//! address gets new copies with new numbers, so its record is made again
+//! and no slot is copied with a descriptor of a buffer let go. The ids are
+//! the entry's generations; the copies themselves are found as making the
+//! view finds them, and the slot keeps the one it shows alive (`keep`).
+//! Unordered access is still made in the slot (its making notes writes).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -41,23 +54,52 @@ pub(crate) fn on() -> bool {
     ON.get_bool()
 }
 
+static BUFFERS: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_TABLE_VIEW_CACHE_BUFFERS");
+
+/// Whether buffer shader views are kept too (`VICTORY_TABLE_VIEW_CACHE_BUFFERS`).
+pub(crate) fn buffers_on() -> bool {
+    BUFFERS.get_bool()
+}
+
+/// Whether a fresh table asks the cache at all.
+pub(crate) fn any_on() -> bool {
+    on() || buffers_on()
+}
+
 /// Locks the entries are spread over, by record.
 const SHARDS: usize = 64;
 /// Slots of the heap each shard owns: 65,536 in all (2 MB).
 const PER_SHARD: u32 = 1024;
 
-/// Copied from the cache, made into it, left to the table's slot, since
-/// the last line.
-static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Copied from the cache, made into it, left to the table's slot; of
+/// those, buffer views copied and made; since the last line.
+static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// What a view shows besides its record: the title texture, its host copy,
-/// the first level shown and the levels the store filled.
+/// the first level shown and the levels the store filled; for a buffer
+/// view, the numbers of the host copies it reads (its buffer's, its own
+/// bytes' or 0), and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Shows {
     title: usize,
     copy: *const HostTexture,
     first: Option<u32>,
     prefilled: u32,
+    copies: [u64; 2],
+}
+
+impl Shows {
+    /// A buffer view on copies `whole` and `own`.
+    fn buffer(copies: &super::BufferSrvCopies) -> Shows {
+        Shows {
+            title: 0,
+            copy: std::ptr::null(),
+            first: None,
+            prefilled: 0,
+            copies: [copies.0.id(), copies.1.as_ref().map_or(0, |own| own.0.id())],
+        }
+    }
 }
 
 /// What a slot of the cache was made from.
@@ -190,6 +232,7 @@ impl ViewCache {
             copy: std::sync::Arc::as_ptr(&copy),
             first: crate::resource::first_shown(resource),
             prefilled: copy.prefilled.load(Relaxed),
+            copies: [0; 2],
         };
         let device = &crate::host::host()?.device;
         let s = shard_of(&key);
@@ -238,6 +281,72 @@ impl ViewCache {
         COUNTS[1].fetch_add(1, Relaxed);
         Some(texture)
     }
+
+    /// [`copy`](Self::copy) for a buffer shader view: from the cache while
+    /// the host copies it reads are the ones its entry was made on, else
+    /// made there on them first. `None`: not a buffer shader view, or one
+    /// the host cannot make (nothing written).
+    fn copy_buffer(
+        &self,
+        view: &View,
+        key: [u32; 3],
+        to: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<ID3D12Resource> {
+        let (address, len, desc, buffer_view) = super::buffer_srv_args(view)?;
+        let copies = super::buffer_srv_copies(address, len, &desc, buffer_view)?;
+        let shows = Shows::buffer(&copies);
+        let shown = copies.1.as_ref().map_or(&copies.0, |own| &own.0).buffer.clone();
+        let device = &crate::host::host()?.device;
+        let s = shard_of(&key);
+        let base = s as u32 * PER_SHARD;
+        let mut shard = self.shards[s].lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match shard.found(&key, &shows) {
+            Some(slot) => {
+                COUNTS[0].fetch_add(1, Relaxed);
+                COUNTS[3].fetch_add(1, Relaxed);
+                slot
+            }
+            None => {
+                let slot = shard.take(key);
+                let made = super::buffer_srv_on(
+                    copies.0,
+                    copies.1,
+                    address,
+                    len,
+                    desc,
+                    self.slot(base + slot),
+                )
+                .and_then(|(kept, _)| kept);
+                let Some(made) = made.filter(|b| b.as_raw() == shown.as_raw()) else {
+                    shard.owners[slot as usize] = None;
+                    return None;
+                };
+                drop(made);
+                shard.entries.insert(
+                    key,
+                    Entry {
+                        slot,
+                        shows,
+                        _copy: Weak::new(),
+                    },
+                );
+                COUNTS[1].fetch_add(1, Relaxed);
+                COUNTS[4].fetch_add(1, Relaxed);
+                slot
+            }
+        };
+        // SAFETY: a slot of the cache made from this record on these copies
+        // (alive: `shown` is one, the other held by the lookup); `to` a heap's slot.
+        unsafe {
+            device.CopyDescriptorsSimple(
+                1,
+                to,
+                self.slot(base + slot),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
+        };
+        Some(shown)
+    }
 }
 
 impl HostHeap {
@@ -253,7 +362,17 @@ impl HostHeap {
             COUNTS[2].fetch_add(1, Relaxed);
             return false;
         };
-        match cache().and_then(|c| c.copy(&view, words, self.cpu(index))) {
+        let made = cache().and_then(|c| {
+            let to = self.cpu(index);
+            if buffers_on() && super::buffer_srv_args(&view).is_some() {
+                return c.copy_buffer(&view, words, to);
+            }
+            if !on() {
+                return None;
+            }
+            c.copy(&view, words, to)
+        });
+        match made {
             Some(texture) => {
                 self.keep(index, Some(texture));
                 true
@@ -273,15 +392,22 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     tracing::info!(
-        "table views per frame (VICTORY_TABLE_VIEW_CACHE={}): {:.0} copied from the cache, \
-         {:.0} made into it, {:.0} made in the table as before",
+        "table views per frame (VICTORY_TABLE_VIEW_CACHE={} BUFFERS={}): {:.0} copied from the cache, \
+         {:.0} made into it, {:.0} made in the table as before; buffer views {:.0} copied, {:.0} made",
         u8::from(on()),
+        u8::from(buffers_on()),
         c[0] as f64 / frames,
         c[1] as f64 / frames,
         c[2] as f64 / frames,
+        c[3] as f64 / frames,
+        c[4] as f64 / frames,
     );
 }
 
 #[cfg(test)]
 #[path = "view_cache_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "view_cache_bench.rs"]
+mod bench;

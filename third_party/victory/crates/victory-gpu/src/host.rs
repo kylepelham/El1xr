@@ -5251,6 +5251,10 @@ impl HostList {
         self.twins_to_depth();
         self.textures_back();
         self.indirect_args_back();
+        let used = self.deferred().budget_zeroed;
+        if let Some(Some((_, _, gpu))) = self.budget.get().filter(|_| used) {
+            crate::indirect::card_budget::end_run(&self.list, *gpu);
+        }
         crate::gpucost::end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5547,6 +5551,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(self, &depth.texture, &plane.texture);
+        crate::tile_args_watch::plane_drawn(std::ptr::from_ref(twin) as usize, self.ops.id());
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5643,6 +5648,7 @@ impl HostList {
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            crate::tile_args_watch::twin_written(std::sync::Arc::as_ptr(&u.twin) as usize, self.ops.id());
             self.changes.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -6272,6 +6278,7 @@ impl HostList {
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
+            crate::indirect::card_budget::begin_run(*gpu);
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
@@ -6301,7 +6308,7 @@ impl HostList {
                 }
             }), true));
         }
-        Some(*gpu)
+        Some(crate::indirect::card_budget::card(*gpu).unwrap_or(*gpu))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -6419,6 +6426,16 @@ impl HostList {
         }
         self.kept_pipeline.store(pipeline, Ordering::Relaxed);
         !self.deferred().bound.insert(pipeline)
+    }
+
+    /// The texture uploads the list deferred to its submission (tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_textures(&self) -> Vec<crate::texture::PreludeUpload> {
+        let deferred = self.deferred();
+        deferred.copies.iter().filter_map(|step| match step {
+            Step::Texture(upload) => Some(upload.clone()),
+            _ => None,
+        }).collect()
     }
 
     /// The shader-visible descriptor heaps the list keeps (tests).
@@ -8141,6 +8158,7 @@ impl Meter {
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2), of which {split_raw:.0} dispatches in one piece (VICTORY_SPLIT_RAW=1)"
             );
             crate::indirect::split_ahead::line(frames);
+            crate::indirect::card_budget::line(frames);
             let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4]
                 .map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + raw + fell > 0.0 {
@@ -8470,6 +8488,7 @@ impl Meter {
                 ram_mb = self.ram_mb
             );
             crate::defrag::log_progress();
+            crate::loop_cap::log();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

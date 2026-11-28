@@ -1376,6 +1376,10 @@ pub(crate) mod idle_sweep;
 pub(crate) mod console_formats;
 #[cfg(test)]
 mod format_table_tests;
+#[cfg(windows)]
+pub(crate) mod card_kept;
+#[cfg(all(test, windows))]
+mod class_depth_tests;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
@@ -2582,6 +2586,7 @@ fn duplicate_bytes(mut copies: Vec<(usize, u64)>) -> u64 {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    card_kept::tick();
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
