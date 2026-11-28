@@ -299,6 +299,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// (El1xr) Logs the first texture in each of the console's own formats the host has no
+/// match for, or names another format by (116/117 10-bit float colour, 189 signed 10-bit
+/// colour, 190 two 4-bit channels, 191: A4B4G4R4 on the host, 4 bytes a texel on the
+/// console): `console format:`.
+#[cfg(windows)]
+fn console_only(format: u32, flags: u32) {
+    static SEEN: [std::sync::Once; 5] = [const { std::sync::Once::new() }; 5];
+    let Some(i) = [116, 117, 189, 190, 191].iter().position(|&f| f == format) else {
+        return;
+    };
+    SEEN[i].call_once(|| {
+        tracing::warn!(format, flags, "console format: a texture in a format the host does not have as the console does");
+    });
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -3192,6 +3207,7 @@ fn host_texture_as(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    console_only(d.format, d.flags);
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
