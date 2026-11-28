@@ -17,6 +17,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_AMBIENT_SKY_BOUND_OPAQUE", Apply::Live),
     ("VICTORY_AMBIENT_SPECULAR_BOUND", Apply::Restart),
     ("VICTORY_ASK_QUIET_GAP_MB", Apply::Restart),
+    ("VICTORY_ASK_SPANS_KEPT", Apply::Live),
     ("VICTORY_ASK_SPREAD", Apply::Restart),
     ("VICTORY_ASK_WIDE_MB", Apply::Restart),
     ("VICTORY_ASYNC_HEAP_SYNC", Apply::Restart),
