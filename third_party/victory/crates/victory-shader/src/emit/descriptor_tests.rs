@@ -386,3 +386,93 @@ fn a_view_index_a_table_gives_is_left_alone_under_heap_cap() {
         translate_limited(&program, None).dxil
     );
 }
+
+/// `native` translated with the title view limit at `limit` and the remap table `len` long.
+fn translate_remapped(native: &NativeProgram, limit: u32, len: Option<u32>) -> HostShader {
+    let was = super::shader::TITLE_REMAP_LEN_HERE.replace(len);
+    let shader = translate_limited(native, Some(limit));
+    super::shader::TITLE_REMAP_LEN_HERE.set(was);
+    shader
+}
+
+#[test]
+fn a_view_index_the_title_computes_past_the_limit_reads_the_remapped_slot_under_heap_cap_3() {
+    // (heapcap, VICTORY_HEAP_CAP=3) Title slots 0 and 1 are the host's own; slot 2 is the null
+    // slot; title slots from 2 on read the table: title 2 -> host 3, title 4 -> host 4, title 5
+    // -> host 5, the rest (3 dead, 6.., past the table) -> the null slot 2.
+    let program = heap_indexed();
+    let remapped = translate_remapped(&program, 2, Some(8));
+    assert_ne!(remapped.dxil, translate_remapped(&program, 2, None).dxil);
+    assert_eq!(
+        translate_remapped(&program, 2, Some(0)).dxil,
+        translate_remapped(&program, 2, None).dxil,
+        "no table: the clamp of =1"
+    );
+    let (t0, t3, t4, t5) = (
+        [[0.0f32; 4]; 13 * 7],
+        [[0.0f32; 4]; 5 * 3],
+        [[0.0f32; 4]; 4 * 4],
+        [[0.0f32; 4]; 9 * 2],
+    );
+    let views = [
+        View::Texture(13, 7, &t0),
+        View::RawUav(4),
+        View::NullTexture,
+        View::Texture(5, 3, &t3),
+        View::Texture(4, 4, &t4),
+        View::Texture(9, 2, &t5),
+    ];
+    // dword k: the host slot of title slot 2 + k; dword 8 (past the table): the null slot
+    let table = vec![3, 2, 4, 5, 2, 2, 2, 2, 2];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&remapped)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let size = |s0: u32| {
+            let mut ud = vec![0u32; remapped.user_data_dwords().max(1) as usize];
+            for u in &remapped.user_data {
+                if (u.root, u.dword) == (RootType::Constants, 0) {
+                    ud[u.index as usize] = s0;
+                }
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            words[0][..2].to_vec()
+        };
+        assert_eq!(size(0), [13, 7], "{label}: below the limit, its own slot");
+        assert_eq!(size(2), [5, 3], "{label}: title 2 reads host 3");
+        assert_eq!(size(4), [4, 4], "{label}: title 4 reads host 4");
+        assert_eq!(size(5), [9, 2], "{label}: title 5 reads host 5");
+        let null = size(3);
+        assert!(![[13, 7], [5, 3], [4, 4], [9, 2]].iter().any(|t| null == t), "{label}: {null:?}");
+        for s0 in [6, 9, 10, 898_339, (1 << 27) - 1] {
+            assert_eq!(size(s0), null, "{label}: title {s0} reads the null slot");
+        }
+    }
+}

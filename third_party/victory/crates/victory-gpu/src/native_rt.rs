@@ -32,6 +32,7 @@ use windows::core::Interface;
 use crate::object::Object;
 
 mod batch;
+mod gpu_instances;
 mod refit;
 #[cfg(test)]
 mod refit_bench;
@@ -136,6 +137,8 @@ static REFIT_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Barriers recorded after or between builds (one per build without
 /// `VICTORY_NATIVE_BVH_BATCH=1`, [`batch`]).
 static BARRIERS: AtomicU64 = AtomicU64::new(0);
+/// Top levels whose instances were made on the card ([`gpu_instances`]).
+static GPU_INSTANCES: AtomicU64 = AtomicU64::new(0);
 
 /// What a bottom level is built from: its flags and each geometry's
 /// description (addresses, counts, formats). Equal: the same structure, unless
@@ -506,29 +509,57 @@ fn build_one(
             // The instances from title memory, each bottom level replaced by ours.
             let n = *count as usize;
             let mut raw = vec![0u8; n * INSTANCE_SIZE];
-            if n > 0 && !crate::host::read_into(*instances as *const u8, &mut raw) {
+            let on_card = gpu_instances::on();
+            let read = n == 0 || crate::host::read_into(*instances as *const u8, &mut raw);
+            if !read && !on_card {
                 SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let missing = retarget_instances(&mut raw, |title| {
-                store.by_title.get_mut(&title).map_or(0, |s| {
-                    s.used = frame;
-                    // SAFETY: a live buffer.
-                    unsafe { s.buffer.GetGPUVirtualAddress() }
-                })
-            });
-            MISSING_BLAS.fetch_add(missing, Ordering::Relaxed);
+            if read {
+                // On the card's path only to keep the named bottom levels
+                // and count those without ours.
+                let missing = retarget_instances(&mut raw, |title| {
+                    store.by_title.get_mut(&title).map_or(0, |s| {
+                        s.used = frame;
+                        // SAFETY: a live buffer.
+                        unsafe { s.buffer.GetGPUVirtualAddress() }
+                    })
+                });
+                MISSING_BLAS.fetch_add(missing, Ordering::Relaxed);
+            }
             let size = (n * INSTANCE_SIZE).max(INSTANCE_SIZE) as u64;
-            let upload = crate::host::host().and_then(|h| h.upload_buffer(size));
-            let Some((upload, data)) = upload else {
-                SKIPPED.fetch_add(1, Ordering::Relaxed);
-                return;
+            let va = if on_card {
+                let pairs = store
+                    .by_title
+                    .iter()
+                    .filter(|(_, s)| s.built && !s.top_built)
+                    // SAFETY: live buffers.
+                    .map(|(t, s)| (*t, unsafe { s.buffer.GetGPUVirtualAddress() }))
+                    .collect();
+                let made = host_address(host, *instances, size)
+                    .and_then(|title_va| gpu_instances::record(device, host, title_va, *count, pairs));
+                let Some(array) = made else {
+                    SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                GPU_INSTANCES.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: a live buffer.
+                let va = unsafe { array.GetGPUVirtualAddress() };
+                instance_upload = Some(array);
+                va
+            } else {
+                let upload = crate::host::host().and_then(|h| h.upload_buffer(size));
+                let Some((upload, data)) = upload else {
+                    SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                // SAFETY: the mapped upload buffer holds at least `raw`.
+                unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), data, raw.len()) };
+                // SAFETY: a live buffer.
+                let va = unsafe { upload.GetGPUVirtualAddress() };
+                instance_upload = Some(upload);
+                va
             };
-            // SAFETY: the mapped upload buffer holds at least `raw`.
-            unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), data, raw.len()) };
-            // SAFETY: a live buffer.
-            let va = unsafe { upload.GetGPUVirtualAddress() };
-            instance_upload = Some(upload);
             (
                 *dest,
                 D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
@@ -811,6 +842,7 @@ fn summary() {
         refit = REFIT.swap(0, Ordering::Relaxed),
         refit_refused = REFIT_REFUSED.swap(0, Ordering::Relaxed),
         barriers = BARRIERS.swap(0, Ordering::Relaxed),
+        gpu_instances = GPU_INSTANCES.swap(0, Ordering::Relaxed),
         structures_kept = kept,
         mb_live = BYTES.load(Ordering::Relaxed) >> 20,
         "native bvh: host structures built in the last 5 s"

@@ -4,14 +4,16 @@
 //! the one that does the job.
 
 /// Teleport candidates: (hash, argument slots). Shape: entity handle (slots 0-1), a vector (slots
-/// 2-3), then scalars; no result; reaches an entity or ped resolver. Most likely first.
+/// 2-3), then scalars; no result; reaches an entity or ped resolver. Most likely first: the first
+/// (handle, vector, int, float, byte) writes a target position into a ped component or posts a
+/// network warp event, the closest match to SET_ENTITY_COORDS / a ped warp found by hand.
 pub const TELEPORT: &[(u64, u8)] = &[
+    (0x4a65_60c6_18a1_1572, 7),
     (0x9b2b_2fe9_27b5_6e85, 9),
     (0xee25_9d14_cbc7_301b, 9),
     (0xa3df_0fc3_f6e7_1ca9, 8),
     (0x41ed_1695_dfc4_1002, 8),
     (0x53e2_5c7a_dc65_ccae, 8),
-    (0x4a65_60c6_18a1_1572, 7),
     (0x582c_e5fa_c780_410f, 7),
     (0x0121_bbe1_6337_ceb2, 6),
     (0x5c71_23a3_278c_9102, 6),
@@ -467,4 +469,84 @@ pub const PLAYER_GETTERS: &[u64] = &[
     0x9355_1a73_4004_ca67,
     0xf06c_a07c_b9fa_3991,
     0x8d34_043e_3c62_31b9,
+];
+
+/// Entity setters for the pair finder: (hash, argument slots, value read as a float). Shape: entity
+/// handle (slots 0-1), a number (slot 2; read with `mov` or `vmovss`, not a bool test), at most one
+/// more scalar; no result; reaches the entity or ped resolver; not the task cluster.
+pub const ENTITY_SETTERS: &[(u64, u8, bool)] = &[
+    (0xcb59_7bc1_19fc_3bce, 3, false),
+    (0x33ce_bbb2_5f6f_bf3b, 3, false),
+    (0x6794_003c_e830_f2e7, 4, false),
+    (0x7151_0e0e_24f6_43d8, 3, false),
+    (0x5f1b_ad05_d88f_4b02, 3, false),
+    (0xd92f_ee40_3356_11e3, 3, false),
+    (0x1943_8c0e_76a3_f5c0, 3, false),
+    (0x977b_4f1d_c245_ad87, 3, false),
+    (0xecd1_7734_bc92_760c, 3, false),
+    (0x112d_da79_69e6_7998, 3, false),
+    (0x828b_505a_3c54_3043, 4, false),
+    (0xe261_8458_f208_96d4, 4, false),
+    (0xf3a1_fce5_5eb6_13d3, 4, false),
+    (0xba3b_9ae4_30d4_63f9, 3, true),
+    (0xa91f_fb65_5337_2997, 3, false),
+    (0xda24_b748_5219_a805, 3, false),
+    (0x4d5d_5f12_195f_feee, 3, false),
+    (0x8414_d42f_14b2_06a7, 4, false),
+    (0xbea3_41ad_3e2d_bfff, 4, false),
+    (0x47d1_c2d7_c238_2381, 4, false),
+    (0xb814_dd7d_7d67_d47d, 4, false),
+    (0xdcbb_5edf_ad54_6a91, 4, false),
+    (0x204c_b344_1f2e_2f57, 3, false),
+    (0x945a_cbe0_5be6_0650, 3, false),
+    (0x4773_360d_08fb_e3f7, 4, false),
+    (0xc04f_2772_5c76_c9d0, 4, false),
+    (0xf96d_675c_5f6a_c723, 4, false),
+    (0x5837_8840_a04b_f80f, 3, false),
+    (0xfe4b_3f68_9a96_0ce5, 4, false),
+    (0x7a68_274a_e991_8309, 3, false),
+    (0x9268_5101_d5f8_b3bf, 3, true),
+    (0x9076_f447_0511_f663, 4, false),
+    (0x38c4_a028_feb8_99a0, 3, false),
+    (0xf109_d710_f4ed_27e7, 4, false),
+    (0xb47b_9fed_1e77_d95e, 3, false),
+    (0x489e_e237_3c24_db9b, 3, false),
+    (0x242e_33fe_e038_fb77, 3, false),
+    (0x2664_1dc3_3e7a_3e2c, 3, false),
+    (0xb368_96ba_43d6_5676, 3, false),
+    (0xa0e9_40a3_a429_e98c, 3, false),
+    (0xc8f5_969a_8ea2_f52b, 3, false),
+    (0xb565_3579_09c0_5d62, 3, false),
+    (0x4b82_b05d_fbde_3a99, 3, false),
+    (0x5c99_c16d_0bad_88ef, 3, false),
+    (0x2de7_7b77_63a8_dbb0, 4, false),
+    (0x4ec4_a0c4_edaf_53c4, 4, false),
+    (0xf5d6_9687_ca91_0266, 4, false),
+    (0x1a90_9a10_5245_cf7d, 3, false),
+    (0xd83f_573f_d2c9_0f1c, 4, false),
+    (0xe0d1_ff3d_2ab4_aa5c, 4, false),
+    (0xf957_6eee_796a_546a, 3, false),
+    (0x0975_95d7_b800_f25d, 3, true),
+    (0x5a75_ddc1_186c_4668, 3, true),
+    (0x6601_767f_eac6_8c54, 4, false),
+    (0x44a8_3f2d_92d7_08cb, 3, false),
+    (0x3be0_d15f_e714_b730, 3, true),
+    (0x7439_640c_669c_97e5, 4, false),
+    (0x8a6f_13e7_cb15_38e6, 4, false),
+    (0x1080_8ea2_bd9e_11fa, 3, false),
+    (0xd9cc_aff5_4577_e7de, 4, false),
+];
+
+/// Player setters for the pair finder: (hash, argument slots). Shape: player index (slot 0), an int
+/// (slot 1, read with `mov`), at most one more scalar; no result; reaches the player lookup. The
+/// first two set a level of 0..=6 in the wanted manager (`SET_PLAYER_WANTED_LEVEL`-like; the second
+/// also applies it at once); their slot 2 is a key into the manager's table, not pinned.
+pub const PLAYER_SETTERS: &[(u64, u8)] = &[
+    (0x99f1_dcca_3222_b48b, 3),
+    (0xc4ed_6b52_9523_720e, 3),
+    (0xbda0_ee0e_3985_b6ef, 2),
+    (0xee60_0f22_a065_7b1f, 2),
+    (0xfb96_13a8_a15a_ecaf, 2),
+    (0x1ac0_32fa_6c0b_6635, 3),
+    (0x6880_512c_68e8_77a4, 3),
 ];

@@ -537,7 +537,13 @@ impl Hub {
             (pads, source.keys())
         };
         let first = pads.iter().flatten().next().copied().unwrap_or_default();
-        let blocked = victory_gpu::menu::feed_pad(first.buttons, first.left_x, first.left_y);
+        let blocked = victory_gpu::menu::feed_pad(
+            first.buttons,
+            first.left_x,
+            first.left_y,
+            first.left_trigger,
+            first.right_trigger,
+        );
         shield(&mut pads, &mut keys, blocked);
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
