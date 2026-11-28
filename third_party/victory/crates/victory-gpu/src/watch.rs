@@ -62,6 +62,8 @@ pub(crate) fn guard_4k_join() -> bool {
 }
 mod holes;
 pub(crate) mod ask_split;
+/// (worldstream) `VICTORY_ASK_END_FAST=1`: an end with nothing standing leaves the journal's lock alone.
+mod end_fast;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
 
@@ -1760,6 +1762,8 @@ pub(crate) fn ask_ahead(ranges: impl IntoIterator<Item = (usize, usize)>) {
     if j.kept {
         return;
     }
+    // Before the kernel calls ([`end_fast`]).
+    end_fast::AHEAD_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
     j.ahead_asked = next_asking();
     j.ahead.clear();
     j.ordered = false;
@@ -1814,6 +1818,7 @@ pub(crate) fn ask_ahead_done() {
     if !j.kept {
         j.ahead.clear();
         j.ordered = false;
+        end_fast::AHEAD_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2550,13 +2555,17 @@ pub(crate) fn ask_once_end() {
     if !ask_once_active() && !reservation::enabled() {
         return;
     }
-    reservation::outside::ENDS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    reservation::outside::ENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if end_fast::skips() {
+        return;
+    }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept || reservation::enabled() {
         j.kept = false;
         KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
         j.ordered = false;
+        end_fast::AHEAD_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
