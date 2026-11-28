@@ -18,6 +18,7 @@ pub(crate) mod away_grace;
 mod buffer_format;
 mod copy_first;
 mod flicker;
+mod format_cast;
 pub(crate) mod heap_cap;
 mod heap_remap;
 mod heap_notices;
@@ -32,6 +33,7 @@ mod recheck_tail;
 pub(crate) mod remade_safe;
 mod slot_wait;
 mod srgb_cast;
+pub(crate) mod swap_watch;
 pub(crate) mod view_ages;
 mod view_addresses;
 pub(crate) mod buffer_ranges;
@@ -3900,6 +3902,7 @@ impl HostHeap {
                 // (`levels_wait`, `VICTORY_LEVELS_WAIT_SHOWN`).
             } else {
                 crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsMade);
+                let prior = made[index as usize];
                 made[index as usize] = key;
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
@@ -3907,6 +3910,11 @@ impl HostHeap {
                         resolved = copy;
                         if view_ages::on() {
                             view_ages::shown(self.ages_key(), index);
+                        }
+                        // `VICTORY_SWAP_WATCH`: what the slot showed before.
+                        if prior != key && !self.sampler && swap_watch::on() {
+                            let old = (prior != 0).then(|| view_at(prior as u32, (prior >> 32) as u32)).flatten();
+                            swap_watch::made(self.ages_key(), index, old.as_ref(), &view);
                         }
                     }
                     None => {
@@ -4984,6 +4992,9 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        if typeless {
+            format_cast::note(0, own, unordered, format_cast::Outcome::NoDescription);
+        }
         return !typeless;
     }
     // A view of a target whose format the host refuses, in the title's
@@ -4996,15 +5007,49 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
+        format_cast::note(view, own, unordered, format_cast::Outcome::OtherFamily);
         return false;
     }
     if let Some(format) = format
         && !typeless
-        && !srgb_cast::keeps(view, own, unordered)
+        && view != own
     {
-        *format = d.Format;
+        // (El1xr) Kept as the title named it (sRGB twins, `VICTORY_FORMAT_CAST`), else read
+        // in the texture's own format; each pair said once (`view format:`).
+        if srgb_cast::keeps(view, own, unordered) || format_cast::keeps(view, own, unordered) {
+            format_cast::note(view, own, unordered, format_cast::Outcome::Kept);
+        } else {
+            format_cast::note(view, own, unordered, format_cast::Outcome::Own);
+            *format = d.Format;
+        }
     }
     true
+}
+
+/// (El1xr) `VICTORY_TYPELESS_WHOLE_VIEW=1` ([`format_cast`]): for a view without a
+/// description of title texture `resource`, whose host copy `texture` is typeless, a
+/// description of all of it in the title's format; `None` otherwise (the view stays as it was).
+fn whole_typeless(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    unordered: bool,
+) -> Option<D3D12_RESOURCE_DESC> {
+    if !format_cast::whole_view() {
+        return None;
+    }
+    let own = crate::resource::view_format(resource)?;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let host = d.Format.0 as u32;
+    let typeless = crate::resource::family(host) == host && crate::resource::family(host + 1) == host;
+    if !typeless {
+        return None;
+    }
+    format_cast::note(0, own, unordered, format_cast::Outcome::Whole);
+    Some(D3D12_RESOURCE_DESC {
+        Format: DXGI_FORMAT(format_cast::readable(own, unordered) as i32),
+        ..d
+    })
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5178,7 +5223,10 @@ pub(crate) fn make(
                         }
                     }
                 }
-                let mut desc = desc.as_ref().map(srv_desc);
+                let mut desc = desc.as_ref().map(srv_desc).or_else(|| {
+                    let d = whole_typeless(resource, texture, false)?;
+                    Some(format_cast::whole_srv(&d, d.Format.0 as u32))
+                });
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -5281,7 +5329,14 @@ pub(crate) fn make(
                     desc = Some(view);
                     twin
                 }
-                None => texture,
+                None => {
+                    if desc.is_none()
+                        && let Some(d) = whole_typeless(resource, texture, true)
+                    {
+                        desc = Some(format_cast::whole_uav(&d, d.Format.0 as u32));
+                    }
+                    texture
+                }
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;

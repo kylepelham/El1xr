@@ -15,6 +15,8 @@ mod camera_tap;
 mod draw_dump;
 #[cfg(windows)]
 mod heap_find;
+#[cfg(windows)]
+mod exposure_watch;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2143,6 +2145,10 @@ impl State {
         #[cfg(windows)]
         if crate::heap_find::recording() {
             self.heap_find(list, p, compute);
+        }
+        #[cfg(windows)]
+        if crate::exposure_watch::on() {
+            self.exposure_watch(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
