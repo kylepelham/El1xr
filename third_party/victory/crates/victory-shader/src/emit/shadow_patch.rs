@@ -55,7 +55,7 @@ use super::glass_patch::{
 use crate::native::NativeProgram;
 
 /// What a walk leaves for the code after it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Out {
     /// On a hit of one of the walk's lanes: the hit's distance.
     HitT(u8),
@@ -87,7 +87,7 @@ pub(super) enum Out {
 
 /// One walk of a shadow trace.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Walk {
+pub(super) struct Walk<'a> {
     /// The comparison that sets SCC for the skip (one SOPC word) and the skip
     /// (`s_cbranch_scc1 past`) right after it.
     pub cmp: u32,
@@ -114,7 +114,7 @@ pub(super) struct Walk {
     /// The instance mask for the query (`InstanceMask & mask != 0`): 0xff where the title's
     /// walk tests none.
     pub mask: u32,
-    pub outs: &'static [Out],
+    pub outs: &'a [Out],
 }
 
 /// A known shadow trace: its container hash as the run names programs, container digest,
@@ -128,7 +128,7 @@ pub(super) struct Trace {
     pub code: u64,
     pub structures: [Option<u32>; 2],
     pub per_wave: bool,
-    pub walks: &'static [Walk],
+    pub walks: &'static [Walk<'static>],
 }
 
 /// How the host binds a known shadow trace ([`shadow_binding`]).
@@ -142,6 +142,10 @@ pub struct ShadowBinding {
     /// and gives their addresses >> 8 ([`super::shader::USER_SHADOW_BASE_FIRST`], `_SECOND`;
     /// 0 for one it did not build); otherwise both must be built.
     pub per_wave: bool,
+    /// Spliced by [`super::walk_splice`]: no registers are known; the candidates are the
+    /// program's first two distinct structures, and a program whose walks do not all pick per
+    /// wave is bound only with one.
+    pub any: bool,
 }
 
 /// The trap temporaries the per-wave choice reads on entry: the host's two candidate bases.
@@ -333,6 +337,7 @@ pub fn shadow_binding(hash: &str) -> Option<ShadowBinding> {
         hash: t.hash,
         registers: t.structures,
         per_wave: t.per_wave,
+        any: false,
     })
 }
 
@@ -356,7 +361,7 @@ const S_CBRANCH_SCC0: u32 = 4;
 const S_CBRANCH_EXECZ: u32 = 8;
 
 /// The region at byte `start` for `walk` of the program `code`, the arm's VGPRs from `own`.
-pub(super) fn region(walk: &Walk, code: &[u8], start: usize, own: u8) -> Vec<u32> {
+pub(super) fn region(walk: &Walk<'_>, code: &[u8], start: usize, own: u8) -> Vec<u32> {
     // The arms' lengths do not depend on where they are.
     let arms: Vec<u8> = match walk.choose {
         None => vec![walk.structure],
@@ -401,7 +406,7 @@ pub(super) fn region(walk: &Walk, code: &[u8], start: usize, own: u8) -> Vec<u32
 
 /// One native arm at byte `at` on top level `structure`: the walk's set-up (straight code, the
 /// same wherever it runs), [`arm`], the jump to where the walk's results are read.
-fn native_arm(walk: &Walk, code: &[u8], at: usize, own: u8, structure: u8) -> Vec<u32> {
+fn native_arm(walk: &Walk<'_>, code: &[u8], at: usize, own: u8, structure: u8) -> Vec<u32> {
     let setup = &code[walk.skip + 4..walk.head];
     let mut w: Vec<u32> =
         setup.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -412,7 +417,7 @@ fn native_arm(walk: &Walk, code: &[u8], at: usize, own: u8, structure: u8) -> Ve
 }
 
 /// The native arm after the walk's set-up (see the module notes): `w` starts at byte `base`.
-pub(super) fn arm(w: &mut Vec<u32>, walk: &Walk, own: u8, structure: u8, code: &[u8], base: usize) {
+pub(super) fn arm(w: &mut Vec<u32>, walk: &Walk<'_>, own: u8, structure: u8, code: &[u8], base: usize) {
     let ray = own;
     let hit = own + RAY_DWORDS;
     let ids = hit + HIT_DWORDS;
@@ -463,7 +468,7 @@ pub(super) fn arm(w: &mut Vec<u32>, walk: &Walk, own: u8, structure: u8, code: &
 }
 
 /// The trace `native` is, byte for byte, if any.
-fn known(digest: &[u8; 16], native: &NativeProgram) -> Option<&'static Trace> {
+pub(super) fn known(digest: &[u8; 16], native: &NativeProgram) -> Option<&'static Trace> {
     TRACES.iter().find(|t| {
         *digest == t.container && native.code.len() == t.bytes && fnv(&native.code) == t.code
     })
@@ -490,9 +495,14 @@ pub(super) fn primitive_word(title: u32, own: u8) -> u32 {
 }
 
 pub(super) fn apply(trace: &Trace, native: &mut NativeProgram) {
+    apply_walks(trace.walks, native);
+}
+
+/// The splice of `walks` on `native`'s program.
+pub(super) fn apply_walks(walks: &[Walk<'_>], native: &mut NativeProgram) {
     let own = u8::try_from(native.vgprs).expect("a program under 256 VGPRs");
     let code = native.code.clone();
-    for walk in trace.walks {
+    for walk in walks {
         for out in walk.outs {
             if let Out::Primitive { at, .. } = *out {
                 let title = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());

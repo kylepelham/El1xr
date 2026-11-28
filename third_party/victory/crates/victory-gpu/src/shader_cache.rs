@@ -126,6 +126,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if victory_shader::emit::native_shadow() {
         h.update(b"VICTORY_NATIVE_SHADOW=1");
     }
+    if victory_shader::emit::native_shadow_auto() {
+        h.update(b"VICTORY_NATIVE_SHADOW_AUTO=1");
+    }
     if victory_shader::emit::heap_view_address() {
         h.update(b"VICTORY_HEAP_VIEW_ADDRESS=1");
     }
