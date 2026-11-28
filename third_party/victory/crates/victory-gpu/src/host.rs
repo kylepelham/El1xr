@@ -4710,7 +4710,8 @@ impl Host {
             heap_rounds.wrote();
         }
         let t_card = std::time::Instant::now();
-        let (card, mut card_order) = self.card_before(runs, flown);
+        let defer = late && send_thread::on() && card_rec::on();
+        let (card, mut card_order, mut card_pending) = self.card_before(runs, flown, defer);
         if let Some(sync) = card.as_ref().and_then(|c| c.sync.clone()) {
             lists.insert(0, Some(sync));
             for f in firsts.iter_mut().skip(1) {
@@ -4747,10 +4748,11 @@ impl Host {
                     self.submitted_fence.store(fence, Ordering::Release);
                     back.iter().for_each(|(shadow, _)| shadow.note_write_fence(fence));
                 };
-                if send_thread::send_ahead(self, &mut lists, &mut apart, fence, note) {
+                if send_thread::send_ahead(self, &mut lists, &mut apart, &mut card_pending, fence, note) {
                     crate::dred::sent(fence, this_submission, runs);
                     Ok(())
                 } else {
+                    send_thread::record_here(&mut card_pending);
                     send_thread::wait_idle();
                     // SAFETY: closed lists; the fence is ours.
                     let signalled = unsafe {
@@ -4822,6 +4824,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        send_thread::record_here(&mut card_pending);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -5197,6 +5200,7 @@ impl HostList {
         self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         self.card_constants.clear();
+        crate::read_back_pool::give(&mut self.deferred().backs, |b| b.0);
         *self.deferred() = Deferred::default();
         use crate::list_reap::{alone, let_go};
         let_go(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()), |(_, _, h)| alone(h));
@@ -9241,6 +9245,8 @@ mod flush;
 mod beside;
 #[path = "host_send_thread.rs"]
 pub(crate) mod send_thread;
+#[path = "host_card_rec.rs"]
+mod card_rec;
 #[path = "host_one_pass.rs"]
 mod one_pass;
 #[path = "host_step_reads.rs"]

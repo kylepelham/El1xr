@@ -24,6 +24,16 @@
 //! Frames are cut at the present: what was recorded between two presents
 //! counts for the second. A title that records the next frame's lists
 //! while the last is presented has some of them counted a frame early.
+//!
+//! Round 7 (#96): each missing program says why it did not run in the dark
+//! frame (`dropped xN: <reason>`, the reason `crate::drop_why` notes, kept
+//! while the catcher is on whether or not `VICTORY_DROP_REASONS` is) or
+//! `not issued` (the title recorded none of it); indirect drops count for
+//! their pipeline, not for "no pipeline"; compute programs are named as
+//! their container spells them; and the watched programs (the title's
+//! depth-of-field passes by default, `VICTORY_FLICKER_CATCH_WATCH=<name
+//! part>,..` for others) are listed in every line with their runs, drops
+//! and indirect paths in the dark frame, the one before and the one after.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -146,12 +156,33 @@ static SETTLED: AtomicU32 = AtomicU32::new(0);
 static AMBIENT: AtomicU32 = AtomicU32::new(0);
 
 /// Per title pipeline: draws and dispatches run, dropped; per render
-/// target: binds.
+/// target: binds; per pipeline: the last drop reason and the indirect paths
+/// taken.
 #[derive(Default)]
 struct Frame {
     programs: HashMap<usize, (u32, u32)>,
     targets: HashMap<usize, u32>,
+    why: HashMap<usize, &'static str>,
+    paths: HashMap<usize, u8>,
 }
+
+/// How an indirect execution of a title pipeline was run (bits of a frame's
+/// paths per pipeline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Path {
+    /// From the title's record in its host copy, as written.
+    Raw = 1,
+    /// From a copy our pass clamped in place, just before it.
+    Clamped = 2,
+    /// From a slot clamped in the list's prelude.
+    Ahead = 4,
+    /// Raw after our pass made the record safe in place.
+    Sanitized = 8,
+    /// Its views cleared instead (`VICTORY_ZERO_OUT`).
+    Zeroed = 16,
+}
+
+const PATH_NAMES: [&str; 5] = ["raw", "clamped", "ahead", "sanitized", "zeroed"];
 
 static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
 
@@ -181,24 +212,24 @@ pub(crate) fn descriptor(what: usize) {
     }
 }
 
-fn program(pipeline: usize, ran: bool) {
+fn program(pipeline: usize, ran: bool, why: &'static str) {
     if !on() {
         return;
     }
     NOW[if ran { Kind::Ran } else { Kind::Dropped } as usize].fetch_add(1, Relaxed);
-    let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    let n = frame
-        .get_or_insert_with(Frame::default)
-        .programs
-        .entry(pipeline)
-        .or_default();
+    let mut guard = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = guard.get_or_insert_with(Frame::default);
+    let n = frame.programs.entry(pipeline).or_default();
     let first = *n == (0, 0);
     if ran {
         n.0 += 1;
     } else {
         n.1 += 1;
+        frame
+            .why
+            .insert(pipeline, if why.is_empty() { "unclassified" } else { why });
     }
-    drop(frame);
+    drop(guard);
     if first {
         // Named while a list has it bound (alive): a pipeline made later at
         // the same address keeps this name.
@@ -212,12 +243,38 @@ fn program(pipeline: usize, ran: bool) {
 
 /// A draw or dispatch of title pipeline `pipeline` was recorded on the host.
 pub(crate) fn ran(pipeline: usize) {
-    program(pipeline, true);
+    program(pipeline, true, "");
 }
 
-/// A draw or dispatch of title pipeline `pipeline` (0: not known) was dropped.
-pub(crate) fn dropped(pipeline: usize) {
-    program(pipeline, false);
+/// A draw or dispatch of title pipeline `pipeline` (0: not known) was
+/// dropped, for reason `why` (`crate::drop_why`'s; empty: none noted).
+pub(crate) fn dropped(pipeline: usize, why: &'static str) {
+    program(pipeline, false, why);
+}
+
+/// An indirect execution of title pipeline `pipeline` ran by `path`.
+pub(crate) fn path(pipeline: usize, path: Path) {
+    if on() {
+        let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        *frame
+            .get_or_insert_with(Frame::default)
+            .paths
+            .entry(pipeline)
+            .or_default() |= path as u8;
+    }
+}
+
+/// The paths in bits `mask`, `raw+clamped`; `-` for none.
+pub(crate) fn path_names(mask: u8) -> String {
+    let names: Vec<&str> = (0..PATH_NAMES.len())
+        .filter(|b| mask >> b & 1 != 0)
+        .map(|b| PATH_NAMES[b])
+        .collect();
+    if names.is_empty() {
+        "-".to_owned()
+    } else {
+        names.join("+")
+    }
 }
 
 /// A draw bound title resource `resource` as a render target.
@@ -280,6 +337,33 @@ pub(crate) struct Summary {
     pub(crate) programs: Vec<(usize, u32, u32)>,
     /// (render target, binds), by target.
     pub(crate) targets: Vec<(usize, u32)>,
+    /// (pipeline, the reason of its last drop), by pipeline.
+    pub(crate) why: Vec<(usize, &'static str)>,
+    /// (pipeline, its indirect paths' bits), by pipeline.
+    pub(crate) paths: Vec<(usize, u8)>,
+}
+
+impl Summary {
+    /// Runs and drops of pipeline `p`.
+    fn of(&self, p: usize) -> (u32, u32) {
+        self.programs
+            .binary_search_by_key(&p, |&(q, _, _)| q)
+            .map_or((0, 0), |i| (self.programs[i].1, self.programs[i].2))
+    }
+
+    /// The reason of pipeline `p`'s last drop.
+    fn why_of(&self, p: usize) -> &'static str {
+        self.why
+            .binary_search_by_key(&p, |&(q, _)| q)
+            .map_or("unclassified", |i| self.why[i].1)
+    }
+
+    /// Pipeline `p`'s indirect paths.
+    fn paths_of(&self, p: usize) -> u8 {
+        self.paths
+            .binary_search_by_key(&p, |&(q, _)| q)
+            .map_or(0, |i| self.paths[i].1)
+    }
 }
 
 static RINGED: Mutex<VecDeque<Summary>> = Mutex::new(VecDeque::new());
@@ -305,6 +389,10 @@ pub(crate) fn frame_done(frame: u64) {
     programs.sort_unstable();
     let mut targets: Vec<_> = taken.targets.into_iter().collect();
     targets.sort_unstable();
+    let mut why: Vec<_> = taken.why.into_iter().collect();
+    why.sort_unstable();
+    let mut paths: Vec<_> = taken.paths.into_iter().collect();
+    paths.sort_unstable();
     let mut ring = RINGED.lock().unwrap_or_else(|e| e.into_inner());
     ring.push_back(Summary {
         frame,
@@ -313,6 +401,8 @@ pub(crate) fn frame_done(frame: u64) {
         ambient,
         programs,
         targets,
+        why,
+        paths,
     });
     while ring.len() > RING {
         ring.pop_front();
@@ -321,7 +411,7 @@ pub(crate) fn frame_done(frame: u64) {
 
 #[cfg(all(windows, not(test)))]
 fn name_of(pipeline: usize) -> String {
-    crate::pipeline::shaders_of(pipeline as crate::object::This)
+    crate::pipeline::named_shaders_of(pipeline as crate::object::This)
 }
 
 /// (Tests count made-up pipelines.)
@@ -390,8 +480,10 @@ pub(crate) fn ambient_names(mask: u32) -> String {
 
 /// The pipelines of `dark` against `before` (and `after`, the frame the
 /// picture was back): missing (ran before, not in the dark frame; `*`: ran
-/// again after), extra (ran only in the dark frame), fewer (under half the
-/// draws of before), dropped in the dark frame.
+/// again after; each `(not issued)` or `(dropped xN: <reason>)` in the dark
+/// frame, and the two tallied), extra (ran only in the dark frame), fewer
+/// (under half the draws of before), dropped in the dark frame (with the
+/// reason of its last drop).
 pub(crate) fn programs_diff(
     before: &Summary,
     dark: &Summary,
@@ -432,14 +524,32 @@ pub(crate) fn programs_diff(
     dropped.sort_unstable_by(most);
     fewer.sort_unstable_by(|x, y| (y.1 - y.2).cmp(&(x.1 - x.2)).then(x.0.cmp(&y.0)));
     let again = |p: usize| a.as_ref().is_some_and(|a| ran_in(a, p));
-    let list = |v: &[(usize, u32)], star: bool| -> String {
+    let dropped_in_dark = |p: usize| d.get(&p).map_or(0, |n| n.1);
+    /// What a list says of each pipeline after its count.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Says {
+        Nothing,
+        /// Missing: again after (`*`), not issued or dropped and why.
+        Missing,
+        /// Dropped: why.
+        Why,
+    }
+    let list = |v: &[(usize, u32)], says: Says| -> String {
         let mut parts: Vec<String> = v
             .iter()
             .take(NAMED)
             .map(|&(p, n)| {
+                let tail = match says {
+                    Says::Nothing => String::new(),
+                    Says::Missing => match dropped_in_dark(p) {
+                        0 => " (not issued)".to_owned(),
+                        k => format!(" (dropped x{k}: {})", dark.why_of(p)),
+                    },
+                    Says::Why => format!(" ({})", dark.why_of(p)),
+                };
                 format!(
-                    "{}{} x{n}",
-                    if star && again(p) { "*" } else { "" },
+                    "{}{} x{n}{tail}",
+                    if says == Says::Missing && again(p) { "*" } else { "" },
                     name(p)
                 )
             })
@@ -449,19 +559,102 @@ pub(crate) fn programs_diff(
         }
         format!("{}[{}]", v.len(), parts.join("; "))
     };
+    let missing_dropped = missing.iter().filter(|&&(p, _)| dropped_in_dark(p) > 0).count();
     let fewer_text: Vec<String> = fewer
         .iter()
         .take(NAMED)
         .map(|&(p, was, now)| format!("{} {was}->{now}", name(p)))
         .collect();
     format!(
-        "programs missing={} extra={} fewer={}[{}] dropped={}",
-        list(&missing, true),
-        list(&extra, false),
+        "programs missing={} (not issued {}, dropped {}) extra={} fewer={}[{}] dropped={}",
+        list(&missing, Says::Missing),
+        missing.len() - missing_dropped,
+        missing_dropped,
+        list(&extra, Says::Nothing),
         fewer.len(),
         fewer_text.join("; "),
-        list(&dropped, false)
+        list(&dropped, Says::Why)
     )
+}
+
+/// Parts of program names watched in every line: the title's depth of
+/// field (`DepthOfField` and the resolve that knows of it), whose blurred
+/// layers are what goes dark (the out-of-focus walls, window and people
+/// black, the subject in focus lit, in the b5g/b5h triplets).
+const WATCHED_NAMES: [&str; 11] = [
+    "CS_ResetIndirectArgsBuffer_",
+    "CS_DOF2TileClassification",
+    "CS_TileClassification",
+    "CS_PrefilterColor",
+    "CS_PrefilterBoundaryColor",
+    "CS_SkipPrefilterColor_",
+    "CS_MainBlur_",
+    "CS_SimpleMainBlur_",
+    "CS_Composite_",
+    "CS_SkipComposite_",
+    "DOFAware_",
+];
+
+/// The watched name parts: [`WATCHED_NAMES`] and those in
+/// `VICTORY_FLICKER_CATCH_WATCH` (comma-separated).
+fn watched_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut v: Vec<String> = WATCHED_NAMES.iter().map(|&n| n.to_owned()).collect();
+        if let Ok(more) = std::env::var("VICTORY_FLICKER_CATCH_WATCH") {
+            v.extend(more.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned));
+        }
+        v
+    })
+}
+
+/// The watched programs (a name containing one of `parts`) seen in any of
+/// the three frames: `name ran D/B/A dropped D/B/A [why] paths D/B/A` each
+/// (`-`: no frame after kept).
+pub(crate) fn watched(
+    before: &Summary,
+    dark: &Summary,
+    after: Option<&Summary>,
+    name: &dyn Fn(usize) -> String,
+    parts: &[String],
+) -> String {
+    let mut seen: Vec<usize> = [Some(before), Some(dark), after]
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s.programs.iter().map(|&(p, _, _)| p))
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let shown: Vec<String> = seen
+        .into_iter()
+        .filter_map(|p| {
+            let n = name(p);
+            parts.iter().any(|w| n.contains(w.as_str())).then_some((p, n))
+        })
+        .map(|(p, n)| {
+            let (b, d) = (before.of(p), dark.of(p));
+            let a = after.map(|a| a.of(p));
+            let third = |x: Option<u32>| x.map_or_else(|| "-".to_owned(), |x| x.to_string());
+            let why = if d.1 > 0 {
+                format!(" ({})", dark.why_of(p))
+            } else {
+                String::new()
+            };
+            format!(
+                "{n} ran {}/{}/{} dropped {}/{}/{}{why} paths {}/{}/{}",
+                d.0,
+                b.0,
+                third(a.map(|a| a.0)),
+                d.1,
+                b.1,
+                third(a.map(|a| a.1)),
+                path_names(dark.paths_of(p)),
+                path_names(before.paths_of(p)),
+                after.map_or_else(|| "-".to_owned(), |a| path_names(a.paths_of(p)))
+            )
+        })
+        .collect();
+    format!("watched={}[{}]", shown.len(), shown.join("; "))
 }
 
 /// The counts that differ between `dark` and `before`, as
@@ -527,9 +720,10 @@ pub(crate) fn report(event: &detect::Event) -> String {
         );
     };
     format!(
-        "flicker catch: frame {frame} vs {} ({head}): {}; {}; settled={}/{}; ambient {} / before {}; {}",
+        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}",
         frame - 1,
         programs_diff(&before, &dark, after.as_ref(), &named),
+        watched(&before, &dark, after.as_ref(), &named, watched_names()),
         counts_diff(&before, &dark, after.as_ref()),
         settle_names(dark.settled),
         settle_names(before.settled),

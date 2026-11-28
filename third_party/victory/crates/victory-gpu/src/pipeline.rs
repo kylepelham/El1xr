@@ -952,6 +952,25 @@ pub(crate) fn shaders_of(this: This) -> String {
     format!("[{}]", names.join(", "))
 }
 
+/// [`shaders_of`] with each program's name where its container spells one
+/// (`compute 03c01507703d7449 CS_MainBlur_446b3af2_Wrapped`; not the
+/// `SV_` semantics a geometry stage's search finds first).
+#[cfg(windows)]
+pub(crate) fn named_shaders_of(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".to_owned();
+    }
+    let names: Vec<String> = pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| match program_name(&s.container).filter(|n| !n.starts_with("SV_")) {
+            Some(name) => format!("{} {} {name}", s.stage, s.hash),
+            None => format!("{} {}", s.stage, s.hash),
+        })
+        .collect();
+    format!("[{}]", names.join(", "))
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -1467,6 +1486,8 @@ mod make;
 mod eager;
 #[cfg(windows)]
 mod recipe;
+#[cfg(windows)]
+mod pso_canon;
 #[cfg(windows)]
 pub use recipe::{Warmed as RecipesWarmed, warm as warm_recipes};
 #[cfg(windows)]

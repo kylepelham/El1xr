@@ -7,7 +7,9 @@
 //! A failure point notes its reason on its thread ([`set`]); the drop site
 //! counts it ([`count`]) and clears it. A drop with no reason noted is
 //! counted as "unclassified". A second line names the pipelines (their
-//! shaders' hashes) dropped most. An indirect execution's site names its
+//! shaders' hashes) dropped most. The reason and pipeline are also noted
+//! while the flicker catcher is on (`crate::flicker_catch`), which keeps
+//! each dropped pipeline's reason for its line. An indirect execution's site names its
 //! signature: `indirect <kind> [<argument types>] stride S max M count
 //! yes|no`, the kind `draw`, `indexed` or `mesh` for geometry, `dispatch`
 //! for compute.
@@ -114,9 +116,15 @@ static COUNTS: Mutex<Option<Counts>> = Mutex::new(None);
 /// Frames presented at the last line.
 static FRAMES_AT: AtomicU64 = AtomicU64::new(0);
 
+/// Whether reasons are noted: counted here, or kept by the flicker
+/// catcher.
+fn noting() -> bool {
+    on() || crate::flicker_catch::on()
+}
+
 /// Notes why the draw or dispatch being prepared on this thread fails.
 pub(crate) fn set(why: &'static str) {
-    if on() {
+    if noting() {
         WHY.set(why);
     }
 }
@@ -147,26 +155,36 @@ fn signature_of(arguments: &[[u32; 4]], stride: u32, max: u32, counted: bool) ->
 /// Notes the title pipeline of the indirect execution recorded now on this
 /// thread (its drop is counted where the pipeline is not at hand).
 pub(crate) fn pipeline(this: usize) {
-    if on() {
+    if noting() {
         PIPELINE.set(this);
     }
+}
+
+/// The flicker catcher's count of a dropped indirect execution: of the
+/// pipeline and for the reason last noted on this thread (before
+/// [`count`], which takes them).
+pub(crate) fn indirect_dropped() {
+    crate::flicker_catch::dropped(PIPELINE.get(), WHY.get());
 }
 
 /// Counts a drop at `site` (draw, indexed, mesh, dispatch) of title
 /// pipeline `this` for the reason last noted on this thread.
 pub(crate) fn count_of(site: &'static str, this: usize) {
-    crate::flicker_catch::dropped(this);
+    crate::flicker_catch::dropped(this, WHY.get());
     crate::pieces_diag::dropped(this);
     if on() {
         PIPELINE.set(this);
-        count(site);
     }
+    count(site);
 }
 
 /// Counts a drop at `site` for the reason and pipeline last noted on this
 /// thread.
 pub(crate) fn count(site: &'static str) {
     if !on() {
+        // Noted for the flicker catcher only: taken.
+        WHY.set("");
+        PIPELINE.set(0);
         return;
     }
     let why = match WHY.replace("") {
@@ -193,7 +211,7 @@ pub(crate) fn count(site: &'static str) {
 
 /// Clears what was noted on this thread for an indirect execution that ran.
 pub(crate) fn ran() {
-    if on() {
+    if noting() {
         WHY.set("");
         PIPELINE.set(0);
         SIGNATURE.set(None);

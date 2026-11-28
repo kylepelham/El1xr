@@ -1454,7 +1454,7 @@ fn read_back(
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes)
         .ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let buffer = crate::read_back_pool::buffer(host, size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -2191,8 +2191,8 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::drop_why::indirect_dropped();
     crate::drop_why::count("indirect");
-    crate::flicker_catch::dropped(0);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

@@ -156,6 +156,7 @@ mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
 mod flicker_catch;
+mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;
 #[cfg(windows)]
@@ -245,6 +246,8 @@ mod card_prof;
 mod prep_cut;
 #[cfg(windows)]
 mod result_ring;
+#[cfg(windows)]
+mod read_back_pool;
 #[cfg(windows)]
 mod wide_copy;
 #[cfg(windows)]

@@ -266,19 +266,18 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, mut graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(
-            graphics
-                .as_ref()
-                .map(|g| g.describe())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        // (bootfast) `VICTORY_PSO_CANON=1`: of its canonical form.
+        let state = graphics
+            .as_deref_mut()
+            .map(|g| super::pso_canon::state(g, &key))
+            .unwrap_or_default();
+        key.update(state.as_bytes());
         let left_out = left_out(&shaders);
         let head_map = head_map::is_head_map(shaders.iter().map(|s| (s.stage, s.hash.as_str())));
         let scene_input = left_out.is_none()
@@ -1125,6 +1124,7 @@ fn drained() {
             "host pipelines all made"
         );
         super::eager::log();
+        super::pso_canon::log();
     }
     save_library_async();
 }

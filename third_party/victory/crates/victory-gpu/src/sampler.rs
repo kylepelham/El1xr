@@ -52,7 +52,7 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
-        D3D12_SAMPLER_DESC {
+        let desc = D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
@@ -72,8 +72,101 @@ impl Fields {
             } else {
                 self.max_lod
             },
+        };
+        if clamp_on() { clamped(desc) } else { desc }
+    }
+}
+
+/// Whether console samplers get their values clamped into the host's ranges
+/// (`VICTORY_SAMPLER_CLAMP=1`; off by default, read once).
+fn clamp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_SAMPLER_CLAMP")
+            .is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!(
+                "console samplers clamped into the host's ranges (VICTORY_SAMPLER_CLAMP=1; VItoriaBr #129)"
+            );
+        }
+        on
+    })
+}
+
+/// Console samplers [`clamped`] changed, since the start.
+pub(crate) static SAMPLERS_CLAMPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `desc` with its values in the host's ranges, which the title's words can
+/// leave: NaN or infinite LOD bounds, a maximum LOD below the minimum, a bias
+/// past 16 levels, an address mode the host has no name for, a comparison
+/// function on a sampler that does not compare. (Ported from
+/// uiliannn/VItoriaBr #129, wilu222.) A sampler without a mip filter keeps
+/// its maximum at its minimum (see [`Fields::host`]).
+fn clamped(desc: D3D12_SAMPLER_DESC) -> D3D12_SAMPLER_DESC {
+    let lod = |value: f32, fallback: f32| {
+        if value.is_nan() {
+            fallback
+        } else {
+            value.clamp(-D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX)
+        }
+    };
+    let address = |mode: D3D12_TEXTURE_ADDRESS_MODE| match mode.0 {
+        1..=5 => mode,
+        _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    };
+    let min_lod = lod(desc.MinLOD, 0.0);
+    let out = D3D12_SAMPLER_DESC {
+        AddressU: address(desc.AddressU),
+        AddressV: address(desc.AddressV),
+        AddressW: address(desc.AddressW),
+        MipLODBias: if desc.MipLODBias.is_nan() {
+            0.0
+        } else {
+            desc.MipLODBias
+                .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+        },
+        // Only a comparison sampler (reduction 1) reads the function.
+        ComparisonFunc: if (desc.Filter.0 >> 7) & 3 == 1 {
+            desc.ComparisonFunc
+        } else {
+            D3D12_COMPARISON_FUNC_NEVER
+        },
+        MinLOD: min_lod,
+        MaxLOD: lod(desc.MaxLOD, min_lod).max(min_lod),
+        ..desc
+    };
+    if bits(&out) != bits(&desc) {
+        let n = SAMPLERS_CLAMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_multiple_of(1000) {
+            tracing::info!(
+                clamped = n,
+                from = ?bits(&desc),
+                to = ?bits(&out),
+                "sampler clamp: a console sampler had values outside the host's ranges (VICTORY_SAMPLER_CLAMP)"
+            );
         }
     }
+    out
+}
+
+/// The fields of a sampler description as bits (NaN equal to itself).
+fn bits(d: &D3D12_SAMPLER_DESC) -> [u32; 13] {
+    [
+        d.Filter.0 as u32,
+        d.AddressU.0 as u32,
+        d.AddressV.0 as u32,
+        d.AddressW.0 as u32,
+        d.MipLODBias.to_bits(),
+        d.MaxAnisotropy,
+        d.ComparisonFunc.0 as u32,
+        d.BorderColor[0].to_bits(),
+        d.BorderColor[1].to_bits(),
+        d.BorderColor[2].to_bits(),
+        d.BorderColor[3].to_bits(),
+        d.MinLOD.to_bits(),
+        d.MaxLOD.to_bits(),
+    ]
 }
 
 /// Whether the host GPU filters anisotropically with point mips
@@ -217,5 +310,73 @@ mod tests {
             );
         }
         eprintln!("made an anisotropic sampler, filter {:#x}", desc.Filter.0);
+    }
+
+    /// The plain description, then clamped: LOD bounds finite and ordered,
+    /// NaN falling back to 0 (minimum) or the minimum (maximum).
+    #[test]
+    fn clamped_lod_bounds_are_finite_and_ordered() {
+        let mut w = [0u32; 27];
+        w[3] = 2; // linear mips
+        w[9] = 4.0f32.to_bits();
+        w[10] = 2.0f32.to_bits();
+        let d = console(&w, true);
+        assert_eq!((d.MinLOD, d.MaxLOD), (4.0, 2.0), "unclamped: as the title wrote it");
+        let c = clamped(d);
+        assert_eq!((c.MinLOD, c.MaxLOD), (4.0, 4.0));
+        w[9] = f32::NAN.to_bits();
+        w[10] = f32::NAN.to_bits();
+        let d = console(&w, true);
+        assert!(d.MinLOD.is_nan() && d.MaxLOD.is_nan());
+        let c = clamped(d);
+        assert_eq!((c.MinLOD, c.MaxLOD), (0.0, 0.0));
+        w[9] = f32::NEG_INFINITY.to_bits();
+        w[10] = f32::INFINITY.to_bits();
+        let c = clamped(console(&w, true));
+        assert_eq!((c.MinLOD, c.MaxLOD), (-D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX));
+        // Without a mip filter both are the (clamped) minimum.
+        w[3] = 0;
+        w[9] = 3.0f32.to_bits();
+        w[10] = 8.0f32.to_bits();
+        let c = clamped(console(&w, true));
+        assert_eq!((c.MinLOD, c.MaxLOD), (3.0, 3.0));
+        w[9] = f32::NAN.to_bits();
+        let c = clamped(console(&w, true));
+        assert_eq!((c.MinLOD, c.MaxLOD), (0.0, 0.0));
+    }
+
+    /// Bias, address modes and the comparison function land in the host's
+    /// ranges; a sampler already inside them is left as it was.
+    #[test]
+    fn clamped_bias_address_and_comparison_stay_in_host_ranges() {
+        let mut w = [0u32; 27];
+        w[6..9].copy_from_slice(&[3, 3, 3]);
+        let d = console(&w, true);
+        assert_eq!(bits(&clamped(d)), bits(&d), "already in range: unchanged");
+        w[11] = 100.0f32.to_bits();
+        assert_eq!(console(&w, true).MipLODBias, 100.0);
+        assert_eq!(clamped(console(&w, true)).MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
+        w[11] = (-100.0f32).to_bits();
+        assert_eq!(clamped(console(&w, true)).MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
+        w[11] = f32::NAN.to_bits();
+        assert_eq!(clamped(console(&w, true)).MipLODBias, 0.0);
+        // Address modes 1..=5 pass; others become clamp.
+        w[6..9].copy_from_slice(&[0, 5, 9]);
+        let c = clamped(console(&w, true));
+        assert_eq!(c.AddressU, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        assert_eq!(c.AddressV, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE);
+        assert_eq!(c.AddressW, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        // A minimum or maximum reduction, or a plain sampler with a host
+        // value past the functions, takes no comparison function.
+        w[5] = 1;
+        w[16] = 4;
+        assert_eq!(clamped(console(&w, true)).ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+        w[5] = 0;
+        w[16] = 99;
+        assert_eq!(console(&w, true).ComparisonFunc.0, 99);
+        assert_eq!(clamped(console(&w, true)).ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+        // A comparison sampler keeps its function.
+        w[16] = 4;
+        assert_eq!(clamped(console(&w, true)).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
     }
 }

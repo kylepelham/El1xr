@@ -33,6 +33,7 @@ mod inside_copy_tests;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
+mod recheck_mips;
 mod reinterpret;
 pub(crate) mod settle_reread;
 mod short_remap;
@@ -2031,6 +2032,7 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     // (Neptune) Of a texture made level by level: the levels the title holds. The memory
     // behind them is another texture's, and its changes are not this one's.
     let len = if s.on_demand { s.held_bytes() } else { s.size };
+    recheck_mips::note(s.memory as u64, len as u64, &s.layout);
     Some((s.memory as u64, len as u64))
 }
 
@@ -2038,8 +2040,18 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// it up to 48 KiB, else of twelve pieces of 4 KiB spread evenly over it,
 /// the first and the last included. Read through the kernel, so pages not
 /// there count as zeros. (A texture whose change falls between the pieces
-/// is missed.)
+/// is missed, unless `VICTORY_HEAP_RECHECK_MIPS=1` noted the start of each
+/// of its mips for this memory: [`recheck_mips`].)
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    match recheck_mips::noted(at, len) {
+        Some(ranges) => fingerprint_ranges(at, len, &ranges),
+        None => fingerprint_ranges(at, len, &[]),
+    }
+}
+
+/// [`fingerprint`] that also reads `ranges` (offsets from `at`, bytes, each
+/// at most 48 KiB) after the pieces.
+fn fingerprint_ranges(at: u64, len: u64, ranges: &[(u64, u64)]) -> u64 {
     const PIECE: usize = 4 << 10;
     const PIECES: usize = 12;
     thread_local! {
@@ -2067,6 +2079,9 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
                 take(((len - PIECE) / (PIECES - 1) * n) & !0xfff, PIECE);
             }
             take(len - PIECE, PIECE);
+        }
+        for &(from, bytes) in ranges {
+            take(from as usize, (bytes as usize).min(PIECES * PIECE));
         }
         let hash = hasher.finalize();
         let mut first = [0u8; 8];
