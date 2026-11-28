@@ -38,6 +38,8 @@ pub(crate) mod plan_split;
 pub(crate) mod copied_shared;
 #[path = "shadow_refresh_stamp.rs"]
 pub(crate) mod refresh_stamp;
+#[path = "shadow_merge_due.rs"]
+pub(crate) mod merge_due;
 #[path = "shadow_wide_wake.rs"]
 pub(crate) mod wide_wake;
 pub use lazy::LazyAccessHold;
