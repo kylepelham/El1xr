@@ -2081,6 +2081,10 @@ impl State {
             self.draw_dump(list, p, compute);
         }
         #[cfg(windows)]
+        if !compute && crate::heap_find::follows() {
+            self.heap_find_follow(p);
+        }
+        #[cfg(windows)]
         if crate::heap_find::recording() {
             self.heap_find(list, p, compute);
         }
@@ -2150,7 +2154,7 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return prepare_failed!(self, DynamicDescriptorTable);
             }
-            if stage.shader.ambient.is_some() {
+            if stage.shader.ambient.is_some() || stage.shader.hdr.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -3836,6 +3840,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.zero_out(list, p) {
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -3874,6 +3881,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.hdr_scrub(list, p);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on(role)
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
@@ -5112,6 +5120,12 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if ran
+            && kind == 2
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.hdr_scrub(list, p);
+        }
         // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
         // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
@@ -5273,6 +5287,9 @@ impl State {
                 p.compute, p.mesh, self.topology
             ));
             return false;
+        }
+        if kind == DISPATCH && self.zero_out(list, p) {
+            return true;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some((args, max)) = crate::shadow::find_any(arguments, len)
@@ -5840,6 +5857,8 @@ mod bake_fresh;
 mod bake_publish;
 mod material_pass;
 mod skin_views;
+mod zero_views;
+mod hdr_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

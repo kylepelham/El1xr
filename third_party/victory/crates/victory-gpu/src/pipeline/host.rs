@@ -236,6 +236,16 @@ impl GraphicsState {
         }
     }
 
+    /// (`VICTORY_SCREEN_PIPELINE_WAIT`) Whether it draws a pass over the
+    /// screen: triangles with no vertex input and no depth or stencil test
+    /// (the title's lighting, composition and post passes).
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -1207,6 +1217,30 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// Source: fxceless/victory-fork #892 (sagouindupm).
+    #[test]
+    fn screen_pass_is_inputless_depthless_triangles() {
+        let mut s = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        assert!(s.screen_pass(), "no depth format: a screen pass");
+        s.depth_format = DXGI_FORMAT_D32_FLOAT;
+        s.depth.DepthEnable = true.into();
+        assert!(!s.screen_pass(), "a depth test: not a screen pass");
+        s.depth.DepthEnable = false.into();
+        s.depth.StencilEnable = false.into();
+        assert!(s.screen_pass(), "a depth target with no test: a screen pass");
+        s.depth.StencilEnable = true.into();
+        assert!(!s.screen_pass(), "a stencil test: not a screen pass");
+        s.depth.StencilEnable = false.into();
+        s.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!s.screen_pass(), "vertex input: not a screen pass");
+        s.inputs.clear();
+        s.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!s.screen_pass(), "lines: not a screen pass");
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {

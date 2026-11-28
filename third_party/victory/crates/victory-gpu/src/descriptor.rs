@@ -1617,6 +1617,37 @@ pub(crate) fn shader_views_where(
     found
 }
 
+/// (#115, `crate::heap_find`) The slots of the shader-visible view heaps
+/// that hold no record of ours (descriptors the title wrote itself) whose
+/// first eight words `keep` takes: (heap start, slot index, words).
+#[cfg(windows)]
+pub(crate) fn raw_slots_where(
+    mut keep: impl FnMut(&[u32; 8]) -> bool,
+    most: usize,
+) -> Vec<(u64, u32, [u32; 8])> {
+    let mut found = Vec::new();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: as in `shader_views_where`.
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(step) = increment(heap.desc.kind).filter(|_| heap.desc.kind == VIEWS_KIND) else {
+            continue;
+        };
+        for index in 0..heap.desc.count {
+            if found.len() >= most {
+                return found;
+            }
+            let slot = start + u64::from(index) * u64::from(step);
+            // SAFETY: a view slot in title memory is 32 bytes.
+            let words = unsafe { (slot as *const [u32; 8]).read_unaligned() };
+            if words[0] != VIEW_TAG && keep(&words) {
+                found.push((start, index, words));
+            }
+        }
+    }
+    found
+}
+
 /// (#115) The shader-visible heap slot of `handle`: heap start and index.
 #[cfg(windows)]
 pub(crate) fn shader_heap_slot(handle: u64) -> Option<(u64, u32)> {

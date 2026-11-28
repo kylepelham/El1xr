@@ -98,6 +98,7 @@ mod intersect_tests;
 pub mod host;
 mod idiom;
 mod link;
+mod null_view_size;
 mod loops_wave;
 mod lower;
 pub mod meet;
@@ -2622,6 +2623,35 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// The colour a pixel program writes: with `VICTORY_NAN_SCRUB_INF=1` the scrub holds an
+    /// infinity at 65504 (another program than the scrub to 0), and with `VICTORY_HDR_CLAMP=1`
+    /// it is held to the HDR range (`lower::hdr_hold`). Off, the translation is the one
+    /// before both switches.
+    #[test]
+    fn bright_colours_are_held_when_asked() {
+        use lower::hdr_hold::{HDR_MAX, TEST_HDR_CLAMP, TEST_SCRUB_INF};
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let translated = |inf: bool, clamp: bool| {
+            let was = (TEST_SCRUB_INF.replace(Some(inf)), TEST_HDR_CLAMP.replace(Some(clamp)));
+            let shader = pixel(&words, PERSP_CENTER);
+            TEST_SCRUB_INF.set(was.0);
+            TEST_HDR_CLAMP.set(was.1);
+            let shader = shader.expect("the pixel program translates");
+            validate(&shader);
+            shader.dxil
+        };
+        let plain = translated(false, false);
+        let held_inf = translated(true, false);
+        assert_ne!(held_inf, plain, "the infinity hold changed nothing");
+        let clamped = translated(false, true);
+        assert!(clamped.len() > plain.len(), "the clamp added nothing");
+        let both = translated(true, true);
+        assert!(both != clamped && both != held_inf);
+        assert_eq!(translated(false, false), plain);
+        assert_eq!(HDR_MAX, 65024.0);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

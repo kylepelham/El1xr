@@ -64,11 +64,18 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light (`crate::ambient`).
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Its place in `crate::hdr_scrub::NAMES` while `VICTORY_HDR_SCRUB` is on.
+    #[cfg(windows)]
+    pub(crate) hdr: Option<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
     #[cfg(windows)]
     skin: OnceLock<bool>,
+    /// What its dispatches become under `VICTORY_ZERO_OUT` (`crate::zero_out`), looked up on
+    /// first asking.
+    #[cfg(windows)]
+    zero: OnceLock<Option<crate::zero_out::Zero>>,
     /// The decoration bake family its container names (`crate::bake_name`), looked up on first asking.
     #[cfg(windows)]
     bake: OnceLock<Option<crate::bake_name::Kind>>,
@@ -87,6 +94,17 @@ impl Shader {
     #[cfg(windows)]
     pub(crate) fn skin(&self) -> bool {
         *self.skin.get_or_init(|| self.stage == "pixel" && crate::skin_fill::skin_program(&self.container))
+    }
+
+    /// Whether `VICTORY_ZERO_OUT` names it (a compute program), and what its dispatches
+    /// become (`crate::zero_out`).
+    #[cfg(windows)]
+    pub(crate) fn zeroed(&self) -> Option<crate::zero_out::Zero> {
+        *self.zero.get_or_init(|| {
+            (self.stage == "compute")
+                .then(|| crate::zero_out::of(&self.hash, &self.container))
+                .flatten()
+        })
     }
 
     /// The decoration bake family its container names (`crate::bake_name`).
@@ -191,10 +209,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     .then(|| crate::ambient::role(bytes))
                     .flatten(),
                 #[cfg(windows)]
+                hdr: (stage == "compute" && crate::hdr_scrub::mode() != 0)
+                    .then(|| crate::hdr_scrub::pass_of(bytes))
+                    .flatten(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 skin: OnceLock::new(),
                 #[cfg(windows)]
+                zero: OnceLock::new(),
                 bake: OnceLock::new(),
             })
         })
@@ -216,8 +239,10 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         ambient: (stage == "compute")
             .then(|| crate::ambient::role(container))
             .flatten(),
+        hdr: None,
         translated: OnceLock::new(),
         skin: OnceLock::new(),
+        zero: OnceLock::new(),
         bake: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
@@ -938,6 +963,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// At present `frame`: the line for a frame that dropped passes over the
+/// screen for want of their pipeline.
+#[cfg(windows)]
+pub(crate) fn presented(frame: u64) {
+    make::presented(frame);
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -1002,6 +1034,7 @@ pub(crate) fn note_drop(this: This) {
         "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
+        make::note_dropped(&p.host);
         #[cfg(feature = "diagnostics")]
         let skipped = skipped_shader(p).map(|hash| format!("skipped shader {hash}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1158,6 +1191,7 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    native_retry::made(&shaders);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
@@ -1263,10 +1297,11 @@ pub(crate) extern "system" fn create_compute_x(
 /// retries at 0x1f0 with its full shader container.
 pub(crate) extern "system" fn cached_compute(
     _: This,
-    _desc: *const u8,
+    desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    native_retry::refused(native_retry::Slot::Compute, desc);
     use std::sync::atomic::{AtomicU64, Ordering};
     static MISSES: AtomicU64 = AtomicU64::new(0);
     if !out.is_null() {
@@ -1389,6 +1424,7 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub(crate) mod native_retry;
 mod early;
 #[cfg(windows)]
 mod library;
