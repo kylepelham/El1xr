@@ -119,6 +119,13 @@
 //! (after the last Bink write, 692): `VICTORY_HEAP_FIND_ENTRY=1` watches
 //! that word every frame and names the draws whose constants point at its
 //! record ([`entry`]).
+//!
+//! (round 11) Part R2: during the Bink window (f827-848, the table shot at
+//! f834) no searched word named the Bink slot 42608 exactly; the hits were
+//! particle sort keys and, after the window, a reused slot. The forward
+//! material shaders keep only the low 24 bits of a record's texture word
+//! (`refs::INDEX_BITS`), so with `VICTORY_HEAP_FIND_ENTRY=1` a word with
+//! flags in bits 24-31 over a found slot's index is a hit too.
 
 pub(crate) mod entry;
 mod refs;
@@ -169,7 +176,7 @@ const MOST_DRAW_LINES: u32 = 400;
 pub(crate) const NEAR: u32 = 1024;
 /// Bytes of a view slot as translated shaders count them (slot = byte
 /// offset >> 5).
-const SLOT_BYTES: u64 = 32;
+pub(crate) const SLOT_BYTES: u64 = 32;
 /// Bytes of a root view looked at, from its address (its size is not
 /// known; buffer views are read by their own size: [`refs::taken`]).
 pub(crate) const MOST_SCAN: u64 = 16 << 10;
