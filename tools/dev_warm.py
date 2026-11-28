@@ -28,12 +28,17 @@ EXPERT_RE = re.compile(r'\("(VICTORY_[A-Z0-9_]+)", Apply::(\w+)\)')
 SETTINGS_EXPERT = SETTINGS_TABLE.with_name("expert.rs")
 
 
-def victory_exe(repo_root: Path, diag: bool = False) -> Path:
+# The release-family cargo profiles (third_party/victory/Cargo.toml) `bench`, `train` and the launcher can run;
+# `diag` stays its own flag (it also needs the diagnostics feature).
+RELEASE_PROFILES = ("release", "release-lto")
+
+
+def victory_exe(repo_root: Path, diag: bool = False, profile: str = "release") -> Path:
     """The victory.exe the launcher runs for this profile (it honours CARGO_TARGET_DIR)."""
     target = Path(os.environ["CARGO_TARGET_DIR"]) if os.environ.get("CARGO_TARGET_DIR") else (
         repo_root / "third_party" / "victory" / "target"
     )
-    return target / ("diag" if diag else "release") / "victory.exe"
+    return target / ("diag" if diag else profile) / "victory.exe"
 
 
 def exe_identity(exe: Path, launcher: Path | None = None) -> str:

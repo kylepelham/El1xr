@@ -312,7 +312,7 @@ def setup_train(dev, tmp_path, monkeypatch, bench_log=""):
         log_path.write_text(bench_log, encoding="utf-8")
         return fake_world_stats(dev, 30.0), 0, 0, 0
 
-    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path):
+    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path, profile="release"):
         warm.append((dict(overrides), pipelines))
         return True, {"translated": 7, "hits": 0, "shaders": 7, "recipes": 2}
 
