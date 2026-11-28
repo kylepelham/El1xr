@@ -203,6 +203,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_HEAPS", "Places host copies of streamed textures in shared memory blocks."),
     ("VICTORY_TEX_EARLY", "Starts texture checks as soon as they are reached, on helper threads."),
     ("VICTORY_TILES_AHEAD", "Gives streamed textures card memory ahead, off the submitting thread."),
+    ("VICTORY_TILES_SERIAL", "Makes tile mapping calls one at a time instead of side by side."),
     ("VICTORY_TILE_ARGS_WATCH", "Logs the indirect records skin lighting draws ran with, per draw."),
     ("VICTORY_TITLE_BOOST", "Keeps the priority boost on when the title asks to turn it off."),
     ("VICTORY_TITLE_WAITS", "Logs title-thread write faults and which die title and our threads ran."),
