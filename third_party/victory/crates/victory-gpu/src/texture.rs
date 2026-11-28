@@ -25,6 +25,7 @@ use crate::object::This;
 
 pub(crate) mod alias_skip;
 pub(crate) mod blind_hash;
+pub(crate) mod card_mips;
 mod gpu_detile;
 mod hash_behind;
 mod inside_copy;
@@ -821,6 +822,13 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    host_written_sub(resource, None);
+}
+
+/// [`host_written`] of subresource `sub` of `resource` (`None`: all of them,
+/// or one the caller cannot name): [`card_mips`].
+pub(crate) fn host_written_sub(resource: This, sub: Option<u32>) {
+    card_mips::wrote(resource as usize, sub);
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default)
@@ -942,6 +950,7 @@ pub(crate) fn forget(resource: usize) {
     crate::table_null::forget(resource);
     crate::staging_hold::forget(resource);
     crate::idle_evict::forget(resource);
+    card_mips::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -990,9 +999,16 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     if host_written && crate::descriptor::host::swap_watch::on() {
         crate::descriptor::host::swap_watch::host_kept(resource, texture);
     }
+    // `VICTORY_CARD_MIPS_TRACK=1` ([`card_mips`]): of a texture the card
+    // wrote some subresources of, the others are the title's.
+    let card_owned = if host_written && card_mips::on() {
+        card_mips::partly(resource as usize, subresources(texture))
+    } else {
+        None
+    };
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written
+    if host_written && card_owned.is_none()
         || !list.first_use(resource as usize) && crate::resource::staged_first(resource) <= first
     {
         return;
@@ -1056,7 +1072,20 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         copy,
         resource: resource as usize,
         on_demand,
+        card_owned,
     });
+}
+
+/// `texture`'s subresources, planes left out.
+fn subresources(texture: &ID3D12Resource) -> u32 {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize)
+    };
+    u32::from(d.MipLevels) * layers
 }
 
 /// Pure claim helper for [`PreludeUpload::finish_refresh`]: returns
@@ -1083,6 +1112,9 @@ pub(crate) struct PreludeUpload {
     /// not written it since the list was recorded ([`host_wrote`]).
     pub(crate) resource: usize,
     on_demand: Option<crate::resource::OnDemand>,
+    /// (`VICTORY_CARD_MIPS_TRACK`) The subresources the card had written
+    /// when the read was recorded: left out of the copies ([`card_mips`]).
+    card_owned: Option<Arc<[u64]>>,
 }
 
 /// `VICTORY_PRELUDE_RECHECK=1`: a prelude upload is checked again at
@@ -1112,7 +1144,13 @@ impl PreludeUpload {
         // uploads a host-written texture): a character's baked skin drawn as
         // coloured specks or a blue face for a whole scene, in about half the
         // runs (the diner's bartender). (trustno1-coder/VIctory-NVIDIA #33)
-        if prelude_recheck() && host_wrote(self.resource) {
+        if prelude_recheck()
+            && host_wrote(self.resource)
+            && !self
+                .card_owned
+                .as_ref()
+                .is_some_and(|seen| card_mips::same(self.resource, seen))
+        {
             static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SKIPPED.fetch_add(1, Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -1219,13 +1257,19 @@ impl PreludeUpload {
         };
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
+        let mut skipped = 0;
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
+            let sub = self.staging.subresource(i);
+            if self.card_owned.as_deref().is_some_and(|o| card_mips::owns(o, sub)) {
+                skipped += 1;
+                continue;
+            }
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: self.staging.subresource(i),
+                    SubresourceIndex: sub,
                 },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -1244,6 +1288,17 @@ impl PreludeUpload {
         }
         if let Some(gpu) = gpu {
             gpu_detile::copied(cmd_list, gpu);
+        }
+        if let Some(owned) = &self.card_owned {
+            let parts = self.staging.footprints.len() as u64;
+            card_mips::uploaded(self.resource, owned, parts - skipped, skipped, || {
+                // SAFETY: a live texture.
+                let d = unsafe { texture.GetDesc() };
+                format!(
+                    "{}x{} f{} mips {} layers {} first {}",
+                    d.Width, d.Height, d.Format.0, d.MipLevels, d.DepthOrArraySize, self.staging.first
+                )
+            });
         }
     }
 }

@@ -47,6 +47,7 @@ pub(super) fn line(frames: f64) {
         [0, 1, 2, 3, 4, 5].map(|i| COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let [joined, joined_blocks, split] =
         [0, 1, 2].map(|i| RUN_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    super::fault_unlocked::line(frames);
     tracing::info!(
         "4 KiB guards per frame (VICTORY_GUARD_4K=1): {opened:.0} pages opened alone; checks noted {alone:.0} blocks \
          at their 4 KiB pages alone and {whole:.0} written whole too; {failed:.1} pages not made read-only again; \
@@ -512,6 +513,47 @@ fn protect_run(at: usize, len: usize, flags: u32) -> bool {
     unsafe {
         windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len, flags, &mut old)
             != 0
+    }
+}
+
+/// (#88) The open pages of `block` (bits), for `fault_unlocked`.
+pub(super) fn open_pages(block: usize) -> u64 {
+    part_of(&OPEN, block, false).map_or(0, |p| p.0[block % super::PART].load(Acquire) & SUBS)
+}
+
+/// (#88) `VICTORY_FAULT_UNLOCKED`: [`fault`] beside a walk closing `block` (protected, not
+/// aliased, its claim held by the walk). The page is noted open before it is made writable, and
+/// noted again if the close took the note in between: the walk then leaves the block not clean.
+/// `None`: not done; else what the handler returns, and whether it was noted again.
+pub(super) fn fault_beside(block: usize, at: usize) -> Option<((usize, bool), bool)> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let cell = &part_of(&OPEN, block, false)?.0[block % super::PART];
+    let bit = 1u64 << ((at % BLOCK) / KERNEL_PAGE);
+    if cell.load(SeqCst) & bit != 0 && writable(at) {
+        return Some(((0, true), false));
+    }
+    cell.fetch_or(bit, SeqCst);
+    if !protect_page(
+        at / KERNEL_PAGE * KERNEL_PAGE,
+        windows_sys::Win32::System::Memory::PAGE_READWRITE,
+    ) {
+        // Left noted open: the walk leaves the block not clean, the next check closes it.
+        return None;
+    }
+    let again = cell.load(SeqCst) & bit == 0;
+    if again {
+        cell.fetch_or(bit, SeqCst);
+    }
+    super::port6_count(super::P6_FAULTS, 1);
+    count(0, 1);
+    Some(((1, true), again))
+}
+
+/// (#88) `VICTORY_FAULT_UNLOCKED`: a walk left `block` not clean only for pages opened beside its
+/// close; as a fault after the walk would have found it clean: nothing else made it not clean.
+pub(super) fn mark_only(block: usize) {
+    if let Some(part) = part_of(&OPEN, block, false) {
+        part.0[block % super::PART].fetch_or(ONLY, AcqRel);
     }
 }
 

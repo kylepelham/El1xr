@@ -510,6 +510,7 @@ impl HostPipeline {
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
                             || slot == victory_shader::emit::SLOT_MEET
+                            || slot == victory_shader::emit::SLOT_LOOP_CAP
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_REMAP

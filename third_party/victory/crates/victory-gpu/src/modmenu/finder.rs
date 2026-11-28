@@ -14,6 +14,12 @@
 //! (`mod menu: get sweep 2 ...`). Health, armour and wanted level are read by some of them; the
 //! values (and what changes between passes) name them.
 //!
+//! Find weather (`MOD_WEATHER_FIND=run`, [`weather::WeatherFind`]) and Find vehicle
+//! (`MOD_VEHICLE_FIND=run`, [`vehicle::VehicleFind`]) run the same way. Find all
+//! (`MOD_FIND_ALL=run`) runs teleport, stats, weather and vehicle one after another and writes what
+//! they found to the settings file (`VICTORY_MOD_MENU_FOUND`, [`found`]), which later launches
+//! read at start instead of searching.
+//!
 //! Find stats (`MOD_FIND_STATS=run`): the pair finder ([`stats::PairFind`]) on the player ped, then
 //! on player 0; what it finds drives the health, armour and wanted rows.
 
@@ -22,7 +28,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use super::{candidates, stats};
+use super::vehicle::{self, VehicleFind};
+use super::weather::{self, WeatherFind};
+use super::{candidates, found, stats};
 use super::teleport::{self, Native, coords, dist, move_to, player, show};
 
 /// Where a teleport candidate is asked to put the player, from where the player stands.
@@ -296,6 +304,13 @@ static TP: Mutex<Option<TpFind>> = Mutex::new(None);
 static GET: Mutex<Option<GetSweep>> = Mutex::new(None);
 /// Find stats: the ped pass, then the player pass ([`stats::PairFind`]).
 static PAIRS: Mutex<Vec<stats::PairFind>> = Mutex::new(Vec::new());
+static WEATHER: Mutex<Option<WeatherFind>> = Mutex::new(None);
+static VEHICLE: Mutex<Option<VehicleFind>> = Mutex::new(None);
+/// Find all's stage: the finder it started last ([`STAGES`]).
+static ALL: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Find all's finders, in order.
+pub const STAGES: &[&str] = &["teleport", "stats", "weather", "vehicle"];
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -327,7 +342,86 @@ pub fn tp_set(v: &str) {
 fn refresh() {
     let tp = lock(&TP).is_some();
     let get = lock(&GET).is_some();
-    ACTIVE.store(tp || get || !lock(&PAIRS).is_empty(), Relaxed);
+    let pairs = !lock(&PAIRS).is_empty();
+    let weather = lock(&WEATHER).is_some();
+    let vehicle = lock(&VEHICLE).is_some();
+    let all = lock(&ALL).is_some();
+    ACTIVE.store(tp || get || pairs || weather || vehicle || all, Relaxed);
+}
+
+pub fn weather_set(v: &str) {
+    *lock(&WEATHER) = (v == "run").then(WeatherFind::new);
+    refresh();
+}
+
+pub fn weather_get() -> String {
+    lock(&WEATHER)
+        .as_ref()
+        .map_or_else(|| "off".into(), WeatherFind::status)
+}
+
+pub fn vehicle_set(v: &str) {
+    *lock(&VEHICLE) = (v == "run").then(|| {
+        let env = std::env::var("VICTORY_MOD_MENU_VEHICLE_MODELS").ok();
+        VehicleFind::new(vehicle::models(env.as_deref()))
+    });
+    refresh();
+}
+
+pub fn vehicle_get() -> String {
+    lock(&VEHICLE)
+        .as_ref()
+        .map_or_else(|| "off".into(), VehicleFind::status)
+}
+
+pub fn all_set(v: &str) {
+    *lock(&ALL) = (v == "run").then_some(usize::MAX);
+    refresh();
+}
+
+pub fn all_get() -> String {
+    match *lock(&ALL) {
+        None => "off".into(),
+        Some(usize::MAX) => "starting".into(),
+        Some(i) => format!("{} ({}/{})", STAGES[i], i + 1, STAGES.len()),
+    }
+}
+
+/// Whether Find all's stage `i` has finished.
+fn stage_done(i: usize) -> bool {
+    match i {
+        0 => lock(&TP).as_ref().is_none_or(|f| f.done),
+        1 => lock(&PAIRS).iter().all(|p| p.done),
+        2 => lock(&WEATHER).as_ref().is_none_or(|f| f.done),
+        _ => lock(&VEHICLE).as_ref().is_none_or(|f| f.done),
+    }
+}
+
+/// Starts Find all's next stage when the current one is done; saves at the end.
+fn all_step(log: &mut dyn FnMut(String), save: fn(&str) -> Result<(), String>) {
+    let Some(stage) = *lock(&ALL) else { return };
+    if stage != usize::MAX && !stage_done(stage) {
+        return;
+    }
+    let next = stage.wrapping_add(1);
+    if next >= STAGES.len() {
+        *lock(&ALL) = None;
+        let line = found::format();
+        log(match save(&line) {
+            Ok(()) => format!("find all done: saved VICTORY_MOD_MENU_FOUND={line}"),
+            Err(e) => format!("find all done: VICTORY_MOD_MENU_FOUND={line} not saved ({e})"),
+        });
+        refresh();
+        return;
+    }
+    log(format!("find all: {} ({}/{})", STAGES[next], next + 1, STAGES.len()));
+    *lock(&ALL) = Some(next);
+    match next {
+        0 => tp_set("run"),
+        1 => stats_set("run"),
+        2 => weather_set("run"),
+        _ => vehicle_set("run"),
+    }
 }
 
 pub fn stats_set(v: &str) {
@@ -396,6 +490,23 @@ pub fn tick(call: &mut Native) {
             }
         }
     }
+    if let Some(f) = lock(&WEATHER).as_mut()
+        && !f.done
+    {
+        f.tick(call, &weather::types(), &mut log);
+        if let Some((h, _)) = f.found {
+            weather::set_found(h);
+        }
+    }
+    if let Some(f) = lock(&VEHICLE).as_mut()
+        && !f.done
+    {
+        f.tick(call, &mut log);
+        if let Some(found) = f.found {
+            vehicle::set_found(found);
+        }
+    }
+    all_step(&mut log, found::save);
 }
 
 #[cfg(test)]
@@ -557,6 +668,27 @@ mod tests {
         assert_eq!(g.status(), "done: 0 changed between passes");
         assert_eq!(show_raw(1), "i32 1 f32 0.000 raw 0x1", "an int reads as a tiny float");
         assert!(show_raw(0x7f7f_ffff).contains("f32 3.4028235e38"), "no 39-digit floats");
+    }
+
+    #[test]
+    fn find_all_runs_the_stages_in_turn_and_saves_at_the_end() {
+        fn saved(line: &str) -> Result<(), String> {
+            assert!(!line.contains(' '), "{line}");
+            Ok(())
+        }
+        let mut lines = Vec::new();
+        *lock(&ALL) = Some(2);
+        all_step(&mut |s| lines.push(s), saved);
+        assert_eq!(lines, vec!["find all: vehicle (4/4)"]);
+        assert_eq!(all_get(), "vehicle (4/4)");
+        assert!(vehicle_get().starts_with("model 1/"));
+        all_step(&mut |s| lines.push(s), saved);
+        assert_eq!(lines.len(), 1, "waits for the vehicle finder");
+        vehicle_set("off");
+        all_step(&mut |s| lines.push(s), saved);
+        assert!(lines[1].starts_with("find all done: saved VICTORY_MOD_MENU_FOUND="), "{lines:?}");
+        assert_eq!(all_get(), "off");
+        assert_eq!(STAGES.len(), 4);
     }
 
     #[test]

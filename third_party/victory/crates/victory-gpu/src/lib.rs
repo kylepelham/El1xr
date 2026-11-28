@@ -152,6 +152,8 @@ mod pacing;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+mod fetch_check;
+#[cfg(windows)]
 mod relay_runs;
 #[cfg(windows)]
 mod screenshot;
@@ -334,6 +336,8 @@ pub mod priority;
 #[cfg(windows)]
 #[cfg(windows)]
 mod defrag;
+#[cfg(windows)]
+mod loop_cap;
 mod watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wc_skip;
@@ -354,6 +358,6 @@ pub use shadow::LazyAccessHold;
 pub use watch::{
     Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
     title_pages_committed,
-    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
+    title_memory_remapping, title_memory_remapping_range, title_memory_remapping_try, title_memory_written, writing as kernel_will_write,
     writing_hold as kernel_will_write_hold, written_through_view,
 };

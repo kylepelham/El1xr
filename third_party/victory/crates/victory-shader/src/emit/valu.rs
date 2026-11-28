@@ -568,9 +568,12 @@ impl Lower<'_> {
                     Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
                     Some(Err(why)) => return Err(why),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = match self.f16_by_mode(inst, r) {
+                    Some(h) => h,
+                    None => self
+                        .s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]),
+                };
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -595,9 +598,12 @@ impl Lower<'_> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = match self.f16_by_mode(inst, a) {
+                    Some(r) => r,
+                    None => self
+                        .s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]),
+                };
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -690,6 +696,55 @@ impl Lower<'_> {
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add3_u32" | "v_add_co_u32"
+            | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32"
+            | "v_subrev_co_ci_u32"
+                if v.clamp && v.omod == 0 && super::isa_fixes::Fix::U32Clamp.on() =>
+            {
+                // `VICTORY_U32_CLAMP=1`: the exact result clamped to 0..=u32::MAX; the carry
+                // (borrow) out, as without the clamp, from before the saturation.
+                let (mut a, mut bb) = (s(self, 0)?, s(self, 1)?);
+                if name.contains("subrev") {
+                    std::mem::swap(&mut a, &mut bb);
+                }
+                let cin = if name.ends_with("_ci_u32") {
+                    let m = match v.src.get(2) {
+                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
+                        _ => None,
+                    };
+                    let m = m
+                        .and_then(|m| self.x.st.masks.get(&m).copied())
+                        .ok_or("a carry-in from an untracked mask")?;
+                    Some(self.boolean(m, c)?)
+                } else {
+                    None
+                };
+                let add = name.starts_with("v_add");
+                let (mut r, mut carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if name == "v_add3_u32" {
+                    let third = s(self, 2)?;
+                    let (sum, third_carry) = self.add_sub_carry(c, true, r, third, None);
+                    r = sum;
+                    carry = self.s.m.bin(c, Bin::Or, carry, third_carry);
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a vector register");
+                };
+                let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                let saturated = self.s.m.select(c, carry, limit, r);
+                self.write(inst, Reg::V(reg), saturated, guard);
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, carry);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
             | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {

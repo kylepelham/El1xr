@@ -17,6 +17,8 @@ mod draw_dump;
 mod heap_find;
 #[cfg(windows)]
 mod exposure_watch;
+#[cfg(windows)]
+mod flicker_region;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -1894,6 +1896,10 @@ impl State {
         if kind == victory_shader::emit::USER_THREAD_LIMIT {
             return crate::rt_diag::thread_limit();
         }
+        // Per stage, set by `bind` (`Shader::loop_cap`).
+        if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+            return 0;
+        }
         // The spliced traces (glass, shadow) take their ray queries only with their host top
         // levels bound.
         if kind == victory_shader::emit::USER_GLASS_NATIVE {
@@ -2150,6 +2156,10 @@ impl State {
         if crate::exposure_watch::on() {
             self.exposure_watch(list, p, compute);
         }
+        #[cfg(windows)]
+        if crate::flicker_catch::region::on() {
+            self.flicker_region(p, compute);
+        }
         // Textures picked by index, before anything asks for them.
         {
             let _lap = BindLap::start(1);
@@ -2259,8 +2269,11 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                        values[u.index as usize] = if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+                            stage.shader.loop_cap()
+                        } else {
+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref())
+                        };
                         continue;
                     }
                     let fresh = made
@@ -2420,6 +2433,13 @@ impl State {
                     if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list)
                         && compute
                     {
+                        self.bind_resource(list, compute, param, RootResource::Uav(gpu));
+                    }
+                    continue;
+                }
+                if slot == victory_shader::emit::SLOT_LOOP_CAP {
+                    // Ours: where shaders count lanes stopped at a loop's limit.
+                    if let Some(gpu) = crate::loop_cap::bind() {
                         self.bind_resource(list, compute, param, RootResource::Uav(gpu));
                     }
                     continue;
@@ -3310,8 +3330,9 @@ impl State {
             bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
             crate::texture::prepare::threads(),
         );
-        // While loading, the frame's cap: a pass with none left looks at the bake's own slots alone.
-        let load_left = (spread && !world).then(|| crate::bake_spread::load_left(frame, spread_mode));
+        // The frame's cap (while loading; in the world with `VICTORY_BAKE_SPREAD_FRAME`): a pass with
+        // none left looks at the bake's own slots alone.
+        let load_left = crate::bake_spread::frame_left(spread, world, frame, spread_mode);
         let only = bake_pass::ONLY.get();
         let none_left = load_left.is_some_and(|left| left.is_zero());
         let (mut due, census) =
@@ -3857,7 +3878,7 @@ impl State {
             add(C::Handed, handed);
             add(C::Us, entered.elapsed().as_micros() as u64);
             if load_left.is_some() {
-                crate::bake_spread::load_took(frame, entered.elapsed().as_micros() as u64);
+                crate::bake_spread::frame_took(frame, entered.elapsed().as_micros() as u64, !world);
             }
         }
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
