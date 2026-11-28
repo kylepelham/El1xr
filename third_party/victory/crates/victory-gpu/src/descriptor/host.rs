@@ -18,6 +18,7 @@ mod buffer_format;
 mod copy_first;
 mod flicker;
 pub(crate) mod heap_cap;
+mod heap_remap;
 mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
@@ -1717,6 +1718,7 @@ impl HostHeap {
             "host descriptor heap made null"
         );
         heap_notices::born(h.id, h.sampler);
+        heap_remap::born(&h);
         Some(h)
     }
 
@@ -1891,6 +1893,7 @@ impl HostHeap {
         taken.set_taken(first, n);
         self.free
             .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        heap_cap::note_free(self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
