@@ -568,9 +568,12 @@ impl Lower<'_> {
                     Some(Err(FIRST_HALF)) | None => self.s.m.i32(0),
                     Some(Err(why)) => return Err(why),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = match self.f16_by_mode(inst, r) {
+                    Some(h) => h,
+                    None => self
+                        .s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]),
+                };
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -595,9 +598,12 @@ impl Lower<'_> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = match self.f16_by_mode(inst, a) {
+                    Some(r) => r,
+                    None => self
+                        .s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]),
+                };
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };

@@ -173,6 +173,7 @@ pub use lower::thread_limit::on as dispatchx_mask;
 pub use lower::heap_address::on as heap_view_address;
 pub use lower::mask_elsewhere::on as mask_elsewhere;
 pub use lower::halves::{HalfViewsOff, half_views_off};
+pub use lower::f16_round::on as f16_round_mode;
 pub use div_zero::on as div_inf_zero;
 
 /// The loop limit without an override: 2^20.

@@ -138,6 +138,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
             h.update(b"VICTORY_HALF_VIEWS_OFF=loads");
         }
     }
+    if victory_shader::emit::f16_round_mode() {
+        h.update(b"VICTORY_F16_ROUND_MODE=1");
+    }
     if victory_shader::emit::div_inf_zero() {
         h.update(b"VICTORY_DIV_INF_ZERO=1");
     }

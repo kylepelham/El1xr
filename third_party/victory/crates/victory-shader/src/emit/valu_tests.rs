@@ -3032,3 +3032,28 @@ fn normalized_buffer_fields_load_the_nearest_float() {
         });
     }
 }
+
+/// `VICTORY_F16_ROUND_MODE=1`: `v_cvt_f16_f32` rounds as MODE's 16/64-bit field says.
+/// 1 + 3/4 of an f16 step is 0x3C01 to nearest, 0x3C00 toward zero; after
+/// `s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3` (as the title sets it) toward zero, on
+/// every host, where the host's own conversion rounds to nearest (WARP) or toward zero
+/// (NVIDIA) whatever the mode.
+#[test]
+fn f16_results_round_as_the_mode_says() {
+    // v_cvt_f16_f32 v0, v1 (v0 = 0 on entry: the high half stays 0).
+    let cvt = vop1(0x0A, 0, vgpr(1));
+    // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), lit(value)
+    let setreg = |value: u32| [0xBA80_0881u32, value];
+    let x = 1.0f32 + 0.75 / 1024.0;
+    let cases = [[x.to_bits(), 0, 0, 0]];
+    super::lower::f16_round::FORCED.set(true);
+    let nearest = build_valu_cs(&[cvt]);
+    let zero = build_valu_cs(&[&setreg(3)[..], &[cvt]].concat());
+    let back = build_valu_cs(&[&setreg(3)[..], &setreg(0)[..], &[cvt]].concat());
+    super::lower::f16_round::FORCED.set(false);
+    for (name, shader, want) in [("nearest", &nearest, 0x3C01), ("zero", &zero, 0x3C00), ("back", &back, 0x3C01)] {
+        run_cases(shader, &cases, |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {name}");
+        });
+    }
+}
