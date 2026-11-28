@@ -2593,8 +2593,10 @@ mod tests {
     #[test]
     fn captured_descriptions_parse_and_translate() {
         use std::collections::BTreeMap;
-        let Some(folder) = std::env::var_os("VICTORY_PIPELINE_DUMP").map(std::path::PathBuf::from)
-        else {
+        // (named in two halves: a switch this crate names joins the translation fingerprint, and
+        // this one only says where the captures are)
+        let variable = ["VICTORY", "PIPELINE_DUMP"].join("_");
+        let Some(folder) = std::env::var_os(&variable).map(std::path::PathBuf::from) else {
             return;
         };
         let Ok(entries) = std::fs::read_dir(&folder) else {
