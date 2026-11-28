@@ -5370,6 +5370,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    reservation::quiet::forget(at, len);
     if empty_notice::skip(at, len) {
         return;
     }
@@ -5536,6 +5537,7 @@ pub(crate) fn is_guarded(block: usize) -> bool {
 /// protections, and removes `watch` guard metadata so the pages release cleanly.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn before_virtual_free(at: usize, len: usize) {
+    reservation::quiet::forget(at, len);
     crate::shadow::lazy_release_range(at, len);
     if len == 0 {
         return;
