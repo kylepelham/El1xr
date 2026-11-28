@@ -161,6 +161,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_FIND", Apply::Live),
     ("VICTORY_HEAP_FIND_EVERY_MS", Apply::Live),
     ("VICTORY_HEAP_FIND_WINDOW", Apply::Live),
+    ("VICTORY_HEAP_NOTICES", Apply::Restart),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
     // Not live: list stamps and the round floor are kept only while on; turned on mid-run it

@@ -17,6 +17,7 @@ use crate::host::host;
 mod buffer_format;
 mod copy_first;
 mod flicker;
+mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
@@ -715,19 +716,37 @@ pub(crate) fn page_written(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
+    // `VICTORY_HEAP_NOTICES`: for each view heap.
+    let push = |ranges: &mut Vec<(u64, u64)>, start, end| push_range(ranges, start, end, MOST);
+    let mut compacted = heap_notices::note(heap_notices::Kind::Written, start, end, push);
+    if heap_notices::shared_read() {
+        let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        compacted += push_range(&mut ranges, start, end, MOST);
+    }
+    if compacted != 0 {
+        PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
+    }
+}
+
+/// Keeps `[start, end)` in `ranges`, joined to the last range if it
+/// follows it (pages are mapped and written one after the other); a full
+/// list is compacted first. Returns how many ranges were compacted.
+fn push_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize) -> usize {
     if let Some(last) = ranges.last_mut()
         && last.1 == start
     {
         last.1 = end;
-        return;
+        return 0;
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        compact(&mut ranges, MOST);
+    let mut compacted = 0;
+    if ranges.len() >= most {
+        // Compact instead of clearing so streaming bursts never drop texture invalidations.
+        compacted = ranges.len();
+        compact(ranges, most);
     }
     ranges.push((start, end));
+    compacted
 }
 
 /// Whose the memory of a texture view is, by [`Spans`].
@@ -798,21 +817,17 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    // `VICTORY_HEAP_NOTICES`: for each view heap.
+    let push = |ranges: &mut Vec<(u64, u64)>, start, end| push_range(ranges, start, end, MOST);
+    let mut compacted = heap_notices::note(heap_notices::Kind::Remapped, start, end, push);
+    if heap_notices::shared_read() {
+        let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        compacted += push_range(&mut ranges, start, end, MOST);
     }
-    if ranges.len() >= MOST {
-        // Compact instead of clearing so streaming bursts never drop texture invalidations.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        compact(&mut ranges, MOST);
+    if compacted != 0 {
+        STALE[2].fetch_add(compacted as u64, Relaxed);
     }
-    ranges.push((start, end));
 }
 
 /// Merges overlapping or touching (within `gap` bytes) ranges in place.
@@ -1697,6 +1712,7 @@ impl HostHeap {
             ms = started.elapsed().as_millis(),
             "host descriptor heap made null"
         );
+        heap_notices::born(h.id, h.sampler);
         Some(h)
     }
 
@@ -2106,12 +2122,17 @@ impl HostHeap {
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
-    /// shortcut: the ranges are kept in one place for all heaps; the heap
-    /// whose pass runs first takes them (a title has one view heap).
+    /// The ranges are kept in one place for all heaps, and the heap whose
+    /// pass runs first takes them, unless `VICTORY_HEAP_NOTICES=1` keeps
+    /// them for each heap ([`heap_notices`]).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = if heap_notices::subscribed(self.id) {
+            heap_notices::take(self.id, heap_notices::Kind::Remapped)
+        } else {
+            std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         join_ranges(&mut ranges, 0);
         if ranges.is_empty() {
             return 0;
@@ -2154,8 +2175,11 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let mut ranges =
-            std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = if heap_notices::subscribed(self.id) {
+            heap_notices::take(self.id, heap_notices::Kind::Written)
+        } else {
+            std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         join_ranges(&mut ranges, 0);
         if ranges.is_empty() {
             return 0;
