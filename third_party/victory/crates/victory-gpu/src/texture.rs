@@ -107,9 +107,10 @@ pub(crate) struct Staging {
     /// buffer then holds the title's bytes as laid out, and the prelude
     /// detiles them into this one's buffer, which its copies read.
     gpu: Option<gpu_detile::Gpu>,
-    /// The submission that last recorded a copy from it
-    /// (`VICTORY_STAGING_UNDER_FLIGHT`, [`staging_flight`]; 0: none seen).
-    sent: std::sync::atomic::AtomicU64,
+    /// The submissions that last recorded a copy from it, and its spares
+    /// (`VICTORY_STAGING_UNDER_FLIGHT`, `VICTORY_STAGING_FLIGHT_WAIT`,
+    /// [`staging_flight`]).
+    flight: staging_flight::Flight,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -580,23 +581,30 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        for (buffer, data, bytes) in self.flight.take_spares() {
+            stage_give(buffer, data, bytes);
+        }
         if self.piece.is_some() {
             return;
         }
-        // (Neptune) Its upload buffer is kept for the next staging buffer of its size class.
-        // The last holder is gone: the texture's entry, and every list that recorded an
-        // upload from it (a list is reset when the card has run it).
-        let most = stage_pool_most();
-        if most != 0 && !crate::commitline::upload_over_cap() {
-            let (class, size) = stage_class(self.bytes);
-            let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-            if pool.bytes + size <= most {
-                if pool.free.len() <= class {
-                    pool.free.resize_with(class + 1, Vec::new);
-                }
-                pool.free[class].push((self.buffer.clone(), self.data as usize));
-                pool.bytes += size;
+        stage_give(self.buffer.clone(), self.data as usize, self.bytes);
+    }
+}
+
+/// (Neptune) An upload buffer of a staging buffer of `bytes` bytes is kept for the next
+/// staging buffer of its size class. The last holder is gone: the texture's entry, and every
+/// list that recorded an upload from it (a list is reset when the card has run it).
+fn stage_give(buffer: ID3D12Resource, data: usize, bytes: u64) {
+    let most = stage_pool_most();
+    if most != 0 && !crate::commitline::upload_over_cap() {
+        let (class, size) = stage_class(bytes);
+        let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.bytes + size <= most {
+            if pool.free.len() <= class {
+                pool.free.resize_with(class + 1, Vec::new);
             }
+            pool.free[class].push((buffer, data));
+            pool.bytes += size;
         }
     }
 }
@@ -1169,7 +1177,6 @@ impl PreludeUpload {
                 crate::descriptor::host::levels_waiting(self.staging.memory as u64);
             }
         }
-        staging_flight::copied(&self.staging.sent);
         Some(first_upload)
     }
 
@@ -1195,14 +1202,20 @@ impl PreludeUpload {
             }
         }
         let texture = &self.copy.texture;
+        // The buffer detiled last (`VICTORY_STAGING_FLIGHT_WAIT`: a spare).
+        let slot = self.staging.flight.recorded();
+        let (buffer, base) = self
+            .staging
+            .flight
+            .buffer(slot, (&self.staging.buffer, self.staging.base));
         // On the card's way: detiled here first, into the buffer the copies read.
         let gpu = self.staging.gpu.as_ref();
         if let Some(gpu) = gpu {
-            gpu_detile::record(cmd_list, &self.staging.buffer, self.staging.base, gpu);
+            gpu_detile::record(cmd_list, buffer, base, gpu);
         }
         let (source, base) = match gpu {
             Some(gpu) => (gpu_detile::copy_source(gpu), 0),
-            None => (&self.staging.buffer, self.staging.base),
+            None => (buffer, base),
         };
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
@@ -2031,7 +2044,16 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        staging_flight::detiled(self.resource, &self.sent, tiled.len());
+        staging_flight::detiled(self.resource, &self.flight, tiled.len());
+        // `VICTORY_STAGING_FLIGHT_WAIT`: a spare when a copy may still read it.
+        let (slot, data) = self.flight.target(self.data, || {
+            let (buffer, data) = stage_buffer(host()?, self.bytes)?;
+            if let Some(gpu) = &self.gpu {
+                // SAFETY: a new spare's mapping of `raw.bytes`, ours alone.
+                unsafe { gpu_detile::prepare(gpu, &self.layout, data) };
+            }
+            Some((buffer, data, self.bytes))
+        });
         crate::readable_once::bump(self.resource);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
@@ -2059,7 +2081,8 @@ impl Staging {
         if let Some(gpu) = &self.gpu {
             // SAFETY: the mapping holds `gpu.raw.bytes`, written only here
             // (under the staging's `last`), as the PC's way writes it.
-            unsafe { gpu_detile::stage(gpu, self.data, tiled, held) };
+            unsafe { gpu_detile::stage(gpu, data, tiled, held) };
+            self.written(slot);
             return;
         }
         let started = gpu_detile::on().then(std::time::Instant::now);
@@ -2077,7 +2100,7 @@ impl Staging {
             // SAFETY: the subresource's part of the mapped staging buffer, up
             // to its end (`slice_len`).
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -2094,6 +2117,15 @@ impl Staging {
         }
         if let Some(started) = started {
             gpu_detile::detiled_on_pc(started.elapsed().as_micros() as u64);
+        }
+        self.written(slot);
+    }
+
+    /// `slot` of its buffers was detiled whole and the next prelude copies
+    /// from it; moved off the last one, the texture is due again.
+    fn written(&self, slot: usize) {
+        if self.flight.written(slot) {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -2813,7 +2845,7 @@ fn build_staging_untimed(
         base,
         piece,
         gpu,
-        sent: std::sync::atomic::AtomicU64::new(0),
+        flight: staging_flight::Flight::new(),
     });
     Some(s)
 }

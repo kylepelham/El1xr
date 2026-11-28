@@ -412,6 +412,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_TABLED_TEXTURES", Apply::Restart),
     ("VICTORY_TABLES_BY_CONTENT", Apply::Restart),
     ("VICTORY_TABLE_DEFER", Apply::Restart),
+    ("VICTORY_TEST_D3D12_DEBUG", Apply::Restart),
     ("VICTORY_TEST_SPLIT_RAW_WIDE", Apply::Restart),
     ("VICTORY_TEST_TITLES", Apply::Restart),
     ("VICTORY_TEXBACK_ASYNC", Apply::Restart),
