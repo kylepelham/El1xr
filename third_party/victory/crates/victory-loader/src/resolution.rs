@@ -1,6 +1,7 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
 //! `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`, `VICTORY_UPSCALER`; each off
-//! without it): places
+//! without it; `VICTORY_RESOLUTION` and `VICTORY_UPSCALE_QUALITY` set them
+//! at start, `victory_core::render_plan`): places
 //! in the title's code changed at load, each compared byte for byte first
 //! and left alone, said so, if it differs (another build of the title).
 //!
@@ -48,13 +49,7 @@ pub enum Patched {
 }
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
-pub const MODES: [(u32, u32); 5] = [
-    (1280, 720),
-    (1664, 936),
-    (1920, 1080),
-    (2560, 1440),
-    (3840, 2160),
-];
+pub const MODES: [(u32, u32); 5] = victory_core::render_plan::MODES;
 
 /// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `None` if unset or not one
 /// (said why).
@@ -70,9 +65,7 @@ pub fn asked_output() -> Option<(u32, u32)> {
 }
 
 pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
-    let (w, h) = spec.trim().split_once(['x', 'X'])?;
-    let size = (w.trim().parse().ok()?, h.trim().parse().ok()?);
-    MODES.contains(&size).then_some(size)
+    victory_core::render_plan::parse_mode(spec)
 }
 
 /// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
@@ -96,15 +89,28 @@ pub fn parse_render_scale(spec: &str) -> Option<f32> {
         .filter(|s| (0.5..=1.0).contains(s))
 }
 
-/// `VICTORY_FFX_SCALE=<s>`, 0.5 to 1.0: FidelityFX's render scale (Series
-/// S). Crashed at 0.5 (run res-6); see the module's notes.
+/// `VICTORY_FFX_SCALE=<s>`, 1/3 to 1.0: FidelityFX's render scale (Series
+/// S). Crashed at 0.5 (run res-6) before `ffxQuery` answered the jitter
+/// phase count the title's DLL refuses; see the module's notes. Below 0.5
+/// only `VICTORY_UPSCALE_QUALITY=ultra_performance` (1/3) asks for it.
 pub fn asked_ffx_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_FFX_SCALE").ok()?;
-    let scale = parse_render_scale(&spec);
+    let scale = parse_ffx_scale(&spec);
     if scale.is_none() {
-        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected 0.5 to 1.0");
+        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected 0.333 to 1.0");
     }
     scale
+}
+
+/// The lowest FidelityFX scale taken: Ultra performance's 1/3, a little under
+/// so its printed f32 parses in.
+pub const FFX_SCALE_MIN: f32 = 0.33;
+
+pub fn parse_ffx_scale(spec: &str) -> Option<f32> {
+    spec.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|s| (FFX_SCALE_MIN..=1.0).contains(s))
 }
 
 /// `VICTORY_UPSCALER=<kind>`: 6 (the title's own) or 7 (FidelityFX).
@@ -282,6 +288,7 @@ pub fn ffx_scale_live() -> bool {
 /// targets are sized for it; a larger render size would not fit). Whether the
 /// title takes it before its next target rebuild is for a run to show (the
 /// render size in `VICTORY_UPSCALE_PROBE`'s lines). Returns the scale written.
+/// A startup scale under 0.5 (Ultra performance) is also the floor.
 #[cfg(windows)]
 pub fn request_ffx_scale(scale: f32) -> Result<f32, &'static str> {
     let slot = FFX_SLOT.load(Ordering::Relaxed);
@@ -314,7 +321,8 @@ unsafe fn write_live_scale(slot: usize, start: f32, asked: f32) -> Result<f32, &
     if slot % 4 != 0 {
         return Err("slot not aligned");
     }
-    let scale = asked.clamp(0.5, start.max(0.5));
+    let floor = start.min(0.5);
+    let scale = asked.clamp(floor, start.max(floor));
     let mut old = 0;
     // SAFETY: the caller's promise; an aligned 4-byte store is atomic for the
     // title's loads, and the page stays executable throughout.
@@ -458,6 +466,11 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+        assert_eq!(parse_ffx_scale("0.33333334"), Some(1.0 / 3.0));
+        assert_eq!(parse_ffx_scale("0.6666667"), Some(2.0 / 3.0));
+        assert_eq!(parse_ffx_scale("0.3"), None);
+        assert_eq!(parse_ffx_scale("1.01"), None);
+        assert_eq!(MODES, victory_core::render_plan::MODES);
     }
 
     /// The calls and loads in the bytes compared are the ones the
@@ -570,6 +583,10 @@ mod tests {
             assert_eq!(read(), 0.667);
             assert_eq!(write_live_scale(slot, 0.667, 0.1), Ok(0.5));
             assert_eq!(read(), 0.5);
+            // Ultra performance's 1/3 at start: never larger than it.
+            assert_eq!(write_live_scale(slot, 1.0 / 3.0, 0.6), Ok(1.0 / 3.0));
+            assert_eq!(write_live_scale(slot, 1.0 / 3.0, 0.1), Ok(1.0 / 3.0));
+            assert_eq!(write_live_scale(slot, 0.667, 0.1), Ok(0.5));
             assert!(write_live_scale(slot, 0.667, f32::NAN).is_err());
             assert!(write_live_scale(slot + 1, 0.667, 0.6).is_err());
             assert_eq!(read(), 0.5);

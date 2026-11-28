@@ -1,7 +1,7 @@
 //! (El1xr) The menu's state and navigation, with no OS calls: tabs from the registry's groups, the
 //! selected row, value stepping by kind, presets, and what a key, button or click does.
 
-use super::model::{Applied, Apply, FIRST, Info, Kind, MenuModel, named};
+use super::model::{Applied, Apply, FIRST, Info, Kind, MenuModel, first_pick, named};
 
 /// A tab: one of the registry's groups, or the presets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,8 +318,13 @@ pub fn step_value(name: &str, kind: Kind, current: &str, dir: i32) -> Option<Str
     if let Some(values) = named(name) {
         let n = values.len() as i32;
         let at = values.iter().position(|&(v, _)| v == current);
-        let next = at.map_or(0, |at| (at as i32 + dir).rem_euclid(n));
-        return Some(values[next as usize].0.to_string());
+        let next = match at {
+            Some(at) => (at as i32 + dir).rem_euclid(n) as usize,
+            None => first_pick(name)
+                .and_then(|s| values.iter().position(|&(v, _)| v == s))
+                .unwrap_or(0),
+        };
+        return Some(values[next].0.to_string());
     }
     Some(match kind {
         Kind::Bool => if current == "1" { "0" } else { "1" }.to_string(),
@@ -492,9 +497,9 @@ mod tests {
         assert_eq!(
             names,
             [
+                "VICTORY_RESOLUTION",
                 "VICTORY_UPSCALE",
-                "VICTORY_DLSS_QUALITY",
-                "VICTORY_FFX_SCALE",
+                "VICTORY_UPSCALE_QUALITY",
                 "VICTORY_DLSS_SHARPNESS",
                 "VICTORY_FRAME_GEN"
             ]
@@ -576,8 +581,21 @@ mod tests {
         assert_eq!(shown("VICTORY_DLSS_QUALITY", q, "5"), "DLAA");
         assert_eq!(
             shown("VICTORY_UPSCALE", Kind::Choice(&["off"]), "off"),
-            "Title's own"
+            "Off"
         );
+        // Quality steps from Quality first when unset, then through the modes; Resolution from
+        // Native.
+        let modes = Kind::Choice(victory_core::render_plan::QUALITIES);
+        assert_eq!(step_value("VICTORY_UPSCALE_QUALITY", modes, "", 1).unwrap(), "quality");
+        assert_eq!(step_value("VICTORY_UPSCALE_QUALITY", modes, "", -1).unwrap(), "quality");
+        assert_eq!(step_value("VICTORY_UPSCALE_QUALITY", modes, "quality", -1).unwrap(), "balanced");
+        assert_eq!(step_value("VICTORY_UPSCALE_QUALITY", modes, "dlaa", 1).unwrap(), "ultra_performance");
+        assert_eq!(shown("VICTORY_UPSCALE_QUALITY", modes, "ultra_performance"), "Ultra performance");
+        let res = Kind::Choice(victory_core::render_plan::RESOLUTIONS);
+        assert_eq!(step_value("VICTORY_RESOLUTION", res, "", 1).unwrap(), "native");
+        assert_eq!(step_value("VICTORY_RESOLUTION", res, "native", -1).unwrap(), "3840x2160");
+        assert_eq!(step_value("VICTORY_RESOLUTION", res, "2560x1440", 1).unwrap(), "3840x2160");
+        assert_eq!(shown("VICTORY_RESOLUTION", res, "2560x1440"), "2560 x 1440");
         assert_eq!(shown("X", c, "fsr"), "FSR");
         assert_eq!(shown("X", Kind::Int { min: 0, max: 9 }, "0"), "Off");
         assert_eq!(shown("X", scale, ""), "Default");
@@ -652,7 +670,7 @@ mod tests {
         m.act(&mut model, Action::SelectRow(0));
         m.act(&mut model, Action::Activate);
         assert_eq!(m.status.as_deref(), Some("Quality preset applied"));
-        assert_eq!(model.get("VICTORY_DLSS_QUALITY").as_deref(), Some("5"));
+        assert_eq!(model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("quality"));
         assert_eq!(model.get("VICTORY_UPSCALE").as_deref(), Some("dlss"));
         let presets = model.presets().len();
         m.act(&mut model, Action::SelectRow(presets));

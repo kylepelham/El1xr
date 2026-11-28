@@ -227,6 +227,10 @@ fn main() -> Result<()> {
     // The user's settings file (`VICTORY_SETTINGS_FILE`), into the environment before any
     // thread starts or reads it; nothing without a file.
     let settings = victory_core::settings::init();
+    // (El1xr) `VICTORY_RESOLUTION` / `VICTORY_UPSCALE_QUALITY`: the output size and upscaler
+    // quality as the switches that do them, into the environment too; nothing without them.
+    let from_file = settings.applied.iter().cloned().collect();
+    let render_plan = victory_core::render_plan::derive_env(&from_file, victory_gpu::menu::primary_display_size);
     // `VICTORY_HEAP_COUNT=1`: the Rust heap's live bytes for the resident line (off: it slowed loading).
     victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_some_and(|v| v == "1"));
     // (Neptune) Discord Rich Presence while a title runs (`discord.rs`).
@@ -234,7 +238,7 @@ fn main() -> Result<()> {
         discord::start();
     }
     victory_core::logging::init("info");
-    for line in settings.lines() {
+    for line in settings.lines().into_iter().chain(render_plan.lines()) {
         tracing::info!("{line}");
     }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.

@@ -31,6 +31,10 @@ pub trait MenuModel: Send {
     fn presets(&self) -> &[Preset] {
         &[]
     }
+    /// A line that says more than the help under `name`'s row (what the next start renders at).
+    fn detail(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The live registry. `save` is the registry's unless a test swaps it.
@@ -85,38 +89,45 @@ impl MenuModel for Registry {
     fn presets(&self) -> &[Preset] {
         PRESETS
     }
+
+    fn detail(&self, name: &str) -> Option<String> {
+        super::display::detail(name, settings::get, super::display::primary_display_size)
+    }
 }
 
-/// DLSS presets over the upscaler and its quality mode (`upscale_live`'s numbers).
+/// DLSS presets over the upscaler and its quality mode (`victory_core::render_plan`): the render
+/// size follows the Resolution row.
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "Quality",
-        help: "DLSS at full resolution (DLAA).",
-        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_DLSS_QUALITY", "5")],
+        help: "DLSS Quality: renders at 0.667 of the resolution.",
+        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_UPSCALE_QUALITY", "quality")],
     },
     Preset {
         name: "Balanced",
-        help: "DLSS Quality mode.",
-        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_DLSS_QUALITY", "2")],
+        help: "DLSS Balanced: renders at 0.58 of the resolution.",
+        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_UPSCALE_QUALITY", "balanced")],
     },
     Preset {
         name: "Performance",
-        help: "DLSS Performance mode.",
-        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_DLSS_QUALITY", "0")],
+        help: "DLSS Performance: renders at half the resolution.",
+        values: &[("VICTORY_UPSCALE", "dlss"), ("VICTORY_UPSCALE_QUALITY", "performance")],
     },
 ];
 
 /// Settings listed first in their tab, in this order; the rest follow in the registry's.
 pub const FIRST: &[&str] = &[
+    "VICTORY_RESOLUTION",
     "VICTORY_UPSCALE",
-    "VICTORY_DLSS_QUALITY",
-    "VICTORY_FFX_SCALE",
+    "VICTORY_UPSCALE_QUALITY",
     "VICTORY_DLSS_SHARPNESS",
     "VICTORY_FRAME_GEN",
     "VICTORY_PRESENT_CAP",
     "VICTORY_PRESENT_SYNC",
     "VICTORY_PRESENT_SMOOTH",
     "VICTORY_OVERLAY",
+    "VICTORY_DLSS_QUALITY",
+    "VICTORY_FFX_SCALE",
 ];
 
 /// Values that read better by name, in the order the menu steps through them.
@@ -124,10 +135,35 @@ const NAMED: &[(&str, &[(&str, &str)])] = &[
     (
         "VICTORY_UPSCALE",
         &[
-            ("off", "Title's own"),
+            ("off", "Off"),
             ("stretch", "Stretch"),
             ("dlss", "DLSS"),
         ],
+    ),
+    (
+        "VICTORY_UPSCALE_QUALITY",
+        &[
+            ("ultra_performance", "Ultra performance"),
+            ("performance", "Performance"),
+            ("balanced", "Balanced"),
+            ("quality", "Quality"),
+            ("dlaa", "DLAA"),
+        ],
+    ),
+    (
+        "VICTORY_RESOLUTION",
+        &[
+            ("1280x720", "1280 x 720"),
+            ("1664x936", "1664 x 936"),
+            ("1920x1080", "1920 x 1080"),
+            ("2560x1440", "2560 x 1440"),
+            ("3840x2160", "3840 x 2160"),
+            ("native", "Native"),
+        ],
+    ),
+    (
+        "VICTORY_UPSCALER",
+        &[("6", "Title's own"), ("7", "FidelityFX")],
     ),
     (
         "VICTORY_DLSS_QUALITY",
@@ -141,6 +177,15 @@ const NAMED: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
 ];
+
+/// The value an unset `name` steps to first, either way (else the first named one).
+pub fn first_pick(name: &str) -> Option<&'static str> {
+    match name {
+        "VICTORY_UPSCALE_QUALITY" => Some(victory_core::render_plan::DEFAULT_QUALITY),
+        "VICTORY_RESOLUTION" => Some("native"),
+        _ => None,
+    }
+}
 
 /// The values of `name` by name, in stepping order, if it has them.
 pub fn named(name: &str) -> Option<&'static [(&'static str, &'static str)]> {

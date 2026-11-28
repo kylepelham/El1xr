@@ -5,11 +5,13 @@
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
 //! * [`settings`]: every `VICTORY_*` setting, the settings file, live changes.
+//! * [`render_plan`]: the output resolution and upscaler quality mode, as switches.
 
 pub mod config;
 pub mod heapcount;
 pub mod logging;
 pub mod policy;
+pub mod render_plan;
 pub mod settings;
 
 pub use config::Config;
