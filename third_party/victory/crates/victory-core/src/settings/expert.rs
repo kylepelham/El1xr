@@ -325,7 +325,6 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_RESINFO_MIP_BOUNDS", Apply::Retranslate),
     ("VICTORY_RESINFO_MSAA", Apply::Retranslate),
     ("VICTORY_RESINFO_SHAPE", Apply::Retranslate),
-    ("VICTORY_RESULT_RING", Apply::Live),
     ("VICTORY_REUPLOAD_WHEN_FULL", Apply::Restart),
     ("VICTORY_RIPE_BLOCKS", Apply::Restart),
     ("VICTORY_ROOT_BIND_CACHE", Apply::Restart),
