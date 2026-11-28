@@ -3889,6 +3889,8 @@ impl State {
             crate::drop_why::set("MissingHostPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(true);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -4332,6 +4334,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("mesh", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 
@@ -5072,6 +5076,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("draw", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 
@@ -5196,6 +5202,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("indexed", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 }

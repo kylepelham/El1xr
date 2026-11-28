@@ -33,6 +33,14 @@ pub(crate) fn object_span(this: This) -> Option<(u64, u64)> {
     Some((r.data() as u64, size))
 }
 
+/// The width and height of title resource `this`.
+pub(crate) fn object_size(this: This) -> Option<(u64, u64)> {
+    (!this.is_null()).then(|| {
+        let d = &resource(this).desc;
+        (d.width, u64::from(d.height))
+    })
+}
+
 /// The width of title resource `this`.
 pub(crate) fn object_width(this: This) -> Option<u64> {
     (!this.is_null()).then(|| resource(this).desc.width)
