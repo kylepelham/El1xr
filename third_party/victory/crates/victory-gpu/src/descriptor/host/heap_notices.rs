@@ -79,6 +79,12 @@ pub(super) fn born(id: u64, sampler: bool) {
     } else {
         SHARED_READERS.fetch_add(1, Relaxed);
     }
+    // Whether a title has more than one view heap (what the switch is for).
+    static MADE: AtomicUsize = AtomicUsize::new(0);
+    let made = MADE.fetch_add(1, Relaxed) + 1;
+    if made <= 16 {
+        tracing::info!(id, made, own_notices = on(), "heap notices: a host view heap made");
+    }
 }
 
 /// A heap went: out of the subscribers, or one shared reader fewer.
