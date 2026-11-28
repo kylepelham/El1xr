@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use super::queue::{Call, Outcome, Queue};
+use super::queue::{Call, Outcome, Queue, Script};
 use crate::menu::model::{Applied, Apply, Info, Kind, MenuModel, SetError};
 
 /// What an option does.
@@ -16,10 +17,12 @@ use crate::menu::model::{Applied, Apply, Info, Kind, MenuModel, SetError};
 pub enum Effect {
     /// Shows our own state (`status` gives the text); no native.
     Status(fn() -> String),
-    /// Shows a native's result, read again at most every [`READ_EVERY`] while it is drawn.
+    /// Shows a native's result, read again at most every [`READ_EVERY`] while it is drawn. With
+    /// a `script`, the script runs instead (`hash` is its first native).
     Read {
         hash: u64,
         args: &'static [u64],
+        script: Option<Script>,
         show: fn([u64; 4]) -> String,
     },
     /// Calls a native with the value chosen, as argument slots.
@@ -27,6 +30,9 @@ pub enum Effect {
         hash: u64,
         args: fn(&str) -> Vec<u64>,
     },
+    /// Our own state that drives natives from the game thread (`get` shows it, `set` takes a
+    /// valid value), such as the clock hold.
+    Own { get: fn() -> String, set: fn(&str) },
 }
 
 pub struct Opt {
@@ -55,6 +61,54 @@ pub const NATIVE_CLOCK_MINUTES: u64 = 0x47dc_2440_b1e9_ddce;
 /// unknown; the trainer passes 0.
 pub const NATIVE_SET_CLOCK_TIME: u64 = 0x04d2_1127_c5ad_3a60;
 
+// The player, mapped offline on 1.0.2.1 from the batch 5 census (`AnyXboxX-coord/modmenu/STATE.md`).
+// Entity handles are 128-bit ids (two slots) and vectors are four packed floats (two slots).
+/// `PLAYER_PED_ID`-like: 0 args; the local player global (`+0xab56e38`) through the title's
+/// entity-to-id function (`+0x2a6520`, mode 2), a 128-bit handle in result slots 0-1. Called in
+/// every census window.
+pub const NATIVE_PLAYER_PED_ID: u64 = 0x6471_f11f_f69d_8a77;
+/// `GET_ENTITY_COORDS`-like: (handle in slots 0-1, flag in slot 2); resolves the handle to an
+/// entity (`+0x350170`, the type check `0xb1389614`), reads its matrix translation (`+0x70`) and
+/// adds the world cell (`+0x4dc3790`): x, y, z, w floats in result slots 0-1.
+pub const NATIVE_GET_ENTITY_COORDS: u64 = 0x6c66_0bb2_5792_a0f9;
+
+/// Hours the clock rows take, as choices (an `Int` 0 would read "Off" in the menu).
+pub const HOURS: &[&str] = &[
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23",
+];
+/// The clock hold's values: off, or the hour to keep.
+pub const HOLD: &[&str] = &[
+    "off", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+    "16", "17", "18", "19", "20", "21", "22", "23",
+];
+
+/// The hour the clock is held at (`-1`: no hold). The game-thread hook sets the clock to it on
+/// every tick, so the title's own scripts (the prologue puts 7:30 back within 10 s) cannot move it.
+static HOLD_HOUR: AtomicI64 = AtomicI64::new(-1);
+
+/// The held hour, if any.
+pub fn held_hour() -> Option<u64> {
+    u64::try_from(HOLD_HOUR.load(Relaxed)).ok()
+}
+
+fn hold_get() -> String {
+    held_hour().map_or_else(|| "off".into(), |h| h.to_string())
+}
+
+fn hold_set(v: &str) {
+    HOLD_HOUR.store(v.parse().unwrap_or(-1), Relaxed);
+}
+
+/// The player's position: the player ped's handle, then that entity's coordinates.
+fn player_coords(
+    call: &mut dyn FnMut(u64, &[u64]) -> Option<[u64; 4]>,
+    _: &[u64],
+) -> Option<[u64; 4]> {
+    let [lo, hi, ..] = call(NATIVE_PLAYER_PED_ID, &[])?;
+    call(NATIVE_GET_ENTITY_COORDS, &[lo, hi, 0])
+}
+
 pub(crate) const fn info(
     name: &'static str,
     group: &'static str,
@@ -78,15 +132,143 @@ fn natives_status() -> String {
     super::status()
 }
 
+fn working_status() -> String {
+    let natives = OPTIONS
+        .iter()
+        .filter(|o| !matches!(o.effect, Effect::Status(_)));
+    let (ok, all) = natives.fold((0, 0), |(ok, all), o| {
+        (ok + usize::from(o.verified), all + 1)
+    });
+    format!("{ok} of {all} confirmed in game; the rest say (unverified)")
+}
+
 fn show_int([v, ..]: [u64; 4]) -> String {
     (v as i64 as i32).to_string()
+}
+
+fn show_handle([lo, hi, ..]: [u64; 4]) -> String {
+    format!("{hi:016x}{lo:016x}")
+}
+
+/// x y z of four packed floats in slots 0-1.
+fn show_xyz([a, b, ..]: [u64; 4]) -> String {
+    let f = |v: u64| f32::from_bits(v as u32);
+    format!("{:.1} {:.1} {:.1}", f(a), f(a >> 32), f(b))
 }
 
 fn clock_time(v: &str) -> Vec<u64> {
     vec![v.parse().unwrap_or(0), 0, 0, 0]
 }
 
+// Rows in menu order: per tab, what works first. `verified`: batch 5 part I read the clock (12:00,
+// 8:00, 7:30 as the prologue sets it), the frame rate (60 while loading, 30 in game) and set the
+// hour (read 3 right after; the prologue's script put 7:30 back within 10 s, hence the hold).
 pub const OPTIONS: &[Opt] = &[
+    Opt {
+        info: info(
+            "MOD_CLOCK_HOUR",
+            "World",
+            "Hour",
+            "The in-game clock's hour, read through the title's clock getter.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_CLOCK_HOURS,
+            args: &[],
+            script: None,
+            show: show_int,
+        },
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_MINUTE",
+            "World",
+            "Minute",
+            "The in-game clock's minute.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_CLOCK_MINUTES,
+            args: &[],
+            script: None,
+            show: show_int,
+        },
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_SET_HOUR",
+            "World",
+            "Set hour",
+            "Sets the in-game clock to this hour, minute and second 0, once. Mission scripts may set \
+             their own time again; use Hold hour to keep it.",
+            Kind::Choice(HOURS),
+        ),
+        effect: Effect::Set {
+            hash: NATIVE_SET_CLOCK_TIME,
+            args: clock_time,
+        },
+        verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_HOLD",
+            "World",
+            "Hold hour (unverified)",
+            "Sets the clock to this hour on every game tick, so scripts cannot move it. Off lets the \
+             clock run again.",
+            Kind::Choice(HOLD),
+        ),
+        effect: Effect::Own {
+            get: hold_get,
+            set: hold_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_PLAYER_COORDS",
+            "Player",
+            "Position (unverified)",
+            "The player's x y z: the player ped's handle, then that entity's coordinates.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_PLAYER_PED_ID,
+            args: &[],
+            script: Some(player_coords),
+            show: show_xyz,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_PLAYER_PED",
+            "Player",
+            "Player ped handle (unverified)",
+            "The player ped's 128-bit entity handle; stays the same while the player does.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_PLAYER_PED_ID,
+            args: &[],
+            script: None,
+            show: show_handle,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_WORKING",
+            "Status",
+            "Working options",
+            "Rows confirmed by a game run; the others are mapped offline and await a check.",
+            Kind::Text,
+        ),
+        effect: Effect::Status(working_status),
+        verified: true,
+    },
     Opt {
         info: info(
             "MOD_NATIVES",
@@ -102,60 +284,18 @@ pub const OPTIONS: &[Opt] = &[
         info: info(
             "MOD_TITLE_FPS",
             "Status",
-            "Title frame rate (unverified)",
-            "Read through the title's own native on its thread: proves calls work.",
+            "Title frame rate",
+            "Read through the title's own native on its thread: proves calls work (60 while \
+             loading, 30 in game).",
             Kind::Text,
         ),
         effect: Effect::Read {
             hash: NATIVE_TITLE_FPS,
             args: &[],
+            script: None,
             show: show_int,
         },
-        verified: false,
-    },
-    Opt {
-        info: info(
-            "MOD_CLOCK_HOUR",
-            "World",
-            "Hour (unverified)",
-            "The in-game clock's hour, read through the title's clock getter.",
-            Kind::Text,
-        ),
-        effect: Effect::Read {
-            hash: NATIVE_CLOCK_HOURS,
-            args: &[],
-            show: show_int,
-        },
-        verified: false,
-    },
-    Opt {
-        info: info(
-            "MOD_CLOCK_MINUTE",
-            "World",
-            "Minute (unverified)",
-            "The in-game clock's minute.",
-            Kind::Text,
-        ),
-        effect: Effect::Read {
-            hash: NATIVE_CLOCK_MINUTES,
-            args: &[],
-            show: show_int,
-        },
-        verified: false,
-    },
-    Opt {
-        info: info(
-            "MOD_CLOCK_SET_HOUR",
-            "World",
-            "Set hour (unverified)",
-            "Sets the in-game clock to this hour, minute and second 0.",
-            Kind::Int { min: 0, max: 23 },
-        ),
-        effect: Effect::Set {
-            hash: NATIVE_SET_CLOCK_TIME,
-            args: clock_time,
-        },
-        verified: false,
+        verified: true,
     },
 ];
 
@@ -194,7 +334,12 @@ impl MenuModel for Trainer {
         let opt = self.opt(name)?;
         match opt.effect {
             Effect::Status(status) => Some(status()),
-            Effect::Read { hash, args, show } => {
+            Effect::Read {
+                hash,
+                args,
+                script,
+                show,
+            } => {
                 let now = Instant::now();
                 let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
                 let due = asked
@@ -205,6 +350,7 @@ impl MenuModel for Trainer {
                         name: opt.info.name,
                         hash,
                         args: args.to_vec(),
+                        script,
                     })
                 {
                     asked.insert(opt.info.name, now);
@@ -221,6 +367,7 @@ impl MenuModel for Trainer {
                     .cloned()
                     .unwrap_or_else(|| opt.info.default.to_string()),
             ),
+            Effect::Own { get, .. } => Some(get()),
         }
     }
 
@@ -240,16 +387,22 @@ impl MenuModel for Trainer {
         let opt = self
             .opt(name)
             .ok_or_else(|| SetError::Unknown(name.to_string()))?;
-        let Effect::Set { hash, args } = opt.effect else {
-            return Err(invalid());
-        };
         if !victory_core::settings::valid(opt.info.kind, value) {
             return Err(invalid());
         }
+        let (hash, args) = match opt.effect {
+            Effect::Set { hash, args } => (hash, args),
+            Effect::Own { set, .. } => {
+                set(value);
+                return Ok(Applied::Now);
+            }
+            Effect::Status(_) | Effect::Read { .. } => return Err(invalid()),
+        };
         let call = Call {
             name: opt.info.name,
             hash,
             args: args(value),
+            script: None,
         };
         if !self.queue.push(call) {
             return Err(invalid());
@@ -290,6 +443,7 @@ mod tests {
             effect: Effect::Read {
                 hash: 0xaa,
                 args: &[7],
+                script: None,
                 show: show_int,
             },
             verified: true,
@@ -387,5 +541,103 @@ mod tests {
         };
         assert_eq!(hash, NATIVE_SET_CLOCK_TIME);
         assert_eq!(args("13"), vec![13, 0, 0, 0], "hour, minute 0, second 0, flag 0");
+        assert!(victory_core::settings::valid(set.info.kind, "0"));
+        assert!(!victory_core::settings::valid(set.info.kind, "24"));
+        let t = Trainer::new(OPTIONS, queue());
+        assert_eq!(
+            tabs(&t, false),
+            vec![
+                Tab::Group("World"),
+                Tab::Group("Player"),
+                Tab::Group("Status")
+            ],
+            "opens on the clock, which works"
+        );
+        for o in OPTIONS {
+            let tab: Vec<_> = OPTIONS
+                .iter()
+                .filter(|p| p.info.group == o.info.group)
+                .collect();
+            let first_unverified = tab.iter().position(|p| !p.verified).unwrap_or(tab.len());
+            assert!(
+                tab[first_unverified..].iter().all(|p| !p.verified),
+                "working rows first in {}",
+                o.info.group
+            );
+        }
+    }
+
+    #[test]
+    fn the_clock_hold_is_our_own_state() {
+        let q = queue();
+        let mut t = Trainer::new(OPTIONS, q);
+        assert_eq!(t.get("MOD_CLOCK_HOLD").as_deref(), Some("off"));
+        assert_eq!(t.set("MOD_CLOCK_HOLD", "3"), Ok(Applied::Now));
+        assert_eq!(held_hour(), Some(3));
+        assert_eq!(t.get("MOD_CLOCK_HOLD").as_deref(), Some("3"));
+        assert!(t.set("MOD_CLOCK_HOLD", "24").is_err());
+        assert_eq!(held_hour(), Some(3), "a bad value changes nothing");
+        assert_eq!(t.set("MOD_CLOCK_HOLD", "off"), Ok(Applied::Now));
+        assert_eq!(held_hour(), None);
+        assert!(
+            q.idle(),
+            "the game-thread hook, not the menu, calls the native"
+        );
+    }
+
+    #[test]
+    fn player_position_reads_the_ped_then_its_coordinates() {
+        let q = queue();
+        let t = Trainer::new(OPTIONS, q);
+        assert_eq!(t.get("MOD_PLAYER_COORDS").as_deref(), Some("reading"));
+        let xyz = |x: f32, y: f32, z: f32| {
+            [
+                u64::from(x.to_bits()) | u64::from(y.to_bits()) << 32,
+                u64::from(z.to_bits()),
+                0,
+                0,
+            ]
+        };
+        let mut natives = Vec::new();
+        q.drain(|c| {
+            let script = c.script.expect("a script row");
+            script(
+                &mut |hash, args| {
+                    natives.push((hash, args.to_vec()));
+                    match hash {
+                        NATIVE_PLAYER_PED_ID => Some([0x11, 0x22, 0, 0]),
+                        NATIVE_GET_ENTITY_COORDS => Some(xyz(-1.5, 1024.0, 30.5)),
+                        _ => None,
+                    }
+                },
+                &c.args,
+            )
+        });
+        assert_eq!(
+            natives,
+            vec![
+                (NATIVE_PLAYER_PED_ID, vec![]),
+                (NATIVE_GET_ENTITY_COORDS, vec![0x11, 0x22, 0])
+            ],
+            "the handle's two slots, then the flag"
+        );
+        assert_eq!(
+            t.get("MOD_PLAYER_COORDS").as_deref(),
+            Some("-1.5 1024.0 30.5")
+        );
+        assert_eq!(
+            show_handle([0x11, 0x22, 0, 0]),
+            "00000000000000220000000000000011"
+        );
+        assert_eq!(
+            player_coords(&mut |_, _| None, &[]),
+            None,
+            "no ped, no read"
+        );
+        assert!(
+            working_status().starts_with("4 of 7 confirmed"),
+            "{}",
+            working_status()
+        );
     }
 }

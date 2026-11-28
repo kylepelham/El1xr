@@ -13,6 +13,9 @@
 //! game tick after the table is built and logs `mod menu: selftest ...` with the result.
 //! `VICTORY_MOD_MENU_CENSUS=1` counts calls per native ([`census`]) and logs the busiest every
 //! [`CENSUS_EVERY`]; `VICTORY_MOD_MENU_PROBE=1` logs the trainer's reads ([`probe`]).
+//!
+//! The clock hold (`MOD_CLOCK_HOLD`) sets the clock on every game tick while it is on and logs
+//! `mod menu: clock hold at H` / `mod menu: clock hold off` when it changes.
 
 pub mod census;
 pub mod model;
@@ -20,7 +23,7 @@ pub mod natives;
 pub mod probe;
 pub mod queue;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,6 +62,8 @@ static TICKS: AtomicUsize = AtomicUsize::new(0);
 static CENSUS: OnceLock<census::Census> = OnceLock::new();
 static CENSUS_LAST: Mutex<Option<Instant>> = Mutex::new(None);
 static PROBE: LazyLock<Mutex<probe::Probe>> = LazyLock::new(Mutex::default);
+/// The hold the hook last logged (`-1`: off).
+static HOLD_LOGGED: AtomicI64 = AtomicI64::new(-1);
 
 /// How often the census logs, and how many natives each time.
 pub const CENSUS_EVERY: Duration = Duration::from_secs(30);
@@ -134,18 +139,24 @@ pub fn game_tick() {
             name: "selftest",
             hash: model::NATIVE_TITLE_FPS,
             args: Vec::new(),
+            script: None,
         };
         QUEUE.push(call);
     }
     side_logs();
+    hold_clock();
     if QUEUE.idle() {
         return;
     }
-    QUEUE.drain(|call| {
-        let rva = table.scan.find(call.hash)?;
+    let mut native = |hash: u64, args: &[u64]| {
+        let rva = table.scan.find(hash)?;
         // SAFETY: a handler the scan found in the mapped image, on the title's thread; the
-        // options pass each native the slots it takes.
-        Some(unsafe { natives::invoke(table.base + rva as usize, &call.args) })
+        // options and scripts pass each native the slots it takes.
+        Some(unsafe { natives::invoke(table.base + rva as usize, args) })
+    };
+    QUEUE.drain(|call| match call.script {
+        Some(script) => script(&mut native, &call.args),
+        None => native(call.hash, &call.args),
     });
     if SELFTEST_QUEUED.load(Relaxed)
         && let Some(outcome) = QUEUE.result("selftest")
@@ -163,6 +174,26 @@ pub fn game_tick() {
                 model::NATIVE_TITLE_FPS
             ),
         }
+    }
+}
+
+/// While the clock hold is on, queues the clock set for this tick; logs when the hold changes.
+fn hold_clock() {
+    let held = model::held_hour();
+    let now = held.map_or(-1, |h| h as i64);
+    if HOLD_LOGGED.swap(now, Relaxed) != now {
+        match held {
+            Some(h) => tracing::info!("mod menu: clock hold at {h}"),
+            None => tracing::info!("mod menu: clock hold off"),
+        }
+    }
+    if let Some(h) = held {
+        QUEUE.push(Call {
+            name: "hold",
+            hash: model::NATIVE_SET_CLOCK_TIME,
+            args: vec![h, 0, 0, 0],
+            script: None,
+        });
     }
 }
 

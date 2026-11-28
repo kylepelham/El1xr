@@ -3,8 +3,9 @@
 //! `mod menu: probe MOD_CLOCK_HOUR 0x3d4e6e6637d30df7 -> 14 raw [..]`.
 //!
 //! `VICTORY_MOD_MENU_PROBE_SET=NAME=value[;NAME=value...][@seconds]` also runs those
-//! [`Effect::Set`] rows once, `seconds` (default [`SET_AFTER`]) after the first game tick, and
-//! logs `mod menu: probe set NAME=value`; the reads after it show what changed.
+//! [`Effect::Set`] and [`Effect::Own`] rows (such as `MOD_CLOCK_HOLD=3`) once, `seconds` (default
+//! [`SET_AFTER`]) after the first game tick, and logs `mod menu: probe set NAME=value`; the reads
+//! after it show what changed.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -85,9 +86,18 @@ impl Probe {
                             name: probe_name(info.name),
                             hash: *hash,
                             args: args(value),
+                            script: None,
                         };
                         let queued = queue.push(call);
                         format!("mod menu: probe set {name}={value} {hash:#018x} queued={queued}")
+                    }
+                    Some(Opt {
+                        info,
+                        effect: Effect::Own { set, .. },
+                        ..
+                    }) if victory_core::settings::valid(info.kind, value) => {
+                        set(value);
+                        format!("mod menu: probe set {name}={value} (own state)")
                     }
                     _ => format!(
                         "mod menu: probe set {name}={value} refused (no such set row or bad value)"
@@ -101,7 +111,13 @@ impl Probe {
         }
         self.last = Some(now);
         for o in options {
-            let Effect::Read { hash, args, show } = o.effect else {
+            let Effect::Read {
+                hash,
+                args,
+                script,
+                show,
+            } = o.effect
+            else {
                 continue;
             };
             let name = probe_name(o.info.name);
@@ -121,6 +137,7 @@ impl Probe {
                 name,
                 hash,
                 args: args.to_vec(),
+                script,
             });
         }
         lines
@@ -142,6 +159,7 @@ mod tests {
             effect: Effect::Read {
                 hash: 0xaa,
                 args: &[],
+                script: None,
                 show: |r| (r[0] as i32).to_string(),
             },
             verified: false,
@@ -160,7 +178,17 @@ mod tests {
             },
             verified: false,
         },
+        Opt {
+            info: super::super::model::info("P_OWN", "World", "Own", "", Kind::Bool),
+            effect: Effect::Own {
+                get: || String::new(),
+                set: |v| OWN.store(v == "1", std::sync::atomic::Ordering::Relaxed),
+            },
+            verified: false,
+        },
     ];
+
+    static OWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     #[test]
     fn set_plans_parse_with_an_optional_delay() {
@@ -182,7 +210,7 @@ mod tests {
         let q = Queue::default();
         let mut p = Probe::default();
         let t0 = Instant::now();
-        let plan = parse_set("P_SET=12;P_READ=1;NOPE=3@20").unwrap();
+        let plan = parse_set("P_SET=12;P_READ=1;NOPE=3;P_OWN=1@20").unwrap();
         assert!(
             p.tick(t0, OPTS, &q, Some(&plan)).is_empty(),
             "first tick only asks"
@@ -198,13 +226,15 @@ mod tests {
                 .is_empty()
         );
         let lines = p.tick(t0 + Duration::from_secs(21), OPTS, &q, Some(&plan));
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert!(
             lines[0].starts_with("mod menu: probe set P_SET=12 0x00000000000000bb queued=true")
         );
         assert!(lines[1].contains("refused"), "a read is not a set");
         assert!(lines[2].contains("refused"), "unknown row");
-        assert!(lines[3].starts_with("mod menu: probe P_READ 0x00000000000000aa -> 14 raw"));
+        assert_eq!(lines[3], "mod menu: probe set P_OWN=1 (own state)");
+        assert!(OWN.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(lines[4].starts_with("mod menu: probe P_READ 0x00000000000000aa -> 14 raw"));
         let mut seen = Vec::new();
         q.drain(|c| {
             seen.push((c.hash, c.args.clone()));
