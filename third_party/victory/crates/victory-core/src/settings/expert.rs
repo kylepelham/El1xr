@@ -44,6 +44,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_BVH_BUILDER_EARLY", Apply::Restart),
     ("VICTORY_BVH_CARD_WINDOWS_MB", Apply::Restart),
     ("VICTORY_BVH_COMMIT_FLOOR_MB", Apply::Restart),
+    ("VICTORY_BVH_DECLARE_CHECK", Apply::Restart),
+    ("VICTORY_BVH_DECLARE_OUTPUTS", Apply::Restart),
     ("VICTORY_BVH_PREMAP", Apply::Restart),
     ("VICTORY_BVH_QUARANTINE", Apply::Restart),
     ("VICTORY_CACHE_CORES", Apply::Restart),
