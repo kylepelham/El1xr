@@ -1358,7 +1358,7 @@ fn emit_program(
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let first = emit_program_plain(c, native, p, st, io, res);
-    loops_wave::again(first, native, p, st, |st, res| {
+    loops_wave::again(first, native, p, st, c.digest, |st, res| {
         emit_program_plain(c, native, p, st, io, res)
     })
 }

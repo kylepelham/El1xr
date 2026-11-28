@@ -54,6 +54,7 @@ pub(super) fn again(
     native: &NativeProgram,
     p: &Program,
     st: &Structured,
+    digest: [u8; 16],
     emit: impl FnOnce(&Structured, &Resources) -> Emitted,
 ) -> Emitted {
     let Ok((_, Some(wave))) = &first else {
@@ -81,7 +82,9 @@ pub(super) fn again(
     match again {
         // (`VICTORY_UNDERWATER_WIDE=1`: not a retry that still needs wider waves than the host's,
         // whose blocks to meet the wave-wide form needs)
-        Ok((shader, Some(w))) if w <= wave && super::underwater::retry_counts(w, lower::host_max_wave()) => {
+        Ok((shader, Some(w)))
+            if w <= wave && super::underwater::retry_counts(digest, w, lower::host_max_wave()) =>
+        {
             if why {
                 eprintln!(
                     "WAVE-LOOPS {} loop branches taken by each host wave together",
@@ -276,7 +279,8 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let bytes = crate::dxbc::build(&[]);
+        let mut bytes = crate::dxbc::build(&[]);
+        bytes[4..20].copy_from_slice(&super::super::underwater::DIGESTS[0]);
         let c = super::super::Container::parse(&bytes).unwrap();
         assert_eq!(loop_branches(&p, &st).len(), 1);
         let wave = lower::TEST_HOST_WAVE.replace(Some(32));

@@ -10,10 +10,12 @@
 //! ([`listed`], digest-scoped; the tiled siblings `CS_TransmissionVolumetrics_Tiled*` are not
 //! added by this switch).
 //!
-//! And a host-loop retry (`VICTORY_LOOPS_WAVE=1`, [`super::loops_wave`]) that still needs 64-lane
-//! waves on a 32-lane host no longer counts as solved ([`retry_counts`]): it kept the blocks where
-//! the halves have to meet from the wave-wide form, which then found nothing to widen and
-//! refused Submerged.
+//! And for these two programs a host-loop retry (`VICTORY_LOOPS_WAVE=1`, [`super::loops_wave`])
+//! that still needs 64-lane waves on a 32-lane host no longer counts as solved ([`retry_counts`]):
+//! it kept the blocks where the halves have to meet from the wave-wide form, which then found
+//! nothing to widen and refused Submerged. (foxhound's took that for every program; here it is
+//! scoped to the two: everywhere it changed 18 more programs, among them the defrag and triangle
+//! programs `VICTORY_WAVE_PAIRS_ONLY` holds.)
 //!
 //! Off by default. `VICTORY_WATER_WIDE=1` reaches the same two programs (and the untiled
 //! `CS_TransmissionVolumetrics`) through the run-time list and `VICTORY_WAVE_WIDE=last`; this
@@ -23,7 +25,7 @@
 //! PortalsOnly digest is from trustno1-coder/VIctory-NVIDIA #101.
 
 /// The containers' digests (bytes 4..20 of the container).
-const DIGESTS: [[u8; 16]; 2] = [
+pub(super) const DIGESTS: [[u8; 16]; 2] = [
     // CS_TransmissionVolumetricsSubmerged (926c46bab3b86bd6)
     [
         0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc,
@@ -58,10 +60,11 @@ pub(super) fn listed(threads: Option<u32>, digest: [u8; 16]) -> bool {
     threads == Some(64) && on() && DIGESTS.contains(&digest)
 }
 
-/// Whether a host-loop retry that gives waves of `wave` lanes on a host of `host_wave` counts as
-/// solved: with the switch on, not when it still needs waves wider than the host's.
-pub(super) fn retry_counts(wave: u32, host_wave: u32) -> bool {
-    !on() || wave <= host_wave
+/// Whether a host-loop retry of the program of `digest` that gives waves of `wave` lanes on a
+/// host of `host_wave` counts as solved: with the switch on, not for the two programs when it
+/// still needs waves wider than the host's.
+pub(super) fn retry_counts(digest: [u8; 16], wave: u32, host_wave: u32) -> bool {
+    !on() || wave <= host_wave || !DIGESTS.contains(&digest)
 }
 
 #[cfg(test)]
@@ -75,11 +78,12 @@ mod tests {
         assert!(listed(Some(64), DIGESTS[1]));
         assert!(!listed(Some(128), DIGESTS[0]));
         assert!(!listed(Some(64), [0; 16]));
-        assert!(!retry_counts(64, 32));
-        assert!(retry_counts(32, 32));
+        assert!(!retry_counts(DIGESTS[0], 64, 32));
+        assert!(retry_counts(DIGESTS[0], 32, 32));
+        assert!(retry_counts([0; 16], 64, 32));
         TEST_UNDERWATER_WIDE.set(Some(false));
         assert!(!listed(Some(64), DIGESTS[0]));
-        assert!(retry_counts(64, 32));
+        assert!(retry_counts(DIGESTS[1], 64, 32));
         TEST_UNDERWATER_WIDE.set(was);
     }
 }
