@@ -202,9 +202,11 @@ pub(super) unsafe fn close(prelude: &ID3D12GraphicsCommandList) -> windows::core
 }
 
 /// At the list's reset (every submission of it has run): its prelude, if it
-/// has one and it is closed, is reset and left open, with the switch.
+/// has one and it is closed, is reset and left open, with the switch (or
+/// with `VICTORY_RESET_ASIDE`, which takes landed lists' resets off the
+/// submitting thread, `crate::land_aside`).
 pub(super) fn reset_ahead(list: &HostList) {
-    if !ahead_on() || list.prelude_open.load(Relaxed) {
+    if !(ahead_on() || crate::land_aside::reset_aside_on()) || list.prelude_open.load(Relaxed) {
         return;
     }
     let Some(Some((allocator, prelude))) = list.prelude.get() else {
