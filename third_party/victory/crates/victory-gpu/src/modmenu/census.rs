@@ -378,9 +378,9 @@ mod tests {
         assert_eq!((census.hooked, census.skipped), (2, 1));
         // SAFETY: the stand-in handlers follow the handler contract.
         unsafe {
-            assert_eq!(invoke(base, &[]), [42, 0, 0, 0]);
-            assert_eq!(invoke(base, &[1]), [42, 0, 0, 0]);
-            assert_eq!(invoke(base + 0x100, &[]), [7, 0, 0, 0]);
+            assert_eq!(invoke(base, &[]), Ok([42, 0, 0, 0]));
+            assert_eq!(invoke(base, &[1]), Ok([42, 0, 0, 0]));
+            assert_eq!(invoke(base + 0x100, &[]), Ok([7, 0, 0, 0]));
         }
         assert_eq!(census.count(0xa), Some(2));
         assert_eq!(census.count(0xb), Some(1));

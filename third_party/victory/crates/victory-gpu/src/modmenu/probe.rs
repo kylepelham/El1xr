@@ -2,10 +2,11 @@
 //! menu. Every [`EVERY`] it logs the last result of each [`Effect::Read`] row and asks again:
 //! `mod menu: probe MOD_CLOCK_HOUR 0x3d4e6e6637d30df7 -> 14 raw [..]`.
 //!
-//! `VICTORY_MOD_MENU_PROBE_SET=NAME=value[;NAME=value...][@seconds]` also runs those
-//! [`Effect::Set`] and [`Effect::Own`] rows (such as `MOD_CLOCK_HOLD=3`) once, `seconds` (default
-//! [`SET_AFTER`]) after the first game tick, and logs `mod menu: probe set NAME=value`; the reads
-//! after it show what changed.
+//! `VICTORY_MOD_MENU_PROBE_SET=NAME=value[@seconds][;NAME=value[@seconds]...]` also runs those
+//! [`Effect::Set`] and [`Effect::Own`] rows (such as `MOD_CLOCK_HOLD=3`) once each, `seconds`
+//! after the first game tick, and logs `mod menu: probe set NAME=value`; the reads after it show
+//! what changed. A row without its own time runs at [`SET_AFTER`], except in the older form where
+//! only the last row has a time (`A=1;B=2@30`): then that time is the whole plan's.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -16,34 +17,55 @@ use super::queue::{Call, Outcome, Queue};
 pub const EVERY: Duration = Duration::from_secs(10);
 pub const SET_AFTER: Duration = Duration::from_secs(90);
 
-/// Sets asked for by `VICTORY_MOD_MENU_PROBE_SET`, and when.
+/// One set asked for by `VICTORY_MOD_MENU_PROBE_SET`, and when.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SetPlan {
-    pub sets: Vec<(String, String)>,
+pub struct PlannedSet {
+    pub name: String,
+    pub value: String,
     pub after: Duration,
 }
 
+/// The sets asked for, in order.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetPlan {
+    pub sets: Vec<PlannedSet>,
+}
+
 pub fn parse_set(v: &str) -> Option<SetPlan> {
-    let (list, after) = match v.rsplit_once('@') {
-        Some((l, s)) => (l, Duration::from_secs(s.trim().parse().ok()?)),
-        None => (v, SET_AFTER),
-    };
-    let sets: Vec<(String, String)> = list
-        .split(';')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let (n, v) = s.split_once('=')?;
-            Some((n.trim().to_string(), v.trim().to_string()))
-        })
-        .collect::<Option<_>>()?;
-    (!sets.is_empty()).then_some(SetPlan { sets, after })
+    let mut sets = Vec::new();
+    let mut timed = Vec::new();
+    for s in v.split(';').filter(|s| !s.trim().is_empty()) {
+        let (row, at) = match s.rsplit_once('@') {
+            Some((r, t)) => (r, Some(Duration::from_secs(t.trim().parse().ok()?))),
+            None => (s, None),
+        };
+        let (n, v) = row.split_once('=')?;
+        let (name, value) = (n.trim(), v.trim());
+        if name.is_empty() || value.is_empty() {
+            return None;
+        }
+        timed.push(at.is_some());
+        sets.push(PlannedSet {
+            name: name.to_string(),
+            value: value.to_string(),
+            after: at.unwrap_or(SET_AFTER),
+        });
+    }
+    let last = sets.last()?.after;
+    if timed.iter().rev().skip(1).all(|t| !t) && timed.last() == Some(&true) {
+        for s in &mut sets {
+            s.after = last;
+        }
+    }
+    Some(SetPlan { sets })
 }
 
 #[derive(Default)]
 pub struct Probe {
     first: Option<Instant>,
     last: Option<Instant>,
-    set_done: bool,
+    /// How many of the plan's sets have run, by index.
+    set_done: Vec<bool>,
 }
 
 fn probe_name(name: &'static str) -> &'static str {
@@ -70,12 +92,13 @@ impl Probe {
     ) -> Vec<String> {
         let first = *self.first.get_or_insert(now);
         let mut lines = Vec::new();
-        if let Some(plan) = plan
-            && !self.set_done
-            && now - first >= plan.after
-        {
-            self.set_done = true;
-            for (name, value) in &plan.sets {
+        if let Some(plan) = plan {
+            self.set_done.resize(plan.sets.len(), false);
+            for (i, PlannedSet { name, value, after }) in plan.sets.iter().enumerate() {
+                if self.set_done[i] || now - first < *after {
+                    continue;
+                }
+                self.set_done[i] = true;
                 let line = match options.iter().find(|o| o.info.name == name) {
                     Some(Opt {
                         info,
@@ -190,19 +213,86 @@ mod tests {
 
     static OWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    fn times(v: &str) -> Vec<(String, String, u64)> {
+        parse_set(v)
+            .unwrap()
+            .sets
+            .into_iter()
+            .map(|s| (s.name, s.value, s.after.as_secs()))
+            .collect()
+    }
+
+    fn row(n: &str, v: &str, t: u64) -> (String, String, u64) {
+        (n.into(), v.into(), t)
+    }
+
     #[test]
     fn set_plans_parse_with_an_optional_delay() {
-        assert_eq!(
-            parse_set("A=1; B = 2 @30"),
-            Some(SetPlan {
-                sets: vec![("A".into(), "1".into()), ("B".into(), "2".into())],
-                after: Duration::from_secs(30)
-            })
-        );
-        assert_eq!(parse_set("A=1").unwrap().after, SET_AFTER);
+        assert_eq!(times("A=1; B = 2 @30"), vec![row("A", "1", 30), row("B", "2", 30)]);
+        assert_eq!(times("A=1"), vec![row("A", "1", SET_AFTER.as_secs())]);
         assert_eq!(parse_set("A"), None);
         assert_eq!(parse_set(""), None);
         assert_eq!(parse_set("A=1@soon"), None);
+        assert_eq!(parse_set("A=@5"), None);
+    }
+
+    #[test]
+    fn each_row_keeps_its_own_time() {
+        // Batch 5 part T's plan: every timed row was refused as `run@60` and the rest ran at 140.
+        let plan = "MOD_GET_SWEEP=run;MOD_FIND_STATS=run@60;MOD_HEALTH_REFILL=refill@120;\
+                    MOD_WANTED_CLEAR=clear@125;MOD_GOD_MODE=on@130;MOD_TP_FIND=run@140";
+        assert_eq!(
+            times(plan),
+            vec![
+                row("MOD_GET_SWEEP", "run", SET_AFTER.as_secs()),
+                row("MOD_FIND_STATS", "run", 60),
+                row("MOD_HEALTH_REFILL", "refill", 120),
+                row("MOD_WANTED_CLEAR", "clear", 125),
+                row("MOD_GOD_MODE", "on", 130),
+                row("MOD_TP_FIND", "run", 140),
+            ]
+        );
+        assert_eq!(times("A=1@5;B=2"), vec![row("A", "1", 5), row("B", "2", SET_AFTER.as_secs())]);
+    }
+
+    #[test]
+    fn the_trainer_rows_take_the_part_t_values() {
+        use crate::modmenu::model::OPTIONS;
+        for (name, value) in [
+            ("MOD_GET_SWEEP", "run"),
+            ("MOD_FIND_STATS", "run"),
+            ("MOD_HEALTH_REFILL", "refill"),
+            ("MOD_ARMOUR_REFILL", "refill"),
+            ("MOD_WANTED_CLEAR", "clear"),
+            ("MOD_GOD_MODE", "on"),
+            ("MOD_NEVER_WANTED", "on"),
+            ("MOD_TP_FIND", "run"),
+            ("MOD_TP_SAVE_1", "save"),
+            ("MOD_TP_GOTO_1", "go"),
+        ] {
+            let o = OPTIONS.iter().find(|o| o.info.name == name).expect(name);
+            assert!(matches!(o.effect, Effect::Own { .. }), "{name}");
+            assert!(victory_core::settings::valid(o.info.kind, value), "{name}={value}");
+        }
+    }
+
+    #[test]
+    fn timed_sets_run_each_at_its_own_time() {
+        let q = Queue::default();
+        let mut p = Probe::default();
+        let t0 = Instant::now();
+        let plan = parse_set("P_OWN=0@10;P_SET=3@20").unwrap();
+        let at = |p: &mut Probe, s: u64| -> Vec<String> {
+            p.tick(t0 + Duration::from_secs(s), OPTS, &q, Some(&plan))
+                .into_iter()
+                .filter(|l| l.contains("probe set"))
+                .collect()
+        };
+        assert!(at(&mut p, 0).is_empty());
+        assert_eq!(at(&mut p, 11), vec!["mod menu: probe set P_OWN=0 (own state)"]);
+        assert!(at(&mut p, 12).is_empty(), "once");
+        assert_eq!(at(&mut p, 21).len(), 1);
+        assert!(at(&mut p, 40).is_empty());
     }
 
     #[test]

@@ -3,6 +3,10 @@
 //! Candidate natives for the finder ([`super::finder`]), by shape only: the in-game read-back names
 //! the one that does the job.
 
+/// Natives that fault for the player on 1.0.2.1: never called. `0xf272ca4d7752933e` (an entity
+/// getter) read through a null at `+0x1479bd0` in batch 5 part T.
+pub const FAULTS: &[u64] = &[0xf272_ca4d_7752_933e];
+
 /// Teleport candidates: (hash, argument slots). Shape: entity handle (slots 0-1), a vector (slots
 /// 2-3), then scalars; no result; reaches an entity or ped resolver. Most likely first: the first
 /// (handle, vector, int, float, byte) writes a target position into a ped component or posts a
