@@ -1,5 +1,12 @@
 use super::*;
 
+impl Host {
+    /// The submission lock, for a test doing a submission's steps by hand.
+    pub(crate) fn submission_lock_for_test(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[test]
 fn read_buffer_into_copies_small_buffers_without_floor() {
     let from: Vec<u8> = (0..64u32).map(|i| (i * 3 + 1) as u8).collect();

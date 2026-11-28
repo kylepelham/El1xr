@@ -429,6 +429,16 @@ fn make_test_shadow(h: &crate::host::Host, addr: u64, len: u64, carded: bool) ->
     Some(shadow)
 }
 
+/// `shadow.writing` as a submission does it: under the submission lock, with
+/// the snapshots it notes (`take_snapshots`) taken before the lock goes. A
+/// note left in the shared list is taken by the next submission of any test,
+/// perhaps after this test dropped the copy and its memory (#78).
+fn writing_in_submission(h: &crate::host::Host, shadow: &Shadow, at: usize, len: usize) {
+    let _submitting = h.submission_lock_for_test();
+    shadow.writing(at, len);
+    take_snapshots();
+}
+
 fn page_protect(addr: usize) -> u32 {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain struct filled by `VirtualQuery`.
@@ -1100,7 +1110,7 @@ fn lazy_copyback_f2_merge_under_writes_settles_resync_page() {
     assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
 
     // Simulate Flight 2 in-flight (`pending` covers page).
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     assert!(shadow.writes_pending());
 
     // CPU read faults via VEH -> flushes `B` to title, sets `LAZY_RESYNC`,
@@ -1519,7 +1529,7 @@ fn lazy_copyback_writing_skips_pending_resync_and_stale_under_flights_settles_gp
     assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
 
     // Flight 1 declares the page in `self.pending`.
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     assert!(shadow.writes_pending());
 
     // CPU read faults via VEH -> flushes `B`, marks `LAZY_RESYNC`, records `FlushedBaseline(B)`.
@@ -1538,7 +1548,7 @@ fn lazy_copyback_writing_skips_pending_resync_and_stale_under_flights_settles_gp
     // Calling `Shadow::writing` again while range is STILL in `self.pending`
     // MUST skip resync so `FlushedBaseline`, `self.data`, and `card.has_dirty`
     // stay intact for Flight 1's `card_merge_relay`.
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
     assert!(
         !shadow.card.as_ref().unwrap().has_dirty.load(Ordering::Acquire),
@@ -1567,7 +1577,7 @@ fn lazy_copyback_writing_skips_pending_resync_and_stale_under_flights_settles_gp
     // Once Flight 1 retires from `self.pending`, `Shadow::writing` resyncs cleanly.
     shadow.copy_back_done(&[(block.addr(), block.addr() + PAGE)]);
     assert!(!shadow.has_lazy_resync_under_writes(block.addr(), PAGE));
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     assert_eq!(shadow.resync_count.load(Ordering::Acquire), 0);
     assert!(shadow.card.as_ref().unwrap().has_dirty.load(Ordering::Acquire));
 
@@ -1604,7 +1614,7 @@ fn lazy_copyback_merge_under_writes_settles_mid_loop_resync() {
     assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
 
     // Flight 1 marks range pending; VEH flushes `B` -> `LAZY_RESYNC`.
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     // SAFETY: VEH demand-flushes page to `PAGE_READWRITE`.
     assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x5555_0000);
     assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
@@ -1667,7 +1677,7 @@ fn lazy_copyback_f1_full_cover_written_while_pending_preserves_fresh_data() {
     assert_eq!(page_protect(block.addr()), PAGE_NOACCESS);
 
     // Flight 1 is in flight (`shadow.writes_pending() == true`).
-    shadow.writing(block.addr(), PAGE);
+    writing_in_submission(h, &shadow, block.addr(), PAGE);
     assert!(shadow.writes_pending());
 
     // DirectStorage overwrites all 64 KiB with fresh `D` (`0x7777_0000 + i`)
@@ -1990,7 +2000,7 @@ fn lazy_copyback_async_inflight_write_cross_queue_sync() {
 
         // Frame N+1: declare `writing` and fire an ASYNC compute dispatch on
         // `host.queue` (writing `0x5555_0000 ^ i`) with ZERO CPU wait!
-        shadow.writing(block.addr(), LEN);
+        writing_in_submission(h, &shadow, block.addr(), LEN);
         // SAFETY: open command list, live pipeline, and shadow buffer.
         unsafe {
             async_list.list.SetComputeRootSignature(&pipe.root);
@@ -2583,8 +2593,7 @@ fn lazy_copyback_relay_hand_back_multipage_offsets() {
 
     // Declare writes on pages 1..3 (`at == PAGE` and `at == 2 * PAGE`), take
     // snapshot (`before`), then simulate GPU shader writes directly into `shadow.data`.
-    shadow.writing(block.addr() + PAGE, 2 * PAGE);
-    take_snapshots();
+    writing_in_submission(h, &shadow, block.addr() + PAGE, 2 * PAGE);
     // SAFETY: writing simulated GPU results to pages 1 and 2 of non-carded `shadow.data`.
     unsafe {
         let p1 = std::slice::from_raw_parts_mut(shadow.data.add(PAGE).cast::<u32>(), PAGE / 4);
