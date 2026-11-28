@@ -507,7 +507,8 @@ fn permutes_outside_sections(p: &ir::Program) -> bool {
     })
 }
 
-/// [`emit`] of `p` as it is.
+/// [`emit`] of `p` as it is; with `VICTORY_LANE_MASK_WIDE=1`, split per lane once more where
+/// the branches it takes wave-wide keep every form from the host ([`crate::lane_split`]).
 fn emit_any(
     c: &Container,
     native: &NativeProgram,
@@ -516,6 +517,24 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let first = emit_any_once(c, native, p, st, io, res);
+    crate::lane_split::again(first, st.wide.len(), lower::host_max_wave(), || {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_any_once(c, native, p, &st, io, &res)
+    })
+    .map(|(shader, _)| shader)
+}
+
+/// [`emit_any`] in the structure `st` gives, with the wave size the result requires of the host.
+fn emit_any_once(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // A program `with_wave_pairs_vt` names: the paired form with Vice-Tay #208's rules first,
     // the other forms as before if it refuses the program.
     if WAVE_PAIRS_VT_HERE.get()
@@ -529,7 +548,7 @@ fn emit_any(
         match tried {
             Ok((shader, Some(32))) => {
                 WAVE_PAIRS_VT_TOOK.set(Some(Ok(())));
-                return Ok(shader);
+                return Ok((shader, Some(32)));
             }
             Ok(_) => WAVE_PAIRS_VT_TOOK.set(Some(Err("a wave size other than 32"))),
             Err(ShaderError::Unsupported { what, .. }) => WAVE_PAIRS_VT_TOOK.set(Some(Err(what))),
@@ -558,11 +577,11 @@ fn emit_any(
                 Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
             }
         }
-        if let Ok((shader, _)) = again {
+        if let Ok(shader) = again {
             return Ok(shader);
         }
     }
-    r.map(|(shader, _)| shader)
+    r
 }
 
 /// Whether console wave64 compute programs may take the paired form ([`paired`]):

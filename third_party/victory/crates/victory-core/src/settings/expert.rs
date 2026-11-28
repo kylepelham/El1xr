@@ -190,6 +190,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_KEYS", Apply::Restart),
     ("VICTORY_LAND_ASIDE", Apply::Restart),
     ("VICTORY_LANE_CORE", Apply::Restart),
+    ("VICTORY_LANE_MASK_WIDE", Apply::Retranslate),
     // Not live: how submissions are prepared against flights in the air (late copies, merges
     // under writes); flights prepared under one stage would be settled under another.
     ("VICTORY_LATE_WAIT", Apply::Restart),
