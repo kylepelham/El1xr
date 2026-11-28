@@ -37,20 +37,44 @@ fn another_program_is_left_as_it_is() {
     assert_eq!(native.code, before);
 }
 
+/// Every row is consistent: a SOPC comparison, the set-up between the skip and the loop's
+/// head, the arm going on at the merge or after it; a walk whose results take exec ends with
+/// [`Out::Exec`] and has the indices it needs from the first top level; the host finds each
+/// trace's top levels by its hash.
 #[test]
 fn the_tables_agree() {
-    assert_eq!(TRACES.iter().map(|t| t.hash).collect::<Vec<_>>(), SHADOW_TRACES);
     for t in TRACES {
         assert!(!t.walks.is_empty(), "{}", t.hash);
+        assert_eq!(shadow_structures(t.hash), Some(t.structures));
         for w in t.walks {
             assert!(
-                w.skip < w.past && w.past <= w.merge && w.merge < t.bytes,
-                "{}",
+                w.skip < w.head && w.head < w.past && w.past <= w.resume,
+                "{}: {w:?}",
                 t.hash
             );
             assert_eq!(w.cmp >> 23, 0x17e, "{}: a SOPC word", t.hash);
+            assert!(w.structure < 2);
+            let exec = w.outs.iter().position(|o| matches!(o, Out::Exec { .. }));
+            assert!(
+                exec.is_none_or(|k| k == w.outs.len() - 1),
+                "{}: Exec last",
+                t.hash
+            );
+            if exec.is_some() {
+                assert!(
+                    w.resume > w.past,
+                    "{}: going on past the console reads",
+                    t.hash
+                );
+            }
         }
     }
+    assert_eq!(
+        shadow_structures("a1b20bc47e3c9597"),
+        Some([Some(355), Some(356)])
+    );
+    assert_eq!(shadow_structures("559d9f0184e15fe3"), Some([None, None]));
+    assert_eq!(shadow_structures("6d7fe7745ab9c6d8"), None);
 }
 
 /// The splice on code of the known layout: the skip becomes a branch to the region; the
@@ -101,10 +125,66 @@ fn the_skip_goes_to_the_region_and_the_region_decodes() {
     assert!(region.iter().all(|i| i.name().is_some()), "{texts:?}");
 }
 
+/// A near walk of the distant trace: the set-up copied after the title arm, both markers on
+/// the first top level (`ttmp[0:3]`, `ttmp[4:7]`), exec handed over, and the arm going on
+/// past the console reads; a far walk's marker on the second (`ttmp[8:11]`).
+#[test]
+fn a_distant_walk_runs_its_set_up_and_goes_on_past_the_reads() {
+    let bytes = 0x5600;
+    let mut native = stand_in(&DISTANT, bytes);
+    for w in DISTANT.walks {
+        for (k, word) in native.code[w.skip + 4..w.head]
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            word.copy_from_slice(&v_mov(200, 0x80 + k as u32 % 64).to_le_bytes());
+        }
+    }
+    apply(&DISTANT, &mut native);
+    let insts = crate::gfx10::decode(&native.code).expect("decodes");
+    let texts = |from: usize, to: usize| -> Vec<String> {
+        insts
+            .iter()
+            .filter(|i| i.offset >= from && i.offset < to)
+            .map(|i| i.text(false))
+            .collect()
+    };
+    let starts: Vec<usize> = DISTANT
+        .walks
+        .iter()
+        .map(|w| {
+            let word = u32::from_le_bytes(native.code[w.skip..w.skip + 4].try_into().unwrap());
+            let delta = i64::from(word as u16 as i16);
+            (w.skip as i64 + 4 + 4 * delta) as usize
+        })
+        .collect();
+    for (k, w) in DISTANT.walks.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(native.code.len());
+        let t = texts(starts[k], end);
+        let setup = (w.head - w.skip - 4) / 4;
+        let copied = texts(w.skip + 4, w.head);
+        assert_eq!(&t[5..5 + setup], &copied[..], "walk {k}: the set-up");
+        let markers: Vec<&String> = t.iter().filter(|x| x.starts_with("image_bvh64")).collect();
+        if w.structure == 0 {
+            assert_eq!(markers.len(), 2, "walk {k}");
+            assert!(markers[0].contains("ttmp[0:3]") && markers[1].contains("ttmp[4:7]"));
+            assert_eq!(t[t.len() - 2], "s_mov_b32 exec_lo, ttmp0", "walk {k}");
+        } else {
+            assert_eq!(markers.len(), 1, "walk {k}");
+            assert!(markers[0].contains("ttmp[8:11]"));
+        }
+        assert_eq!(
+            t.last().unwrap(),
+            &format!("s_branch label_{:04X}", w.resume),
+            "walk {k}"
+        );
+    }
+}
+
 /// The title's own programs (not in the repository: set `SHADOW_TRACE_DIR` to a folder of
 /// their containers as `victory translate` dumps them, `<name>.<hash>.cdxil`): each known one,
-/// spliced, translates, validates, has one marker per walk, asks for ray tracing 1.1 and the
-/// host's word.
+/// spliced, translates, validates, has its markers, asks for ray tracing 1.1 and the host's
+/// word.
 #[test]
 fn the_shadow_traces_spliced_translate_and_validate() {
     let Some(dir) = std::env::var_os("SHADOW_TRACE_DIR") else {
@@ -116,6 +196,7 @@ fn the_shadow_traces_spliced_translate_and_validate() {
         .flatten()
         .map(|e| e.path())
         .collect();
+    let mut programs = Vec::new();
     for trace in TRACES {
         let hash = trace.hash;
         let path = files
@@ -125,19 +206,22 @@ fn the_shadow_traces_spliced_translate_and_validate() {
         let bytes = std::fs::read(path).expect("the container");
         let c = crate::dxbc::Container::parse(&bytes).expect("a container");
         let part = super::super::program_part(&c).expect("a program part");
-        let mut native = crate::native_programs(part.data)
+        let native = crate::native_programs(part.data)
             .expect("native programs")
             .into_iter()
             .find(|p| p.stage == HwStage::Cs)
             .expect("a compute program");
         eprintln!(
-            "{}: digest {:02x?}, {} bytes, fnv {:#018x}, {} vgprs",
+            "{}: {} bytes, fnv {:#018x}, {} vgprs",
             trace.hash,
-            c.digest,
             native.code.len(),
             fnv(&native.code),
             native.vgprs
         );
+        programs.push((trace, bytes, native));
+    }
+    for (trace, bytes, mut native) in programs {
+        let c = crate::dxbc::Container::parse(&bytes).expect("a container");
         assert!(
             rewrite(&c.digest, &mut native),
             "{} is known byte for byte",
@@ -152,7 +236,18 @@ fn the_shadow_traces_spliced_translate_and_validate() {
             .iter()
             .filter(|b| matches!(b.1, crate::resource::BvhNodes::Native(_)))
             .count();
-        assert_eq!(markers, trace.walks.len(), "{}", trace.hash);
+        let want: usize = trace
+            .walks
+            .iter()
+            .map(|w| {
+                1 + usize::from(
+                    w.outs
+                        .iter()
+                        .any(|o| matches!(o, Out::Contribution(_) | Out::Geometry(_))),
+                )
+            })
+            .sum();
+        assert_eq!(markers, want, "{}", trace.hash);
         let io = crate::io::raise(&p, &native).expect("io");
         let shader = super::super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
         let first = u32::from_le_bytes(shader.dxil[32..36].try_into().unwrap()) as usize;
@@ -175,12 +270,22 @@ fn the_shadow_traces_spliced_translate_and_validate() {
     }
 }
 
+/// One thread of a card test: whether it is one of the walk's lanes, the ray's origin,
+/// direction z (x and y 0) and maximum distance.
+#[derive(Clone, Copy)]
+struct Lane {
+    walks: bool,
+    origin: [f32; 3],
+    dz: f32,
+    extent: f32,
+}
+
 /// A wave32 program that runs `walk`'s arm alone: each thread's record (origin, direction,
 /// extent, whether it is one of the walk's lanes) into the registers the walk keeps them in,
-/// the lanes' SGPR from that flag as a compare makes it, `v17` 0 and `v24` 7 before; then
-/// `v17 v15 v24` stored at 16 bytes a thread.
-fn checkerboard_arm_program() -> NativeProgram {
-    let walk = &MASKED;
+/// the lanes' SGPR from that flag as a compare makes it, `preset` registers 7 before; after
+/// the arm, exec back from the walk's saved SGPR where its results took it, then the four
+/// `stores` operand codes stored at 16 bytes a thread.
+fn arm_program(walk: &Walk, preset: &[u8], stores: [u32; 4]) -> NativeProgram {
     let mut w = vec![
         0xbe85_0380, // s_mov_b32 s5, 0
         0xf408_0202,
@@ -209,14 +314,17 @@ fn checkerboard_arm_program() -> NativeProgram {
     }
     w.push(vopc(V_CMP_NE_U32, ZERO, 67));
     w.push(s_mov(walk.lanes, VCC_LO));
-    w.push(v_mov(17, ZERO));
-    w.push(v_mov(24, 0x87)); // 7
-    arm(&mut w, walk, 80);
-    w.push(0x3428_0084); // v_lshlrev_b32 v20, 4, v0
-    for (k, r) in [17u8, 15, 24].into_iter().enumerate() {
-        w.push(v_mov(70 + k as u8, v(r)));
+    for &r in preset {
+        w.push(v_mov(r, 0x87)); // 7
     }
-    w.push(v_mov(73, ZERO));
+    arm(&mut w, walk, 80);
+    if let Some(Out::Exec { saved, .. }) = walk.outs.last() {
+        w.push(s_mov(EXEC_LO, *saved));
+    }
+    w.push(0x3428_0084); // v_lshlrev_b32 v20, 4, v0
+    for (k, src) in stores.into_iter().enumerate() {
+        w.push(v_mov(70 + k as u8, src));
+    }
     w.extend([0xe078_1000, 0x8003_4614]); // buffer_store_dwordx4 v[70:73], v20, s[12:15], 0 offen
     w.push(0xbf81_0000); // s_endpgm
     let table = |kind, at| UsedResource {
@@ -260,35 +368,23 @@ fn checkerboard_arm_program() -> NativeProgram {
     }
 }
 
-/// Checkerboard's walk with an instance mask of 0xc0, to see the mask reach the query (the
-/// title's walk tests none: 0xff).
-const MASKED: Walk = Walk { mask: 0xc0, ..CHECKERBOARD.walks[0] };
-
-/// Checkerboard's arm on the card: a lane of the walk takes the closest opaque hit of an
-/// instance in the walk's mask (an instance of mask 0x01 in front is not seen), `v17` 1 and `v15` the distance; a lane outside the walk, a miss and a hit past the
-/// maximum distance leave both; `v24` is 0 on every lane.
-#[test]
-fn the_checkerboard_arm_finds_occluders_on_the_card() {
-    use super::super::host::{Dispatch, Host, Root, Stride, View};
-    use super::super::host_tlas::{Instance, Scene};
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; skipped");
-        return;
-    };
-    if !super::super::host_tlas::supported(&host.device) {
-        eprintln!("no ray tracing tier 1.1; skipped");
-        return;
-    }
-    let _one = super::super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let native = checkerboard_arm_program();
+/// Runs `native` on the card with `scenes` at the two top levels' root SRVs (the first at
+/// [`super::super::shader::SLOT_TLAS`], the second at `SLOT_TLAS_NEAR`), one thread a lane
+/// (threads past them repeat the last); each thread's four stored dwords.
+fn run_on_card(
+    host: &super::super::host::Host,
+    native: &NativeProgram,
+    mut scenes: [Option<super::super::host_tlas::Scene>; 2],
+    lanes: &[Lane],
+) -> Vec<[u32; 4]> {
+    use super::super::host::{Dispatch, Root, Stride, View};
+    use super::super::shader::{SLOT_TLAS, SLOT_TLAS_NEAR};
     let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = crate::structure::structure(&p).expect("structure");
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = crate::io::raise(&p, &native).expect("io");
+    let io = crate::io::raise(&p, native).expect("io");
     let out = super::super::lower::lower(&super::super::lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -317,59 +413,40 @@ fn the_checkerboard_arm_finds_occluders_on_the_card() {
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: out.half_views,
     };
-    assert_eq!(shader.root_srvs, [super::super::shader::SLOT_TLAS]);
     assert!(shader.root_cbvs.is_empty() && shader.root_uavs.is_empty());
+    let mut srvs = shader.root_srvs.clone();
+    srvs.sort_unstable();
+    srvs.dedup();
     let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
-    // Threads: (one of the walk's lanes, direction z, extent).
-    let lanes: [(bool, f32, f32); 4] = [
-        (true, 1.0, 100.0),
-        (false, 1.0, 100.0),
-        (true, -1.0, 100.0),
-        (true, 1.0, 4.0),
-    ];
+    let mut roots = vec![(
+        0,
+        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+    )];
+    for (k, slot) in srvs.iter().enumerate() {
+        let which = if *slot == SLOT_TLAS {
+            0
+        } else {
+            assert_eq!(*slot, SLOT_TLAS_NEAR);
+            1
+        };
+        roots.push((1 + k as u32, Root::Tlas(scenes[which].take())));
+    }
     let mut record = vec![0u32; 8 * 32];
     for t in 0..32 {
-        let (walks, dz, extent) = lanes[t.min(lanes.len() - 1)];
+        let l = lanes[t.min(lanes.len() - 1)];
         let r = &mut record[8 * t..];
-        for (k, f) in [-0.5, -0.5, 0.0, 0.0, 0.0, dz, extent]
-            .into_iter()
-            .enumerate()
-        {
+        let [x, y, z] = l.origin;
+        for (k, f) in [x, y, z, 0.0, 0.0, l.dz, l.extent].into_iter().enumerate() {
             r[k] = f32::to_bits(f);
         }
-        r[7] = u32::from(walks);
+        r[7] = u32::from(l.walks);
     }
-    let triangle = [[-1.0, -1.0, 5.0], [1.0, -1.0, 5.0], [-1.0, 1.0, 5.0]];
-    let scene = Scene {
-        geometries: vec![(vec![triangle], true)],
-        instances: vec![
-            // Outside the mask, nearer.
-            Instance {
-                offset: [0.0, 0.0, -2.0],
-                id: 1,
-                contribution: 0,
-                mask: 0x01,
-            },
-            Instance {
-                offset: [0.0; 3],
-                id: 2,
-                contribution: 0,
-                mask: 0x40,
-            },
-        ],
-    };
     let got = host
         .dispatch(
             &root,
             &pso,
             &Dispatch {
-                roots: vec![
-                    (
-                        0,
-                        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
-                    ),
-                    (1, Root::Tlas(Some(scene))),
-                ],
+                roots,
                 views: &[
                     View::Buffer {
                         data: &record,
@@ -382,6 +459,83 @@ fn the_checkerboard_arm_finds_occluders_on_the_card() {
             },
         )
         .expect("dispatch");
+    got[0]
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect()
+}
+
+fn card() -> Option<super::super::host::Host> {
+    let Ok(host) = super::super::host::Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    if !super::super::host_tlas::supported(&host.device) {
+        eprintln!("no ray tracing tier 1.1; skipped");
+        return None;
+    }
+    Some(host)
+}
+
+/// A small triangle at z = 5 over x, y in -1..1, instanced as `instances` (offset, mask,
+/// contribution), in a scene of `geometries` copies of it (the hit is the first).
+fn triangles(
+    instances: &[([f32; 3], u8, u32)],
+    geometries: usize,
+) -> super::super::host_tlas::Scene {
+    use super::super::host_tlas::{Instance, Scene};
+    let triangle = [[-1.0, -1.0, 5.0], [1.0, -1.0, 5.0], [-1.0, 1.0, 5.0]];
+    let far = [[-1.0, -1.0, 500.0], [1.0, -1.0, 500.0], [-1.0, 1.0, 500.0]];
+    Scene {
+        geometries: (0..geometries)
+            .map(|g| (vec![if g + 1 == geometries { triangle } else { far }], true))
+            .collect(),
+        instances: instances
+            .iter()
+            .enumerate()
+            .map(|(k, &(offset, mask, contribution))| Instance {
+                offset,
+                id: k as u32,
+                contribution,
+                mask,
+            })
+            .collect(),
+    }
+}
+
+/// Checkerboard's walk with an instance mask of 0xc0, to see the mask reach the query (the
+/// title's walk tests none: 0xff).
+const MASKED: Walk = Walk {
+    mask: 0xc0,
+    ..CHECKERBOARD.walks[0]
+};
+
+/// Checkerboard's arm on the card: a lane of the walk takes the closest opaque hit of an
+/// instance in the walk's mask (an instance of mask 0x01 in front is not seen), `v17` 1 and
+/// `v15` the distance; a lane outside the walk, a miss and a hit past the maximum distance
+/// leave both; `v24` is 0 on every lane.
+#[test]
+fn the_checkerboard_arm_finds_occluders_on_the_card() {
+    let Some(host) = card() else { return };
+    let _one = super::super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let native = arm_program(&MASKED, &[], [v(17), v(15), v(24), ZERO]);
+    let lane = |walks, dz, extent| Lane {
+        walks,
+        origin: [-0.5, -0.5, 0.0],
+        dz,
+        extent,
+    };
+    let lanes = [
+        lane(true, 1.0, 100.0),
+        lane(false, 1.0, 100.0),
+        lane(true, -1.0, 100.0),
+        lane(true, 1.0, 4.0),
+    ];
+    // Outside the mask and nearer; in it.
+    let scene = triangles(&[([0.0, 0.0, -2.0], 0x01, 0), ([0.0; 3], 0x40, 0)], 1);
+    let got = run_on_card(&host, &native, [Some(scene), None], &lanes);
     let f = f32::to_bits;
     let want = [
         [1, f(5.0), 0, 0],
@@ -390,7 +544,76 @@ fn the_checkerboard_arm_finds_occluders_on_the_card() {
         [0, f(4.0), 0, 0],
     ];
     for (t, want) in want.iter().enumerate() {
-        let got = &got[0][4 * t..4 * t + 4];
-        assert_eq!(got, want, "thread {t}: got {got:x?}");
+        assert_eq!(&got[t], want, "thread {t}: got {:x?}", got[t]);
+    }
+}
+
+/// The distant trace's near walk on the card: hit lanes of the walk get the instance's
+/// contribution and the geometry index (the second instance, contribution 40; the third
+/// geometry), the others 0 in both; exec and the walk's `hits` SGPR are the hit lanes and
+/// `saved` the exec before. Its far walk: the leaf `v25` 1 and the distance `v21` on a hit,
+/// on the second top level only (the first holds nothing there).
+#[test]
+fn the_distant_walks_hand_over_their_results_on_the_card() {
+    let Some(host) = card() else { return };
+    let _one = super::super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let lane = |walks, x, dz| Lane {
+        walks,
+        origin: [x, -0.5, 0.0],
+        dz,
+        extent: 100.0,
+    };
+    // Hit, outside the walk, a miss, a hit.
+    let lanes = [
+        lane(true, -0.5, 1.0),
+        lane(false, -0.5, 1.0),
+        lane(true, -0.5, -1.0),
+        lane(true, -0.5, 1.0),
+    ];
+    let near = &DISTANT.walks[0];
+    let Some(&Out::Exec { saved, hits }) = near.outs.last() else {
+        panic!("{near:?}")
+    };
+    let native = arm_program(near, &[22, 23], [v(22), v(23), saved, hits]);
+    let instances = [([1000.0, 0.0, 0.0], 0xff, 30), ([0.0; 3], 0xff, 40)];
+    let got = run_on_card(
+        &host,
+        &native,
+        [Some(triangles(&instances, 3)), None],
+        &lanes,
+    );
+    // Lanes 0 and 3 hit (and the threads past the lanes, as lane 3); lane 2 misses.
+    let hit_lanes: u32 = !0b0110;
+    for (t, want) in [[40, 2], [0, 0], [0, 0], [40, 2]].iter().enumerate() {
+        assert_eq!(
+            &got[t][..2],
+            want,
+            "near walk, thread {t}: got {:x?}",
+            got[t]
+        );
+        assert_eq!(got[t][2], u32::MAX, "saved: the whole wave");
+        assert_eq!(got[t][3], hit_lanes, "hits");
+    }
+    let far = &DISTANT.walks[1];
+    let native = arm_program(far, &[25], [v(25), v(21), ZERO, ZERO]);
+    let got = run_on_card(
+        &host,
+        &native,
+        [None, Some(triangles(&instances, 1))],
+        &lanes,
+    );
+    let f = f32::to_bits;
+    for (t, want) in [[1, f(5.0)], [7, f(100.0)], [7, f(100.0)], [1, f(5.0)]]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            &got[t][..2],
+            want,
+            "far walk, thread {t}: got {:x?}",
+            got[t]
+        );
     }
 }

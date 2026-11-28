@@ -152,7 +152,7 @@ pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
 pub use shadow_splice::native_shadow;
-pub use shadow_patch::SHADOW_TRACES;
+pub use shadow_patch::shadow_structures;
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;

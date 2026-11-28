@@ -24,8 +24,10 @@
 //! dispatch's two host top levels for its root SRVs
 //! (`victory_shader::emit::SLOT_TLAS`, `SLOT_TLAS_NEAR`): what [`dispatch`]
 //! returns. `VICTORY_NATIVE_SHADOW=1` does the same for the shadow traces the
-//! shadow splice knows (`victory_shader::emit::SHADOW_TRACES`): their one
-//! structure view's host top level, for `SLOT_TLAS` (counted as `shadow_*`).
+//! shadow splice knows (`victory_shader::emit::shadow_structures`): the host
+//! top levels of their two structure views (t355, t356 for the distant
+//! traces; the one view, in both, for Checkerboard), for `SLOT_TLAS` and
+//! `SLOT_TLAS_NEAR` (counted as `shadow_*`, one count a view looked up).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,13 +130,15 @@ pub(crate) fn dispatch(
     let glass = kind == Walks::Glass;
     let view = |slot: u8, dword: u32| crate::descriptor::view(table(slot)? + u64::from(dword) * 4);
     let mut matched = [0u64; 2];
-    let walks: &[(Option<u32>, usize)] = match kind {
-        Walks::Glass => &[(Some(GLASS_FAR), 0), (Some(GLASS_NEAR), 1)],
-        Walks::VBuffer => &[(None, 2)],
-        Walks::Trace => &[(None, 3)],
-        Walks::Shadow => &[(None, 4)],
+    // (register, count row, the top levels it is matched for: 0 first, 1 second, 2 both).
+    let walks: &[(Option<u32>, usize, u8)] = match kind {
+        Walks::Glass => &[(Some(GLASS_FAR), 0, 0), (Some(GLASS_NEAR), 1, 1)],
+        Walks::VBuffer => &[(None, 2, 3)],
+        Walks::Trace => &[(None, 3, 3)],
+        Walks::Shadow([a, b]) if a == b => &[(a, 4, 2)],
+        Walks::Shadow([a, b]) => &[(a, 4, 0), (b, 4, 1)],
     };
-    for &(register, row) in walks {
+    for &(register, row, to) in walks {
         let address = find_structure(&views, register, view);
         let host = address.and_then(crate::native_rt::top_level);
         let found = classify(address, |_| host);
@@ -151,17 +155,16 @@ pub(crate) fn dispatch(
                 );
             }
         }
-        if row < 2 {
-            matched[row] = host.unwrap_or(0);
-        }
-        if row == 4 {
-            matched = [host.unwrap_or(0); 2];
+        match to {
+            0 | 1 => matched[usize::from(to)] = host.unwrap_or(0),
+            2 => matched = [host.unwrap_or(0); 2],
+            _ => {}
         }
         COUNTS[row][found as usize].fetch_add(1, Ordering::Relaxed);
     }
     summary();
     match kind {
-        Walks::Glass | Walks::Shadow => both(matched),
+        Walks::Glass | Walks::Shadow(_) => both(matched),
         Walks::VBuffer | Walks::Trace => None,
     }
 }
