@@ -1,12 +1,12 @@
 <div align="center">
 
-![El1xr: Grand Theft Auto VI for Xbox Series, running on a Windows PC. 23.5 fps in the world at 4K on an RTX 5090, 0 refused pipelines, 32 s from launch to the world, playable as of 27 November 2026](docs/images/hero.svg)
+![El1xr: Grand Theft Auto VI for Xbox Series, running on a Windows PC. 23.1-25.7 fps at 4K on an RTX 5090, 0 refused pipelines, 27-28 s from launch to the world, playable as of 27 November 2026](docs/images/hero.svg)
 
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-9b5cff?style=flat-square&labelColor=170f2b)
 ![Platform: Windows 10 and 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2de2e6?style=flat-square&labelColor=170f2b)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-ff8a3d?style=flat-square&labelColor=170f2b&logo=rust&logoColor=white)
 ![Status: playable](https://img.shields.io/badge/status-playable-ff3d8b?style=flat-square&labelColor=170f2b)
-![23.5 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.5%20fps-ffd36e?style=flat-square&labelColor=170f2b)
+![23.1-25.7 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.1--25.7%20fps-ffd36e?style=flat-square&labelColor=170f2b)
 ![Discord: bonemeld](https://img.shields.io/badge/Discord-bonemeld-5865F2?style=flat-square&labelColor=170f2b&logo=discord&logoColor=white)
 
 **English** · [Français](docs/i18n/README.fr.md) · [Español](docs/i18n/README.es.md) · [Deutsch](docs/i18n/README.de.md) · [Italiano](docs/i18n/README.it.md) · [Português](docs/i18n/README.pt-BR.md) · [日本語](docs/i18n/README.ja.md) · [中文](docs/i18n/README.zh-CN.md) · [Русский](docs/i18n/README.ru.md)
@@ -18,9 +18,9 @@ El1xr runs the Xbox Series version of Grand Theft Auto VI (build 1.0.2.1) on a W
 ## Status
 
 > [!NOTE]
-> **As of 27 November 2026, GTA VI (Xbox Series, build 1.0.2.1) boots, reaches the menus and is playable in the open world on Windows.** In the latest quiet test runs (batch 3, 4K, RTX 5090) the world runs at a median 23.5 fps, with 0 refused GPU pipelines. That is still short of the next goal, a steady 30 fps. After that come no hitches and no visual faults.
+> **As of 27 November 2026, GTA VI (Xbox Series, build 1.0.2.1) boots, reaches the menus and is playable in the open world on Windows.** In the latest quiet test runs (batch 4, 4K, RTX 5090) the game runs at 23.1-25.7 fps over a 200-second run, with 0 refused GPU pipelines. That is still short of the next goal, a steady 30 fps. After that come no hitches and no visual faults.
 
-![Milestones: boots, main menu and in-game by 24 November 2026; playable at 23.5 fps on 27 November 2026; 30 fps next; stable in progress](docs/images/milestones.svg)
+![Milestones: boots, main menu and in-game by 24 November 2026; playable at 23.1-25.7 fps on 27 November 2026; 30 fps next; stable in progress](docs/images/milestones.svg)
 
 | Milestone | Status | Evidence | Date |
 |---|---|---|---|
@@ -28,38 +28,44 @@ El1xr runs the Xbox Series version of Grand Theft Auto VI (build 1.0.2.1) on a W
 | First frame | Done | The startup animation and legal screens render without flicker. | by 24 Nov 2026 |
 | Main menu | Done | Profile screen, first-run settings, legal screens, loading screen and pause menu all work. Menus run at 30 fps (RTX 4070 SUPER). | by 24 Nov 2026 |
 | In-game | Done | The game reaches the open world and the character moves under player control. A 13-minute session in the prison ran at about 4 fps (RTX 4070 SUPER). | by 24 Nov 2026 |
-| Playable | Done, below target speed | The world plays at 23.5 fps at 4K (RTX 5090; median of the in-world part of a quiet 200-second batch 3 run). | 27 Nov 2026 |
+| Playable | Done, below target speed | The game plays at 23.1-25.7 fps at 4K (RTX 5090; two quiet 200-second batch 4 runs). | 27 Nov 2026 |
 | Story progress | First two missions completed | A contributor completed the first two missions in a 45-minute session at about 2 fps (RTX 4070 SUPER; reported, not measured from logs). All cutscenes play in full. On Linux (Proton, RX 9070 XT), a 23-minute run got past the prologue into chapter 1. | 25 Nov 2026 |
-| 30 fps | Not yet | 23.5 fps in the world, 42 ms median frame time against the 33.3 ms target (RTX 5090, 4K). | 27 Nov 2026 |
-| Stable | In progress | With the default settings, 200-second test runs finish with no crash, no GPU driver reset and no device loss. Entering the world still stalls for 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)), and visual faults still vary from run to run (see Known issues). | 27 Nov 2026 |
+| 30 fps | Not yet | 23.1-25.7 fps, 40-43 ms median frame time against the 33.3 ms target (RTX 5090, 4K). | 27 Nov 2026 |
+| Stable | In progress | With the default settings, 200-second test runs finish with no crash, no GPU driver reset and no device loss. The stall when entering the world is rarer (1 of 8 quiet batch 4 runs) but not gone ([#78](https://github.com/kylepelham/El1xr/issues/78)), and visual faults still vary from run to run (see Known issues). | 27 Nov 2026 |
 
 ## Performance
 
-![At a glance: 23.5 fps in the world, 0 refused GPU pipelines, 32 s from launch to the world, 7 hitches over 1 s per run](docs/images/stats.svg)
+![At a glance: 23.1-25.7 fps, 27-28 s from launch to the world, 0 black faces in 24 diner snapshots with bake inputs first, 31 black frames shown during loading instead of 152](docs/images/stats.svg)
 
 | Measure (RTX 5090, 4K) | Now | Goal |
 |---|---|---|
-| In-world frame rate (median) | **23.5 fps** | 30+ fps |
-| Median frame time | 42 ms | 33.3 ms or less |
-| 99th-percentile frame in steady play | ~70 ms | no hitches |
-| CPU time to prepare a frame | 28 ms | under the GPU's time |
+| Frame rate over a 200 s run | **23.1-25.7 fps** | 30+ fps |
+| Median frame time | 40-43 ms | 33.3 ms or less |
+| 99th-percentile frame in steady play | 64-69 ms | no hitches |
+| CPU time to prepare a frame | 26-28 ms | under the GPU's time |
 | Refused GPU pipelines | **0** | 0 |
-| Launch to first world frame | 32 s | |
-| Launch to settled play | 49 s | |
-| Stall when entering the world | 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)) | none |
-| Frames over 250 ms in the world | 20 per run | none |
-| Hitches over 1 s | 7 per run | none |
-| Streaming after entering the world | 74 s | a few seconds |
+| Launch to first world frame | 27-28 s | |
+| Stall when entering the world | 6.6 s in 1 of 8 quiet runs; worst frame 1.2-3.0 s in the others ([#78](https://github.com/kylepelham/El1xr/issues/78)) | none |
+| Frames over 250 ms in the world | 10-12 per run | none |
+| Black frames shown in the first 90 s | 31 | none |
+| Streaming after entering the world | 71-72 s | a few seconds |
 
-These figures come from batch 3's quiet runs (`python tools/dev.py bench --quiet --seconds 200`, 27 November 2026). Each run fast-boots from a fixed checkpoint while other work on the machine is paused, and the numbers are read from the emulator's own frame log. Some diagnostic logging was on in every run. The stall when entering the world is the range over batch 3's runs.
+These figures come from batch 4 (27 November 2026), with the switches the launcher now turns on. Frame rate, frame times, CPU time, frames over 250 ms and streaming come from two quiet 200-second runs: each fast-boots from a fixed checkpoint while other work on the machine is paused, and the numbers are read from the emulator's own frame log. Launch time comes from two runs with the new loading switches, alternated with two runs without them (32-33 s) while builds ran on other CPU cores. The black frames were counted in a quiet 90-second run. Some diagnostic logging was on in every run.
 
 ![Where a frame goes: game passes 22.8 ms, El1xr GPU work 7.0 ms, untimed 3.8 ms, GPU idle 6.2 ms, against the 33.3 ms line for 30 fps](docs/images/frame-budget.svg)
 
 The last GPU timing profile, taken before batch 3, put a settled frame at about 40 ms. The game's own rendering passes need 22.8 ms of GPU time, which leaves room for 30 fps. The rest is El1xr's own GPU work (7 ms: bounds checks on indirect draws, texture copies between formats, uploads) and time the GPU sits idle (6-10 ms) while one CPU thread prepares the next batch of work. Those two are what the next updates go after.
 
-![Batch 3: with pooled blocks, launch to the first world frame went from 58-67 s to 32 s, launch to settled play from 117-120 s to 49 s, and frames over 250 ms in the world from 51-74 to 20](docs/images/load-times.svg)
+![Batch 4: with the loading switches, launch to the first world frame went from 32-33 s to 27-28 s; with the last-frame hold, black frames shown in the first 90 s went from 152 to 31; with bake inputs first, diner snapshots with a black face went from 0-3 per run to 0](docs/images/load-times.svg)
 
-Batch 3 (27 November 2026) kept two groups of switches, now on by default in the launcher: memory in 2 MiB sections, game buffers kept in GPU memory and higher priority for the frame threads (the seven-switch fg_rt set), and staging, GPU, shared and upload buffers taken from pooled blocks (four switches). The 4 KiB write guards are on too; they measured neutral. Against the same build without pooled blocks, run back to back, launch to the first world frame dropped from 58-67 s to 32 s, settled play from 117-120 s to 49 s, frames over 250 ms in the world from 51-74 to 20, hitches over 1 s from 26-35 to 7, and streaming from 80-87 s to 74 s. A seven-switch group that tore the walls of the prison cell was dropped. The batch's run with none of these switches got 14 fps and a 100 s launch, but the machine was under heavier load during it, so it is not a clean before-and-after comparison.
+Batch 4 (27 November 2026) kept four changes, now on by default in the launcher. Batch 3's switches stay on.
+
+- **Bake inputs first** (`VICTORY_BAKE_INPUTS=1`): face and skin bakes get their input textures before anything else. In the diner, none of 24 snapshots over two runs showed a black face, against 0-3 per run without it, at no measurable cost in frame rate.
+- **Faster loading** (`VICTORY_LOAD_FPS=60`, `VICTORY_LOAD_END=world`, `VICTORY_LOAD_UNPACED=1`): the loading screen runs at up to 60 fps until the world appears. Launch to the first world frame went from 32-33 s to 27-28 s in back-to-back runs, with no new stall at world entry.
+- **Hold the last frame** (`VICTORY_HOLD_LAST_FRAME=1`): when the game presents an all-black frame, the last good frame stays on screen instead. In a quiet 90-second run it covered 40 of the 71 black frames the game presented; the 31 left come at the very start of boot, before there is a frame to hold. A matching run without it put 152 black frames on screen.
+- **In-game settings menu** (`VICTORY_MENU=1`): press F9, or hold View and Menu for a second, with the game window in front. A self-test in the next batch opened it twice over the running game, drew all 10 tabs and handed input back to the game on closing.
+
+Against a run with every switch off, batch 3's switches also cut black frames in the first 90 s from 116 to 77, and the worst frame at world entry from 5.8 s to 1.7-2.7 s. Eight other switches were dropped: one tore the prison cell's wall and bunk (`SPLIT_AHEAD`), two turned faces or the cell black or noisy (`EXCHANGE_PAIRS`, `GPU_DETILE`), one brought black faces back at world entry although it saved 5 s of loading (`BAKE_ONE_BUDGET`), one added 13 ms of CPU time per frame (`FLUSH_ONE_PASS`), one missed texture changes (`TEXTURE_HASH_SAMPLED`), and two changed nothing measurable (`CARD_DECL_JOIN`, `STALE_BATCH`). Testing also found that upscaling at 4K crashed the game (a divide by zero, 0xc0000094); a fix is written and waits for its test run. After playing this build, the maintainer described it as "a lot more stable, less hitches, more stable frame rate, less flicker"; that is an impression from play, not a measurement.
 
 ### Test machine
 
@@ -111,9 +117,10 @@ python tools/dev.py gate       # every test, fails on any warning
 
 ## Known issues
 
-- **Visual faults that vary from run to run.** In about half of test runs, faces turn black or blotched (being worked on in [#35](https://github.com/kylepelham/El1xr/issues/35)), Lucia wears the wrong outfit in the diner, or her hair turns orange at the prison window.
-- **A stall when entering the world.** Right after the world first appears, the game freezes for 3-9 s while the GPU works through one batch of commands. The cause is being investigated in [#78](https://github.com/kylepelham/El1xr/issues/78).
-- **Slow streaming.** After entering the world it takes about 74 s for every asset to arrive, with pop-in meanwhile.
+- **Visual faults that vary from run to run.** Black or blotched faces are rarer with bake inputs first, but still turn up in some runs ([#35](https://github.com/kylepelham/El1xr/issues/35)). Lucia can still wear the wrong outfit in the diner, and her hair can turn orange at the prison window.
+- **A stall when entering the world.** It is rarer than in batch 3, where nearly every run froze for 3-9 s, but one of batch 4's eight quiet runs still froze for 6.6 s while the GPU worked through one batch of commands. The cause is being investigated in [#78](https://github.com/kylepelham/El1xr/issues/78).
+- **Slow streaming.** After entering the world it takes about 71 s for every asset to arrive, with pop-in meanwhile.
+- **Upscaling crashes at 4K.** With DLSS or FSR upscaling on, the game crashes as the world first appears (a divide by zero in the game's FSR 4 code). A fix is waiting for its test run; upscaling is off by default.
 - **The GPU waits on the CPU** for 6-10 ms per frame (see the frame budget above).
 - **Ray-traced lighting is mostly off.** The game builds its ray-tracing structures in software, and that builder is disabled for now.
 - **One reference machine.** Current figures are from the RTX 5090 above. Other GPUs have not been measured with the current build.
@@ -124,7 +131,7 @@ The target is a steady 30 fps at 4K on the RTX 5090, then no hitches and no visu
 
 - **The world-entry stall** ([#78](https://github.com/kylepelham/El1xr/issues/78)): finding which pass in that batch of GPU commands takes seconds.
 - **Less waiting and less overhead**: cutting the 6-10 ms the GPU waits on the CPU each frame, and El1xr's own 7 ms of GPU work.
-- **DLSS upscaling** and **hardware ray tracing on the RT cores**, which would bring back ray-traced lighting.
+- **DLSS upscaling** (once the crash fix is tested) and **hardware ray tracing on the RT cores**, which would bring back ray-traced lighting.
 - **Offline shader and pipeline pre-warming**, so that no shader is compiled during play.
 - **Fixes for the black faces ([#35](https://github.com/kylepelham/El1xr/issues/35)) and the run-to-run outfits**.
 

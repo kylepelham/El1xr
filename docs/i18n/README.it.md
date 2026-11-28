@@ -1,12 +1,12 @@
 <div align="center">
 
-![El1xr: Grand Theft Auto VI per Xbox Series in esecuzione su un PC Windows. 23,5 fps nel mondo di gioco in 4K su una RTX 5090, 0 pipeline rifiutate, 32 s dall'avvio al mondo di gioco, giocabile dal 27 novembre 2026](../images/hero.svg)
+![El1xr: Grand Theft Auto VI per Xbox Series in esecuzione su un PC Windows. 23,1-25,7 fps in 4K su una RTX 5090, 0 pipeline rifiutate, 27-28 s dall'avvio al mondo di gioco, giocabile dal 27 novembre 2026](../images/hero.svg)
 
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-9b5cff?style=flat-square&labelColor=170f2b)
 ![Platform: Windows 10 and 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2de2e6?style=flat-square&labelColor=170f2b)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-ff8a3d?style=flat-square&labelColor=170f2b&logo=rust&logoColor=white)
 ![Status: playable](https://img.shields.io/badge/status-playable-ff3d8b?style=flat-square&labelColor=170f2b)
-![23.5 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.5%20fps-ffd36e?style=flat-square&labelColor=170f2b)
+![23.1-25.7 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.1--25.7%20fps-ffd36e?style=flat-square&labelColor=170f2b)
 ![Discord: bonemeld](https://img.shields.io/badge/Discord-bonemeld-5865F2?style=flat-square&labelColor=170f2b&logo=discord&logoColor=white)
 
 [English](../../README.md) · [Français](README.fr.md) · [Español](README.es.md) · [Deutsch](README.de.md) · **Italiano** · [Português](README.pt-BR.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Русский](README.ru.md)
@@ -18,9 +18,9 @@ El1xr esegue la versione Xbox Series di Grand Theft Auto VI (build 1.0.2.1) su u
 ## Stato
 
 > [!NOTE]
-> **Al 27 novembre 2026, GTA VI (Xbox Series, build 1.0.2.1) si avvia, raggiunge i menu ed è giocabile nel mondo aperto su Windows.** Nelle ultime sessioni di prova a macchina scarica (batch 3, 4K, RTX 5090) il mondo gira a una mediana di 23,5 fps, con 0 pipeline GPU rifiutate. È ancora sotto il prossimo obiettivo, 30 fps stabili. Poi vengono l'assenza di scatti e di difetti visivi.
+> **Al 27 novembre 2026, GTA VI (Xbox Series, build 1.0.2.1) si avvia, raggiunge i menu ed è giocabile nel mondo aperto su Windows.** Nelle ultime sessioni di prova a macchina scarica (batch 4, 4K, RTX 5090) il gioco gira a 23,1-25,7 fps su una sessione di 200 secondi, con 0 pipeline GPU rifiutate. È ancora sotto il prossimo obiettivo, 30 fps stabili. Poi vengono l'assenza di scatti e di difetti visivi.
 
-![Traguardi: avvio, menu principale e mondo di gioco entro il 24 novembre 2026; giocabile a 23,5 fps il 27 novembre 2026; prossimo traguardo i 30 fps; stabilità in corso](../images/milestones.svg)
+![Traguardi: avvio, menu principale e mondo di gioco entro il 24 novembre 2026; giocabile a 23,1-25,7 fps il 27 novembre 2026; prossimo traguardo i 30 fps; stabilità in corso](../images/milestones.svg)
 
 | Traguardo | Stato | Riscontro | Data |
 |---|---|---|---|
@@ -28,38 +28,44 @@ El1xr esegue la versione Xbox Series di Grand Theft Auto VI (build 1.0.2.1) su u
 | Primo fotogramma | Fatto | L'animazione iniziale e le schermate legali vengono visualizzate senza sfarfallio. | entro il 24 nov 2026 |
 | Menu principale | Fatto | Schermata del profilo, impostazioni del primo avvio, schermate legali, schermata di caricamento e menu di pausa funzionano tutti. I menu girano a 30 fps (RTX 4070 SUPER). | entro il 24 nov 2026 |
 | In gioco | Fatto | Il gioco raggiunge il mondo aperto e il personaggio si muove sotto il controllo del giocatore. Una sessione di 13 minuti nella prigione è girata a circa 4 fps (RTX 4070 SUPER). | entro il 24 nov 2026 |
-| Giocabile | Fatto, sotto la velocità obiettivo | Il mondo gira a 23,5 fps in 4K (RTX 5090; mediana della parte nel mondo di una sessione di 200 secondi del batch 3 a macchina scarica). | 27 nov 2026 |
+| Giocabile | Fatto, sotto la velocità obiettivo | Il gioco gira a 23,1-25,7 fps in 4K (RTX 5090; due sessioni da 200 secondi del batch 4 a macchina scarica). | 27 nov 2026 |
 | Avanzamento della storia | Prime due missioni completate | Un collaboratore ha completato le prime due missioni in una sessione di 45 minuti a circa 2 fps (RTX 4070 SUPER; riferito, non misurato dai log). Tutte le cutscene vengono riprodotte per intero. Su Linux (Proton, RX 9070 XT) una sessione di 23 minuti ha superato il prologo ed è arrivata al capitolo 1. | 25 nov 2026 |
-| 30 fps | Non ancora | 23,5 fps nel mondo, tempo per fotogramma mediano di 42 ms contro l'obiettivo di 33,3 ms (RTX 5090, 4K). | 27 nov 2026 |
-| Stabile | In corso | Con le impostazioni predefinite, le sessioni di prova da 200 secondi terminano senza crash, senza reset del driver GPU e senza perdita del dispositivo. All'ingresso nel mondo c'è ancora un blocco di 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)), e i difetti visivi cambiano ancora da una sessione all'altra (vedi Problemi noti). | 27 nov 2026 |
+| 30 fps | Non ancora | 23,1-25,7 fps, tempo per fotogramma mediano di 40-43 ms contro l'obiettivo di 33,3 ms (RTX 5090, 4K). | 27 nov 2026 |
+| Stabile | In corso | Con le impostazioni predefinite, le sessioni di prova da 200 secondi terminano senza crash, senza reset del driver GPU e senza perdita del dispositivo. Il blocco all'ingresso nel mondo è diventato più raro (1 sessione su 8 a macchina scarica nel batch 4), ma non è sparito ([#78](https://github.com/kylepelham/El1xr/issues/78)), e i difetti visivi cambiano ancora da una sessione all'altra (vedi Problemi noti). | 27 nov 2026 |
 
 ## Prestazioni
 
-![In breve: 23,5 fps nel mondo, 0 pipeline GPU rifiutate, 32 s dall'avvio al mondo di gioco, 7 scatti oltre 1 s per sessione](../images/stats.svg)
+![In breve: 23,1-25,7 fps, 27-28 s dall'avvio al mondo, 0 volti neri in 24 istantanee del diner con gli input dei bake serviti per primi, 31 fotogrammi neri mostrati durante il caricamento invece di 152](../images/stats.svg)
 
 | Misura (RTX 5090, 4K) | Ora | Obiettivo |
 |---|---|---|
-| Frame rate nel mondo (mediana) | **23,5 fps** | 30+ fps |
-| Tempo per fotogramma mediano | 42 ms | 33,3 ms o meno |
-| Fotogramma al 99° percentile a regime | ~70 ms | nessuno scatto |
-| Tempo CPU per preparare un fotogramma | 28 ms | sotto il tempo della GPU |
+| Frame rate su una sessione di 200 s | **23,1-25,7 fps** | 30+ fps |
+| Tempo per fotogramma mediano | 40-43 ms | 33,3 ms o meno |
+| Fotogramma al 99° percentile a regime | 64-69 ms | nessuno scatto |
+| Tempo CPU per preparare un fotogramma | 26-28 ms | sotto il tempo della GPU |
 | Pipeline GPU rifiutate | **0** | 0 |
-| Dall'avvio al primo fotogramma del mondo | 32 s | |
-| Dall'avvio al gioco stabilizzato | 49 s | |
-| Blocco all'ingresso nel mondo | 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)) | nessuno |
-| Fotogrammi oltre 250 ms nel mondo | 20 per sessione | nessuno |
-| Scatti oltre 1 s | 7 per sessione | nessuno |
-| Streaming dopo l'ingresso nel mondo | 74 s | pochi secondi |
+| Dall'avvio al primo fotogramma del mondo | 27-28 s | |
+| Blocco all'ingresso nel mondo | 6,6 s in 1 sessione su 8 a macchina scarica; fotogramma peggiore di 1,2-3,0 s nelle altre ([#78](https://github.com/kylepelham/El1xr/issues/78)) | nessuno |
+| Fotogrammi oltre 250 ms nel mondo | 10-12 per sessione | nessuno |
+| Fotogrammi neri mostrati nei primi 90 s | 31 | nessuno |
+| Streaming dopo l'ingresso nel mondo | 71-72 s | pochi secondi |
 
-Questi valori vengono dalle sessioni del batch 3 a macchina scarica (`python tools/dev.py bench --quiet --seconds 200`, 27 novembre 2026). Ogni sessione parte con l'avvio rapido da un checkpoint fisso mentre il resto del lavoro sulla macchina è sospeso, e i valori vengono letti dal registro dei fotogrammi dell'emulatore stesso. In ogni sessione era attiva una parte dei log diagnostici. Il blocco all'ingresso nel mondo è l'intervallo osservato nelle sessioni del batch 3.
+Questi valori vengono dal batch 4 (27 novembre 2026), con gli switch che il launcher ora attiva. Frame rate, tempi per fotogramma, tempo CPU, fotogrammi oltre 250 ms e streaming vengono da due sessioni da 200 secondi a macchina scarica: ognuna parte con l'avvio rapido da un checkpoint fisso mentre il resto del lavoro sulla macchina è sospeso, e i valori vengono letti dal registro dei fotogrammi dell'emulatore stesso. Il tempo di avvio viene da due sessioni con i nuovi switch di caricamento, alternate a due sessioni senza (32-33 s), mentre su altri core della CPU giravano delle compilazioni. I fotogrammi neri sono stati contati in una sessione di 90 secondi a macchina scarica. In ogni sessione era attiva una parte dei log diagnostici.
 
 ![Dove va un fotogramma: passate del gioco 22,8 ms, lavoro GPU di El1xr 7,0 ms, non misurato 3,8 ms, GPU inattiva 6,2 ms, rispetto alla soglia di 33,3 ms per i 30 fps](../images/frame-budget.svg)
 
 L'ultimo profilo dei tempi GPU, misurato prima del batch 3, indicava circa 40 ms per un fotogramma stabilizzato. Le passate di rendering del gioco stesso occupano 22,8 ms di tempo GPU, il che lascia spazio per i 30 fps. Il resto è il lavoro di El1xr sulla GPU (7 ms: controlli dei limiti sui draw indiretti, copie di texture tra formati, caricamenti) e il tempo in cui la GPU resta inattiva (6-10 ms) mentre un solo thread della CPU prepara il lotto di lavoro successivo. Sono queste due voci il bersaglio dei prossimi aggiornamenti.
 
-![Batch 3: con i blocchi in pool, dall'avvio al primo fotogramma del mondo da 58-67 s a 32 s, dall'avvio al gioco stabilizzato da 117-120 s a 49 s, e fotogrammi oltre 250 ms nel mondo da 51-74 a 20](../images/load-times.svg)
+![Batch 4: con gli switch di caricamento, dall'avvio al primo fotogramma del mondo da 32-33 s a 27-28 s; tenendo l'ultimo fotogramma, fotogrammi neri mostrati nei primi 90 s da 152 a 31; con gli input dei bake serviti per primi, istantanee del diner con un volto nero da 0-3 per sessione a 0](../images/load-times.svg)
 
-Il batch 3 (27 novembre 2026) ha tenuto due gruppi di switch, ora attivi per impostazione predefinita nel launcher: memoria in sezioni da 2 MiB, buffer del gioco mantenuti nella memoria della GPU e priorità più alta per i thread dei fotogrammi (il gruppo fg_rt di sette switch), e buffer di staging, GPU, condivisi e di caricamento presi da blocchi in pool (quattro switch). Sono attive anche le guardie di scrittura da 4 KiB, risultate neutre. Rispetto alla stessa build senza blocchi in pool, in sessioni consecutive, il tempo dall'avvio al primo fotogramma del mondo è sceso da 58-67 s a 32 s, il gioco stabilizzato da 117-120 s a 49 s, i fotogrammi oltre 250 ms nel mondo da 51-74 a 20, gli scatti oltre 1 s da 26-35 a 7 e lo streaming da 80-87 s a 74 s. È stato scartato un gruppo di sette switch che strappava i muri della cella della prigione. La sessione del batch senza nessuno di questi switch ha dato 14 fps e un avvio di 100 s, ma durante quella sessione la macchina era più carica, quindi non è un confronto prima-dopo pulito.
+Il batch 4 (27 novembre 2026) ha tenuto quattro modifiche, ora attive per impostazione predefinita nel launcher. Gli switch del batch 3 restano attivi.
+
+- **Prima gli input dei bake** (`VICTORY_BAKE_INPUTS=1`): i bake di volti e pelle ricevono le loro texture di input prima di tutto il resto. Nel diner nessuna delle 24 istantanee di due sessioni mostrava un volto nero, contro 0-3 per sessione senza lo switch, senza costi misurabili sul frame rate.
+- **Caricamento più rapido** (`VICTORY_LOAD_FPS=60`, `VICTORY_LOAD_END=world`, `VICTORY_LOAD_UNPACED=1`): la schermata di caricamento gira fino a 60 fps finché non compare il mondo. Il tempo dall'avvio al primo fotogramma del mondo è sceso da 32-33 s a 27-28 s in sessioni consecutive, senza nuovi blocchi all'ingresso nel mondo.
+- **Tenere l'ultimo fotogramma** (`VICTORY_HOLD_LAST_FRAME=1`): quando il gioco presenta un fotogramma tutto nero, sullo schermo resta l'ultimo fotogramma buono. In una sessione di 90 secondi a macchina scarica ha coperto 40 dei 71 fotogrammi neri presentati dal gioco; i 31 rimasti arrivano all'inizio dell'avvio, quando non c'è ancora un fotogramma da tenere. Una sessione analoga senza lo switch ha mostrato 152 fotogrammi neri.
+- **Menu delle impostazioni in gioco** (`VICTORY_MENU=1`): premi F9, o tieni premuti View e Menu per un secondo, con la finestra del gioco in primo piano. Un autotest nel batch successivo lo ha aperto due volte sopra il gioco in corso, ha disegnato tutte le 10 schede e alla chiusura ha restituito i comandi al gioco.
+
+Rispetto a una sessione con tutti gli switch spenti, quelli del batch 3 hanno anche ridotto i fotogrammi neri dei primi 90 s da 116 a 77, e il fotogramma peggiore all'ingresso nel mondo da 5,8 s a 1,7-2,7 s. Altri otto switch sono stati scartati: uno strappava il muro e la branda della cella della prigione (`SPLIT_AHEAD`), due rendevano volti o la cella neri o rumorosi (`EXCHANGE_PAIRS`, `GPU_DETILE`), uno riportava i volti neri all'ingresso nel mondo pur facendo risparmiare 5 s di caricamento (`BAKE_ONE_BUDGET`), uno aggiungeva 13 ms di tempo CPU per fotogramma (`FLUSH_ONE_PASS`), uno perdeva modifiche alle texture (`TEXTURE_HASH_SAMPLED`), e due non cambiavano nulla di misurabile (`CARD_DECL_JOIN`, `STALE_BATCH`). Le prove hanno anche mostrato che l'upscaling in 4K mandava in crash il gioco (una divisione per zero, 0xc0000094); una correzione è scritta e attende la sua prova. Dopo aver giocato con questa build, il maintainer l'ha descritta come «molto più stabile, meno scatti, frame rate più regolare, meno sfarfallio»: è un'impressione di gioco, non una misura.
 
 ### Macchina di prova
 
@@ -111,9 +117,10 @@ python tools/dev.py gate       # tutti i test, fallisce a ogni avviso
 
 ## Problemi noti
 
-- **Difetti visivi che cambiano da una sessione all'altra.** In circa metà delle sessioni di prova i volti diventano neri o macchiati (ci si sta lavorando in [#35](https://github.com/kylepelham/El1xr/issues/35)), Lucia indossa l'abito sbagliato nel diner, oppure i suoi capelli diventano arancioni alla finestra della prigione.
-- **Un blocco all'ingresso nel mondo.** Subito dopo la prima comparsa del mondo, il gioco si blocca per 3-9 s mentre la GPU elabora un lotto di comandi. La causa è in esame in [#78](https://github.com/kylepelham/El1xr/issues/78).
-- **Streaming lento.** Dopo l'ingresso nel mondo servono circa 74 s perché arrivino tutti gli asset, con elementi che compaiono all'improvviso nel frattempo.
+- **Difetti visivi che cambiano da una sessione all'altra.** I volti neri o macchiati sono più rari con gli input dei bake serviti per primi, ma compaiono ancora in alcune sessioni ([#35](https://github.com/kylepelham/El1xr/issues/35)). Lucia può ancora indossare l'abito sbagliato nel diner, e i suoi capelli possono diventare arancioni alla finestra della prigione.
+- **Un blocco all'ingresso nel mondo.** È più raro che nel batch 3, dove quasi ogni sessione si bloccava per 3-9 s, ma una delle otto sessioni a macchina scarica del batch 4 si è ancora bloccata per 6,6 s mentre la GPU elaborava un lotto di comandi. La causa è in esame in [#78](https://github.com/kylepelham/El1xr/issues/78).
+- **Streaming lento.** Dopo l'ingresso nel mondo servono circa 71 s perché arrivino tutti gli asset, con elementi che compaiono all'improvviso nel frattempo.
+- **L'upscaling va in crash in 4K.** Con l'upscaling DLSS o FSR attivo, il gioco va in crash appena compare il mondo (una divisione per zero nel codice FSR 4 del gioco). Una correzione attende la sua prova; l'upscaling è spento per impostazione predefinita.
 - **La GPU attende la CPU** per 6-10 ms a fotogramma (vedi la ripartizione del fotogramma qui sopra).
 - **L'illuminazione in ray tracing è in gran parte disattivata.** Il gioco costruisce le sue strutture di ray tracing via software, e quel builder per ora è disattivato.
 - **Una sola macchina di riferimento.** I dati attuali vengono dalla RTX 5090 indicata sopra. Le altre GPU non sono ancora state misurate con la build attuale.
@@ -124,7 +131,7 @@ L'obiettivo sono 30 fps stabili in 4K sulla RTX 5090, poi nessuno scatto e nessu
 
 - **Il blocco all'ingresso nel mondo** ([#78](https://github.com/kylepelham/El1xr/issues/78)): capire quale passata di quel lotto di comandi GPU impiega secondi.
 - **Meno attese e meno overhead**: ridurre i 6-10 ms che la GPU passa ad attendere la CPU a ogni fotogramma, e i 7 ms di lavoro GPU propri di El1xr.
-- **Upscaling DLSS** e **ray tracing hardware sui core RT**, che riporterebbe l'illuminazione in ray tracing.
+- **Upscaling DLSS** (una volta provata la correzione del crash) e **ray tracing hardware sui core RT**, che riporterebbe l'illuminazione in ray tracing.
 - **Preriscaldamento offline di shader e pipeline**, in modo che nessuno shader venga compilato durante il gioco.
 - **Correzioni per i volti neri ([#35](https://github.com/kylepelham/El1xr/issues/35)) e gli abiti che cambiano da una sessione all'altra**.
 

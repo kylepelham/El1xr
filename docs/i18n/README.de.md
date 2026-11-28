@@ -1,12 +1,12 @@
 <div align="center">
 
-![El1xr: Grand Theft Auto VI für Xbox Series auf einem Windows-PC. 23,5 fps in der Spielwelt in 4K auf einer RTX 5090, 0 abgelehnte Pipelines, 32 s vom Start bis zur Spielwelt, spielbar seit dem 27. November 2026](../images/hero.svg)
+![El1xr: Grand Theft Auto VI für Xbox Series auf einem Windows-PC. 23,1-25,7 fps in 4K auf einer RTX 5090, 0 abgelehnte Pipelines, 27-28 s vom Start bis zur Spielwelt, spielbar seit dem 27. November 2026](../images/hero.svg)
 
 ![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-9b5cff?style=flat-square&labelColor=170f2b)
 ![Platform: Windows 10 and 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-2de2e6?style=flat-square&labelColor=170f2b)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-ff8a3d?style=flat-square&labelColor=170f2b&logo=rust&logoColor=white)
 ![Status: playable](https://img.shields.io/badge/status-playable-ff3d8b?style=flat-square&labelColor=170f2b)
-![23.5 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.5%20fps-ffd36e?style=flat-square&labelColor=170f2b)
+![23.1-25.7 fps at 4K on RTX 5090](https://img.shields.io/badge/4K%20on%20RTX%205090-23.1--25.7%20fps-ffd36e?style=flat-square&labelColor=170f2b)
 ![Discord: bonemeld](https://img.shields.io/badge/Discord-bonemeld-5865F2?style=flat-square&labelColor=170f2b&logo=discord&logoColor=white)
 
 [English](../../README.md) · [Français](README.fr.md) · [Español](README.es.md) · **Deutsch** · [Italiano](README.it.md) · [Português](README.pt-BR.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Русский](README.ru.md)
@@ -18,9 +18,9 @@ El1xr führt die Xbox-Series-Version von Grand Theft Auto VI (Build 1.0.2.1) auf
 ## Status
 
 > [!NOTE]
-> **Stand 27. November 2026: GTA VI (Xbox Series, Build 1.0.2.1) startet, erreicht die Menüs und ist unter Windows in der offenen Welt spielbar.** In den jüngsten Testläufen auf ruhigem Rechner (Batch 3, 4K, RTX 5090) läuft die Spielwelt im Median mit 23,5 fps, bei 0 abgelehnten GPU-Pipelines. Das liegt noch unter dem nächsten Ziel, stabilen 30 fps. Danach folgen: keine Ruckler und keine Grafikfehler.
+> **Stand 27. November 2026: GTA VI (Xbox Series, Build 1.0.2.1) startet, erreicht die Menüs und ist unter Windows in der offenen Welt spielbar.** In den jüngsten Testläufen auf ruhigem Rechner (Batch 4, 4K, RTX 5090) läuft das Spiel über einen 200-Sekunden-Lauf mit 23,1-25,7 fps, bei 0 abgelehnten GPU-Pipelines. Das liegt noch unter dem nächsten Ziel, stabilen 30 fps. Danach folgen: keine Ruckler und keine Grafikfehler.
 
-![Meilensteine: Start, Hauptmenü und Spielwelt bis 24. November 2026; spielbar mit 23,5 fps am 27. November 2026; als Nächstes 30 fps; Stabilität in Arbeit](../images/milestones.svg)
+![Meilensteine: Start, Hauptmenü und Spielwelt bis 24. November 2026; spielbar mit 23,1-25,7 fps am 27. November 2026; als Nächstes 30 fps; Stabilität in Arbeit](../images/milestones.svg)
 
 | Meilenstein | Status | Beleg | Datum |
 |---|---|---|---|
@@ -28,38 +28,44 @@ El1xr führt die Xbox-Series-Version von Grand Theft Auto VI (Build 1.0.2.1) auf
 | Erstes Bild | Erledigt | Die Startanimation und die rechtlichen Hinweise werden ohne Flackern dargestellt. | bis 24. Nov. 2026 |
 | Hauptmenü | Erledigt | Profilbildschirm, Ersteinrichtung, rechtliche Hinweise, Ladebildschirm und Pausenmenü funktionieren. Die Menüs laufen mit 30 fps (RTX 4070 SUPER). | bis 24. Nov. 2026 |
 | Im Spiel | Erledigt | Das Spiel erreicht die offene Welt, und die Figur lässt sich steuern. Eine 13-minütige Sitzung im Gefängnis lief mit etwa 4 fps (RTX 4070 SUPER). | bis 24. Nov. 2026 |
-| Spielbar | Erledigt, unter der Zielgeschwindigkeit | Die Spielwelt läuft in 4K mit 23,5 fps (RTX 5090; Median des Abschnitts in der Spielwelt eines 200-Sekunden-Laufs aus Batch 3 auf ruhigem Rechner). | 27. Nov. 2026 |
+| Spielbar | Erledigt, unter der Zielgeschwindigkeit | Das Spiel läuft in 4K mit 23,1-25,7 fps (RTX 5090; zwei 200-Sekunden-Läufe aus Batch 4 auf ruhigem Rechner). | 27. Nov. 2026 |
 | Story-Fortschritt | Erste zwei Missionen abgeschlossen | Ein Mitwirkender hat die ersten beiden Missionen in einer 45-minütigen Sitzung mit etwa 2 fps abgeschlossen (RTX 4070 SUPER; gemeldet, nicht aus Logs gemessen). Alle Zwischensequenzen laufen vollständig. Unter Linux (Proton, RX 9070 XT) kam ein 23-minütiger Lauf über den Prolog hinaus bis in Kapitel 1. | 25. Nov. 2026 |
-| 30 fps | Noch nicht | 23,5 fps in der Spielwelt, Median der Frametime 42 ms gegenüber dem Ziel von 33,3 ms (RTX 5090, 4K). | 27. Nov. 2026 |
-| Stabil | In Arbeit | Mit den Standardeinstellungen enden 200-Sekunden-Testläufe ohne Absturz, ohne Reset des GPU-Treibers und ohne Geräteverlust. Beim Betreten der Spielwelt steht das Spiel noch 3-9 s still ([#78](https://github.com/kylepelham/El1xr/issues/78)), und Grafikfehler wechseln noch von Lauf zu Lauf (siehe Bekannte Probleme). | 27. Nov. 2026 |
+| 30 fps | Noch nicht | 23,1-25,7 fps, Median der Frametime 40-43 ms gegenüber dem Ziel von 33,3 ms (RTX 5090, 4K). | 27. Nov. 2026 |
+| Stabil | In Arbeit | Mit den Standardeinstellungen enden 200-Sekunden-Testläufe ohne Absturz, ohne Reset des GPU-Treibers und ohne Geräteverlust. Der Stillstand beim Betreten der Spielwelt ist seltener geworden (1 von 8 ruhigen Läufen in Batch 4), aber nicht verschwunden ([#78](https://github.com/kylepelham/El1xr/issues/78)), und Grafikfehler wechseln noch von Lauf zu Lauf (siehe Bekannte Probleme). | 27. Nov. 2026 |
 
 ## Leistung
 
-![Auf einen Blick: 23,5 fps in der Spielwelt, 0 abgelehnte GPU-Pipelines, 32 s vom Start bis zur Spielwelt, 7 Ruckler über 1 s pro Lauf](../images/stats.svg)
+![Auf einen Blick: 23,1-25,7 fps, 27-28 s vom Start bis zur Spielwelt, 0 schwarze Gesichter in 24 Diner-Aufnahmen mit vorgezogenen Bake-Eingaben, 31 angezeigte schwarze Bilder beim Laden statt 152](../images/stats.svg)
 
 | Messgröße (RTX 5090, 4K) | Jetzt | Ziel |
 |---|---|---|
-| Bildrate in der Spielwelt (Median) | **23,5 fps** | 30+ fps |
-| Median der Frametime | 42 ms | höchstens 33,3 ms |
-| Frame im 99. Perzentil im eingependelten Spiel | ~70 ms | keine Ruckler |
-| CPU-Zeit zur Vorbereitung eines Frames | 28 ms | unter der GPU-Zeit |
+| Bildrate über einen 200-s-Lauf | **23,1-25,7 fps** | 30+ fps |
+| Median der Frametime | 40-43 ms | höchstens 33,3 ms |
+| Frame im 99. Perzentil im eingependelten Spiel | 64-69 ms | keine Ruckler |
+| CPU-Zeit zur Vorbereitung eines Frames | 26-28 ms | unter der GPU-Zeit |
 | Abgelehnte GPU-Pipelines | **0** | 0 |
-| Vom Start bis zum ersten Bild der Spielwelt | 32 s | |
-| Vom Start bis zum eingependelten Spiel | 49 s | |
-| Stillstand beim Betreten der Spielwelt | 3-9 s ([#78](https://github.com/kylepelham/El1xr/issues/78)) | keiner |
-| Frames über 250 ms in der Spielwelt | 20 pro Lauf | keine |
-| Ruckler über 1 s | 7 pro Lauf | keine |
-| Streaming nach dem Betreten der Spielwelt | 74 s | wenige Sekunden |
+| Vom Start bis zum ersten Bild der Spielwelt | 27-28 s | |
+| Stillstand beim Betreten der Spielwelt | 6,6 s in 1 von 8 ruhigen Läufen; schlechtester Frame 1,2-3,0 s in den übrigen ([#78](https://github.com/kylepelham/El1xr/issues/78)) | keiner |
+| Frames über 250 ms in der Spielwelt | 10-12 pro Lauf | keine |
+| Angezeigte schwarze Bilder in den ersten 90 s | 31 | keine |
+| Streaming nach dem Betreten der Spielwelt | 71-72 s | wenige Sekunden |
 
-Diese Werte stammen aus den Läufen von Batch 3 auf ruhigem Rechner (`python tools/dev.py bench --quiet --seconds 200`, 27. November 2026). Jeder Lauf startet per Schnellstart von einem festen Checkpoint, während die übrige Arbeit auf dem Rechner pausiert, und die Werte werden aus dem eigenen Frame-Log des Emulators gelesen. In jedem Lauf war ein Teil der Diagnose-Logs eingeschaltet. Der Stillstand beim Betreten der Spielwelt ist die Spanne über die Läufe von Batch 3.
+Diese Werte stammen aus Batch 4 (27. November 2026), mit den Schaltern, die der Launcher jetzt einschaltet. Bildrate, Frametimes, CPU-Zeit, Frames über 250 ms und Streaming stammen aus zwei 200-Sekunden-Läufen auf ruhigem Rechner: Jeder startet per Schnellstart von einem festen Checkpoint, während die übrige Arbeit auf dem Rechner pausiert, und die Werte werden aus dem eigenen Frame-Log des Emulators gelesen. Die Startzeit stammt aus zwei Läufen mit den neuen Ladeschaltern, im Wechsel mit zwei Läufen ohne sie (32-33 s), während auf anderen CPU-Kernen Builds liefen. Die schwarzen Bilder wurden in einem 90-Sekunden-Lauf auf ruhigem Rechner gezählt. In jedem Lauf war ein Teil der Diagnose-Logs eingeschaltet.
 
 ![Wohin ein Frame geht: Spiel-Passes 22,8 ms, GPU-Arbeit von El1xr 7,0 ms, nicht erfasst 3,8 ms, GPU-Leerlauf 6,2 ms, gemessen an der 33,3-ms-Linie für 30 fps](../images/frame-budget.svg)
 
 Das letzte GPU-Zeitprofil, aufgenommen vor Batch 3, ergab etwa 40 ms für einen eingependelten Frame. Die Render-Passes des Spiels selbst brauchen 22,8 ms GPU-Zeit, 30 fps sind also in Reichweite. Der Rest entfällt auf die eigene GPU-Arbeit von El1xr (7 ms: Bereichsprüfungen bei indirekten Draws, Texturkopien zwischen Formaten, Uploads) und auf Leerlauf der GPU (6-10 ms), während ein einzelner CPU-Thread den nächsten Arbeitsstapel vorbereitet. Genau diese beiden Posten nehmen sich die nächsten Updates vor.
 
-![Batch 3: Mit gepoolten Blöcken sank die Zeit vom Start bis zum ersten Bild der Spielwelt von 58-67 s auf 32 s, vom Start bis zum eingependelten Spiel von 117-120 s auf 49 s, und die Frames über 250 ms in der Spielwelt von 51-74 auf 20](../images/load-times.svg)
+![Batch 4: Mit den Ladeschaltern sank die Zeit vom Start bis zum ersten Bild der Spielwelt von 32-33 s auf 27-28 s, mit dem Halten des letzten Bildes die angezeigten schwarzen Bilder in den ersten 90 s von 152 auf 31, und mit vorgezogenen Bake-Eingaben die Diner-Aufnahmen mit schwarzem Gesicht von 0-3 pro Lauf auf 0](../images/load-times.svg)
 
-Batch 3 (27. November 2026) hat zwei Gruppen von Schaltern behalten, die der Launcher jetzt standardmäßig einschaltet: Speicher in 2-MiB-Abschnitten, Spiel-Buffer im GPU-Speicher gehalten und höhere Priorität für die Frame-Threads (die fg_rt-Gruppe aus sieben Schaltern) sowie Staging-, GPU-, gemeinsame und Upload-Buffer aus gepoolten Blöcken (vier Schalter). Die 4-KiB-Schreibwächter sind ebenfalls an; sie erwiesen sich als neutral. Gegenüber demselben Build ohne gepoolte Blöcke, direkt nacheinander gemessen, sank die Zeit vom Start bis zum ersten Bild der Spielwelt von 58-67 s auf 32 s, bis zum eingependelten Spiel von 117-120 s auf 49 s, die Frames über 250 ms in der Spielwelt von 51-74 auf 20, die Ruckler über 1 s von 26-35 auf 7 und das Streaming von 80-87 s auf 74 s. Eine Gruppe aus sieben Schaltern, die die Wände der Gefängniszelle zerriss, wurde verworfen. Der Lauf des Batches ganz ohne diese Schalter kam auf 14 fps und einen Start in 100 s, doch der Rechner war dabei stärker ausgelastet, daher ist das kein sauberer Vorher-nachher-Vergleich.
+Batch 4 (27. November 2026) hat vier Änderungen behalten, die der Launcher jetzt standardmäßig einschaltet. Die Schalter aus Batch 3 bleiben an.
+
+- **Bake-Eingaben zuerst** (`VICTORY_BAKE_INPUTS=1`): Gesichts- und Haut-Bakes bekommen ihre Eingabetexturen vor allem anderen. Im Diner zeigte keine der 24 Aufnahmen aus zwei Läufen ein schwarzes Gesicht, ohne den Schalter waren es 0-3 pro Lauf; einen messbaren Preis bei der Bildrate gab es nicht.
+- **Schnelleres Laden** (`VICTORY_LOAD_FPS=60`, `VICTORY_LOAD_END=world`, `VICTORY_LOAD_UNPACED=1`): Der Ladebildschirm läuft mit bis zu 60 fps, bis die Spielwelt erscheint. Die Zeit vom Start bis zum ersten Bild der Spielwelt sank in direkt aufeinanderfolgenden Läufen von 32-33 s auf 27-28 s, ohne neuen Stillstand beim Betreten der Spielwelt.
+- **Das letzte Bild halten** (`VICTORY_HOLD_LAST_FRAME=1`): Gibt das Spiel ein komplett schwarzes Bild aus, bleibt stattdessen das letzte gute Bild stehen. In einem 90-Sekunden-Lauf auf ruhigem Rechner überdeckte es 40 der 71 schwarzen Bilder, die das Spiel ausgab; die übrigen 31 kommen ganz am Anfang des Starts, bevor es ein Bild zum Halten gibt. Ein vergleichbarer Lauf ohne den Schalter brachte 152 schwarze Bilder auf den Bildschirm.
+- **Einstellungsmenü im Spiel** (`VICTORY_MENU=1`): F9 drücken oder View und Menu eine Sekunde lang halten, während das Spielfenster im Vordergrund ist. Ein Selbsttest im folgenden Batch öffnete es zweimal über dem laufenden Spiel, zeichnete alle 10 Reiter und gab die Eingabe beim Schließen an das Spiel zurück.
+
+Gegenüber einem Lauf mit allen Schaltern aus senkten die Schalter aus Batch 3 außerdem die schwarzen Bilder in den ersten 90 s von 116 auf 77 und den schlechtesten Frame beim Betreten der Spielwelt von 5,8 s auf 1,7-2,7 s. Acht weitere Schalter wurden verworfen: einer zerriss Wand und Pritsche der Gefängniszelle (`SPLIT_AHEAD`), zwei machten Gesichter oder die Zelle schwarz oder verrauscht (`EXCHANGE_PAIRS`, `GPU_DETILE`), einer brachte die schwarzen Gesichter beim Betreten der Spielwelt zurück, obwohl er 5 s Ladezeit sparte (`BAKE_ONE_BUDGET`), einer kostete 13 ms mehr CPU-Zeit pro Frame (`FLUSH_ONE_PASS`), einer übersah Texturänderungen (`TEXTURE_HASH_SAMPLED`), und zwei änderten nichts Messbares (`CARD_DECL_JOIN`, `STALE_BATCH`). Die Tests zeigten außerdem, dass Upscaling in 4K das Spiel abstürzen ließ (eine Division durch null, 0xc0000094); eine Korrektur ist geschrieben und wartet auf ihren Testlauf. Nach dem Spielen dieses Builds beschrieb der Maintainer ihn als „viel stabiler, weniger Ruckler, gleichmäßigere Bildrate, weniger Flackern“; das ist ein Eindruck beim Spielen, keine Messung.
 
 ### Testrechner
 
@@ -111,9 +117,10 @@ python tools/dev.py gate       # alle Tests, schlägt bei jeder Warnung fehl
 
 ## Bekannte Probleme
 
-- **Grafikfehler, die von Lauf zu Lauf wechseln.** In etwa der Hälfte der Testläufe werden Gesichter schwarz oder fleckig (daran wird in [#35](https://github.com/kylepelham/El1xr/issues/35) gearbeitet), Lucia trägt im Diner das falsche Outfit, oder ihre Haare werden am Gefängnisfenster orange.
-- **Ein Stillstand beim Betreten der Spielwelt.** Kurz nachdem die Spielwelt erscheint, friert das Spiel 3-9 s ein, während die GPU einen Stapel von Befehlen abarbeitet. Die Ursache wird in [#78](https://github.com/kylepelham/El1xr/issues/78) untersucht.
-- **Langsames Streaming.** Nach dem Betreten der Spielwelt dauert es etwa 74 s, bis alle Assets geladen sind; bis dahin ploppen Objekte auf.
+- **Grafikfehler, die von Lauf zu Lauf wechseln.** Schwarze oder fleckige Gesichter sind mit vorgezogenen Bake-Eingaben seltener, tauchen in manchen Läufen aber noch auf ([#35](https://github.com/kylepelham/El1xr/issues/35)). Lucia kann im Diner noch das falsche Outfit tragen, und ihre Haare können am Gefängnisfenster orange werden.
+- **Ein Stillstand beim Betreten der Spielwelt.** Er ist seltener als in Batch 3, wo fast jeder Lauf 3-9 s einfror, doch einer der acht ruhigen Läufe von Batch 4 stand noch 6,6 s still, während die GPU einen Stapel von Befehlen abarbeitete. Die Ursache wird in [#78](https://github.com/kylepelham/El1xr/issues/78) untersucht.
+- **Langsames Streaming.** Nach dem Betreten der Spielwelt dauert es etwa 71 s, bis alle Assets geladen sind; bis dahin ploppen Objekte auf.
+- **Upscaling stürzt in 4K ab.** Mit DLSS- oder FSR-Upscaling stürzt das Spiel ab, sobald die Spielwelt erscheint (eine Division durch null im FSR-4-Code des Spiels). Eine Korrektur wartet auf ihren Testlauf; Upscaling ist standardmäßig aus.
 - **Die GPU wartet auf die CPU**, 6-10 ms pro Frame (siehe die Aufteilung eines Frames oben).
 - **Raytracing-Beleuchtung ist größtenteils aus.** Das Spiel baut seine Raytracing-Strukturen in Software, und dieser Builder ist vorerst deaktiviert.
 - **Ein einziger Referenzrechner.** Die aktuellen Werte stammen von der oben genannten RTX 5090. Andere GPUs wurden mit dem aktuellen Build noch nicht gemessen.
@@ -124,7 +131,7 @@ Ziel sind stabile 30 fps in 4K auf der RTX 5090, danach keine Ruckler und keine 
 
 - **Der Stillstand beim Betreten der Spielwelt** ([#78](https://github.com/kylepelham/El1xr/issues/78)): herausfinden, welcher Pass in diesem Stapel von GPU-Befehlen Sekunden braucht.
 - **Weniger Warten und weniger Overhead**: die 6-10 ms verkürzen, die die GPU in jedem Frame auf die CPU wartet, sowie die 7 ms eigene GPU-Arbeit von El1xr.
-- **DLSS-Upscaling** und **Hardware-Raytracing auf den RT-Kernen**, womit die Raytracing-Beleuchtung zurückkäme.
+- **DLSS-Upscaling** (sobald die Absturzkorrektur getestet ist) und **Hardware-Raytracing auf den RT-Kernen**, womit die Raytracing-Beleuchtung zurückkäme.
 - **Offline-Vorwärmen von Shadern und Pipelines**, damit während des Spielens kein Shader kompiliert wird.
 - **Korrekturen für die schwarzen Gesichter ([#35](https://github.com/kylepelham/El1xr/issues/35)) und die von Lauf zu Lauf wechselnden Outfits**.
 
