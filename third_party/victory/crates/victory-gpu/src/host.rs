@@ -4669,13 +4669,17 @@ impl Host {
             .load(Ordering::Relaxed)
             .saturating_sub(flush_one_before);
         PREP_PARTS[5].fetch_add(def_us.saturating_sub(flush_one_delta), Ordering::Relaxed);
-        let t_flush = std::time::Instant::now();
-        flush::last(|| batch.flush());
-        crate::watch::ask_once_end();
-        PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let t_pre = std::time::Instant::now();
-        finalize_preludes(&mut pending_preludes);
-        PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if beside::wanted(&batch, !pending_preludes.is_empty()) {
+            beside::run(&mut batch, || finalize_preludes(&mut pending_preludes));
+        } else {
+            let t_flush = std::time::Instant::now();
+            flush::last(|| batch.flush());
+            crate::watch::ask_once_end();
+            PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let t_pre = std::time::Instant::now();
+            finalize_preludes(&mut pending_preludes);
+            PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -9183,6 +9187,8 @@ mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_flush_beside.rs"]
+mod beside;
 #[path = "host_one_pass.rs"]
 mod one_pass;
 #[path = "host_step_reads.rs"]

@@ -35,22 +35,30 @@ pub trait MenuModel: Send {
     fn detail(&self, _name: &str) -> Option<String> {
         None
     }
+    /// The value an unset `name` stands for, when it is one of its own values (the monitor's
+    /// resolution, DLSS's default mode).
+    fn effective(&self, _name: &str) -> Option<String> {
+        None
+    }
     /// What the menu is, after the name in its header.
     fn title(&self) -> &'static str {
         "Settings"
     }
 }
 
-/// The live registry. `save` is the registry's unless a test swaps it.
+/// The live registry. `save` is the registry's; in tests it never writes (the menu saves restart
+/// changes at once, and a test must not touch the user's settings file).
 pub struct Registry {
     save: fn() -> std::io::Result<()>,
 }
 
 impl Default for Registry {
     fn default() -> Self {
-        Registry {
-            save: settings::save,
-        }
+        #[cfg(not(test))]
+        let save = settings::save;
+        #[cfg(test)]
+        let save = || Ok(());
+        Registry { save }
     }
 }
 
@@ -97,6 +105,10 @@ impl MenuModel for Registry {
     fn detail(&self, name: &str) -> Option<String> {
         super::display::detail(name, settings::get, super::display::primary_display_size)
     }
+
+    fn effective(&self, name: &str) -> Option<String> {
+        super::display::effective(name, settings::get, super::display::primary_display_size)
+    }
 }
 
 /// DLSS presets over the upscaler and its quality mode (`victory_core::render_plan`): the render
@@ -119,20 +131,77 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// Settings listed first in their tab, in this order; the rest follow in the registry's.
-pub const FIRST: &[&str] = &[
-    "VICTORY_RESOLUTION",
-    "VICTORY_UPSCALE",
-    "VICTORY_UPSCALE_QUALITY",
-    "VICTORY_DLSS_SHARPNESS",
-    "VICTORY_FRAME_GEN",
-    "VICTORY_PRESENT_CAP",
-    "VICTORY_PRESENT_SYNC",
-    "VICTORY_PRESENT_SMOOTH",
-    "VICTORY_OVERLAY",
-    "VICTORY_DLSS_QUALITY",
-    "VICTORY_FFX_SCALE",
-];
+/// A tab split into headed sections: each lists its settings in order; the tab's other settings
+/// follow under [`OTHER`] in the registry's order.
+pub type Sections = &'static [(&'static str, &'static [&'static str])];
+
+/// The groups whose tab is split into sections.
+pub const SECTIONS: &[(&str, Sections)] = &[(
+    "Display",
+    &[
+        (
+            "Resolution and upscaling",
+            &[
+                "VICTORY_RESOLUTION",
+                "VICTORY_UPSCALE",
+                "VICTORY_UPSCALE_QUALITY",
+                "VICTORY_DLSS_SHARPNESS",
+                "VICTORY_DLSS_PRESET",
+                "VICTORY_FRAME_GEN",
+                "VICTORY_RAY_TRACING",
+            ],
+        ),
+        (
+            "Frame pacing",
+            &[
+                "VICTORY_PRESENT_CAP",
+                "VICTORY_PRESENT_SYNC",
+                "VICTORY_PRESENT_TEARING",
+                "VICTORY_PRESENT_SMOOTH",
+                "VICTORY_PRESENT_SMOOTH_READY",
+            ],
+        ),
+        (
+            "Screen and loading",
+            &[
+                "VICTORY_OVERLAY",
+                "VICTORY_LOAD_FPS",
+                "VICTORY_LOAD_END",
+                "VICTORY_LOAD_UNPACED",
+                "VICTORY_HOLD_LAST_FRAME",
+            ],
+        ),
+        (
+            "Lighting",
+            &[
+                "VICTORY_AMBIENT",
+                "VICTORY_AMBIENT_AIR",
+                "VICTORY_AMBIENT_MOST",
+                "VICTORY_AMBIENT_ONCE",
+                "VICTORY_AMBIENT_SPECULAR",
+            ],
+        ),
+        (
+            "Overrides",
+            &[
+                "VICTORY_NATIVE_DEFAULT",
+                "VICTORY_DLSS_QUALITY",
+                "VICTORY_FFX_SCALE",
+                "VICTORY_UPSCALER",
+                "VICTORY_DLSS_REACTIVE",
+                "VICTORY_HDR_STANDIN",
+            ],
+        ),
+    ],
+)];
+
+/// The heading of a sectioned tab's remaining settings.
+pub const OTHER: &str = "Other";
+
+/// `group`'s sections, if its tab has them.
+pub fn sections(group: &str) -> Option<Sections> {
+    SECTIONS.iter().find(|(g, _)| *g == group).map(|&(_, s)| s)
+}
 
 /// Values that read better by name, in the order the menu steps through them.
 const NAMED: &[(&str, &[(&str, &str)])] = &[
@@ -220,8 +289,14 @@ mod tests {
                 assert!(settings::valid(info(name).kind, value), "{name}={value}");
             }
         }
-        for name in FIRST {
-            info(name);
+        for (group, sections) in SECTIONS {
+            let mut seen = std::collections::BTreeSet::new();
+            for (_, names) in *sections {
+                for name in *names {
+                    assert_eq!(info(name).group, *group, "{name}");
+                    assert!(seen.insert(*name), "{name} is in two sections");
+                }
+            }
         }
         for (name, values) in NAMED {
             for (value, _) in *values {
