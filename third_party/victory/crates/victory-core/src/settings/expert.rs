@@ -121,6 +121,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_DYNAMIC_SLOTS", Apply::Restart),
     ("VICTORY_DYNAMIC_WAIT_MS", Apply::Live),
     ("VICTORY_EMIT_DUMP", Apply::Retranslate),
+    ("VICTORY_EMPTY_REMAP", Apply::Live),
     ("VICTORY_EXACT_REUSE", Apply::Restart),
     ("VICTORY_EXACT_REUSE_FRAMES", Apply::Restart),
     ("VICTORY_EXACT_REUSE_LAG", Apply::Restart),
