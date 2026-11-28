@@ -186,6 +186,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_TITLE_WAITS", "Logs title-thread write faults and which die title and our threads ran."),
     ("VICTORY_TYPELESS_WHOLE_VIEW", "Views with no description of typeless copies show it, not null."),
     ("VICTORY_U32_CLAMP", "Clamped unsigned adds saturate as on the console, instead of a refusal."),
+    ("VICTORY_UNMAP_LATER", "Calls that only unmap title pages leave the unmapping to a thread."),
     ("VICTORY_UPLOAD_BLOCKS", "Takes upload buffers from pooled blocks instead of making each."),
     ("VICTORY_UPSCALE_LIVE_TEST", "Steps through upscaler settings live on a timer, for testing."),
     ("VICTORY_UPSCALE_OFF_STRETCH", "Turning the upscaler off live stretches the image until the next start."),
