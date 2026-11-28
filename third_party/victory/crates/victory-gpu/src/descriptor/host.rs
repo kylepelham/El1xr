@@ -2162,6 +2162,7 @@ impl HostHeap {
             std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()))
         };
         join_ranges(&mut ranges, 0);
+        heap_remap::memory_changed(&ranges);
         if ranges.is_empty() {
             return 0;
         }
@@ -2209,6 +2210,7 @@ impl HostHeap {
             std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()))
         };
         join_ranges(&mut ranges, 0);
+        heap_remap::memory_changed(&ranges);
         // `VICTORY_PAGE_SETTLE_REREAD`: staged textures under them read again once they settle.
         if crate::texture::settle_reread::on() {
             crate::texture::settle_reread::page_written(&ranges, crate::host::now_ms());
