@@ -32,6 +32,11 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// The cache [`use_shader_cache`] opened (`crate::shader_pack`).
+pub(crate) fn cache() -> Option<&'static Cache> {
+    CACHE.get()
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
@@ -450,7 +455,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
-fn cached(
+pub(crate) fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
@@ -461,11 +466,20 @@ fn cached(
         translate,
         ran: AtomicBool::new(false),
     };
+    let key = victory_pipeline::CacheKey::new(&converter, &input);
+    // `VICTORY_SHADER_PACK=1`: the pack first; what the loose files serve
+    // (or a translation stores there) goes into it (`crate::shader_pack`).
+    let pack = crate::shader_pack::pack(cache);
+    if let Some(shader) = pack.and_then(|p| p.get(key.bytes())).and_then(|b| decode(&b)) {
+        HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(shader);
+    }
     for _ in 0..2 {
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert_keyed(&key, &converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let bytes = std::fs::read(&path).ok();
+        if let Some(shader) = bytes.as_deref().and_then(decode) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -473,6 +487,9 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
+            if let (Some(pack), Some(bytes)) = (pack, bytes) {
+                pack.put(key.bytes(), bytes);
+            }
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -666,10 +683,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn shader() -> HostShader {
+    pub(crate) fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),

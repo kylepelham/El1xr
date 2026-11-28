@@ -239,6 +239,8 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod shader_pack;
+#[cfg(windows)]
 mod wave_more;
 mod zero_out;
 #[cfg(windows)]

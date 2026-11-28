@@ -32,3 +32,10 @@ pub(crate) fn assumed() -> bool {
 pub fn shader_cache_counts() -> (u64, u64) {
     crate::shader_cache::counts()
 }
+
+/// With `VICTORY_SHADER_PACK=1`: waits until what was queued for the shader
+/// pack is in it (the end of `victory warm`).
+#[cfg(windows)]
+pub fn shader_pack_sync() {
+    crate::shader_pack::sync();
+}

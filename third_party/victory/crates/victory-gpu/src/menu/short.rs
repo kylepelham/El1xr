@@ -117,6 +117,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_SCRATCH_AT_LANDING", "Returns a list's scratch memory when its submission finishes."),
     ("VICTORY_SEND_THREAD", "Sends submissions to the card from a separate thread."),
     ("VICTORY_SETTLE_ROOM", "Allows more lists and changed runs in flight before settling."),
+    ("VICTORY_SHADER_PACK", "Reads translated shaders from one pack file, not a million loose files."),
     ("VICTORY_SHADOW_RASTER_TILES", "Sends sun shadow tiles to the shadow maps when rays always miss."),
     ("VICTORY_SHADOW_TILE_WATCH", "Logs sun-shadow tile programs that changed path between frames."),
     ("VICTORY_SKIN_FILL", "Fills skin's lighting probe inputs with ambient light before skin draws."),
