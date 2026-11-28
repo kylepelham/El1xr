@@ -1010,7 +1010,7 @@ pub(crate) struct HostList {
     /// Whether this list bound a shader-visible descriptor heap (or recorded
     /// a draw/dispatch) since its last reset, so submitting it needs
     /// `descriptor::sync_heaps` and `make_waiting`.
-    uses_heaps: std::sync::atomic::AtomicBool,
+    pub(crate) uses_heaps: std::sync::atomic::AtomicBool,
     /// `VICTORY_HEAP_ROUND_SHARE`: the heap-sync ticket it needs a round
     /// from, stamped when the title gave it to a queue (0: none).
     pub(crate) heap_stamp: std::sync::atomic::AtomicU64,
@@ -2094,6 +2094,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
             }
 #endif
             differs.Store(out_at + group.x * 4u, flag);
+#ifdef HASH_AT
+            // (El1xr) `VICTORY_FETCH_CHECK`: the hash, for the landing to
+            // check what it fetches against (`crate::fetch_check`).
+            differs.Store(HASH_AT + out_at + group.x * 4u, all.x ^ (all.y * 3u) ^ (all.z * 5u) ^ (all.w * 7u));
+#endif
             // With the copy-back on its own thread: the next compare of the
             // piece finds what is written from here on.
             if (compare == 2u) hashes.Store4(piece * 16u, all);
@@ -4616,17 +4621,30 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        let mut aside_ask: Option<(ask_aside::Pending, Vec<(usize, usize)>)> = None;
+        type StaleOut = Option<std::sync::Arc<stale_aside::Out>>;
+        let mut aside_ask: Option<(ask_aside::Pending, Vec<(usize, usize)>, StaleOut)> = None;
         if crate::watch::once() && ask_aside::on() {
             let t_ask = std::time::Instant::now();
             let ranges = ask::ranges(runs);
             let given = (ranges.clone(), crate::watch::look_skip::taken());
+            // (`VICTORY_STALE_ASIDE`) The check behind flights goes with it, after the asking.
+            let t_stale = std::time::Instant::now();
+            let check = (behind && stale_aside::on()).then(|| stale_aside::gather(runs)).flatten();
+            let out = check.as_ref().map(stale_aside::Check::out);
+            let stale_us = t_stale.elapsed().as_micros() as u64;
             aside_ask = ask_aside::start(move || {
                 crate::watch::look_skip::handed(given.1);
                 crate::watch::ask_once(&given.0);
+                if let Some(check) = check {
+                    check.run();
+                }
             })
-            .map(|pending| (pending, ranges));
-            PREP_PARTS[2].fetch_add(t_ask.elapsed().as_micros() as u64, Ordering::Relaxed);
+            .map(|pending| (pending, ranges, out));
+            PREP_PARTS[2].fetch_add(
+                (t_ask.elapsed().as_micros() as u64).saturating_sub(stale_us),
+                Ordering::Relaxed,
+            );
+            PREP_PARTS[3].fetch_add(stale_us, Ordering::Relaxed);
         }
         if aside_ask.is_some() {
             // Joined at the gate in the walk below, with the check behind flights.
@@ -4672,11 +4690,13 @@ impl Host {
             |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
                 for (list, textures) in pending.drain(..) {
                     let mut uploads = Vec::new();
+                    let claims = run_split::claims();
                     for upload in textures {
                         if let Some(first_upload) = upload.finish_refresh() {
                             uploads.push((upload, first_upload));
                         }
                     }
+                    drop(claims);
                     firsts.push(lists.len());
                     let _laps = run_split::prelude();
                     if let Some(prelude) = run_wait::prelude(|| list.prelude(&uploads)) {
@@ -4691,14 +4711,22 @@ impl Host {
             // (`VICTORY_ASK_ASIDE`) The asking joined, then the check behind flights as above.
             let aside = aside_ask.is_some();
             let mut pass = || {
-                let Some((pending, ranges)) = aside_ask.take() else {
+                let Some((pending, ranges, out)) = aside_ask.take() else {
                     return false;
                 };
                 let t_gate = std::time::Instant::now();
                 pending.join();
-                PREP_PARTS[2].fetch_add(t_gate.elapsed().as_micros() as u64, Ordering::Relaxed);
-                let mut is_stale = false;
-                if behind {
+                let waited = t_gate.elapsed().as_micros() as u64;
+                let handed = out.is_some();
+                let checked = out.and_then(|out| out.result(waited));
+                let on_check = checked.map_or(0, |c| c.1);
+                PREP_PARTS[2].fetch_add(waited - on_check, Ordering::Relaxed);
+                PREP_PARTS[3].fetch_add(on_check, Ordering::Relaxed);
+                let mut is_stale = checked.is_some_and(|c| c.0);
+                if behind && checked.is_none() {
+                    if handed {
+                        stale_aside::at_gate();
+                    }
                     let t_stale = std::time::Instant::now();
                     is_stale = stale_under_flights(runs);
                     PREP_PARTS[3].fetch_add(t_stale.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5726,7 +5754,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| run_split::made(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -9364,6 +9392,8 @@ mod ask;
 /// (critpath #88) `VICTORY_ASK_ASIDE=1`: the submission's asking beside the walk of its lists.
 #[path = "host_ask_aside.rs"]
 mod ask_aside;
+#[path = "host_stale_aside.rs"]
+mod stale_aside;
 #[path = "host_pass_merge.rs"]
 mod pass_merge;
 #[path = "host_diff_wide.rs"]

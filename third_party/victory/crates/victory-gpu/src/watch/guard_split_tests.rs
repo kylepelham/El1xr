@@ -48,6 +48,7 @@ impl Drop for Reset {
         super::super::hole_marks::FORCED.set(None);
         super::super::alias_skip::FORCED.set(None);
         super::super::claim_narrow::FORCED.set(None);
+        super::super::fault_unlocked::FORCED.set(None);
         super::super::guard4k::RUNS_FORCED.set(None);
         NOTE_ONCE_FORCED.set(None);
         PUBLISH_TRY_FORCED.set(None);
@@ -431,9 +432,20 @@ fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool, stamp_fresh:
     racing_refreshes_lose_nothing_with(publish_try, guard_4k, stamp_fresh, false)
 }
 
+/// [`racing_refreshes_lose_nothing_all`] with `VICTORY_FAULT_UNLOCKED` off.
+fn racing_refreshes_lose_nothing_with(publish_try: bool, guard_4k: bool, stamp_fresh: bool, walk_cuts: bool) -> usize {
+    racing_refreshes_lose_nothing_all(publish_try, guard_4k, stamp_fresh, walk_cuts, false)
+}
+
 /// [`racing_refreshes_lose_nothing`]; `walk_cuts`: R25's guard walk switches on
 /// (`VICTORY_GUARD_ALIAS_SKIP`, `VICTORY_GUARD_CLAIM_NARROW`, `VICTORY_GUARD_4K_RUNS`).
-fn racing_refreshes_lose_nothing_with(publish_try: bool, guard_4k: bool, stamp_fresh: bool, walk_cuts: bool) -> usize {
+fn racing_refreshes_lose_nothing_all(
+    publish_try: bool,
+    guard_4k: bool,
+    stamp_fresh: bool,
+    walk_cuts: bool,
+    unlocked: bool,
+) -> usize {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     const BLOCKS: usize = 8;
@@ -450,6 +462,7 @@ fn racing_refreshes_lose_nothing_with(publish_try: bool, guard_4k: bool, stamp_f
         super::super::alias_skip::FORCED.set(Some(walk_cuts));
         super::super::claim_narrow::FORCED.set(Some(walk_cuts));
         super::super::guard4k::RUNS_FORCED.set(Some(walk_cuts));
+        super::super::fault_unlocked::FORCED.set(Some(unlocked));
     };
     setup();
     let view = View::new(BLOCKS);
@@ -848,3 +861,6 @@ fn bench_holes_kept() {
 
 #[path = "walk_cuts_tests.rs"]
 mod walk_cuts;
+
+#[path = "fault_unlocked_tests.rs"]
+mod fault_unlocked_t;
