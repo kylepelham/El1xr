@@ -1036,11 +1036,12 @@ fn workers() -> bool {
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn(|| {
                     crate::topology::pin_background("victory-pipelines");
-                    // Below the title's own threads (loading, recording).
+                    // Below the title's own threads (loading, recording),
+                    // unless `VICTORY_PIPELINE_PRIORITY` says otherwise.
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let _ = SetThreadPriority(GetCurrentThread(), worker_priority());
                     }
                     loop {
                         next().make();
@@ -1075,6 +1076,32 @@ fn worker_count(processors: usize, value: Option<&str>) -> usize {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| processors.saturating_sub(4))
         .clamp(2, MOST)
+}
+
+/// The workers' thread priority, `VICTORY_PIPELINE_PRIORITY` (read once).
+fn worker_priority() -> windows::Win32::System::Threading::THREAD_PRIORITY {
+    static PRIORITY: OnceLock<windows::Win32::System::Threading::THREAD_PRIORITY> = OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        let value = std::env::var("VICTORY_PIPELINE_PRIORITY").ok();
+        let priority = parse_worker_priority(value.as_deref());
+        tracing::info!(value = value.as_deref().unwrap_or("unset"), priority = priority.0, "pipeline worker priority");
+        priority
+    })
+}
+
+/// `normal` (ezbyDev/victory-amd: a 1,500-pipeline backlog cleared in
+/// seconds instead of minutes, so fewer late pipelines and stand-ins after a
+/// load) or `above_normal`; `lowest` and `idle` go further down. Anything
+/// else, and unset, keeps below normal, under the title's threads.
+fn parse_worker_priority(value: Option<&str>) -> windows::Win32::System::Threading::THREAD_PRIORITY {
+    use windows::Win32::System::Threading::*;
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("normal" | "1") => THREAD_PRIORITY_NORMAL,
+        Some("above_normal" | "above") => THREAD_PRIORITY_ABOVE_NORMAL,
+        Some("lowest") => THREAD_PRIORITY_LOWEST,
+        Some("idle") => THREAD_PRIORITY_IDLE,
+        _ => THREAD_PRIORITY_BELOW_NORMAL,
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -1547,6 +1574,20 @@ mod tests {
         assert_eq!(worker_count(32, Some("6")), 6);
         assert_eq!(worker_count(32, Some("0")), 28);
         assert_eq!(worker_count(32, Some("x")), 28);
+    }
+
+    #[test]
+    fn worker_priority_stays_below_normal_unless_asked() {
+        use windows::Win32::System::Threading::*;
+        assert_eq!(parse_worker_priority(None), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("x")), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("0")), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("normal")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some(" Normal ")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some("1")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some("above_normal")), THREAD_PRIORITY_ABOVE_NORMAL);
+        assert_eq!(parse_worker_priority(Some("lowest")), THREAD_PRIORITY_LOWEST);
+        assert_eq!(parse_worker_priority(Some("idle")), THREAD_PRIORITY_IDLE);
     }
 
     #[test]
