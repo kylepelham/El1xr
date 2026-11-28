@@ -30,6 +30,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BAKE_WATCH", "Logs per-frame counts of bake draws and related events."),
     ("VICTORY_BAKE_WHY", "Logs each texture a bake draw is still missing, and when it arrives."),
     ("VICTORY_BAKE_ZERO_WAIT", "How long a bake waits for input textures that are still all zeros, in ms."),
+    ("VICTORY_BARRIER_DEDUP", "Merges one barrier call's transitions of the same texture into one."),
     ("VICTORY_BIND_FAST_HASH", "Uses a faster hash for draw binding lookups; same results, less CPU."),
     ("VICTORY_BLOCKED_INDEX", "Notes which list steps read game memory, so flight checks look at fewer."),
     ("VICTORY_BVH_NO_HIT", "Ray tests return a clean miss when the BVH builder is off."),
