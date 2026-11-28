@@ -276,6 +276,24 @@ def test_menu_selftest_sends_its_grabs_to_the_snap_folder_and_turns_the_menu_on(
     assert dev.menu_pngs_field({}, snap_dir) == ""
 
 
+def test_report_key_bundles_go_beside_the_snaps_and_are_counted(tmp_path):
+    dev = load_dev()
+    snap_dir = tmp_path / "snaps"
+    assert dev.apply_reports({"VICTORY_A": "1"}, snap_dir) == {"VICTORY_A": "1"}
+    assert dev.apply_reports({"VICTORY_REPORT_KEY": "0"}, snap_dir) == {"VICTORY_REPORT_KEY": "0"}
+    assert not snap_dir.exists()
+    old = snap_dir / "reports" / "report-2026-11-28_10-00-00-f7"
+    old.mkdir(parents=True)
+    (old / "summary.txt").write_text("x", encoding="utf-8")
+    out = dev.apply_reports({"VICTORY_REPORT_SELFTEST": "60,90"}, snap_dir)
+    assert out == {"VICTORY_REPORT_DIR": str(snap_dir / "reports"), "VICTORY_REPORT_SELFTEST": "60,90"}
+    assert list((snap_dir / "reports").iterdir()) == []
+    assert dev.apply_reports({"VICTORY_REPORT_KEY": "1", "VICTORY_REPORT_DIR": "x"}, snap_dir)["VICTORY_REPORT_DIR"] == "x"
+    old.mkdir()
+    assert dev.reports_field({"VICTORY_REPORT_KEY": "1"}, snap_dir) == f" reports=1 report_dir={snap_dir / 'reports'}"
+    assert dev.reports_field({}, snap_dir) == ""
+
+
 def test_train_runs_one_step_per_call_and_reports(tmp_path, monkeypatch, capsys):
     dev = load_dev()
     monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")

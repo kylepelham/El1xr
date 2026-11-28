@@ -766,6 +766,35 @@ def apply_snaps(overrides: dict[str, str], every_s: float, snap_dir: Path) -> di
     return {**out, **overrides}
 
 
+REPORT_SWITCHES = ("VICTORY_REPORT_KEY", "VICTORY_REPORT_SELFTEST")
+
+
+def wants_reports(overrides: dict[str, str]) -> bool:
+    """The report key (victory-gpu `report/`) is on: `VICTORY_REPORT_KEY` set and not 0, or its selftest."""
+    return any(overrides.get(k, "0").strip() not in ("", "0") for k in REPORT_SWITCHES)
+
+
+def apply_reports(overrides: dict[str, str], snap_dir: Path) -> dict[str, str]:
+    """With the report key on, its bundles go to `<snap_dir>/reports` (the run's data folder is
+    deleted after the run), emptied of an earlier run's `report-*` folders first."""
+    if not wants_reports(overrides) or "VICTORY_REPORT_DIR" in overrides:
+        return overrides
+    report_dir = snap_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    for old in report_dir.glob("report-*"):
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+    return {"VICTORY_REPORT_DIR": str(report_dir), **overrides}
+
+
+def reports_field(overrides: dict[str, str], snap_dir: Path) -> str:
+    """` reports=N report_dir=...` for a run with the report key on, else nothing."""
+    if not wants_reports(overrides):
+        return ""
+    report_dir = Path(overrides.get("VICTORY_REPORT_DIR") or snap_dir / "reports")
+    return f" reports={sum(1 for p in report_dir.glob('report-*') if p.is_dir())} report_dir={report_dir}"
+
+
 def menu_pngs_field(overrides: dict[str, str], snap_dir: Path) -> str:
     """` menu_pngs=N` for a run with the menu's selftest, else nothing."""
     if MENU_SELFTEST not in overrides:
@@ -785,6 +814,7 @@ def run_bench(
     if args.save:
         resolve_save_dir(args.save)
     overrides = apply_snaps(overrides, args.snap_every, snap_dir)
+    overrides = apply_reports(overrides, snap_dir)
     overrides, mute = apply_mute_default(overrides, args.unmute)
     with isolated_save_data_dir(args.save, "bench") as data_dir:
         cmd = build_launcher_command(
@@ -829,7 +859,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
     ok = bench_ok(stats)
     menu = menu_pngs_field(user_overrides, snap_dir)
     snapped = f" snaps={snaps}{menu} snap_dir={snap_dir}" if args.snap_every > 0 or menu else ""
-    print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}{died_field(stats)}")
+    reports = reports_field(user_overrides, snap_dir)
+    print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}{reports}{died_field(stats)}")
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
     return 0 if ok else 1
@@ -951,6 +982,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     menu_dir = cap_dir / "menu"
     if MENU_SELFTEST in user_overrides:
         overrides = apply_snaps({**overrides, **user_overrides}, 0.0, menu_dir)
+    overrides = apply_reports({**overrides, **user_overrides}, cap_dir)
     overrides.update(user_overrides)
     overrides, mute = apply_mute_default(overrides, args.unmute)
     with isolated_save_data_dir(args.save, f"capture_{safe_tag}") as data_dir:
@@ -977,7 +1009,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(
         f"DEV capture {status} boot_s={float(stats['boot_s']):.1f} "
         f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} refused_ahead={int(stats['refused_ahead'])} "
-        f"driver_resets={_count(resets_after)}{menu_pngs_field(user_overrides, menu_dir)} dir={cap_dir}{died_field(stats)}"
+        f"driver_resets={_count(resets_after)}{menu_pngs_field(user_overrides, menu_dir)}{reports_field(user_overrides, cap_dir)} dir={cap_dir}{died_field(stats)}"
     )
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
