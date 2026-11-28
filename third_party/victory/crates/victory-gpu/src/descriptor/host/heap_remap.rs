@@ -39,6 +39,7 @@ use windows::Win32::Graphics::Direct3D12::{D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12De
 
 use super::super::View;
 
+mod commit;
 mod demand;
 
 /// Frames between looks at every title slot past the host heap.
@@ -52,20 +53,21 @@ const MAKE_BUDGET: u32 = 4096;
 const RETRY_BUDGET: usize = 1024;
 /// Made views readied and shown per [`ready_pass`], at most; shown ones
 /// readied again.
-pub(crate) const READY_BUDGET: usize = 1024;
-pub(crate) const RECHECK_BUDGET: usize = 256;
+pub(crate) const READY_BUDGET: usize = 256;
+pub(crate) const RECHECK_BUDGET: usize = 64;
 /// Time and staged bytes a [`ready_pass`] spends at most.
-const READY_SPAN: std::time::Duration = std::time::Duration::from_millis(3);
-const READY_BYTES: u64 = 64 << 20;
-/// Made views waiting past which a [`ready_pass`] catches up: 4,096 views,
-/// 8 ms and 192 MB a pass (`heap_textures` takes 192 MB a frame too).
+const READY_SPAN: std::time::Duration = std::time::Duration::from_micros(1500);
+const READY_BYTES: u64 = 16 << 20;
+/// Made views waiting past which a [`ready_pass`] catches up: 1,024 views,
+/// 3 ms and 48 MB a pass (Part S: 8 ms and 192 MB a pass put ready_ms at
+/// 473 a window and staging on a box out of commit).
 const CATCH_UP: usize = 4096;
 
 /// Views, time and bytes a [`ready_pass`] spends with `backlog` made views
 /// waiting.
 pub(crate) fn ready_budget(backlog: usize) -> (usize, std::time::Duration, u64) {
     if backlog > CATCH_UP {
-        (CATCH_UP, std::time::Duration::from_millis(8), 192 << 20)
+        (1024, std::time::Duration::from_millis(3), 48 << 20)
     } else {
         (READY_BUDGET, READY_SPAN, READY_BYTES)
     }
@@ -121,6 +123,16 @@ struct Owner {
     /// known), and the frame its entry was flagged to ask whether one does.
     touched: u64,
     armed: Option<u64>,
+    /// Makes that found no host resource in a row, and the frame the next
+    /// may be tried (waits of 8 frames doubling to 1,024).
+    tries: u8,
+    retry_at: u64,
+}
+
+/// The frame a view whose make failed `tries` times in a row, the last at
+/// `frame`, is made again.
+pub(crate) fn retry_at(frame: u64, tries: u8) -> u64 {
+    frame + (8u64 << tries.saturating_sub(1).min(7))
 }
 
 /// What [`Packed::place`] says to do for a title slot.
@@ -167,6 +179,8 @@ pub(crate) struct Packed {
     dirty: Vec<(u32, u32, bool)>,
     seeded: bool,
     last_rescan: u64,
+    /// The frame of the last [`refresh`].
+    now: u64,
     pub counts: Counts,
     /// Table entry `k` names title slot `entry_base + k`, `entry_len` of
     /// them and a last one, null; the table's first dword (0: none).
@@ -213,6 +227,9 @@ pub(crate) struct Counts {
     pub armed: u64,
     pub evicted: u64,
     pub notes: u64,
+    /// The longest ready pass, and passes skipped for commit.
+    pub ready_max_us: u64,
+    pub ready_waits: u64,
 }
 
 impl Packed {
@@ -231,6 +248,7 @@ impl Packed {
             dirty: Vec::new(),
             seeded: false,
             last_rescan: 0,
+            now: 0,
             counts: Counts::default(),
             entry_base: title_null,
             entry_len: victory_shader::emit::REMAP_LEN,
@@ -276,6 +294,15 @@ impl Packed {
         }
     }
 
+    /// Whether no packed slot can be given at `frame`.
+    pub(crate) fn full(&self, frame: u64) -> bool {
+        self.next >= self.cap
+            && self
+                .free
+                .front()
+                .is_none_or(|&(_, at)| frame < at + REUSE_AFTER)
+    }
+
     /// Title slots with a packed slot.
     pub(crate) fn mapped(&self) -> usize {
         self.map.len()
@@ -316,7 +343,10 @@ impl Packed {
                 let Some(owner) = self.owner[k as usize].as_ref() else {
                     return Placed::Nothing;
                 };
-                if !again && owner.key == key && owner.stage != Stage::Failed {
+                if !again
+                    && owner.key == key
+                    && (owner.stage != Stage::Failed || frame < owner.retry_at)
+                {
                     return Placed::Same;
                 }
                 k
@@ -349,7 +379,9 @@ impl Packed {
             (None, None) => return Placed::Nothing,
         };
         self.generation += 1;
-        let touched = self.owner[k as usize].map_or(0, |o| o.touched);
+        let (touched, tries) = self.owner[k as usize]
+            .filter(|o| o.title == slot)
+            .map_or((0, 0), |o| (o.touched, o.tries));
         self.owner[k as usize] = key.map(|key| Owner {
             title: slot,
             key,
@@ -357,6 +389,8 @@ impl Packed {
             stage: Stage::Queued,
             touched,
             armed: None,
+            tries,
+            retry_at: 0,
         });
         self.counts.queued += 1;
         Placed::Make {
@@ -368,9 +402,16 @@ impl Packed {
     /// Make `generation` of host slot `at` ended: with a host resource
     /// (`ok`) or not. Whether it is still that slot's latest make.
     pub(crate) fn made(&mut self, at: u32, generation: u64, ok: bool) -> bool {
+        let now = self.now;
         let current = match self.owner_at(at) {
             Some(owner) if owner.generation == generation && owner.stage == Stage::Queued => {
                 owner.stage = if ok { Stage::Made } else { Stage::Failed };
+                if ok {
+                    owner.tries = 0;
+                } else {
+                    owner.tries = owner.tries.saturating_add(1);
+                    owner.retry_at = retry_at(now, owner.tries);
+                }
                 true
             }
             _ => false,
@@ -464,14 +505,23 @@ impl Packed {
     /// oldest first.
     fn failed(&mut self, most: usize) -> Vec<u32> {
         let mut out = Vec::new();
-        while out.len() < most
-            && let Some((k, generation)) = self.failed_queue.pop_front()
-        {
-            out.extend(
-                self.due(k as usize, Stage::Failed)
-                    .filter(|d| d.generation == generation)
-                    .map(|d| d.title),
-            );
+        for _ in 0..self.failed_queue.len() {
+            if out.len() >= most {
+                break;
+            }
+            let Some((k, generation)) = self.failed_queue.pop_front() else {
+                break;
+            };
+            let Some(o) = self.owner[k as usize].filter(|o| {
+                o.stage == Stage::Failed && o.generation == generation
+            }) else {
+                continue;
+            };
+            if self.now < o.retry_at {
+                self.failed_queue.push_back((k, generation));
+                continue;
+            }
+            out.push(o.title);
         }
         out
     }
@@ -528,11 +578,32 @@ fn full_table(
 ) -> Option<usize> {
     let gpu_host = crate::host::host()?;
     let dwords = victory_shader::emit::FULL_REMAP;
+    // a heap that does not pack reads the same table as every other such heap: one for all
+    // (Part S: 8 MB of upload memory per title view heap)
+    static SHARED: Mutex<Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64, usize)>> =
+        Mutex::new(None);
+    let shared = own == 0 && faults.is_none();
+    if shared
+        && let Some((buffer, gpu, data)) = SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    {
+        let mut tables = FULL_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        if tables.len() >= 16 {
+            tables.remove(0);
+        }
+        tables.push(FullTable {
+            id: host.id,
+            buffer,
+            gpu,
+            faults: None,
+        });
+        return Some(data);
+    }
     let (buffer, data) = gpu_host.upload_buffer(u64::from(dwords) * 4)?;
     crate::host::name(&buffer, || "heap cap: title view slot to host slot".to_owned());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let table = data.cast::<u32>();
+    commit::held(u64::from(dwords) * 4);
     // (`=5`) slots past the own ones may be live: a shader that reads one says so
     let past = if faults.is_some() {
         title_null | victory_shader::emit::FAULT_FLAG
@@ -556,6 +627,10 @@ fn full_table(
     // the newest heaps (the title makes a few); a list binding an older one holds it
     if tables.len() >= 16 {
         tables.remove(0);
+    }
+    if shared {
+        *SHARED.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((buffer.clone(), gpu, table as usize));
     }
     tables.push(FullTable {
         id: host.id,
@@ -647,9 +722,27 @@ fn work(w: &'static Worker) {
 
 /// Does `op`: the descriptor written, nothing else of the heap's touched.
 fn run(op: Op) -> Done {
+    // a texture whose host copy is not there: made only as the commit gate says
+    let texture = match &op.view {
+        Some(View::Shader(resource, _)) => Some(*resource as crate::object::This)
+            .filter(|&r| !crate::resource::host_copy_made(r)),
+        _ => None,
+    };
+    let gated = texture.is_some_and(|r| !commit::copy_allowed(r));
     let made = match &op.view {
+        Some(view) if gated => {
+            super::null_for(view, op.cpu);
+            Some((false, None, super::view_stride(view).unwrap_or(0)))
+        }
         Some(view) => Some(match super::make(view, op.cpu) {
-            Some((kept, _)) => (true, kept, super::view_stride(view).unwrap_or(0)),
+            Some((kept, _)) => {
+                if let Some(r) = texture
+                    && crate::resource::host_copy_made(r)
+                {
+                    commit::made_copy(r);
+                }
+                (true, kept, super::view_stride(view).unwrap_or(0))
+            }
             None => {
                 super::null_for(view, op.cpu);
                 (false, None, super::view_stride(view).unwrap_or(0))
@@ -799,6 +892,8 @@ pub(super) fn born(host: &super::HostHeap) {
     if state.len() >= 4 {
         state.remove(0);
     }
+    // its lists: an owner per packed slot
+    commit::held(u64::from(cap) * size_of::<Option<Owner>>() as u64);
     let packed = Packed::new(host.id, title_null, cap).with_table(table, base, len);
     state.push(if demand && fault_map != 0 {
         packed.with_demand(fault_map)
@@ -842,8 +937,10 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
     let Some(packed) = guard.iter_mut().find(|p| p.id == host.id) else {
         return;
     };
-    take_done(packed, host);
     let frame = crate::frame::current();
+    packed.now = frame;
+    commit::new_frame();
+    take_done(packed, host);
     if packed.demand {
         demand::step(packed, host, start, step, frame);
     }
@@ -875,7 +972,12 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
         return;
     }
     let (mut read, mut makes) = (0u32, 0u32);
-    let mut bytes = vec![0u8; 1 << 19];
+    // one buffer for the run, not one a frame
+    static BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let mut bytes = BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    if bytes.len() < 1 << 19 {
+        bytes.resize(1 << 19, 0);
+    }
     while let Some((lo, hi, again)) = packed.dirty.pop() {
         if read >= READ_BUDGET || makes >= MAKE_BUDGET {
             packed.dirty.push((lo, hi, again));
@@ -900,6 +1002,12 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
                 u32::from_le_bytes(record[w * 4..w * 4 + 4].try_into().unwrap_or_default())
             };
             let key = [word(0), word(1), word(2)];
+            // (`=3`, `=4`) no packed slot free: a slot without one has nothing to do (Part S:
+            // 28.3M overflowing looks by f1202, each a view lookup)
+            if !packed.demand && packed.full(frame) && !packed.map.contains_key(&slot) {
+                packed.counts.overflow += u64::from(key[0] == super::super::VIEW_TAG);
+                continue;
+            }
             let view = (key[0] == super::super::VIEW_TAG)
                 .then(|| super::super::view_at(key[1], key[2]))
                 .flatten();
@@ -955,11 +1063,17 @@ pub(crate) fn ready_pass(host: &super::HostHeap, mut ready: impl FnMut(&View) ->
         return;
     }
     let started = std::time::Instant::now();
+    let pressed = commit::pressed();
     let (made, shown, budget) = {
         let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(packed) = guard.iter_mut().find(|p| p.id == host.id) else {
             return;
         };
+        // no staging while commit is short: made views wait to be shown
+        if pressed {
+            packed.counts.ready_waits += 1;
+            return;
+        }
         let budget = ready_budget(packed.made_backlog());
         (
             packed.take_made(budget.0),
@@ -1010,7 +1124,9 @@ pub(crate) fn ready_pass(host: &super::HostHeap, mut ready: impl FnMut(&View) ->
     packed.counts.readied += readied.len() as u64;
     packed.counts.rechecked += rechecked;
     packed.counts.ready_bytes += bytes;
-    packed.counts.ready_us += started.elapsed().as_micros() as u64;
+    let us = started.elapsed().as_micros() as u64;
+    packed.counts.ready_us += us;
+    packed.counts.ready_max_us = packed.counts.ready_max_us.max(us);
 }
 
 /// The element stride shaders read for host slot `slot` (the strides buffer).
@@ -1025,6 +1141,8 @@ fn stride(host: &super::HostHeap, slot: u32, value: u32) {
 
 fn line(packed: &mut Packed, frame: u64, title: u32) {
     let c = std::mem::take(&mut packed.counts);
+    let [commit_mb, new_copies, new_copy_mb, new_copy_mb_total, gated, free_commit_mb] =
+        commit::fields();
     let [queued, failed, made, shown] = packed.stages();
     tracing::warn!(
         frame,
@@ -1045,6 +1163,8 @@ fn line(packed: &mut Packed, frame: u64, title: u32) {
         rechecked = c.rechecked,
         ready_mb = c.ready_bytes >> 20,
         ready_ms = c.ready_us / 1000,
+        ready_max_ms = c.ready_max_us / 1000,
+        ready_waits = c.ready_waits,
         worker_ms = c.worker_us / 1000,
         dropped = c.dropped,
         demand = packed.demand,
@@ -1061,6 +1181,12 @@ fn line(packed: &mut Packed, frame: u64, title: u32) {
         backlog = packed.dirty.len(),
         dynamic_peak = PEAK_TAKEN[0].swap(0, Relaxed),
         dynamic_peak_ever = PEAK_TAKEN[1].load(Relaxed),
+        commit_mb,
+        new_copies,
+        new_copy_mb,
+        new_copy_mb_total,
+        gated,
+        free_commit_mb,
         "heap cap: packed title views"
     );
 }
@@ -1239,9 +1365,12 @@ mod tests {
             "queued"
         );
         assert!(p.made(at, generation, false));
+        assert!(p.failed(10).is_empty(), "not due yet");
+        assert_eq!(p.place(NULL_SLOT + 4, key, false, 1), Placed::Same, "a look before it is due");
+        p.now = retry_at(0, 1);
         assert_eq!(p.failed(10), [NULL_SLOT + 4]);
         assert!(p.take_made(10).is_empty(), "nothing to show");
-        let (again, generation) = make_at(p.place(NULL_SLOT + 4, key, false, 1));
+        let (again, generation) = make_at(p.place(NULL_SLOT + 4, key, false, p.now));
         assert_eq!(again, at, "not made: again");
         assert!(p.made(at, generation, true));
         assert!(p.failed(10).is_empty());
@@ -1317,8 +1446,39 @@ mod tests {
         let again = p.take_made(10);
         assert_eq!(again.iter().map(|d| d.title - NULL_SLOT).collect::<Vec<_>>(), [2, 3]);
         assert!(p.made(at, generation, false));
+        p.now = 100;
         assert_eq!(p.failed(10), [NULL_SLOT + 1]);
         assert!(p.failed(10).is_empty(), "taken once");
+    }
+
+    #[test]
+    fn a_failed_make_waits_longer_each_time_and_a_success_starts_over() {
+        assert_eq!(retry_at(100, 1), 108);
+        assert_eq!(retry_at(100, 2), 116);
+        assert_eq!(retry_at(100, 8), 100 + 1024);
+        assert_eq!(retry_at(100, 200), 100 + 1024, "at most 1,024 frames");
+        let mut p = Packed::new(1, NULL_SLOT, 8);
+        let key = Some([1, 5, 1]);
+        let slot = NULL_SLOT + 4;
+        let mut tries = 0;
+        // Part S: 1.59M failed makes by f902; now a slot that keeps failing is made 9 times in
+        // 3,000 frames, not at every look
+        for frame in 0..3000u64 {
+            p.now = frame;
+            if let Placed::Make { at, generation } = p.place(slot, key, false, frame) {
+                tries += 1;
+                assert!(p.made(at, generation, false));
+            }
+        }
+        assert!(tries <= 12, "{tries} makes");
+        p.now = 5000;
+        let (at, generation) = make_at(p.place(slot, key, false, 5000));
+        assert!(p.made(at, generation, true));
+        p.now = 5001;
+        let (at, generation) = make_at(p.place(slot, Some([1, 6, 1]), false, 5001));
+        assert!(p.made(at, generation, false));
+        assert_eq!(p.place(slot, Some([1, 6, 1]), false, 5001 + 7), Placed::Same);
+        assert!(matches!(p.place(slot, Some([1, 6, 1]), false, 5001 + 8), Placed::Make { .. }), "the wait starts over");
     }
 
     #[test]

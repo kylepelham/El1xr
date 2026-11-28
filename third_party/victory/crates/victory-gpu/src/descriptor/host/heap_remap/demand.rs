@@ -202,6 +202,7 @@ pub(super) fn fault_buffer() -> Option<(ID3D12Resource, usize)> {
     let host = crate::host::host()?;
     let bytes = u64::from(victory_shader::emit::FAULT_DWORDS) * 4;
     let (buffer, data) = host.shared_buffer(bytes)?;
+    super::commit::held(bytes);
     crate::host::name(&buffer, || {
         "heap cap: title view slots shaders asked for".to_owned()
     });
