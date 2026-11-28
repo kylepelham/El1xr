@@ -26,6 +26,8 @@ mod cold_skip;
 pub mod console;
 #[cfg(windows)]
 mod commitline;
+#[cfg(windows)]
+mod poolslack;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
@@ -199,6 +201,8 @@ pub mod root;
 mod stretch;
 #[cfg(windows)]
 mod table_defer;
+#[cfg(windows)]
+mod table_null;
 #[cfg(windows)]
 mod readable_once;
 #[cfg(windows)]

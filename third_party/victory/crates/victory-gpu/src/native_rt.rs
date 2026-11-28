@@ -31,6 +31,11 @@ use windows::core::Interface;
 
 use crate::object::Object;
 
+mod batch;
+mod refit;
+#[cfg(test)]
+mod refit_bench;
+
 /// Whether host structures are built (`VICTORY_NATIVE_BVH=1`).
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -56,11 +61,15 @@ pub struct Triangles {
 pub enum Build {
     Bottom {
         dest: u64,
+        /// An update's source (0: none named).
+        source: u64,
         flags: u32,
         geometries: Vec<Triangles>,
     },
     Top {
         dest: u64,
+        /// An update's source (0: none named).
+        source: u64,
         flags: u32,
         count: u32,
         instances: u64,
@@ -78,6 +87,11 @@ struct Structure {
     /// A top level whose build was recorded into this buffer: what
     /// [`top_level`] hands to rays (a buffer made but not built is not).
     top_built: bool,
+    /// A build or refit was recorded into it, with `ALLOW_UPDATE`
+    /// (`updatable`) and of this shape ([`refit`]).
+    built: bool,
+    updatable: bool,
+    shape: u64,
 }
 
 /// Structures neither built nor named by a top level for this many frames
@@ -114,6 +128,14 @@ static FREED: AtomicU64 = AtomicU64::new(0);
 static ALIASED: AtomicU64 = AtomicU64::new(0);
 /// Bottom levels with a geometry DXR would not take (format, counts).
 static REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Builds the title asked as updates; of them refit on the host, and
+/// built from scratch though `VICTORY_NATIVE_BVH_REFIT=1` ([`refit`]).
+static UPDATES_ASKED: AtomicU64 = AtomicU64::new(0);
+static REFIT: AtomicU64 = AtomicU64::new(0);
+static REFIT_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Barriers recorded after or between builds (one per build without
+/// `VICTORY_NATIVE_BVH_BATCH=1`, [`batch`]).
+static BARRIERS: AtomicU64 = AtomicU64::new(0);
 
 /// What a bottom level is built from: its flags and each geometry's
 /// description (addresses, counts, formats). Equal: the same structure, unless
@@ -219,6 +241,9 @@ pub fn copy(dest: u64, source: u64, mode: u32) {
         sig: src.sig,
         used: crate::queue::presented(),
         top_built: src.top_built,
+        built: src.built,
+        updatable: src.updatable,
+        shape: src.shape,
     };
     store.by_title.insert(dest, alias);
     ALIASED.fetch_add(1, Ordering::Relaxed);
@@ -288,9 +313,10 @@ fn buffer(
     out
 }
 
-/// The title's flags without an update (we build each time from scratch).
-fn flags(title: u32) -> D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS {
-    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS((title & 0x1f) as i32)
+/// The title's flags without an update (built from scratch), or with one
+/// for a host refit ([`refit::host_flags`]).
+fn flags(title: u32, refit: bool) -> D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS {
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(refit::host_flags(title, refit) as i32)
 }
 
 /// Builds `builds` into the host list behind the title list `list`.
@@ -336,8 +362,13 @@ pub fn build(list: *const Object, builds: &[Build]) {
                 keep
             });
         }
+        let mut batch = batch::on().then(batch::Batch::default);
         for b in builds {
-            build_one(&device, &device5, &l4, host, store, b, tier >= 11);
+            build_one(&device, &device5, &l4, host, store, b, tier >= 11, batch.as_mut());
+        }
+        if batch.as_ref().is_some_and(batch::Batch::pending) {
+            // The structures are ready before the list reads them.
+            barrier_all(&l4);
         }
         state.replay(host);
     });
@@ -356,14 +387,36 @@ fn build_one(
     store: &mut Store,
     b: &Build,
     tier_1_1: bool,
+    batch: Option<&mut batch::Batch>,
 ) {
     let frame = crate::queue::presented();
+    let (title_flags, source_title, shape) = match b {
+        Build::Bottom {
+            dest,
+            source,
+            flags: f,
+            geometries,
+        } => (*f, if *source == 0 { *dest } else { *source }, refit::bottom_shape(*f, geometries)),
+        Build::Top {
+            dest,
+            source,
+            flags: f,
+            count,
+            ..
+        } => (*f, if *source == 0 { *dest } else { *source }, refit::top_shape(*f, *count)),
+    };
+    let update = refit::asked(title_flags);
+    if update {
+        UPDATES_ASKED.fetch_add(1, Ordering::Relaxed);
+    }
+    let refit = update && refit::on() && refit_planned(store, b, source_title, shape);
     // A bottom level built from the same inputs, not one that moves: kept.
     let mut sig = 0;
     if let Build::Bottom {
         dest,
         flags: f,
         geometries,
+        ..
     } = b
     {
         sig = signature(*f, geometries);
@@ -371,6 +424,7 @@ fn build_one(
         if let Some(st) = store.by_title.get_mut(dest)
             && st.sig == sig
             && !moves
+            && !(update && refit::on())
         {
             st.used = frame;
             REUSED.fetch_add(1, Ordering::Relaxed);
@@ -385,6 +439,7 @@ fn build_one(
             dest,
             flags: f,
             geometries,
+            ..
         } => {
             if !geometries.iter().all(|g| geometry_ok(g, tier_1_1)) {
                 REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -432,7 +487,7 @@ fn build_one(
                 *dest,
                 D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
                     Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                    Flags: flags(*f),
+                    Flags: flags(*f, refit),
                     NumDescs: geometry.len() as u32,
                     DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -446,6 +501,7 @@ fn build_one(
             flags: f,
             count,
             instances,
+            ..
         } => {
             // The instances from title memory, each bottom level replaced by ours.
             let n = *count as usize;
@@ -477,7 +533,7 @@ fn build_one(
                 *dest,
                 D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
                     Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                    Flags: flags(*f),
+                    Flags: flags(*f, refit),
                     NumDescs: *count,
                     DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
                     Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -495,7 +551,24 @@ fn build_one(
         return;
     }
     let result_size = info.ResultDataMaxSizeInBytes.next_multiple_of(256);
-    let scratch_size = info.ScratchDataSizeInBytes.next_multiple_of(256);
+    let scratch_size = if refit {
+        info.UpdateScratchDataSizeInBytes
+    } else {
+        info.ScratchDataSizeInBytes
+    }
+    .next_multiple_of(256);
+    // A refit reads its source: its address before the destination may be
+    // made again below, and the source held until the list is done.
+    let source_va = if refit {
+        let Some(src) = store.by_title.get(&source_title) else {
+            return;
+        };
+        host.keep(&src.buffer);
+        // SAFETY: a live buffer.
+        unsafe { src.buffer.GetGPUVirtualAddress() }
+    } else {
+        0
+    };
     // The result buffer: kept for this title address, made bigger when needed.
     let fits = store
         .by_title
@@ -516,6 +589,9 @@ fn build_one(
             sig,
             used: frame,
             top_built: false,
+            built: false,
+            updatable: false,
+            shape: 0,
         };
         if let Some(old) = store.by_title.insert(dest, fresh) {
             // The list may still read the old one: it holds it until done.
@@ -526,20 +602,46 @@ fn build_one(
         st.sig = sig;
         st.used = frame;
     }
+    // With `batch`: this build's part of the arena, after a barrier if it
+    // depends on a pending build or the arena is full.
+    let top = matches!(b, Build::Top { .. });
+    let mut scratch_at = 0;
+    let mut scratch_want = scratch_size;
+    let mut batch = batch;
+    if let Some(batch) = batch.as_mut() {
+        let arena = store.scratch.as_ref().map_or(0, |s| s.size);
+        let reads = if refit { source_title } else { 0 };
+        if batch.must_flush(top, dest, reads, scratch_size, arena) {
+            barrier_all(l4);
+            batch.flushed();
+        }
+        scratch_want = scratch_size.max(batch::ARENA_MIN);
+    }
     let scratch_fits = store
         .scratch
         .as_ref()
-        .is_some_and(|s| s.size >= scratch_size);
+        .is_some_and(|s| s.size >= batch.as_ref().map_or(0, |b| b.used()) + scratch_size);
     if !scratch_fits {
-        let Some(buf) = buffer(device, scratch_size, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) else {
+        if let Some(batch) = batch.as_mut()
+            && batch.pending()
+        {
+            // A bigger arena: start it after the pending builds (the old
+            // one is held by the list until done).
+            barrier_all(l4);
+            batch.flushed();
+        }
+        let Some(buf) = buffer(device, scratch_want, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) else {
             return;
         };
         let fresh = Structure {
             buffer: buf,
-            size: scratch_size,
+            size: scratch_want,
             sig: 0,
             used: frame,
             top_built: false,
+            built: false,
+            updatable: false,
+            shape: 0,
         };
         if let Some(old) = store.scratch.replace(fresh) {
             host.keep(&old.buffer);
@@ -548,27 +650,44 @@ fn build_one(
     let (Some(result), Some(scratch)) = (store.by_title.get(&dest), store.scratch.as_ref()) else {
         return;
     };
+    if let Some(batch) = batch.as_mut() {
+        scratch_at = batch.take(top, dest, scratch_size);
+    }
     // SAFETY: live buffers.
     let desc = unsafe {
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: result.buffer.GetGPUVirtualAddress(),
             Inputs: inputs,
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch.buffer.GetGPUVirtualAddress(),
+            SourceAccelerationStructureData: source_va,
+            ScratchAccelerationStructureData: scratch.buffer.GetGPUVirtualAddress() + scratch_at,
         }
     };
     // SAFETY: an open list; the description names live buffers.
     unsafe { l4.BuildRaytracingAccelerationStructure(&desc, None) };
-    // The shared scratch and this result are ready before the next build reads them.
-    let barriers = [uav_barrier(&scratch.buffer), uav_barrier(&result.buffer)];
-    // SAFETY: an open list.
-    unsafe { l4.ResourceBarrier(&barriers) };
+    if batch.is_none() {
+        // The shared scratch and this result are ready before the next build reads them.
+        let barriers = [uav_barrier(&scratch.buffer), uav_barrier(&result.buffer)];
+        // SAFETY: an open list.
+        unsafe { l4.ResourceBarrier(&barriers) };
+        BARRIERS.fetch_add(1, Ordering::Relaxed);
+    }
     host.keep(&result.buffer);
     host.keep(&scratch.buffer);
     if let Some(upload) = instance_upload {
         host.keep(&upload);
     }
+    if let Some(st) = store.by_title.get_mut(&dest) {
+        st.built = true;
+        st.updatable = refit::host_flags(title_flags, refit) & refit::ALLOW_UPDATE != 0;
+        st.shape = shape;
+    }
     match b {
+        _ if refit => {
+            if let (Build::Top { .. }, Some(st)) = (b, store.by_title.get_mut(&dest)) {
+                st.top_built = true;
+            }
+            REFIT.fetch_add(1, Ordering::Relaxed)
+        }
         Build::Bottom { .. } => BUILT_BOTTOM.fetch_add(1, Ordering::Relaxed),
         Build::Top { .. } => {
             if let Some(st) = store.by_title.get_mut(&dest) {
@@ -577,6 +696,36 @@ fn build_one(
             BUILT_TOP.fetch_add(1, Ordering::Relaxed)
         }
     };
+}
+
+/// Whether the update `b` the title asked (of this `shape`, from
+/// `source_title`) can be a host refit; a refusal is counted, the first
+/// few logged with the reason.
+fn refit_planned(store: &Store, b: &Build, source_title: u64, shape: u64) -> bool {
+    let dest = match b {
+        Build::Bottom { dest, .. } | Build::Top { dest, .. } => *dest,
+    };
+    let source = store.by_title.get(&source_title).map(|s| refit::Source {
+        updatable: s.updatable,
+        shape: s.shape,
+        size: s.size,
+        built: s.built,
+    });
+    let Err(why) = refit::plan(source, shape, source_title == dest) else {
+        return true;
+    };
+    REFIT_REFUSED.fetch_add(1, Ordering::Relaxed);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            reason = ?why,
+            dest = format!("{dest:#x}"),
+            source = format!("{source_title:#x}"),
+            top = matches!(b, Build::Top { .. }),
+            "native bvh refit: an update built from scratch (the first 8)"
+        );
+    }
+    false
 }
 
 /// The host GPU address of the top level built for title address
@@ -603,6 +752,23 @@ pub(crate) fn tops_kept() -> usize {
         .ok()
         .and_then(|s| s.as_ref().map(|s| s.by_title.values().filter(|st| st.top_built).count()))
         .unwrap_or(0)
+}
+
+/// A barrier on every unordered access before it ([`batch`]): the builds
+/// recorded since are done before what follows reads or reuses them.
+fn barrier_all(l4: &ID3D12GraphicsCommandList4) {
+    let all = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    // SAFETY: an open list; a barrier naming no resource.
+    unsafe { l4.ResourceBarrier(&[all]) };
+    BARRIERS.fetch_add(1, Ordering::Relaxed);
 }
 
 fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
@@ -641,6 +807,10 @@ fn summary() {
         freed = FREED.swap(0, Ordering::Relaxed),
         aliased = ALIASED.swap(0, Ordering::Relaxed),
         refused = REFUSED.swap(0, Ordering::Relaxed),
+        updates_asked = UPDATES_ASKED.swap(0, Ordering::Relaxed),
+        refit = REFIT.swap(0, Ordering::Relaxed),
+        refit_refused = REFIT_REFUSED.swap(0, Ordering::Relaxed),
+        barriers = BARRIERS.swap(0, Ordering::Relaxed),
         structures_kept = kept,
         mb_live = BYTES.load(Ordering::Relaxed) >> 20,
         "native bvh: host structures built in the last 5 s"
@@ -674,6 +844,7 @@ mod tests {
             std::ptr::null(),
             &[Build::Top {
                 dest: 1,
+                source: 0,
                 flags: 0,
                 count: 0,
                 instances: 0,

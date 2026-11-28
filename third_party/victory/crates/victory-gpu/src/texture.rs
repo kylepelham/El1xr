@@ -775,6 +775,7 @@ pub(crate) fn let_go_idle() {
             // (A live texture: one the title releases leaves the
             // table first, under this lock.)
             crate::resource::set_staged_first(resource as This, u32::MAX);
+            crate::table_null::unstaged(resource, crate::table_null::Why::StagingIdle);
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
@@ -917,6 +918,7 @@ pub(crate) fn forget(resource: usize) {
     }
     // (Neptune) And what a prepare thread made ready for it: its memory goes.
     prepare::forget(resource);
+    crate::table_null::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);

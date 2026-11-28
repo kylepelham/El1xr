@@ -607,7 +607,7 @@ mod tests {
     /// The Display tab comes in headed sections, resolution and upscaling first; its settings no
     /// section names follow under Other; Down skips the titles.
     #[test]
-    fn the_display_tab_starts_with_the_upscaler_rows() {
+    fn the_display_tab_starts_with_the_picture_rows() {
         let model = Registry::default();
         let display = rows(&model, Tab::DISPLAY, false);
         let names: Vec<&str> = display
@@ -622,11 +622,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "Resolution and upscaling",
+                "Picture",
                 "VICTORY_RESOLUTION",
                 "VICTORY_UPSCALE",
                 "VICTORY_UPSCALE_QUALITY",
-                "VICTORY_DLSS_SHARPNESS",
+                "VICTORY_RAY_TRACING",
             ]
         );
         let headings: Vec<&str> = display
@@ -638,7 +638,7 @@ mod tests {
             .collect();
         assert_eq!(
             &headings[..5],
-            ["Resolution and upscaling", "Frame pacing", "Screen and loading", "Lighting", "Overrides"]
+            ["Picture", "Frame pacing", "Screen and loading", "Lighting", "Overrides"]
         );
         assert!(display.windows(2).all(|w| selectable(&w[0]) || selectable(&w[1])), "no empty section");
         let overlay = row_of(&model, Tab::DISPLAY, "VICTORY_OVERLAY");
@@ -658,7 +658,7 @@ mod tests {
         let mut m = opened(&mut model);
         m.act(&mut model, Action::Up);
         assert_eq!(m.selected, 1, "row 0 is a section title");
-        assert_eq!(rows(&model, Tab::DISPLAY, false)[0], Row::Heading("Resolution and upscaling"));
+        assert_eq!(rows(&model, Tab::DISPLAY, false)[0], Row::Heading("Picture"));
         for _ in 0..200 {
             m.act(&mut model, Action::Down);
         }

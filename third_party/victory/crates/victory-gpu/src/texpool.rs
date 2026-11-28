@@ -137,7 +137,7 @@ impl Ripe {
     };
 
     fn now() -> Ripe {
-        Ripe::ahead(SPARES.load(Ordering::Relaxed))
+        Ripe::ahead(crate::poolslack::spares(SPARES.load(Ordering::Relaxed)))
     }
 
     /// Now, with at most `most` blocks made ahead.
@@ -296,7 +296,11 @@ impl<B: Clone> Pool<B> {
 
     /// The empty blocks it keeps now: none past the cap.
     fn spares(&self) -> usize {
-        if self.capped && crate::commitline::upload_over_cap() { 0 } else { SPARES.load(Ordering::Relaxed) }
+        if self.capped && crate::commitline::upload_over_cap() {
+            0
+        } else {
+            crate::poolslack::spares(SPARES.load(Ordering::Relaxed))
+        }
     }
 
     /// A pool that cuts only fresh memory ([`Pool::fresh`]).
@@ -415,6 +419,20 @@ impl<B: Clone> Pool<B> {
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// (El1xr) Empty blocks (every piece back and rested), for the commit line.
+    fn empties(&self) -> u64 {
+        self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count() as u64
+    }
+
+    /// (El1xr) `VICTORY_POOL_SLACK_MB` under its free commit: frees the pieces that
+    /// rested long enough and lets go of every empty block past `keep` (in a fresh pool
+    /// that does not reuse, every used one too).
+    fn slack_trim(&mut self, now: u64, finished: u64, keep: usize) -> Vec<B> {
+        let mut gone = self.reclaim(now, finished, keep);
+        gone.extend(self.let_go_spares(keep));
+        gone
     }
 
     /// Fewer than `ripe.ahead` blocks are empty: one is to be made ahead.
@@ -833,6 +851,29 @@ pub(crate) fn blocks_alive() -> [u64; 5] {
 pub(crate) fn pool_usage() -> [[u64; 2]; 5] {
     let b = buffers::usage();
     [lock(&TEXTURES).usage(), lock(&STAGING).usage(), b[0], b[1], b[2]]
+}
+
+/// (El1xr) Empty blocks per pool, as [`blocks_alive`] names them.
+pub(crate) fn empty_blocks() -> [u64; 5] {
+    let b = buffers::empties();
+    [lock(&TEXTURES).empties(), lock(&STAGING).empties(), b[0], b[1], b[2]]
+}
+
+/// (El1xr) `VICTORY_POOL_SLACK_MB`: every pool's rested pieces freed and its empty
+/// blocks past `keep` let go (dropped outside its lock): blocks let go per pool.
+pub(crate) fn trim_slack(keep: usize) -> [u64; 5] {
+    let at = now();
+    let finished = crate::host::submissions_finished();
+    let mut n = [0u64; 5];
+    let freed = lock(&TEXTURES).slack_trim(at, finished, keep);
+    n[0] = freed.len() as u64;
+    let_go(Which::Texture, freed);
+    let freed = lock(&STAGING).slack_trim(at, finished, keep);
+    n[1] = freed.len() as u64;
+    let_go(Which::Staging, freed);
+    let b = buffers::trim_slack(at, finished, keep);
+    n[2..].copy_from_slice(&b);
+    n
 }
 
 /// (El1xr) Frees the pieces of the pools of the PC's memory (staging,
@@ -1468,6 +1509,41 @@ mod tests {
             let lost = if fresh { 4 * K64 } else { 0 };
             assert_eq!(pool.usage(), [K64, BLOCK - K64 - lost]);
         }
+    }
+
+    /// (El1xr) `VICTORY_POOL_SLACK_MB` under its free commit: a slack trim frees the rested
+    /// pieces and lets go of every empty block past those kept (one), never one with a piece
+    /// in use or resting; in a fresh pool that does not reuse, every used empty one goes.
+    #[test]
+    fn a_slack_trim_keeps_the_empty_blocks_asked_for_and_only_empty_ones_go() {
+        static ALIVE_HERE: AtomicU64 = AtomicU64::new(0);
+        let make = || Some(0u32);
+        let half = BLOCK / 2;
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT, &ALIVE_HERE);
+        let taken: Vec<Piece> = (0..10).map(|_| pool.take(half, 65536, 0, make).unwrap().0).collect();
+        assert_eq!((pool.blocks(), pool.empties()), (5, 0));
+        // Four blocks emptied (kept as spares by the usual reclaim); the fifth keeps a piece
+        // in use and one resting.
+        for p in &taken[..8] {
+            pool.give(*p, 10);
+        }
+        assert!(pool.reclaim(10 + REST, 0, SPARE_KEPT).is_empty());
+        assert_eq!(pool.empties(), 4);
+        pool.give(taken[8], 10 + REST);
+        assert_eq!(pool.slack_trim(10 + REST, 0, 1).len(), 3);
+        assert_eq!((pool.blocks(), pool.empties()), (2, 1));
+        // Kept already: nothing more goes.
+        assert!(pool.slack_trim(10 + REST, 0, 1).is_empty());
+        // The fifth block's pieces back and rested: empty, but one is kept already.
+        pool.give(taken[9], 10 + REST);
+        assert_eq!(pool.slack_trim(10 + 2 * REST, 0, 1).len(), 1);
+        assert_eq!((pool.blocks(), pool.empties()), (1, 1));
+        // A fresh pool lets go of a used empty block even when it keeps one.
+        let mut fresh: Pool<u32> = Pool::fresh(4, &ALIVE_HERE);
+        let a = fresh.take(half, 65536, 0, make).unwrap().0;
+        fresh.give(a, 0);
+        assert_eq!(fresh.slack_trim(REST, 0, 1).len(), 1);
+        assert_eq!(fresh.blocks(), 0);
     }
 
     #[test]

@@ -68,7 +68,7 @@ const SHADOW: f32 = 28.0;
 const PAD: f32 = 28.0;
 const HEADER_H: f32 = 76.0;
 const TABS_H: f32 = 46.0;
-/// A tab's width: its title's letters at about this many pixels each, plus padding.
+/// A tab's width: its title's letters at about this many pixels each ([`letters`]), plus padding.
 const TAB_LETTER_W: f32 = 8.6;
 const TAB_PAD_W: f32 = 26.0;
 const TAB_GAP: f32 = 4.0;
@@ -79,6 +79,20 @@ const ROW_H: f32 = 60.0;
 const HEADING_H: f32 = 34.0;
 const VALUE_W: f32 = 236.0;
 const BADGE_W: f32 = 98.0;
+
+/// `title`'s width in average letters of the tab font, narrow and wide ones counted as such, so
+/// the gaps between tab titles come out even.
+fn letters(title: &str) -> f32 {
+    title
+        .chars()
+        .map(|c| match c {
+            'i' | 'l' | 'j' | 't' | 'f' | 'r' | 'I' | ' ' => 0.5,
+            'm' | 'w' | 'M' | 'W' => 1.5,
+            c if c.is_ascii_uppercase() => 1.2,
+            _ => 1.0,
+        })
+        .sum()
+}
 
 /// Lays the menu out for a `frame_w` x `frame_h` picture with `tabs` and `rows` rows in the
 /// current tab (`heading(i)`: row `i` is a section title, a shorter row), and scrolls `menu` so
@@ -134,7 +148,7 @@ pub fn layout(
     // Tabs as wide as their titles, narrowed together when they would not fit.
     let wanted: Vec<f32> = tabs
         .iter()
-        .map(|t| t.title().chars().count() as f32 * TAB_LETTER_W + TAB_PAD_W)
+        .map(|t| letters(t.title()) * TAB_LETTER_W + TAB_PAD_W)
         .collect();
     let room = (w - 2 * pad) as f32 / s - TAB_GAP * tabs.len().saturating_sub(1) as f32;
     let fit = (room / wanted.iter().sum::<f32>().max(1.0)).min(1.0);
@@ -275,6 +289,14 @@ mod tests {
     /// The tabs of the registry with the expert toggle on (the most there can be).
     fn tabs() -> Vec<Tab> {
         super::super::state::tabs(&super::super::model::Registry::default(), true)
+    }
+
+    /// Narrow titles get narrow tabs: "Fixes" is not as wide as five average letters, "Memory"
+    /// is wider than six.
+    #[test]
+    fn tab_widths_follow_the_letters() {
+        assert!(letters("Fixes") < 5.0 && letters("Memory") > 6.0);
+        assert!(letters("Threads") < letters("Streaming"));
     }
 
     #[test]
