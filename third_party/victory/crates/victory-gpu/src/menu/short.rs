@@ -85,6 +85,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_MEET_PRUNE", "Shader translator proves more loops uniform, avoiding slow fallbacks."),
     ("VICTORY_MERGE_SUBMISSIONS", "Sends consecutive game submissions as one host submission."),
     ("VICTORY_MESH_LAUNCH", "Launches single indirect mesh records through an amplification shader."),
+    ("VICTORY_MESH_LINK", "Mesh programs over 32 KiB of outputs keep only what the pixel reads."),
     ("VICTORY_MIRROR_KNOWN", "A texture slot already showing its view skips the second view lookup."),
     ("VICTORY_NATIVE_BVH", "Builds native ray tracing structures beside the game's own builder."),
     ("VICTORY_NATIVE_BVH_BATCH", "Runs native ray tracing builds side by side instead of one by one."),

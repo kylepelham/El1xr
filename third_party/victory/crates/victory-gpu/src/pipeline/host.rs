@@ -20,6 +20,7 @@ use crate::host::host;
 #[path = "host_launch.rs"]
 mod launch;
 pub(crate) use launch::Launch;
+mod mesh_link;
 mod state_bytes;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -618,10 +619,16 @@ impl HostPipeline {
                 }
             };
         // Held until the pipeline is made: the descriptions point into them.
-        let dxils: Vec<Arc<Vec<u8>>> = stages
+        let mut dxils: Vec<Arc<Vec<u8>>> = stages
             .iter()
             .map(|(s, _)| s.dxil())
             .collect::<Option<_>>()?;
+        // `VICTORY_MESH_LINK=1`: a mesh program past 32 KiB of outputs, linked to its pixel program.
+        if mesh.is_some()
+            && let [(ms, _), (ps, _)] = &stages[..]
+        {
+            dxils = mesh_link::code(mesh_link::on(), dxils, |m, p| mesh_link::linked(ms, m, ps, p));
+        }
         let code = |i: usize| {
             dxils.get(i).map_or(D3D12_SHADER_BYTECODE::default(), |d| {
                 D3D12_SHADER_BYTECODE {
