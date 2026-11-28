@@ -332,6 +332,8 @@ pub mod priority;
 #[cfg(windows)]
 #[cfg(windows)]
 mod defrag;
+#[cfg(windows)]
+mod loop_cap;
 mod watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wc_skip;
