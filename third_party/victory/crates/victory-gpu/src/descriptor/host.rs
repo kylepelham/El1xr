@@ -31,9 +31,11 @@ pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 pub(crate) mod remade_safe;
+mod shown_already;
 mod slot_wait;
 mod srgb_cast;
 pub(crate) mod swap_watch;
+mod sweep_fast;
 pub(crate) mod view_ages;
 mod view_addresses;
 pub(crate) mod view_cache;
@@ -362,7 +364,11 @@ fn views_remade_quiet() -> bool {
 /// cutscene the car seat was a green and blue checkerboard for two seconds.
 pub(crate) fn show_after() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| show_after_from(std::env::var_os("VICTORY_SHOW_AFTER").as_deref()))
+}
+
+fn show_after_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != std::ffi::OsStr::new("0"))
 }
 
 /// Commits a texture view slot whose host descriptor was held back by
@@ -2298,9 +2304,8 @@ impl HostHeap {
     /// `VICTORY_TEXTURE_SWEEP=0` turns it off, `count` only counts.
     pub(crate) fn texture_sweep(&self, heap: &super::Heap, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        /// Slots looked at at a time, and the least time between.
+        /// Slots looked at at a time.
         const SLOTS: u32 = 1 << 15;
-        const EVERY_MS: u64 = 100;
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TEXTURE_SWEEP").as_deref() {
             Ok("0") => 0,
@@ -2314,22 +2319,25 @@ impl HostHeap {
         let Ok(mut sweep) = SWEEP.try_lock() else {
             return;
         };
-        if now.saturating_sub(sweep.2) < EVERY_MS {
+        if now.saturating_sub(sweep.2) < sweep_fast::every_ms() {
             return;
         }
         sweep.2 = now;
         let (from, mut counts) = (sweep.0.min(self.count), sweep.1);
         let to = from.saturating_add(SLOTS).min(self.count);
-        self.sweep_part(
+        let (back, resumed_at) = self.sweep_part(
             from..to,
             |index| heap.handle(index),
             frame,
             mode == 2,
             &mut counts,
         );
-        sweep.0 = to;
+        let next = resumed_at.unwrap_or(to).min(to);
+        let lap_done = next >= self.count;
+        sweep_fast::note_step(back, next < to, now, lap_done);
+        sweep.0 = next;
         sweep.1 = counts;
-        if to >= self.count {
+        if lap_done {
             for (to, counted) in SWEPT.iter().zip(counts) {
                 to.store(counted, Relaxed);
             }
@@ -2346,14 +2354,36 @@ impl HostHeap {
         frame: u64,
         put_back: bool,
         counts: &mut [u64; 10],
-    ) {
+    ) -> (u32, Option<u32>) {
+        self.sweep_part_with(
+            slots,
+            handle,
+            frame,
+            put_back,
+            sweep_fast::most(),
+            sweep_fast::resume_on_cap(),
+            counts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_part_with(
+        &self,
+        slots: std::ops::Range<u32>,
+        handle: impl Fn(u32) -> Option<u64>,
+        frame: u64,
+        put_back: bool,
+        most: u32,
+        resume: bool,
+        counts: &mut [u64; 10],
+    ) -> (u32, Option<u32>) {
         use std::sync::atomic::Ordering::Relaxed;
-        /// Put back per part, and only while the queue is shorter than
-        /// this: a view the title forgot to clear may be among them, and
-        /// the queue serves the newest first.
-        const MOST: u32 = 128;
+        /// Put back only while the queue is shorter than this: a view the
+        /// title forgot to clear may be among them, and the queue serves the
+        /// newest first.
         const SHORT: usize = 4_000;
         let mut back = 0;
+        let mut resumed_at = None;
         // The slots whose host slot does not show what the title's says.
         let mut unmade = Vec::new();
         {
@@ -2435,16 +2465,21 @@ impl HostHeap {
                     &desc[..10]
                 );
             }
-            if put_back && back < MOST && matches!(claim, Claim::Own | Claim::Free) {
+            if put_back && back < most && matches!(claim, Claim::Own | Claim::Free) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.len() < SHORT {
                     textures.written(index, frame, frame + 1, false);
                     self.note_slot(index, SLOT_IN_TEXTURES, true);
                     back += 1;
                     SWEPT[10].fetch_add(1, Relaxed);
+                    if resume && back >= most {
+                        resumed_at = Some(index.saturating_add(1));
+                        break;
+                    }
                 }
             }
         }
+        (back, resumed_at)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2693,9 +2728,10 @@ impl HostHeap {
             .collect()
     }
 
-    /// This heap, for `view_ages`.
+    /// This heap, for `view_ages` and `swap_watch` (stable across moving
+    /// `HostHeap` from stack into `Heap::host`'s `OnceLock`).
     fn ages_key(&self) -> usize {
-        std::ptr::from_ref(self) as usize
+        self.id as usize
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -3771,6 +3807,9 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            if view_ages::on() && !self.sampler {
+                view_ages::cleared(self.ages_key(), index);
+            }
             if made[index as usize] != 0 {
                 crate::flicker_catch::count(crate::flicker_catch::Kind::ViewGone);
                 made[index as usize] = 0;
@@ -3866,11 +3905,15 @@ impl HostHeap {
                 }
             }
             if later {
-                if view_ages::on() && !self.sampler && shows_texture(&view) {
-                    let m = made[index as usize];
-                    let old = (m != 0).then(|| view_at(m as u32, (m >> 32) as u32)).flatten();
-                    let kind = view_ages::Kind::Null;
-                    view_ages::waiting(self.ages_key(), index, kind, &view, old.as_ref());
+                if view_ages::on() && !self.sampler {
+                    if shows_texture(&view) {
+                        let m = made[index as usize];
+                        let old = (m != 0).then(|| view_at(m as u32, (m >> 32) as u32)).flatten();
+                        let kind = view_ages::Kind::Null;
+                        view_ages::waiting(self.ages_key(), index, kind, &view, old.as_ref());
+                    } else {
+                        view_ages::cleared(self.ages_key(), index);
+                    }
                 }
                 // A slot of ours that never made a view is already null
                 // (`HostHeap::new` makes every slot null, `made` starts 0
@@ -4620,23 +4663,26 @@ fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element
 fn buffer_srv(
     address: u64,
     len: u64,
-    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     buffer_view: bool,
 ) -> Option<(Kept, Option<BufferCopy>)> {
+    let (whole, own) = buffer_srv_copies(address, len, &desc, buffer_view)?;
+    buffer_srv_on(whole, own, address, len, desc, at)
+}
+
+/// The host copies buffer shader view `desc` of title memory at `address`
+/// (`len` bytes) shows, made now if they are not there: its buffer's copy,
+/// and the copy of the view's own bytes with where they start and how many
+/// (`own_bytes`), if it has one.
+pub(super) fn buffer_srv_copies(
+    address: u64,
+    len: u64,
+    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    buffer_view: bool,
+) -> Option<BufferSrvCopies> {
     let whole = crate::shadow::find(address, len)?;
     let offset = whole.offset(address);
-    // The title range the view reads ([`buffer_range`]): what `buffer_copy`
-    // reports the copy of a made slot with.
-    // SAFETY: a buffer view's union member.
-    let range = {
-        let b = unsafe { desc.Anonymous.Buffer };
-        let element = element_size(&desc);
-        (
-            address + b.FirstElement * element,
-            u64::from(b.NumElements) * element,
-        )
-    };
     // Off the elements of that copy: on a copy of its own bytes, from its
     // element 0 (`own_bytes`).
     let own = buffer_view.then_some(()).and_then(|()| {
@@ -4658,6 +4704,63 @@ fn buffer_srv(
             crate::shadow::exact(start, bytes).map(|own| (own, start, bytes))
         })
     });
+    Some((whole, own))
+}
+
+/// What buffer shader view `view` is made from, as [`make`] makes it: the
+/// title address and length it reads, its description, and whether it is
+/// of dimension buffer. `None` for every other view.
+pub(super) fn buffer_srv_args(
+    view: &View,
+) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC, bool)> {
+    // Buffer views: dimension 1 (`buffer_fields`); a buffer resource.
+    const BUFFER: u32 = 1;
+    match view {
+        // (A buffer object has no host copy of its own: `make` comes here.)
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len, srv_desc(desc), desc[1] == BUFFER))
+        }
+        View::Placed(false, resource, desc) if resource[0] == BUFFER => {
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            if len == 0 {
+                return None;
+            }
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            Some((address, len, srv_desc(words), true))
+        }
+        _ => None,
+    }
+}
+
+/// The host copies of a buffer shader view ([`buffer_srv_copies`]).
+pub(super) type BufferSrvCopies = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+);
+
+/// [`buffer_srv`] on the copies [`buffer_srv_copies`] gave.
+pub(super) fn buffer_srv_on(
+    whole: std::sync::Arc<crate::shadow::Shadow>,
+    own: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    address: u64,
+    len: u64,
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<(Kept, Option<BufferCopy>)> {
+    let offset = whole.offset(address);
+    // The title range the view reads ([`buffer_range`]): what `buffer_copy`
+    // reports the copy of a made slot with.
+    // SAFETY: a buffer view's union member.
+    let range = {
+        let b = unsafe { desc.Anonymous.Buffer };
+        let element = element_size(&desc);
+        (
+            address + b.FirstElement * element,
+            u64::from(b.NumElements) * element,
+        )
+    };
     let (shadow, offset, own_copy) = match own {
         Some((own, start, bytes)) => {
             desc.Anonymous.Buffer.FirstElement = 0;
@@ -5745,6 +5848,18 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// The registry's default is what an unset `VICTORY_SHOW_AFTER` does
+    /// (the menu showed it off while it ran on).
+    #[test]
+    fn show_after_is_on_unless_zero_as_the_registry_says() {
+        use std::ffi::OsStr;
+        assert!(show_after_from(None));
+        assert!(show_after_from(Some(OsStr::new("1"))));
+        assert!(!show_after_from(Some(OsStr::new("0"))));
+        let default = victory_core::settings::info("VICTORY_SHOW_AFTER").unwrap().default;
+        assert_eq!(show_after_from(Some(OsStr::new(default))), show_after_from(None));
+    }
+
     #[test]
     fn the_reread_and_magenta_switches_are_live() {
         use victory_core::settings::check_live;
@@ -6759,6 +6874,78 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(queued(), []);
         host.sweep_part(0..8, handle, 50, true, &mut counts);
         assert_eq!(queued(), [1]);
+    }
+
+    #[test]
+    fn sweep_fast_rescues_past_default_cap_and_resumes_mid_chunk() {
+        let Some(host) = HostHeap::new(false, 220) else {
+            return; // no host GPU
+        };
+        // SAFETY: committed memory below 2^40, left to the process.
+        let at = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            VirtualAlloc(
+                0x7d_5000_0000usize as *const _,
+                1 << 20,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as u64
+        };
+        if at == 0 {
+            return; // taken
+        }
+        let mut slots = vec![[0u32; 8]; 220];
+        let base = slots.as_mut_ptr() as u64;
+        let handle = |index: u32| Some(base + u64::from(index) * 32);
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        for idx in 0..200u32 {
+            let mut desc = [0u32; 16];
+            let addr = at + u64::from(idx) * 4096;
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            super::super::record(
+                handle(idx).unwrap(),
+                View::Placed(false, resource, desc),
+            );
+        }
+        let drain_queue = || -> usize {
+            let mut t = host.textures.lock().unwrap();
+            let n = t.slots.len();
+            t.slots.clear();
+            n
+        };
+
+        // Default cap (128, no resume): rescues only 128 and drops the rest of the chunk.
+        let mut counts = [0; 10];
+        let (back, resumed) =
+            host.sweep_part_with(0..220, handle, 50, true, sweep_fast::DEFAULT_MOST, false, &mut counts);
+        assert_eq!(back, 128);
+        assert_eq!(resumed, None);
+        assert_eq!(drain_queue(), 128);
+
+        // Fast mode with cap 150 + resume: rescues 150, returns resume cursor 150,
+        // and the next step finishes the remaining 50 immediately.
+        let mut counts = [0; 10];
+        let (back1, resumed1) =
+            host.sweep_part_with(0..220, handle, 50, true, 150, true, &mut counts);
+        assert_eq!(back1, 150);
+        assert_eq!(resumed1, Some(150));
+        assert_eq!(drain_queue(), 150);
+
+        let (back2, resumed2) =
+            host.sweep_part_with(resumed1.unwrap()..220, handle, 50, true, 150, true, &mut counts);
+        assert_eq!(back2, 50);
+        assert_eq!(resumed2, None);
+        assert_eq!(drain_queue(), 50);
+
+        // Fast mode with default FAST_MOST (2048): rescues all 200 in one step.
+        let mut counts = [0; 10];
+        let (back_all, resumed_all) =
+            host.sweep_part_with(0..220, handle, 50, true, sweep_fast::FAST_MOST, true, &mut counts);
+        assert_eq!(back_all, 200);
+        assert_eq!(resumed_all, None);
+        assert_eq!(drain_queue(), 200);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
