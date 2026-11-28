@@ -271,6 +271,8 @@ pub(crate) fn present(swap_chain: &IDXGISwapChain3) {
     } else {
         DXGI_PRESENT(0)
     };
+    // The present goes to the host queue behind the frame's lists (`VICTORY_SEND_THREAD`).
+    crate::host::send_thread::wait_idle();
     let dlssg = crate::dlssg::active();
     if dlssg {
         crate::dlssg::before_present();
