@@ -327,8 +327,8 @@ pub(super) fn setting_line(info: &Info, model: &dyn MenuModel, expert: bool) -> 
     let line = detail.as_deref().or_else(|| short(info.name)).unwrap_or(info.help);
     match (line, info.label == info.name) {
         (help, true) => help.to_string(),
-        ("", false) => info.name.to_string(),
-        (help, false) if expert => format!("{help}   {}", info.name),
+        ("", false) if expert => info.name.to_string(),
+        (help, false) if expert && !help.is_empty() => format!("{help}   {}", info.name),
         (help, false) => help.to_string(),
     }
 }
@@ -513,14 +513,20 @@ impl Painter {
         // Footer: hints, then the last change's outcome at the right.
         let f = l.footer;
         rule(&mut bm, l, f.x + pad, f.y, f.w - 2 * pad, RULE);
-        let hints = format!(
-            "{} / Esc close   \u{2191}\u{2193} select   \u{2190}\u{2192} change   Q E tabs   X expert      Pad: A change  B close  LB RB tabs  Y expert",
-            super::hotkey_name()
-        );
+        // Hints for the device last used: the control in the brighter text, what it does dimmer.
         let status = t.fit(SMALL, menu.status.as_deref().unwrap_or_default(), (f.w - 2 * pad) * 3 / 5);
         let sw = t.measure(SMALL, &status).0;
-        let hints = t.fit(SMALL, &hints, f.w - 2 * pad - sw - px(24.0));
-        t.mid(&mut bm, SMALL, &hints, f.x + pad, f, DIM);
+        let end = f.right() - pad - sw - px(24.0);
+        let mut x = f.x + pad;
+        for (control, what) in menu.hints.pairs() {
+            let (cw, ww) = (t.measure(SMALL, &control).0, t.measure(SMALL, what).0);
+            if x + cw + px(5.0) + ww > end {
+                break;
+            }
+            t.mid(&mut bm, SMALL, &control, x, f, SOFT);
+            t.mid(&mut bm, SMALL, what, x + cw + px(5.0), f, DIM);
+            x += cw + px(5.0) + ww + px(16.0);
+        }
         t.mid(&mut bm, SMALL, &status, f.right() - pad - sw, f, SOFT);
         Some(bm)
     }

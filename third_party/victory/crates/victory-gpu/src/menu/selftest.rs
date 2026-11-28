@@ -9,11 +9,16 @@
 //! texture with the menu's own bitmap laid over it, never the screen. The keys go through the
 //! driver whatever window is in front. With no key in its plan nothing here runs; it has no OS
 //! calls.
+//!
+//! Every second pass (the 2nd, 4th, ...) uses the pad instead: View + Menu held to open, RB for
+//! the tabs, the d-pad to move, RT then LT for the change and its undo, B to close.
 
 use std::collections::VecDeque;
 
 use super::Driver;
-use super::input::Key;
+use super::input::{
+    CHORD, CHORD_MS, Device, Key, PAD_A, PAD_B, PAD_DOWN, PAD_LB, PAD_LT, PAD_RB, PAD_RT, PAD_UP, PAD_Y,
+};
 use super::model::{Apply, Kind};
 use super::state::{Row, Tab};
 
@@ -70,7 +75,25 @@ pub enum Out {
 pub struct Tick {
     /// Keys held this poll, on top of the real ones.
     pub keys: Vec<Key>,
+    /// Pad bits held this poll, on top of the real ones.
+    pub pad: u32,
     pub out: Vec<Out>,
+}
+
+/// The pad's way to do what `key` does in the settings menu, and how long it is held (ms).
+pub fn pad_for(key: Key) -> (u32, u64) {
+    match key {
+        Key::Hotkey => (CHORD, CHORD_MS + 200),
+        Key::Esc => (PAD_B, 0),
+        Key::Up => (PAD_UP, 0),
+        Key::Down => (PAD_DOWN, 0),
+        Key::Left => (PAD_LT, 0),
+        Key::Right => (PAD_RT, 0),
+        Key::Enter => (PAD_A, 0),
+        Key::PrevTab => (PAD_LB, 0),
+        Key::NextTab => (PAD_RB, 0),
+        Key::Expert => (PAD_Y, 0),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +138,8 @@ pub struct Selftest {
     pressed: bool,
     last_press: u64,
     closed_at: u64,
+    /// This pass presses the pad's buttons, not keys.
+    pad: bool,
 }
 
 fn secs(ms: u64) -> String {
@@ -143,6 +168,7 @@ impl Selftest {
             pressed: false,
             last_press: 0,
             closed_at: 0,
+            pad: false,
         }
     }
 
@@ -163,6 +189,7 @@ impl Selftest {
                 return t;
             }
             self.next += 1;
+            self.pad = self.next % 2 == 0;
             if driver.menu.open {
                 t.out.push(Out::Warn(format!(
                     "menu selftest: {}s skipped, the menu is already open",
@@ -171,8 +198,9 @@ impl Selftest {
                 return t;
             }
             t.out.push(Out::Log(format!(
-                "menu selftest: pass at {}s starts (game window in front={front}, title input blocked={blocked})",
-                secs(at)
+                "menu selftest: pass at {}s starts by {} (game window in front={front}, title input blocked={blocked})",
+                secs(at),
+                if self.pad { "pad" } else { "keys" }
             )));
             self.pass = Some(at);
             self.steps = [Step::Press(Key::Hotkey), Step::Opened].into();
@@ -198,23 +226,40 @@ impl Selftest {
         let warn = |t: &mut Tick, s: String| t.out.push(Out::Warn(format!("menu selftest: {s}")));
         match step {
             Step::Press(key) => {
+                let (bits, hold) = if self.pad { pad_for(key) } else { (0, 0) };
                 if self.pressed {
+                    if now < self.last_press + hold {
+                        t.pad |= bits;
+                        return false;
+                    }
                     self.pressed = false;
                     self.steps.pop_front();
                 } else {
-                    t.keys.push(key);
+                    if self.pad {
+                        t.pad |= bits;
+                    } else {
+                        t.keys.push(key);
+                    }
                     (self.pressed, self.last_press) = (true, now);
                 }
                 return false;
             }
             Step::Settle => return now >= self.last_press + SETTLE_MS,
             Step::Opened => {
+                let by = if self.pad { d.menu.hints.chord.to_string() + " held" } else { "the hotkey".into() };
                 if !d.menu.open {
-                    warn(t, format!("{at}s: the hotkey did not open the menu"));
+                    warn(t, format!("{at}s: {by} did not open the menu"));
                     self.steps.clear();
                     return false;
                 }
-                log(t, format!("opened (title input blocked={blocked})"));
+                log(t, format!("opened (title input blocked={blocked}) by {by}"));
+                let want = if self.pad { Device::Pad } else { Device::Keys };
+                let hints: Vec<String> = d.menu.hints.pairs().into_iter().map(|(c, w)| format!("{c} {w}")).collect();
+                if d.menu.hints.device == want {
+                    log(t, format!("hints for the {want:?}: {}", hints.join(", ")));
+                } else {
+                    warn(t, format!("hints show the {:?}'s controls, not the {want:?}'s", d.menu.hints.device));
+                }
                 match picture(d) {
                     Ok(line) => log(t, line),
                     Err(why) => warn(t, why),
@@ -272,10 +317,11 @@ impl Selftest {
                         format!("value not set: {name} stayed {from:?} ({status})"),
                     );
                 } else {
+                    let by = if self.pad { "RT" } else { "Right" };
                     log(
                         t,
                         format!(
-                            "value set {name} {from:?} -> {now_v:?} (apply {apply:?}; menu says \"{status}\")"
+                            "value set {name} {from:?} -> {now_v:?} (apply {apply:?}; menu says \"{status}\") by {by}"
                         ),
                     );
                 }
@@ -283,7 +329,7 @@ impl Selftest {
             Step::Restored { name, from } => {
                 let now_v = d.model.get(name).unwrap_or_default();
                 if now_v == from {
-                    log(t, format!("value restored {name} -> {from:?}"));
+                    log(t, format!("value restored {name} -> {from:?} by {}", if self.pad { "LT" } else { "Left" }));
                 } else {
                     warn(
                         t,
@@ -301,7 +347,7 @@ impl Selftest {
                     self.steps.clear();
                     return false;
                 }
-                log(t, "closed".into());
+                log(t, format!("closed by {}", if self.pad { "B" } else { "Esc" }));
                 self.closed_at = now;
             }
             Step::InputBack => {
@@ -476,7 +522,7 @@ mod tests {
         for now in (0..until).step_by(30) {
             let blocked = d.blocked();
             let t = test.tick(now, d, blocked, false);
-            d.tick(now, &t.keys, 0, 0);
+            d.tick(now, &t.keys, t.pad, 0);
             out.extend(t.out);
         }
         out
@@ -532,6 +578,49 @@ mod tests {
         assert!(!d.menu.open && !d.blocked());
         assert_eq!(d.model.get(PREFERRED), before);
         assert!(d.model.pending_restart().is_empty());
+        let _ = d.model.set(PREFERRED, "");
+    }
+
+    /// The second pass is the pad's: the chord opens it, RB steps the tabs, RT/LT change and
+    /// undo, B closes, and the hints name the pad's buttons.
+    #[test]
+    fn every_second_pass_uses_the_pad() {
+        let _lock = registry_lock();
+        let mut d = Driver::new(Box::new(Registry::default()));
+        let before = d.model.get(PREFERRED);
+        let tabs = d.menu.tabs(&*d.model).len();
+        let mut test = Selftest::new(parse("1,40").unwrap());
+        let out = run(&mut test, &mut d, 80_000);
+        let warns: Vec<&Out> = out.iter().filter(|o| matches!(o, Out::Warn(_))).collect();
+        assert!(warns.is_empty(), "{warns:?}");
+        let logs: Vec<&str> = out
+            .iter()
+            .filter_map(|o| match o {
+                Out::Log(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let has = |s: &str| logs.iter().any(|l| l.contains(s));
+        for line in [
+            "pass at 1s starts by keys",
+            "by the hotkey",
+            "by Right",
+            "by Left",
+            "closed by Esc",
+            "pass at 40s starts by pad",
+            "opened (title input blocked=true) by View + Menu held",
+            "hints for the Pad: A change, B close, LB RB tabs, LT RT value, Y expert, View + Menu hold open, close",
+            "by RT",
+            "by LT",
+            "closed by B",
+            &format!("tab {tabs}/{tabs}"),
+            "pass at 40s done",
+        ] {
+            assert!(has(line), "{line}: {logs:#?}");
+        }
+        assert_eq!(logs.iter().filter(|l| l.contains("input returned to title")).count(), 2);
+        assert!(!d.menu.open && !d.blocked());
+        assert_eq!(d.model.get(PREFERRED), before);
         let _ = d.model.set(PREFERRED, "");
     }
 

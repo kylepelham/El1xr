@@ -137,9 +137,11 @@ impl Ctx {
                 keys.extend(KEYS.iter().filter(|(vk, _)| down(*vk)).map(|&(_, k)| k));
             }
         }
+        let mut test_pad = 0;
         if let Some(test) = self.selftest.as_mut() {
             let t = test.tick(now, &mut self.driver, self.spec.blocked.load(Relaxed), front);
             keys.extend(t.keys);
+            test_pad = t.pad;
             let mut shots = Vec::new();
             for out in t.out {
                 match out {
@@ -155,7 +157,9 @@ impl Ctx {
                 tracing::warn!("menu selftest: {name} skipped: no frame went through the read-back present in {} s", SHOT_WAIT.as_secs());
             }
         }
-        let pad = PAD_DOWN.load(Relaxed) | self.spec.pressed.swap(0, Relaxed);
+        let mut pad = PAD_DOWN.load(Relaxed) | self.spec.pressed.swap(0, Relaxed) | test_pad;
+        let other = super::blocked() && !self.spec.blocked.load(Relaxed);
+        super::while_other_open(other, &mut keys, &mut pad);
         let wheel = self.spec.wheel.swap(0, Relaxed);
         self.dirty |= self.driver.tick(now, &keys, pad, wheel);
         self.spec.blocked.store(self.driver.blocked(), Relaxed);
@@ -425,7 +429,7 @@ fn run(game: HWND, spec: &'static Spec) {
                 spec,
                 game,
                 window,
-                driver: Driver::new((spec.model)()),
+                driver: Driver::with_controls((spec.model)(), spec.chord, spec.chord_name, super::key_name((spec.hotkey)())),
                 painter: None,
                 layout: None,
                 at: POINT { x: 0, y: 0 },
