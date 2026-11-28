@@ -74,6 +74,11 @@ pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_mee
 #[path = "halves.rs"]
 mod halves;
 
+/// Infinities held at ±65504 by the NaN scrub, colours held to the HDR range
+/// (`VICTORY_NAN_SCRUB_INF=1`, `VICTORY_HDR_CLAMP`).
+#[path = "hdr_hold.rs"]
+pub(super) mod hdr_hold;
+
 /// The exchanges of two host waves taking turns between two sets of dwords
 /// (`VICTORY_EXCHANGE_PAIRS=1`).
 #[path = "exchange_pairs.rs"]
@@ -7852,11 +7857,12 @@ impl<'a> Lower<'a> {
                 _ => (".i32", x),
             };
             let x = if target {
-                if nan_scrub() {
+                let x = if nan_scrub() {
                     self.scrub_nan(x)
                 } else {
                     self.nan_guard(x, true)
-                }
+                };
+                self.clamp_hdr(x)
             } else {
                 x
             };
