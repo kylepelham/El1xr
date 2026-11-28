@@ -926,6 +926,7 @@ pub(crate) fn forget(resource: usize) {
     prepare::forget(resource);
     crate::table_null::forget(resource);
     crate::staging_hold::forget(resource);
+    crate::idle_evict::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
@@ -2104,6 +2105,87 @@ pub(crate) fn upload_again(resource: This) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .partial = None;
+    }
+}
+
+/// (El1xr) For `crate::idle_evict`: whether title texture `resource`'s host copy holds its
+/// title memory as it is now. `Some(true)`: its staging buffer was uploaded and not detiled
+/// since, and no page of its memory was written after that detiling, by the write watch (or
+/// the guard of view memory, with no unseen write found lately); `Some(false)`: written or not
+/// uploaded since; `None`: it cannot tell (no staging buffer, levels on demand, memory neither
+/// watched nor guarded).
+pub(crate) fn unchanged_since_upload(resource: This) -> Option<bool> {
+    use std::sync::atomic::Ordering::Acquire;
+    let s = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    if s.on_demand {
+        return None;
+    }
+    let last = s.last.lock().unwrap_or_else(|e| e.into_inner());
+    let start = s.memory as usize;
+    let end = start + s.size;
+    let written = crate::watch::writes(start, end, false)
+        .map(|(_, w)| (w, false))
+        .or_else(|| crate::watch::writes(start, end, true).map(|(_, w)| (w, true)));
+    let (written, guarded) = written?;
+    unchanged(
+        s.uploaded.load(Acquire),
+        s.dirty.load(Acquire),
+        last.asked,
+        guarded && crate::frame::current() < last.unguarded,
+        &written,
+    )
+}
+
+/// [`unchanged_since_upload`] from what the staging state says: uploaded, detiled since,
+/// the asking its detiling went by (0: none), a write the guard missed lately, and the pages
+/// written with the asking that found each.
+fn unchanged(
+    uploaded: bool,
+    dirty: bool,
+    asked: u64,
+    unseen: bool,
+    written: &[(usize, u64)],
+) -> Option<bool> {
+    if asked == 0 || unseen {
+        return None;
+    }
+    Some(uploaded && !dirty && written.iter().all(|&(_, w)| w <= asked))
+}
+
+/// For the tests: `resource`'s staging buffer as detiled from its title memory now.
+#[cfg(all(test, windows))]
+pub(crate) fn detiled_for_test(resource: This) -> Option<Vec<u8>> {
+    let s = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    let mut tiled = vec![0u8; s.size];
+    crate::host::copy_mapped(tiled.as_mut_ptr(), s.memory, s.size, false);
+    s.detile(&tiled);
+    let mut out = vec![0u8; s.bytes as usize];
+    // SAFETY: the staging buffer's mapping of `bytes`, alive with `s`.
+    unsafe { std::ptr::copy_nonoverlapping(s.data, out.as_mut_ptr(), out.len()) };
+    Some(out)
+}
+
+#[cfg(test)]
+mod unchanged_tests {
+    /// Unchanged only when uploaded, not detiled since, and no page written after the asking
+    /// its detiling went by; it cannot tell without an asking or after a write the guard
+    /// missed.
+    #[test]
+    fn a_copy_is_unchanged_only_with_no_write_after_its_upload() {
+        let w = [(10usize, 5u64), (11, 7)];
+        assert_eq!(super::unchanged(true, false, 7, false, &w), Some(true));
+        assert_eq!(super::unchanged(true, false, 6, false, &w), Some(false));
+        assert_eq!(super::unchanged(true, true, 7, false, &w), Some(false));
+        assert_eq!(super::unchanged(false, false, 7, false, &w), Some(false));
+        assert_eq!(super::unchanged(true, false, 0, false, &w), None);
+        assert_eq!(super::unchanged(true, false, 7, true, &w), None);
+        assert_eq!(super::unchanged(true, false, 1, false, &[]), Some(true));
     }
 }
 
