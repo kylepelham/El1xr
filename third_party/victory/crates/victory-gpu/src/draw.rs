@@ -588,7 +588,7 @@ pub(crate) struct State {
     scratch_textures: Vec<usize>,
     /// Tables made afresh in this list: (table, slot count, contents) → (first
     /// dynamic slot, scratch CBV epoch if backed by scratch constants).
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Option<u64>)>,
+    fresh_tables: crate::bind_hash::Map<(u64, u32, u64), (u32, Option<u64>)>,
     /// This recording of the list, for the views its fresh tables hold
     /// (`VICTORY_LIST_VIEWS`, `HostHeap::make_listed`; 0: none yet).
     recording: u64,
@@ -596,12 +596,12 @@ pub(crate) struct State {
     /// (`readable`) with nothing to do again while the host list's count of state
     /// changes stands: the host list, that count, and the textures the table shows.
     /// A draw that only tests its depth target and reads it too is not among them.
-    ready_tables: std::collections::HashMap<(u64, u32, u64), (usize, u64, Vec<usize>)>,
+    ready_tables: crate::bind_hash::Map<(u64, u32, u64), (usize, u64, Vec<usize>)>,
     /// (Neptune) The tables (address, slot count, contents) this list has seen, with tables
     /// told apart by their contents alone (`tables_by_content`): one at a new address whose
     /// contents another had takes that one's host slots, and only its own title slots'
     /// notes are made here.
-    seen_tables: std::collections::HashSet<(u64, u32, u64)>,
+    seen_tables: crate::bind_hash::Set<(u64, u32, u64)>,
     /// The dynamic slots the list holds: title heap, host heap identity,
     /// first, count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
@@ -609,9 +609,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: crate::bind_hash::Map<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::bind_hash::Map<(usize, u64), RootSlot>,
     /// The tables the last bind made afresh for a program the stand-in for
     /// the indirect light follows (`crate::ambient`): root parameter, bytes
     /// into the view heap.
@@ -3393,10 +3393,10 @@ impl State {
         // Several slots can show the same texture from the same mip. The list
         // holds each upload even after its staging entry is removed. Reuse
         // it within this pass, where there are no intervening title copies.
-        let mut uploaded: std::collections::HashMap<
+        let mut uploaded: crate::bind_hash::Map<
             (usize, u32),
             Option<((u64, u64), u64, bool)>,
-        > = std::collections::HashMap::new();
+        > = crate::bind_hash::Map::default();
         for (i, (index, write)) in due.into_iter().enumerate() {
             // The time since the last lap: the end of the slot before.
             laps.lap(Laps::REST);

@@ -71,6 +71,8 @@ mod bake_replay;
 #[cfg(windows)]
 mod bake_spread;
 #[cfg(windows)]
+mod bind_hash;
+#[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
 mod bake_why;

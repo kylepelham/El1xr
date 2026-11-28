@@ -29,7 +29,6 @@
 //! Source: DoubleGhosty/cool_fox 4e77a8795b (its skip of `readable` within
 //! a list's epoch), with the per-texture generation added here.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// The switch (`VICTORY_LIST_READABLE_ONCE`; on only when `1`).
@@ -101,7 +100,7 @@ const MOST: usize = 1 << 14;
 struct Ready {
     /// The list and its count of changes.
     at: (usize, u64),
-    made: HashMap<usize, Marks>,
+    made: crate::bind_hash::Map<usize, Marks>,
 }
 
 impl Ready {

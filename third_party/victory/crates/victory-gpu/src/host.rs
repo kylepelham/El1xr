@@ -2850,26 +2850,26 @@ struct Deferred {
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
     /// Host pipelines already kept and named by [`HostList::bind_pipeline`].
-    bound: std::collections::HashSet<usize>,
+    bound: crate::bind_hash::Set<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::bind_hash::Set<(usize, usize, usize)>,
     /// Constant-buffer snapshots already copied into this list's scratch
     /// memory since the last title write (`(address, size) -> host GPU address`).
-    cbv_snapshots: std::collections::HashMap<(u64, u32), u64>,
+    cbv_snapshots: crate::bind_hash::Map<(u64, u32), u64>,
     /// Pre-aggregated refresh spans per shadow (`ask_once`, `stale_under_flights`).
     refresh_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    refresh_map: std::collections::HashMap<usize, usize>,
+    refresh_map: crate::bind_hash::Map<usize, usize>,
     /// Exact `(shadow, address, len)` refreshes for ReBAR windows only.
     rebar_refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Pre-aggregated GPU-written ranges per shadow (`declared_writes`, `card_before`).
     gpu_writes: Vec<Declared>,
-    gpu_write_map: std::collections::HashMap<usize, usize>,
+    gpu_write_map: crate::bind_hash::Map<usize, usize>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::bind_hash::Set<usize>,
     /// Filled root CBV scratch by source address and size since the last
     /// title-memory write recorded on this list.
-    filled_root_cbvs: std::collections::HashMap<(usize, u64), (u64, usize)>,
+    filled_root_cbvs: crate::bind_hash::Map<(usize, u64), (u64, usize)>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
