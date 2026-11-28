@@ -316,6 +316,9 @@ if (-not $NoTunedSettings) {
         VICTORY_AMBIENT_ONCE             = '1'         # batch 5: ambient stand-in counts one bounce (steady p99 -11 ms)
         VICTORY_SKIP_WC_BACK             = '1'         # batch 5: large shader writes to write-combining memory stay on the card (24.6 fps vs 21.5, prep -7 ms)
         VICTORY_HOLD_LAST_FRAME          = '1'         # batch 4: an all-black present shows the last good frame (40 of 71 hidden)
+        VICTORY_SEND_THREAD              = '1'         # batch 5J: lists sent and fences signalled on a thread of their own (exec_submit 1.56 -> 0.11 ms)
+        VICTORY_CARD_RECORD_SEND         = '1'         # batch 5J: card sync/compare lists recorded on the send thread (card_before 2.13 -> 0.57, prep -0.98, +0.8 fps)
+        VICTORY_COPIED_SHARED            = '1'         # batch 5J: page-stamp reads share the host copy's lock (batch_flush -0.6, prep -0.55)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
