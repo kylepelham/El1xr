@@ -593,6 +593,10 @@ impl Tiled {
             batch.levels.push(level);
             batch.total_tiles += tiles;
         }
+        // After the lists handed to the thread that sends (`VICTORY_SEND_THREAD`).
+        if !batches.is_empty() {
+            crate::host::send_thread::wait_idle();
+        }
         for (_, mut batch) in batches {
             given.runs.reserve(batch.runs.len());
             let began = std::time::Instant::now();
@@ -891,6 +895,7 @@ void look() {
                     .ok()?;
                 let allocator: ID3D12CommandAllocator =
                     device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;

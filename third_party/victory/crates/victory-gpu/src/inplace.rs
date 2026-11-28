@@ -332,6 +332,9 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if crate::watch::empty_notice::skip(at, len) {
+        return;
+    }
     let mut v = views();
     if v.views.is_empty() {
         return;

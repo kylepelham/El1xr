@@ -1911,8 +1911,8 @@ struct CardWork {
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
     /// The dwords of `differs` taken by plans whose results were not read
-    /// yet.
-    taken: u32,
+    /// yet ([`crate::result_ring`]).
+    taken: crate::result_ring::Ring,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
     /// (Neptune) With [`relay_own_queue`]: the compare that keeps the
@@ -2648,6 +2648,8 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// Its stretch of the compare's results ([`crate::result_ring`]).
+    results: (u32, u32),
 }
 
 /// (Neptune) Title memory declared as written by shaders in this frame or
@@ -3692,6 +3694,7 @@ impl Host {
                 let allocator: ID3D12CommandAllocator = self
                     .device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                     0,
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -3719,6 +3722,7 @@ impl Host {
             let allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -4057,6 +4061,7 @@ impl Host {
                     }
                     crate::gpucost::end(list);
                     list.Close()?;
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -4669,13 +4674,17 @@ impl Host {
             .load(Ordering::Relaxed)
             .saturating_sub(flush_one_before);
         PREP_PARTS[5].fetch_add(def_us.saturating_sub(flush_one_delta), Ordering::Relaxed);
-        let t_flush = std::time::Instant::now();
-        flush::last(|| batch.flush());
-        crate::watch::ask_once_end();
-        PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let t_pre = std::time::Instant::now();
-        finalize_preludes(&mut pending_preludes);
-        PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if beside::wanted(&batch, !pending_preludes.is_empty()) {
+            beside::run(&mut batch, || finalize_preludes(&mut pending_preludes));
+        } else {
+            let t_flush = std::time::Instant::now();
+            flush::last(|| batch.flush());
+            crate::watch::ask_once_end();
+            PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let t_pre = std::time::Instant::now();
+            finalize_preludes(&mut pending_preludes);
+            PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -4705,7 +4714,7 @@ impl Host {
                 *f += 1;
             }
         }
-        let apart = crate::compare_apart::split(
+        let mut apart = crate::compare_apart::split(
             card.as_ref().and_then(|c| c.check.clone()),
             &mut lists,
             crate::compare_apart::on(),
@@ -4729,22 +4738,34 @@ impl Host {
             let mut t_lists = crate::prep_cut::now();
             let signalled = {
                 let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
-                // SAFETY: closed lists; the fence is ours.
-                let signalled = unsafe {
-                    self.queue.ExecuteCommandLists(&lists);
-                    crate::prep_cut::lap(crate::prep_cut::F::ExecLists, &mut t_lists);
-                    crate::compare_apart::send(&self.queue, &apart);
-                    self.queue.Signal(&self.fence, *submitted)
+                let fence = *submitted;
+                // (`VICTORY_SEND_THREAD`) Noted as submitted before the thread signals it.
+                let note = || {
+                    self.submitted_fence.store(fence, Ordering::Release);
+                    back.iter().for_each(|(shadow, _)| shadow.note_write_fence(fence));
                 };
-                self.card_sent();
-                if signalled.is_ok() {
-                    self.submitted_fence.store(*submitted, Ordering::Release);
-                    crate::dred::sent(*submitted, this_submission, runs);
-                    for (shadow, _) in &back {
-                        shadow.note_write_fence(*submitted);
+                if send_thread::send_ahead(self, &mut lists, &mut apart, fence, note) {
+                    crate::dred::sent(fence, this_submission, runs);
+                    Ok(())
+                } else {
+                    send_thread::wait_idle();
+                    // SAFETY: closed lists; the fence is ours.
+                    let signalled = unsafe {
+                        self.queue.ExecuteCommandLists(&lists);
+                        crate::prep_cut::lap(crate::prep_cut::F::ExecLists, &mut t_lists);
+                        crate::compare_apart::send(&self.queue, &apart);
+                        self.queue.Signal(&self.fence, *submitted)
+                    };
+                    self.card_sent();
+                    if signalled.is_ok() {
+                        self.submitted_fence.store(*submitted, Ordering::Release);
+                        crate::dred::sent(*submitted, this_submission, runs);
+                        for (shadow, _) in &back {
+                            shadow.note_write_fence(*submitted);
+                        }
                     }
+                    signalled
                 }
-                signalled
             };
             drop(card_order);
             if let Err(e) = signalled {
@@ -4805,6 +4826,7 @@ impl Host {
             unsafe {
                 let waited = {
                     let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(group);
                     if i + 1 == groups.len() {
                         crate::compare_apart::send(&self.queue, &apart);
@@ -6168,6 +6190,7 @@ impl HostList {
                     .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
                 // And its records over the budget (`VICTORY_INDIRECT_REST`).
                 crate::indirect::rest::take(words, crate::indirect::budget::log2().unwrap_or(27));
+                crate::indirect::wide::take(words);
                 for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
@@ -6378,9 +6401,19 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_copy(dst, src, len);
                     crate::port::copied(dst, src, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if crate::wide_copy::cut_step(dst, src, len) {
+                        crate::wide_copy::copy_pieces(
+                            dst as *mut u8,
+                            src as *const u8,
+                            len,
+                            crate::wide_copy::STEP_PIECE,
+                            |d, s, n| copy_mapped(d, s, n, true),
+                        );
+                    } else {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     if check_heap_writes
@@ -6764,7 +6797,8 @@ impl Batch {
             None
         };
         let no_lazy = _lazy_hold.is_some();
-        if wide_refresh() && total_bytes >= 32 * 1024 && self.pending_fills.len() >= 8 {
+        let cut = crate::wide_copy::on() && crate::wide_copy::split_fills(&mut self.pending_fills);
+        if wide_refresh() && total_bytes >= 32 * 1024 && (self.pending_fills.len() >= 8 || cut) {
             let fills = std::sync::Arc::new(std::mem::take(&mut self.pending_fills));
             let total = fills.len();
             let chunk = (total / 24).clamp(1, 32);
@@ -7019,6 +7053,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    read_sparse_with(src, dst, len, sparse_zero::on());
+}
+
+/// [`read_sparse`]; `safe_zero`: the zeros for what is not there go only
+/// where the destination is committed (`VICTORY_SPARSE_ZERO_SAFE`).
+fn read_sparse_with(src: *const u8, dst: *mut u8, len: usize, safe_zero: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -7041,8 +7081,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            if safe_zero {
+                sparse_zero::zero(to, n);
+            } else {
+                // SAFETY: this path is only used with a writable host destination.
+                unsafe { to.write_bytes(0, n) };
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
@@ -7062,8 +7106,12 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if sparse_zero::on() {
+                        sparse_zero::zero(to, n);
+                    } else {
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
@@ -7851,6 +7899,7 @@ impl Meter {
         crate::indirect::budget::line(frames);
         crate::indirect::rest::line(frames);
         crate::indirect::raw_check::line(frames);
+        crate::indirect::wide::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
@@ -8010,6 +8059,7 @@ impl Meter {
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
+        crate::alias_later::line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
             [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -8366,6 +8416,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            send_thread::wait_idle();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9183,16 +9234,24 @@ mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_flush_beside.rs"]
+mod beside;
+#[path = "host_send_thread.rs"]
+pub(crate) mod send_thread;
 #[path = "host_one_pass.rs"]
 mod one_pass;
 #[path = "host_step_reads.rs"]
 mod step_reads;
 #[path = "host_run_split.rs"]
 mod run_split;
+#[path = "host_scoped_flush.rs"]
+mod scoped_flush;
 #[path = "host_run_wait.rs"]
 mod run_wait;
 #[path = "host_ask.rs"]
 mod ask;
+#[path = "host_sparse_zero.rs"]
+mod sparse_zero;
 use step_reads::blocked_by;
 
 #[cfg(test)]

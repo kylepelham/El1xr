@@ -66,7 +66,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
-                taken: 0,
+                taken: crate::result_ring::Ring::new((RESULTS / 4) as u32),
                 out: 0,
                 snap,
                 patch,
@@ -437,8 +437,10 @@ impl Host {
         // now, and its list recorded on a kept thread beside the sync list.
         let aside = crate::prep_cut::check_aside() && (!dirty.is_empty() || !uploads.is_empty());
         let mut early: Option<(Vec<CardRange>, Option<Prelude>)> = None;
+        let mut results = (0, 0);
         if aside {
-            let ranges = card_ranges(&declared, joined_decl, &mut work.taken, work.differs.2);
+            let ranges;
+            (ranges, results) = place_ranges(&mut work.taken, work.out, &declared, joined_decl);
             lap.mark(P::Spans);
             let check = ranges.iter().any(|r| r.compared).then(|| {
                 work.check.pop().or_else(|| self.make_prelude()).unwrap_or_else(|| {
@@ -469,7 +471,7 @@ impl Host {
             type Sends = (Option<Vec<(usize, usize)>>, Vec<(usize, usize, usize)>);
             let mut sends: Vec<Sends> = Vec::with_capacity(dirty.len());
             if work.patch.is_some() {
-                let least = masks_least();
+                let least = crate::prep_cut::masks_least().unwrap_or_else(masks_least);
                 let split: Vec<_> = dirty
                     .iter()
                     .map(|(_, ranges)| masked_blocks_slices(ranges, least))
@@ -549,6 +551,7 @@ impl Host {
                             continue;
                         };
                         let copies = copies_opt.as_deref().unwrap_or(ranges.as_slice());
+                        crate::prep_cut::add(crate::prep_cut::F::SyncCopies, copies.len() as u64);
                         for &(a, b) in copies {
                             list.CopyBufferRegion(
                                 &shadow.buffer,
@@ -566,6 +569,7 @@ impl Host {
                     // (Neptune) Transient windows: from their chunks, in the order copied. No
                     // masks, no compare, nothing hashed: shaders do not write them.
                     for (shadow, parts) in &uploads {
+                        crate::prep_cut::add(crate::prep_cut::F::SyncCopies, parts.len() as u64);
                         for (a, b, chunk) in parts {
                             list.CopyBufferRegion(
                                 &shadow.buffer,
@@ -783,17 +787,20 @@ impl Host {
             masks,
             inflight: false,
             inflight_landed: 0,
+            results: (0, 0),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let (ranges, early_check) = match early {
             Some((ranges, check)) => (ranges, check),
             None => {
-                let ranges = card_ranges(&declared, joined_decl, &mut work.taken, work.differs.2);
+                let ranges;
+                (ranges, results) = place_ranges(&mut work.taken, work.out, &declared, joined_decl);
                 (ranges, None)
             }
         };
         plan.ranges = ranges;
+        plan.results = results;
         lap.mark(P::Spans);
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = early_check
@@ -834,12 +841,13 @@ impl Host {
     /// With [`relay`]: whether the compare's result area is half taken by
     /// plans in the air. It starts from the beginning only when no plan is
     /// out, so the caller lets the flights land first.
+    /// ([`crate::result_ring`]: three quarters, as a ring.)
     pub(super) fn card_results_low(&self) -> bool {
         CARD_WORK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+            .is_some_and(|work| work.taken.wants_landing(work.out, crate::result_ring::on()))
     }
 
     /// The plan's submission has run and its results were read
@@ -861,10 +869,9 @@ impl Host {
         work.masks.extend(plan.masks);
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
-        // not read yet: the area starts again only when none is out.
-        if !relay() || work.out == 0 {
-            work.taken = 0;
-        }
+        // not read yet: the area starts again only when none is out (as a
+        // ring, the plan's own stretch comes back now).
+        work.taken.give(plan.results, !relay() || work.out == 0);
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
@@ -903,6 +910,7 @@ impl Host {
                 let allocator: ID3D12CommandAllocator = self
                     .device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                     0,
                     D3D12_COMMAND_LIST_TYPE_COPY,
@@ -1227,6 +1235,8 @@ impl Host {
                     // In the order of the queue: the sends of title bytes so
                     // far are ahead of this fetch, every later one behind it.
                     let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    // Sends handed to the thread that sends (`VICTORY_SEND_THREAD`) are counted in `order`.
+                    super::send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&lists);
                     let after = *order;
                     drop(order);
@@ -1495,13 +1505,28 @@ impl Host {
 /// fetch inside the flight, whether every range has it and the slots landed.
 type CheckRecorded = (windows::core::Result<ID3D12CommandList>, Option<(bool, u32)>);
 
+/// [`card_ranges`] placed where the result area has room for the plan
+/// ([`crate::result_ring`]), and the stretch of it they took.
+fn place_ranges(
+    taken: &mut crate::result_ring::Ring,
+    out: u32,
+    declared: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    joined_decl: bool,
+) -> (Vec<CardRange>, (u32, u32)) {
+    let (start, limit) = taken.room(out, crate::result_ring::on());
+    let mut at = start;
+    let ranges = card_ranges(declared, joined_decl, &mut at, u64::from(limit));
+    (ranges, taken.took(start, at))
+}
+
 /// `card_before`'s compare ranges: each copy's declared ranges joined, each
-/// placed in the compare's results from `taken` on (moved past them).
+/// placed in the compare's results from `taken` on (moved past them), below
+/// the dword `most`.
 fn card_ranges(
     declared: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
     joined_decl: bool,
     taken: &mut u32,
-    differs_bytes: u64,
+    most: u64,
 ) -> Vec<CardRange> {
     let mut at = *taken;
     let mut out: Vec<CardRange> = Vec::new();
@@ -1532,7 +1557,7 @@ fn card_ranges(
                 continue;
             };
             let slot = twin
-                .then(|| run.slot(span.first, span.pieces, &mut at, differs_bytes / 4))
+                .then(|| run.slot(span.first, span.pieces, &mut at, most))
                 .flatten();
             out.push(CardRange {
                 shadow: shadow.clone(),

@@ -3,7 +3,7 @@
 //! in place of it.
 
 use super::*;
-use crate::bake_inputs::{C, PARAM_DWORDS, USER_WORD, add, params_offset, slots};
+use crate::bake_inputs::{C, PARAM_DWORDS, USER_WORD, add, slots};
 
 thread_local! {
     /// While a bake draw's passes run: the title slots it reads, served first by
@@ -57,6 +57,8 @@ impl State {
         let Some((heap, host)) = self.view_heap() else {
             return self.early_textures_plain(list, p, false);
         };
+        // `VICTORY_BAKE_FRESH=1`: its stale slots out of the queue are due now too.
+        let fresh = crate::bake_fresh::on().then(|| self.bake_fresh_before(heap, host, &mine));
         let before = host.texture_slots_pick(&mine).len() as u64;
         PINNED.set(mine);
         SERVED.set(false);
@@ -76,6 +78,9 @@ impl State {
         let waited_ms = self.bake_wait(list, heap, host);
         let mine = PINNED.take();
         let left = host.texture_slots_pick(&mine);
+        if let Some(seen) = &fresh {
+            self.bake_fresh_after(p, heap, host, seen);
+        }
         if crate::bake_why::why() {
             self.bake_why(p, heap, host, &left, waited_ms);
         }
@@ -198,11 +203,25 @@ impl State {
     /// The title slots bake draw `p` reads textures from (`crate::bake_inputs`): from its
     /// parameter constants and records, found through user data word 9.
     pub(super) fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
-        let stage = p
+        let (params, base, len) = self.bake_input_params(p)?;
+        Some(slots(&params, |off| {
+            (off.saturating_add(4) <= len)
+                .then(|| words(base.checked_add(off)?, 1))
+                .flatten()
+                .map(|w| w[0])
+        }))
+    }
+
+    /// Bake draw `p`'s parameter dwords, and its records buffer's title address and length.
+    pub(super) fn bake_input_params(
+        &self,
+        p: &HostPipeline,
+    ) -> Option<([u32; PARAM_DWORDS], u64, u64)> {
+        // (`VICTORY_BAKE_BY_NAME`: also a bake program by name, its offset by family.)
+        let (stage, offsets) = p
             .stages
             .iter()
-            .find(|s| params_offset(s.shader.hash.as_str()).is_some())?;
-        let offset = params_offset(stage.shader.hash.as_str())?;
+            .find_map(|s| Some((s, crate::bake_name::offsets(&s.shader)?)))?;
         let t = stage.translated();
         let u = t.host.user_data.iter().find(|u| u.index == USER_WORD)?;
         if matches!(u.root, RootType::Other(_)) {
@@ -210,15 +229,17 @@ impl State {
         }
         let word = self.user_value(false, u.slot, u.root, u.dword);
         let (heap, _) = self.view_heap()?;
-        let params = match crate::descriptor::view(heap.handle(word.wrapping_add(offset) >> 5)?)? {
-            View::Constant(at, size) => {
-                let n = (size as usize / 4).min(PARAM_DWORDS);
-                let mut p = [0u32; PARAM_DWORDS];
-                p[..n].copy_from_slice(&words(at, n)?);
-                p
+        let params = offsets.iter().find_map(|&offset| {
+            match crate::descriptor::view(heap.handle(word.wrapping_add(offset) >> 5)?)? {
+                View::Constant(at, size) => {
+                    let n = (size as usize / 4).min(PARAM_DWORDS);
+                    let mut p = [0u32; PARAM_DWORDS];
+                    p[..n].copy_from_slice(&words(at, n)?);
+                    Some(p)
+                }
+                _ => None,
             }
-            _ => return None,
-        };
+        })?;
         let records = crate::descriptor::view(heap.handle(word >> 5)?)?;
         let (base, len) = match records {
             View::Shader(object, None) => {
@@ -227,12 +248,7 @@ impl State {
             }
             _ => crate::descriptor::host::buffer_range(&records)?,
         };
-        Some(slots(&params, |off| {
-            (off.saturating_add(4) <= len)
-                .then(|| words(base.checked_add(off)?, 1))
-                .flatten()
-                .map(|w| w[0])
-        }))
+        Some((params, base, len))
     }
 }
 
@@ -254,13 +270,14 @@ pub(super) fn mapped(address: u64, len: u64) -> u64 {
     crate::texture::mapped_bytes(address as *const u8, len as usize)
 }
 
-/// The bake pixel shader of `p`, as [`BAKE_PIXEL_SHADERS`] names it.
+/// The bake pixel shader of `p`, as [`BAKE_PIXEL_SHADERS`] names it (`by_name`: a bake by
+/// `VICTORY_BAKE_BY_NAME` alone).
 pub(super) fn bake_hash(p: &HostPipeline) -> &'static str {
     p.stages
         .iter()
         .find_map(|s| BAKE_PIXEL_SHADERS.iter().find(|&&h| h == s.shader.hash.as_str()))
         .copied()
-        .unwrap_or("?")
+        .unwrap_or(if p.is_bake { "by_name" } else { "?" })
 }
 
 #[cfg(test)]

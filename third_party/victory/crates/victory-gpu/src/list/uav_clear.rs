@@ -3,6 +3,9 @@
 //! memory. D3D12 needs a CPU descriptor and a matching GPU descriptor in the
 //! currently bound shader-visible heap. The queued recording owns the latter
 //! until the list retires.
+//!
+//! [`record`] is shared with `VICTORY_ZERO_OUT` (`crate::zero_out`), which clears a named
+//! program's outputs instead of running its dispatch.
 
 use super::{Rect, This};
 use crate::descriptor::{View, host as views};
@@ -29,7 +32,7 @@ extern "system" fn clear<const FLOAT: bool>(
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
     let mut recorded = false;
     super::with_state(this, |list, state| {
-        let (Some(host), Some(values)) = (crate::host::host(), unsafe { values.as_ref() }) else {
+        let (Some(_), Some(values)) = (crate::host::host(), unsafe { values.as_ref() }) else {
             return;
         };
         if resource.is_null() || count != 0 && rects.is_null() {
@@ -50,63 +53,13 @@ extern "system" fn clear<const FLOAT: bool>(
                     && views::buffer_extent(&view).is_some() => {}
             _ => return,
         }
-        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 1,
-            ..Default::default()
+        let rects: &[Rect] = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: the title passes `count` rectangles.
+            unsafe { std::slice::from_raw_parts(rects, count as usize) }
         };
-        // SAFETY: one CPU-only slot, consumed when recording the clear.
-        let Ok(staging) = (unsafe {
-            host.device
-                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc)
-        }) else {
-            return;
-        };
-        let cpu = unsafe { staging.GetCPUDescriptorHandleForHeapStart() };
-        let Some((Some(backing), _)) = views::make(&view, cpu) else {
-            return;
-        };
-        let buffer = views::buffer_copy(&view);
-        if buffer.as_ref().is_some_and(|(s, _, _)| s.buffer != backing) {
-            return;
-        }
-        let Some((copy, gpu)) = state.clear_slot(list, gpu, &view) else {
-            return;
-        };
-        if let Some((shadow, address, len)) = buffer {
-            shadow.refresh(list, address, len);
-            shadow.gpu_writes(list, address, len);
-        } else if !list.twin_use(resource, true, true) {
-            super::ensure_state(
-                list,
-                resource,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
-            );
-        }
-        list.keep(&backing);
-        // SAFETY: both descriptors describe backing. The recording owns the
-        // bound heap and its allocated slot. A zero count permits a null RECT.
-        unsafe {
-            host.device.CopyDescriptorsSimple(1, copy, cpu, desc.Type);
-            let rects = if count == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(rects.cast(), count as usize)
-            };
-            if FLOAT {
-                list.list.ClearUnorderedAccessViewFloat(
-                    gpu,
-                    cpu,
-                    &backing,
-                    &values.map(f32::from_bits),
-                    rects,
-                );
-            } else {
-                list.list
-                    .ClearUnorderedAccessViewUint(gpu, cpu, &backing, values, rects);
-            }
-        }
-        recorded = true;
+        recorded = record(list, state, gpu, &view, Some(resource), values, rects, FLOAT);
     });
     let n = if recorded { &DONE } else { &SKIPPED }.fetch_add(1, Relaxed) + 1;
     if n.is_power_of_two() {
@@ -116,6 +69,85 @@ extern "system" fn clear<const FLOAT: bool>(
             "console UAV clears"
         );
     }
+}
+
+/// Records on `list` a clear of `view` to `values` (`rects`: all of it when empty); `gpu` is
+/// where the title keeps the view, in the heap `state` has bound. `resource`: the resource
+/// the view is of, for a texture's state (`None`: only a buffer view with a host copy is
+/// cleared). Whether it recorded the clear.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record(
+    list: &crate::host::HostList,
+    state: &mut crate::draw::State,
+    gpu: u64,
+    view: &View,
+    resource: Option<This>,
+    values: &[u32; 4],
+    rects: &[Rect],
+    float: bool,
+) -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        NumDescriptors: 1,
+        ..Default::default()
+    };
+    // SAFETY: one CPU-only slot, consumed when recording the clear.
+    let Ok(staging) = (unsafe {
+        host.device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc)
+    }) else {
+        return false;
+    };
+    let cpu = unsafe { staging.GetCPUDescriptorHandleForHeapStart() };
+    let Some((Some(backing), _)) = views::make(view, cpu) else {
+        return false;
+    };
+    let buffer = views::buffer_copy(view);
+    if buffer.as_ref().is_some_and(|(s, _, _)| s.buffer != backing) {
+        return false;
+    }
+    if buffer.is_none() && resource.is_none() {
+        return false;
+    }
+    let Some((copy, gpu)) = state.clear_slot(list, gpu, view) else {
+        return false;
+    };
+    if let Some((shadow, address, len)) = buffer {
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+    } else if let Some(resource) = resource
+        && !list.twin_use(resource, true, true)
+    {
+        super::ensure_state(
+            list,
+            resource,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+        );
+    }
+    list.keep(&backing);
+    // SAFETY: both descriptors describe backing. The recording owns the
+    // bound heap and its allocated slot. `Rect` is laid out as `RECT`.
+    unsafe {
+        host.device.CopyDescriptorsSimple(1, copy, cpu, desc.Type);
+        let rects: &[windows::Win32::Foundation::RECT] =
+            std::slice::from_raw_parts(rects.as_ptr().cast(), rects.len());
+        if float {
+            list.list.ClearUnorderedAccessViewFloat(
+                gpu,
+                cpu,
+                &backing,
+                &values.map(f32::from_bits),
+                rects,
+            );
+        } else {
+            list.list
+                .ClearUnorderedAccessViewUint(gpu, cpu, &backing, values, rects);
+        }
+    }
+    true
 }
 
 #[cfg(test)]

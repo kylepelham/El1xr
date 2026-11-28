@@ -25,19 +25,19 @@ mod state_bytes;
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
-    blend: D3D12_BLEND_DESC,
-    sample_mask: u32,
-    rasterizer: D3D12_RASTERIZER_DESC,
-    depth: D3D12_DEPTH_STENCIL_DESC,
-    depth_bounds: bool,
+    pub(super) blend: D3D12_BLEND_DESC,
+    pub(super) sample_mask: u32,
+    pub(super) rasterizer: D3D12_RASTERIZER_DESC,
+    pub(super) depth: D3D12_DEPTH_STENCIL_DESC,
+    pub(super) depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
-    inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-    names: Vec<CString>,
-    strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    pub(super) inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    pub(super) names: Vec<CString>,
+    pub(super) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
-    depth_format: DXGI_FORMAT,
-    samples: DXGI_SAMPLE_DESC,
+    pub(super) depth_format: DXGI_FORMAT,
+    pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
 impl Default for GraphicsState {
@@ -234,6 +234,16 @@ impl GraphicsState {
             BackFace: d.BackFace,
             DepthBoundsTestEnable: self.depth_bounds.into(),
         }
+    }
+
+    /// (`VICTORY_SCREEN_PIPELINE_WAIT`) Whether it draws a pass over the
+    /// screen: triangles with no vertex input and no depth or stencil test
+    /// (the title's lighting, composition and post passes).
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -581,7 +591,10 @@ impl HostPipeline {
         let is_bake = compute.is_none()
             && bound
                 .iter()
-                .any(|s| crate::draw::BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+                .any(|s| {
+                    crate::draw::BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())
+                        || crate::bake_name::extra(&s.shader)
+                });
         // (fxceless/victory-fork b1d777a) The launch stage's parameters after the
         // translated stages' (five root words); without them if over the limit.
         let mut launch_roots = (mesh.is_some() && crate::launch::on()).then(|| launch::add_params(&mut params));
@@ -1204,6 +1217,30 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// Source: fxceless/victory-fork #892 (sagouindupm).
+    #[test]
+    fn screen_pass_is_inputless_depthless_triangles() {
+        let mut s = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        assert!(s.screen_pass(), "no depth format: a screen pass");
+        s.depth_format = DXGI_FORMAT_D32_FLOAT;
+        s.depth.DepthEnable = true.into();
+        assert!(!s.screen_pass(), "a depth test: not a screen pass");
+        s.depth.DepthEnable = false.into();
+        s.depth.StencilEnable = false.into();
+        assert!(s.screen_pass(), "a depth target with no test: a screen pass");
+        s.depth.StencilEnable = true.into();
+        assert!(!s.screen_pass(), "a stencil test: not a screen pass");
+        s.depth.StencilEnable = false.into();
+        s.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!s.screen_pass(), "vertex input: not a screen pass");
+        s.inputs.clear();
+        s.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!s.screen_pass(), "lines: not a screen pass");
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {

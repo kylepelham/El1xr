@@ -99,9 +99,12 @@ pub(crate) enum Kind {
     EmptyViews,
     Unmade,
     KeptRead,
+    /// Draws of passes over the screen dropped while their pipeline was
+    /// being made (`crate::pipeline::make::screen_wait`).
+    ScreenUnmade,
 }
 
-pub(crate) const KINDS: usize = 28;
+pub(crate) const KINDS: usize = 29;
 const NAMES: [&str; KINDS] = [
     "ran",
     "dropped",
@@ -131,6 +134,7 @@ const NAMES: [&str; KINDS] = [
     "empty_views",
     "unmade_views",
     "kept_read",
+    "screen_unmade",
 ];
 
 static NOW: [AtomicU32; KINDS] = [const { AtomicU32::new(0) }; KINDS];

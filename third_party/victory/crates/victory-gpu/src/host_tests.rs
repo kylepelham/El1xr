@@ -365,6 +365,62 @@ mod mask_tests {
             assert_eq!(block_mask(1, sample), block_mask_scalar(1, sample));
         }
     }
+
+    /// (entryhitch, `VICTORY_SYNC_MASKS_LEAST`) Whatever the least number
+    /// of ranges a masked block takes, the copies and then the masked pass
+    /// (as `CARD_PATCH` does: a byte whose bit is set is taken from the
+    /// CPU side) leave the card side exactly as one copy per range does:
+    /// every range's bytes, and nothing between them.
+    #[test]
+    fn any_least_sends_the_same_bytes_as_a_copy_per_range() {
+        const LEN: usize = 96 * 1024;
+        let cpu: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let card: Vec<u8> = (0..LEN).map(|i| (i * 13 + 200) as u8).collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        for round in 0..200 {
+            // Ranges in order, none touching another (as `card_dirty` joins
+            // them), some a few bytes, some across a block's end, some long.
+            let mut ranges = Vec::new();
+            let mut at = next(64);
+            while at < LEN - 1 {
+                let len = match next(10) {
+                    0 => 4096 + next(12_000),
+                    1 => 1 + next(4096),
+                    _ => 1 + next(48),
+                };
+                let end = (at + len).min(LEN);
+                ranges.push((at, end));
+                at = end + 1 + next(if round % 2 == 0 { 64 } else { 3000 });
+            }
+            let mut want = card.clone();
+            for &(a, b) in &ranges {
+                want[a..b].copy_from_slice(&cpu[a..b]);
+            }
+            for least in 1..=6 {
+                let (copies, blocks) = masked_blocks(&ranges, least);
+                let mut got = card.clone();
+                for &(a, b) in &copies {
+                    got[a..b].copy_from_slice(&cpu[a..b]);
+                }
+                for (block, in_block) in &blocks {
+                    let mask = block_mask(*block, in_block);
+                    for i in 0..4096 {
+                        if mask[i / 8] & (1 << (i % 8)) != 0 {
+                            let at = block * 4096 + i;
+                            got[at] = cpu[at];
+                        }
+                    }
+                }
+                assert!(got == want, "round {round}, least {least}");
+            }
+        }
+    }
 }
 
 mod relay_merge_tests {

@@ -28,6 +28,16 @@
 //! 600 frames after it went stale; a slot no draw read is made null as
 //! before.
 //!
+//! `VICTORY_FLICKER_KEEP_MS=N` (milliseconds, up to 120,000; off by default;
+//! after zm0kiemedia/Neptune_VI `61f2206058`, "stale slots kept until
+//! replaced, black sky fix"): a stale slot keeps showing its old view until
+//! the title makes it again (its replacement view lands) or `N` ms have
+//! passed, whichever is first, instead of `VICTORY_FLICKER_KEEP`'s frames.
+//! Batch 5 found the title rarely writes a stale slot again within 600
+//! frames, so the frame wait mostly ended in a null; this one waits two
+//! minutes. Taken over `VICTORY_FLICKER_KEEP` when both are set. The cost:
+//! the old host copies stay alive for that long (memory on the card).
+//!
 //! `VICTORY_FLICKER_WATCH=1`: a line a frame (frames with any) counting the
 //! paths that make a slot read black: stale slots made null (and how many
 //! while a submission was in the air), stale slots kept and made null
@@ -46,6 +56,22 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 pub(super) fn keep_frames() -> u64 {
     static N: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_FLICKER_KEEP", parse_keep);
     N.get()
+}
+
+/// Milliseconds a stale slot keeps its old view until made again
+/// (`VICTORY_FLICKER_KEEP_MS`); 0 off. Live, as [`keep_frames`].
+pub(super) fn keep_ms() -> u64 {
+    static N: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_FLICKER_KEEP_MS", parse_keep_ms);
+    N.get()
+}
+
+/// The longest wait `VICTORY_FLICKER_KEEP_MS` takes (Neptune's 120 s).
+const MOST_MS: u64 = 120_000;
+
+fn parse_keep_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(0, |n| n.min(MOST_MS))
 }
 
 /// `VICTORY_FLICKER_KEEP_READ=1`: a kept slot a draw read during its wait
@@ -173,11 +199,13 @@ pub(super) fn made_view(copy: &crate::resource::HostTexture, first: Option<u32>)
     }
 }
 
-/// A stale slot waiting to be made null: (frame it may go, submission that
-/// must finish first, frame it went stale, frame its wait began, host heap,
-/// slot, its key, the host copy it showed).
+/// A stale slot waiting to be made null: (frame it may go, time it may go
+/// (ms, `crate::host::now_ms`; 0: any), submission that must finish first,
+/// frame it went stale, frame its wait began, host heap, slot, its key, the
+/// host copy it showed).
 struct Held {
     frame: u64,
+    ms: u64,
     after: u64,
     stale: u64,
     since: u64,
@@ -193,10 +221,11 @@ static LINE: Mutex<VecDeque<Held>> = Mutex::new(VecDeque::new());
 /// with the switch off too, so none is left showing its old view.
 static EVER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a held slot may be made null: its frames are over and every
-/// submission begun when it went stale has finished.
-fn over(held: &Held, frame: u64, finished: u64) -> bool {
-    held.frame <= frame && held.after <= finished
+/// Whether a held slot may be made null at frame `frame` and time `ms`: its
+/// frames and time are over and every submission begun when it went stale
+/// has finished.
+fn over(held: &Held, frame: u64, ms: u64, finished: u64) -> bool {
+    held.frame <= frame && held.ms <= ms && held.after <= finished
 }
 
 impl super::HostHeap {
@@ -211,7 +240,8 @@ impl super::HostHeap {
         if key == 0 {
             return false;
         }
-        let frames = keep_frames();
+        let ms = keep_ms();
+        let frames = if ms != 0 { 1 } else { keep_frames() };
         if frames == 0 || self.sampler {
             count(Count::StaleNulled);
             if crate::host::submissions_started() > crate::host::submissions_finished() {
@@ -222,14 +252,17 @@ impl super::HostHeap {
         self.hold_stale(
             made,
             index,
-            crate::frame::current() + frames,
+            (
+                crate::frame::current() + frames,
+                if ms != 0 { crate::host::now_ms() + ms } else { 0 },
+            ),
             crate::host::submissions_started(),
         )
     }
 
     /// [`super::HostHeap::stale_kept`] with the switch on: slot `index`
-    /// keeps its view until frame `frame` and submission `after`.
-    fn hold_stale(&self, made: &mut [u64], index: u32, frame: u64, after: u64) -> bool {
+    /// keeps its view until frame and time `(frame, ms)` and submission `after`.
+    fn hold_stale(&self, made: &mut [u64], index: u32, (frame, ms): (u64, u64), after: u64) -> bool {
         let key = made[index as usize];
         let raw = self.kept.get(index as usize).and_then(|k| {
             k.lock()
@@ -251,6 +284,7 @@ impl super::HostHeap {
             .unwrap_or_else(|e| e.into_inner())
             .push_back(Held {
                 frame,
+                ms,
                 after,
                 stale: now,
                 since: now,
@@ -266,24 +300,29 @@ impl super::HostHeap {
     /// Makes null the held slots of this heap whose wait is over, if they
     /// still show what they showed when they went stale.
     pub(super) fn stale_due(&self) {
-        if keep_frames() == 0 && !EVER_HELD.load(Relaxed) {
+        if keep_frames() == 0 && keep_ms() == 0 && !EVER_HELD.load(Relaxed) {
             return;
         }
-        self.release_stale(crate::frame::current(), crate::host::submissions_finished());
+        self.release_stale(
+            (crate::frame::current(), crate::host::now_ms()),
+            crate::host::submissions_finished(),
+        );
     }
 
     /// Makes null the held slots of this heap whose wait is over at frame
-    /// `frame` with submissions up to `finished` done; how many.
-    fn release_stale(&self, frame: u64, finished: u64) -> usize {
+    /// and time `(frame, ms)` with submissions up to `finished` done; how many.
+    fn release_stale(&self, (frame, ms): (u64, u64), finished: u64) -> usize {
         let me = std::ptr::from_ref(self) as usize;
         let due: Vec<Held> = {
             let mut line = LINE.lock().unwrap_or_else(|e| e.into_inner());
-            if line.is_empty() {
+            // A two-minute wait (`VICTORY_FLICKER_KEEP_MS`) holds thousands:
+            // moved only when one of them is due.
+            if !line.iter().any(|h| h.host == me && over(h, frame, ms, finished)) {
                 return 0;
             }
             let (due, left): (Vec<Held>, Vec<Held>) = line
                 .drain(..)
-                .partition(|h| h.host == me && over(h, frame, finished));
+                .partition(|h| h.host == me && over(h, frame, ms, finished));
             line.extend(left);
             due
         };
@@ -376,6 +415,7 @@ mod tests {
     fn held(frame: u64, after: u64) -> Held {
         Held {
             frame,
+            ms: 0,
             after,
             stale: frame,
             since: frame,
@@ -389,13 +429,26 @@ mod tests {
     #[test]
     fn a_kept_slot_waits_for_its_frames_and_its_submissions() {
         let h = held(10, 7);
-        assert!(!over(&h, 9, 7), "frames not over");
+        assert!(!over(&h, 9, 0, 7), "frames not over");
         assert!(
-            !over(&h, 10, 6),
+            !over(&h, 10, 0, 6),
             "a submission begun before it is still in the air"
         );
-        assert!(over(&h, 10, 7));
-        assert!(over(&h, 12, 9));
+        assert!(over(&h, 10, 0, 7));
+        assert!(over(&h, 12, 0, 9));
+        // `VICTORY_FLICKER_KEEP_MS`: its time too.
+        let h = Held { ms: 5_000, ..held(10, 7) };
+        assert!(!over(&h, 400, 4_999, 9), "time not over");
+        assert!(over(&h, 400, 5_000, 9));
+    }
+
+    #[test]
+    fn keep_ms_is_off_unless_a_number_and_at_most_two_minutes() {
+        assert_eq!(parse_keep_ms(None), 0);
+        assert_eq!(parse_keep_ms(Some("x")), 0);
+        assert_eq!(parse_keep_ms(Some(" 120000 ")), 120_000);
+        assert_eq!(parse_keep_ms(Some("500000")), 120_000);
+        victory_core::settings::check_live("VICTORY_FLICKER_KEEP_MS", "9000", keep_ms, 0, 9000);
     }
 
     /// A stale slot with the switch keeps its host copy and forgets its
@@ -424,22 +477,22 @@ mod tests {
             made[i] = key;
             heap.keep(i as u32, Some(if i == 1 { a.clone() } else { b.clone() }));
         }
-        assert!(heap.hold_stale(&mut made, 1, 100, 40));
-        assert!(heap.hold_stale(&mut made, 2, 100, 40));
+        assert!(heap.hold_stale(&mut made, 1, (100, 0), 40));
+        assert!(heap.hold_stale(&mut made, 2, (100, 0), 40));
         assert_eq!(made[1], 0, "the view is forgotten: a title write makes it again");
         assert_eq!(shown(1), Some(raw_of(&a)), "the old host copy is still shown");
         // A slot showing nothing of the host's has nothing to keep.
         made[3] = key;
-        assert!(!heap.hold_stale(&mut made, 3, 100, 40));
+        assert!(!heap.hold_stale(&mut made, 3, (100, 0), 40));
         // Slot 2 made again meanwhile (another host copy).
         let (c, _) = host.upload_buffer(256).unwrap();
         heap.keep(2, Some(c.clone()));
-        assert_eq!(heap.release_stale(99, 40), 0, "frames not over");
-        assert_eq!(heap.release_stale(100, 39), 0, "a submission still in the air");
-        assert_eq!(heap.release_stale(100, 40), 1);
+        assert_eq!(heap.release_stale((99, 0), 40), 0, "frames not over");
+        assert_eq!(heap.release_stale((100, 0), 39), 0, "a submission still in the air");
+        assert_eq!(heap.release_stale((100, 0), 40), 1);
         assert_eq!(shown(1), None, "made null after its wait");
         assert_eq!(shown(2), Some(raw_of(&c)), "made again: left as it is");
-        assert_eq!(heap.release_stale(200, 99), 0, "nothing left");
+        assert_eq!(heap.release_stale((200, 0), 99), 0, "nothing left");
     }
 
     #[test]

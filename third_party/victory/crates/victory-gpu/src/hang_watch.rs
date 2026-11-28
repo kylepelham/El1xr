@@ -107,6 +107,14 @@ fn say(completed: u64, queued: u64, stood: Duration) {
     for line in flights(completed) {
         tracing::error!("hang watch: {line}");
     }
+    let (alive, made, most) = crate::alloc_count::counts();
+    let (idle, _) = crate::list::idle_pool();
+    tracing::error!(
+        "hang watch: command allocators alive {alive} (most {most}, made {made}); idle host lists {idle}"
+    );
+    if let Some(line) = crate::consumer_gate::hang_line() {
+        tracing::error!("hang watch: {line}");
+    }
     let (shader, other) = switches();
     tracing::error!("hang watch: shader switches set: {}", shader.join(" "));
     tracing::error!("hang watch: other switches set: {}", other.join(" "));

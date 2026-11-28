@@ -228,7 +228,20 @@ impl<'a> Lower<'a> {
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                // A slot that shows nothing (a null view: a texture not there yet,
+                // a view the host refused) reports no texels and no levels, and
+                // 0 - 1 fills every bit of these fields. The console's empty
+                // descriptor reads as one texel and one level: with the switch each
+                // count is taken as at least 1 (`max_u32(x, 1)`).
+                let floor = super::super::null_view_size::on();
+                let less = |l: &mut Self, x: V| {
+                    let x = if floor && x != one {
+                        l.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[x, one])
+                    } else {
+                        x
+                    };
+                    l.s.m.bin(c, Bin::Sub, x, one)
+                };
                 let (w, height, depth, levels) = (
                     less(self, w),
                     less(self, height),

@@ -737,6 +737,7 @@ impl LazyReadback {
                 Err(_) => (host.queue().clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
             };
             let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(list_type).ok()?;
+            crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList =
                 host.device.CreateCommandList(0, list_type, &allocator, None).ok()?;
             list.Close().ok()?;
@@ -889,6 +890,9 @@ impl LazyReadback {
             let ok = unsafe {
                 (|| -> windows::core::Result<()> {
                     if !waited_cross_queue && carded_req > host.fence.GetCompletedValue() {
+                        // Its signal on the host queue first (`VICTORY_SEND_THREAD`):
+                        // waited for on the host queue itself, it would never come.
+                        crate::host::send_thread::wait_idle();
                         self.queue.Wait(&host.fence, carded_req)?;
                         waited_cross_queue = true;
                     }
@@ -919,6 +923,8 @@ impl LazyReadback {
                     }
                     self.list.Close()?;
                     let cmd: ID3D12CommandList = self.list.cast()?;
+                    // The host queue when there is no copy queue (`VICTORY_SEND_THREAD`).
+                    crate::host::send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(cmd)]);
                     self.fence_value += 1;
                     self.queue.Signal(&self.fence, self.fence_value)?;

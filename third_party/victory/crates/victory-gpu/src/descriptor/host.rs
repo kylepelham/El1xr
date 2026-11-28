@@ -15,7 +15,9 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod buffer_format;
+mod copy_first;
 mod flicker;
+mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
@@ -24,6 +26,7 @@ pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 mod slot_wait;
+mod srgb_cast;
 pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
 
@@ -713,19 +716,37 @@ pub(crate) fn page_written(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
+    // `VICTORY_HEAP_NOTICES`: for each view heap.
+    let push = |ranges: &mut Vec<(u64, u64)>, start, end| push_range(ranges, start, end, MOST);
+    let mut compacted = heap_notices::note(heap_notices::Kind::Written, start, end, push);
+    if heap_notices::shared_read() {
+        let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        compacted += push_range(&mut ranges, start, end, MOST);
+    }
+    if compacted != 0 {
+        PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
+    }
+}
+
+/// Keeps `[start, end)` in `ranges`, joined to the last range if it
+/// follows it (pages are mapped and written one after the other); a full
+/// list is compacted first. Returns how many ranges were compacted.
+fn push_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize) -> usize {
     if let Some(last) = ranges.last_mut()
         && last.1 == start
     {
         last.1 = end;
-        return;
+        return 0;
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        compact(&mut ranges, MOST);
+    let mut compacted = 0;
+    if ranges.len() >= most {
+        // Compact instead of clearing so streaming bursts never drop texture invalidations.
+        compacted = ranges.len();
+        compact(ranges, most);
     }
     ranges.push((start, end));
+    compacted
 }
 
 /// Whose the memory of a texture view is, by [`Spans`].
@@ -796,21 +817,17 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    // `VICTORY_HEAP_NOTICES`: for each view heap.
+    let push = |ranges: &mut Vec<(u64, u64)>, start, end| push_range(ranges, start, end, MOST);
+    let mut compacted = heap_notices::note(heap_notices::Kind::Remapped, start, end, push);
+    if heap_notices::shared_read() {
+        let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        compacted += push_range(&mut ranges, start, end, MOST);
     }
-    if ranges.len() >= MOST {
-        // Compact instead of clearing so streaming bursts never drop texture invalidations.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        compact(&mut ranges, MOST);
+    if compacted != 0 {
+        STALE[2].fetch_add(compacted as u64, Relaxed);
     }
-    ranges.push((start, end));
 }
 
 /// Merges overlapping or touching (within `gap` bytes) ranges in place.
@@ -1695,6 +1712,7 @@ impl HostHeap {
             ms = started.elapsed().as_millis(),
             "host descriptor heap made null"
         );
+        heap_notices::born(h.id, h.sampler);
         Some(h)
     }
 
@@ -2104,12 +2122,17 @@ impl HostHeap {
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
-    /// shortcut: the ranges are kept in one place for all heaps; the heap
-    /// whose pass runs first takes them (a title has one view heap).
+    /// The ranges are kept in one place for all heaps, and the heap whose
+    /// pass runs first takes them, unless `VICTORY_HEAP_NOTICES=1` keeps
+    /// them for each heap ([`heap_notices`]).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = if heap_notices::subscribed(self.id) {
+            heap_notices::take(self.id, heap_notices::Kind::Remapped)
+        } else {
+            std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         join_ranges(&mut ranges, 0);
         if ranges.is_empty() {
             return 0;
@@ -2152,9 +2175,16 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let mut ranges =
-            std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = if heap_notices::subscribed(self.id) {
+            heap_notices::take(self.id, heap_notices::Kind::Written)
+        } else {
+            std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()))
+        };
         join_ranges(&mut ranges, 0);
+        // `VICTORY_PAGE_SETTLE_REREAD`: staged textures under them read again once they settle.
+        if crate::texture::settle_reread::on() {
+            crate::texture::settle_reread::page_written(&ranges, crate::host::now_ms());
+        }
         if ranges.is_empty() {
             return 0;
         }
@@ -3611,6 +3641,18 @@ impl HostHeap {
         {
             return Some((view, None));
         }
+        // `VICTORY_MIRROR_COPY_FIRST`: the texture's host copy is made before the lock.
+        if tag == VIEW_TAG
+            && copy_first::wanted(
+                copy_first::on(),
+                for_draw,
+                self.made_too[index as usize].load(std::sync::atomic::Ordering::Acquire),
+                key,
+            )
+            && let Some(view) = view_at(i, generation)
+        {
+            copy_first::make_copy(&view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         self.mirror_with_made(&mut made, index, handle, for_draw, record_change, None)
     }
@@ -3861,6 +3903,21 @@ impl HostHeap {
             .unwrap_or(0);
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (made, textures.slots.get(&index).map(|w| w.due <= frame))
+    }
+
+    /// (`VICTORY_BAKE_FRESH`) Slot `index`'s memory and fingerprint at its last whole upload, and
+    /// whether it is live, while it is looked at again (None: not uploaded whole, or the looks
+    /// are over).
+    pub(crate) fn texture_slot_print(&self, index: u32) -> Option<((u64, u64), u64, bool)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.rechecks.get(&index).map(|r| (r.at, r.print, r.live))
+    }
+
+    /// (`VICTORY_BAKE_FRESH`) Slot `index` is due at `frame` as one written now.
+    pub(crate) fn texture_slot_refresh(&self, index: u32, frame: u64) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.changed(index, frame, frame);
+        self.note_slot(index, SLOT_IN_TEXTURES, true);
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -4775,9 +4832,10 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// family takes the texture's format, but for its sRGB or linear twin with
+/// `VICTORY_SRGB_CAST=1` on a host that casts ([`srgb_cast`]).
+/// shortcut: without that, such a view (sRGB of UNORM, say) reads without
+/// its conversion.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4828,6 +4886,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !srgb_cast::keeps(view, own, unordered)
     {
         *format = d.Format;
     }

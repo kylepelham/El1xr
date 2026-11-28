@@ -1017,6 +1017,8 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// A 2D texture SRV of nothing: the null view of a slot that shows no texture.
+    NullTexture,
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1254,6 +1256,20 @@ impl Host {
                             at,
                         );
                         keep.push(tex);
+                    }
+                    View::NullTexture => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
                     }
                     View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)

@@ -27,13 +27,16 @@ pub(crate) mod alias_skip;
 pub(crate) mod blind_hash;
 mod gpu_detile;
 mod inside_copy;
+mod mapped_holes;
 #[cfg(all(test, windows))]
 mod inside_copy_tests;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+pub(crate) mod settle_reread;
 mod short_remap;
+mod slice_len;
 mod stage_unlocked;
 pub(crate) mod staged_ask;
 mod stale_audit;
@@ -1937,8 +1940,15 @@ impl Staging {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = slice_len::subresource_len(
+                footprint.Offset as usize,
+                pitch,
+                rows as usize,
+                f.Depth as usize,
+                self.bytes as usize,
+            );
+            // SAFETY: the subresource's part of the mapped staging buffer, up
+            // to its end (`slice_len`).
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -2251,7 +2261,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     let start = at as usize;
     let end = start.saturating_add(len);
     if by_query() {
-        if !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
+        let holes = mapped_holes::on();
+        if !holes && !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
             return 0;
         }
         let (mut p, mut there) = (start, 0u64);
@@ -2266,7 +2277,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             if n == 0 || next <= p {
                 break;
             }
-            if info.State == MEM_COMMIT {
+            if if holes { mapped_holes::region_counts(&info) } else { info.State == MEM_COMMIT } {
                 there += (next - p) as u64;
             }
             p = next;
@@ -2307,7 +2318,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             && ((asked && unsafe { ends[1].VirtualAttributes.Flags } & 1 != 0)
                 || crate::host::read_into(last_page as *const u8, &mut byte));
         if !last_ok {
-            return 0;
+            return if mapped_holes::on() { mapped_holes::between(start, end) } else { 0 };
         }
     }
     static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

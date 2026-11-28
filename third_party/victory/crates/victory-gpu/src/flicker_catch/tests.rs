@@ -198,7 +198,7 @@ fn the_diff_names_counts_that_differ_and_targets() {
 #[test]
 fn every_kind_has_a_name_in_order() {
     assert_eq!(NAMES.len(), KINDS);
-    assert_eq!(Kind::KeptRead as usize, KINDS - 1);
+    assert_eq!(Kind::ScreenUnmade as usize, KINDS - 1);
     assert_eq!(NAMES[Kind::StaleNulled as usize], "stale_nulled");
     assert_eq!(NAMES[Kind::Zeroed as usize], "zeroed");
 }

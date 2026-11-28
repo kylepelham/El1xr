@@ -34,6 +34,10 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 mod compute_wait;
+#[cfg(windows)]
+mod rescue;
+mod head_map;
+mod screen_wait;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -61,6 +65,17 @@ pub(crate) struct Pending {
     /// (bootfast) Queued at creation by `VICTORY_PIPELINE_EAGER`
     /// ([`super::eager`]); set under [`QUEUE`]'s lock.
     eager: AtomicBool,
+    /// `VICTORY_PIPELINE_RESCUE` ([`rescue`]): a thread has claimed its
+    /// making, that thread's handle while it makes it, and whether it was
+    /// made again after that thread ended.
+    building: AtomicBool,
+    maker: Mutex<usize>,
+    rescued: AtomicBool,
+    /// A pass over the screen ([`GraphicsState::screen_pass`],
+    /// [`screen_wait`]).
+    screen: bool,
+    /// The head blend-shape map's ([`head_map`]).
+    head_map: bool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -135,17 +150,37 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT").is_some_and(|v| v == "1")) {
         return false;
     }
-    shaders.iter().any(|s| {
-        matches!(
-            s.hash.as_str(),
-            "970c4fbb3b017c0e"
-                | "068c90badc86f1fd"
-                | "e4a7e088c7780ce8"
-                | "ebe4e53f031f5249"
-                | "2cc4c197ee29e291"
-                | "369cbe906ea72764"
-        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
-    })
+    static MORE: OnceLock<bool> = OnceLock::new();
+    let more = *MORE.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT_MORE").is_some_and(|v| v == "1"));
+    shaders.iter().any(|s| scene_input_named(s.stage, &s.hash, &s.container, more) || crate::bake_name::extra(s))
+}
+
+/// Whether one shader makes its pipeline a [`scene_input`]: by hash, and
+/// with `more` (`VICTORY_SCENE_INPUT_MORE=1`, after L7aj7med/victory-nvidia
+/// 9ac9998064, a port of ScarlettPort PR #25) also the passes the title runs
+/// once: the vertex program of the six draws that build the environment
+/// BRDF, area-light and scattering tables, and by container name every
+/// permutation of the head/skin decoration bakes and of `CS_CompressBC`,
+/// which block-compresses what they baked (dropped once, the face samples
+/// zero for the run), and the head blend-shape map
+/// `CS_ComputeBlendshapeMappings` (compute `61e54e90adccaf6a`, after
+/// TaynanGT/Vice-Tay #372 3e3fd57: dispatched before its pipeline exists,
+/// the face map is never built; a 4090 measured it 29.8 s late).
+fn scene_input_named(stage: &str, hash: &str, container: &[u8], more: bool) -> bool {
+    const RUN_ONCE: [&[u8]; 3] = [b"BakeDecorations", b"DecorationBlend", b"CS_CompressBC"];
+    matches!(
+        hash,
+        "970c4fbb3b017c0e"
+            | "068c90badc86f1fd"
+            | "e4a7e088c7780ce8"
+            | "ebe4e53f031f5249"
+            | "2cc4c197ee29e291"
+            | "369cbe906ea72764"
+    ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&hash)
+        || (more
+            && ((stage == "vertex" && hash == "ce57291b5a1750ca")
+                || (stage == "compute" && hash == "61e54e90adccaf6a")
+                || RUN_ONCE.iter().any(|name| container.windows(name.len()).any(|w| w == *name))))
 }
 
 /// The longest one scene-input wait may be, whatever is asked.
@@ -244,8 +279,12 @@ impl Pending {
                 .as_bytes(),
         );
         let left_out = left_out(&shaders);
-        let scene_input = left_out.is_none() && scene_input(&shaders);
+        let head_map = head_map::is_head_map(shaders.iter().map(|s| (s.stage, s.hash.as_str())));
+        let scene_input = left_out.is_none()
+            && head_map::scene_input(scene_input(&shaders), head_map, head_map::wait_on());
         Pending {
+            head_map,
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             scene_input,
             scene_waited: AtomicBool::new(false),
             shaders,
@@ -258,6 +297,9 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             eager: AtomicBool::new(false),
+            building: AtomicBool::new(false),
+            maker: Mutex::new(0),
+            rescued: AtomicBool::new(false),
         }
     }
 
@@ -286,6 +328,14 @@ impl Pending {
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         let _ = self.begun.set(Instant::now());
+        #[cfg(windows)]
+        if rescue::on() {
+            rescue::make_with(self, build);
+            let (lock, done) = &self.completion;
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            done.notify_all();
+            return;
+        }
         self.made.get_or_init(|| {
             // A failed translation must complete this queue entry and wake its waiters.
             match catch_unwind(AssertUnwindSafe(build)) {
@@ -446,17 +496,33 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
         super::eager::first_use(origin(p), p.made.get().is_some());
     }
+    let head_map = head_map::first(p);
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
+        screen_wait::front(p);
         if p.scene_input {
             wait_scene_input(p, crate::frame::current());
         } else {
             wait(p, crate::frame::current());
         }
         compute_wait::after(p, crate::frame::current());
+        screen_wait::after(p, crate::frame::current());
         super::eager::waited(p.made.get().is_some());
     }
+    if let Some(first) = head_map {
+        head_map::said(p, first);
+    }
     p.made.get()?.as_ref()
+}
+
+/// A draw of `p` was dropped ([`screen_wait::dropped`]).
+pub(crate) fn note_dropped(p: &Pending) {
+    screen_wait::dropped(p);
+}
+
+/// At present `frame` ([`screen_wait::presented`]).
+pub(crate) fn presented(frame: u64) {
+    screen_wait::presented(frame);
 }
 
 /// How `p` came to be queued, at its first draw or dispatch
@@ -518,6 +584,9 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
     if p.scene_input {
         start(p, REQUESTED, 0);
+        if p.head_map {
+            compute_wait::to_front(p);
+        }
         return;
     }
     if let Some(rank) = super::library::wanted_early(&p.key) {
@@ -967,11 +1036,12 @@ fn workers() -> bool {
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn(|| {
                     crate::topology::pin_background("victory-pipelines");
-                    // Below the title's own threads (loading, recording).
+                    // Below the title's own threads (loading, recording),
+                    // unless `VICTORY_PIPELINE_PRIORITY` says otherwise.
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let _ = SetThreadPriority(GetCurrentThread(), worker_priority());
                     }
                     loop {
                         next().make();
@@ -1006,6 +1076,32 @@ fn worker_count(processors: usize, value: Option<&str>) -> usize {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| processors.saturating_sub(4))
         .clamp(2, MOST)
+}
+
+/// The workers' thread priority, `VICTORY_PIPELINE_PRIORITY` (read once).
+fn worker_priority() -> windows::Win32::System::Threading::THREAD_PRIORITY {
+    static PRIORITY: OnceLock<windows::Win32::System::Threading::THREAD_PRIORITY> = OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        let value = std::env::var("VICTORY_PIPELINE_PRIORITY").ok();
+        let priority = parse_worker_priority(value.as_deref());
+        tracing::info!(value = value.as_deref().unwrap_or("unset"), priority = priority.0, "pipeline worker priority");
+        priority
+    })
+}
+
+/// `normal` (ezbyDev/victory-amd: a 1,500-pipeline backlog cleared in
+/// seconds instead of minutes, so fewer late pipelines and stand-ins after a
+/// load) or `above_normal`; `lowest` and `idle` go further down. Anything
+/// else, and unset, keeps below normal, under the title's threads.
+fn parse_worker_priority(value: Option<&str>) -> windows::Win32::System::Threading::THREAD_PRIORITY {
+    use windows::Win32::System::Threading::*;
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("normal" | "1") => THREAD_PRIORITY_NORMAL,
+        Some("above_normal" | "above") => THREAD_PRIORITY_ABOVE_NORMAL,
+        Some("lowest") => THREAD_PRIORITY_LOWEST,
+        Some("idle") => THREAD_PRIORITY_IDLE,
+        _ => THREAD_PRIORITY_BELOW_NORMAL,
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -1291,6 +1387,26 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)), "the first use waits until the worker has answered");
     }
 
+    /// `VICTORY_SCENE_INPUT_MORE`'s run-once passes are scene inputs only with it; the
+    /// face network's and the listed bakes' hashes are with or without it.
+    #[test]
+    fn the_run_once_passes_are_scene_inputs_only_with_more() {
+        let blend = b"\x00DXBC..\x00PS_DecorationBlend_0011_Wrapped\x00";
+        let bake = b"\x00PS_BakeDecorations_0003\x00";
+        let compress = b"\x00CS_CompressBC_BC7_Wrapped\x00";
+        for more in [false, true] {
+            assert_eq!(scene_input_named("vertex", "ce57291b5a1750ca", b"", more), more);
+            assert_eq!(scene_input_named("compute", "61e54e90adccaf6a", b"", more), more);
+            assert_eq!(scene_input_named("pixel", "0123456789abcdef", blend, more), more);
+            assert_eq!(scene_input_named("pixel", "0123456789abcdef", bake, more), more);
+            assert_eq!(scene_input_named("compute", "0123456789abcdef", compress, more), more);
+            assert!(scene_input_named("pixel", "970c4fbb3b017c0e", b"", more));
+            assert!(scene_input_named("pixel", crate::draw::BAKE_PIXEL_SHADERS[0], b"", more));
+            assert!(!scene_input_named("pixel", "ce57291b5a1750ca", b"", more), "only its vertex stage");
+            assert!(!scene_input_named("compute", "0123456789abcdef", b"\x00CS_Compress\x00", more));
+        }
+    }
+
     /// The water light's two tiled programs are named, and no other shader; with
     /// `VICTORY_WATER_LIGHT` unset nothing is left out.
     #[test]
@@ -1458,6 +1574,20 @@ mod tests {
         assert_eq!(worker_count(32, Some("6")), 6);
         assert_eq!(worker_count(32, Some("0")), 28);
         assert_eq!(worker_count(32, Some("x")), 28);
+    }
+
+    #[test]
+    fn worker_priority_stays_below_normal_unless_asked() {
+        use windows::Win32::System::Threading::*;
+        assert_eq!(parse_worker_priority(None), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("x")), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("0")), THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(parse_worker_priority(Some("normal")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some(" Normal ")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some("1")), THREAD_PRIORITY_NORMAL);
+        assert_eq!(parse_worker_priority(Some("above_normal")), THREAD_PRIORITY_ABOVE_NORMAL);
+        assert_eq!(parse_worker_priority(Some("lowest")), THREAD_PRIORITY_LOWEST);
+        assert_eq!(parse_worker_priority(Some("idle")), THREAD_PRIORITY_IDLE);
     }
 
     #[test]

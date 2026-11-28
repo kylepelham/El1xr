@@ -80,15 +80,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint3 asked = src_args.Load3(src_at);
         // Diagnostics, in the budget buffer's words after the mesh ones:
         // the largest x a compute record asked for, and the records that
-        // asked for more groups in x than one dispatch runs (they are cut
-        // to 65,535 below, so the groups past it never run). Not the
-        // garbage of a slot nothing wrote.
-        if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
-            uint noted;
+        // run fewer groups in x than they asked for (cut to 65,535 below,
+        // or emptied: the groups past it never run; a dispatch in parts
+        // runs them). Not the garbage of a slot nothing wrote.
+        bool plausible = asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u;
+        uint noted;
+        if (plausible) {
             budget.InterlockedMax(12, asked.x, noted);
-            if (asked.x > 65535u) {
-                budget.InterlockedAdd(16, 1u, noted);
-            }
         }
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // In parts: one dimension, and not the garbage of an argument
@@ -99,6 +97,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
+        }
+        if (plausible && asked.x > g.x) {
+            budget.InterlockedAdd(16, 1u, noted);
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
@@ -194,6 +195,7 @@ fn make(taking: rest::Rest) -> windows::core::Result<Clamp> {
 
 fn make_for(device: &ID3D12Device, taking: rest::Rest) -> windows::core::Result<Clamp> {
     let source = budget::clamp_source(SOURCE, budget::log2());
+    let source = wide::clamp_source(&source, wide::on());
     make_from(device, &rest::clamp_source(&source, taking), s!("clamp"))
 }
 
@@ -633,6 +635,8 @@ pub(crate) fn split_ahead() -> bool {
 
 pub(crate) mod split_ahead;
 
+pub(crate) mod wide;
+
 /// (El1xr) `VICTORY_SPLIT_RAW=1` (off by default): a dispatch that would be split into parts
 /// ([`bound_split`]) runs in one piece from the title's own record, as the other indirect
 /// records do with `VICTORY_INDIRECT_RAW=2`: no pass of ours and no waits for every earlier
@@ -991,6 +995,9 @@ void main() {
     #[path = "../rest_tests.rs"]
     mod rest_tests;
 
+    #[path = "../wide_tests.rs"]
+    mod wide_tests;
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
@@ -1036,6 +1043,7 @@ void main() {
                 let allocator: ID3D12CommandAllocator = device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                     .ok()?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;
@@ -2597,6 +2605,7 @@ void work() {
                 let allocator: ID3D12CommandAllocator = device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                     .ok()?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;

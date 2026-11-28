@@ -5,6 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// (worldstream) `VICTORY_ASK_OUTSIDE=1`: the asking's kernel calls made without the journal's lock.
+pub(super) mod outside;
+/// (worldstream) `VICTORY_HOT_SKIP=1`: ranges rewritten whole answered without the kernel.
+mod hot;
+
 pub(super) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -29,6 +34,8 @@ pub(super) fn count_kernel(pages: usize) {
 
 pub(crate) fn line(frames: f64) {
     super::ask_split::line(frames);
+    hot::line(frames);
+    super::look_skip::line(frames);
     if stats() && frames > 0.0 {
         let _journal = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         let [calls, pages, regions] = STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
@@ -214,6 +221,8 @@ pub(super) fn ask(ranges: &[(usize, usize)]) {
     use super::ask_split::{self as split, add_us};
     let started = std::time::Instant::now();
     let _asking = split::Asking::begin();
+    // Counted until after `KEPT` is published (`end_fast`).
+    let _under = super::end_fast::Under::begin();
     ask_timed(ranges, started);
     add_us(split::ASK_US, started);
 }
@@ -246,6 +255,10 @@ fn ask_timed(ranges: &[(usize, usize)], started: std::time::Instant) {
     });
     add(split::PIECES, pieces.len() as u64);
     add_us(split::FILTER_US, started);
+    if outside::on() {
+        outside::ask(&pieces);
+        return;
+    }
     let locking = std::time::Instant::now();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     add_us(split::LOCK_US, locking);
@@ -302,11 +315,33 @@ pub(super) fn completed_write(at: usize, len: usize) {
     }
 }
 
-fn run(j: &mut Journal, mut pieces: &[(usize, usize)]) {
+fn run(j: &mut Journal, pieces: &[(usize, usize)]) {
     j.ahead_asked = next_asking();
     j.ahead.clear();
     j.ordered = true;
     j.kept = !pieces.is_empty();
+    let hot = hot::Round::begin();
+    j.ahead = plan(pieces, |first, last| {
+        if let Some(all) = hot.skipping(first, last) {
+            note_kernel_batch(&all, j.ahead_asked);
+            return true;
+        }
+        let found = ask_kernel_found(j, first, last);
+        if let Some(found) = found {
+            hot.judge(first, last, found);
+        }
+        found.is_some()
+    });
+}
+
+/// The groups `pieces` are asked about in, each asked with `ask` (true: the
+/// kernel answered for it): the ranges answered for, in order, as `ahead`.
+fn plan(mut pieces: &[(usize, usize)], mut ask: impl FnMut(usize, usize) -> bool) -> Vec<(usize, usize)> {
+    let mut ahead: Vec<(usize, usize)> = Vec::new();
+    let covered = |ahead: &[(usize, usize)], first: usize, last: usize| {
+        let i = ahead.partition_point(|&(_, end)| end < last);
+        ahead.get(i).is_some_and(|&(start, _)| start <= first)
+    };
     let mut allocation = None;
     while let Some(&(first, end)) = pieces.first() {
         if allocation.is_none_or(|(a, b, _)| first < a || first >= b) {
@@ -334,22 +369,23 @@ fn run(j: &mut Journal, mut pieces: &[(usize, usize)]) {
             && last <= limit
             && last - first <= AHEAD_MAX
             && !known_view(first * PAGE)
-            && ask_kernel(j, first, last)
+            && ask(first, last)
         {
-            keep(&mut j.ahead, &pieces[..n]);
+            keep(&mut ahead, &pieces[..n]);
         } else if private && n > 1 {
             for &piece in &pieces[..n] {
                 if piece.1 - piece.0 <= AHEAD_MAX
-                    && !covered(j, piece.0, piece.1)
+                    && !covered(&ahead, piece.0, piece.1)
                     && !known_view(piece.0 * PAGE)
-                    && ask_kernel(j, piece.0, piece.1)
+                    && ask(piece.0, piece.1)
                 {
-                    keep(&mut j.ahead, &[piece]);
+                    keep(&mut ahead, &[piece]);
                 }
             }
         }
         pieces = &pieces[n..];
     }
+    ahead
 }
 
 #[cfg(test)]

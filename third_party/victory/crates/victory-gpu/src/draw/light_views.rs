@@ -4,9 +4,31 @@
 //! `VICTORY_AMBIENT_VARIANTS=1`), and what came of each dispatch counted by
 //! `crate::ambient_cover`.
 
+use super::miss_views::{depth_like, stencil_view};
 use super::*;
 use crate::ambient::{Role, Views};
 use crate::ambient_cover::Outcome;
+
+/// `VICTORY_AMBIENT_DEPTH_CHECK=1` (off by default; TheSmurphilicious
+/// 9f8294c6c1, a port of readmet3xt-lab/foxhound d226814 + bda6e59): the
+/// resolve's depth is never a view of a stencil plane where another depth of
+/// the image's size is in its tables. After the `_ReflectiveCaustics`
+/// variant `34fb51b8a0312e82` the depth place names the scene depth's
+/// stencil plane, and the estimate made of it lights the room as a flat
+/// milky fill. With the check, the resolve's views also read a texture the
+/// title placed in its memory as the resource made for it, as the miss
+/// program's do.
+fn depth_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_DEPTH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// The depth the resolve reads: with the check on and the usual place a
+/// stencil plane, the first other one `others` finds; `None` keeps the
+/// usual place (as without the check when no other fits).
+fn other_depth<T>(check: bool, stencil: bool, others: impl FnOnce() -> Option<T>) -> Option<T> {
+    (check && stencil).then(others).flatten()
+}
 
 impl State {
     /// After a dispatch of `p` of `role` ([`Role::Resolve`],
@@ -42,11 +64,15 @@ impl State {
             .ok_or("no host view heap is set")?;
         let places =
             crate::ambient_places::places(role, &t.used, crate::ambient_places::variants())?;
+        let check = role == Role::Resolve && depth_check();
         let entry = |kind: ResourceType, (slot, offset): (u8, u32), not_set, no_view, no_copy| {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return Err(not_set);
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)) {
+            let view = crate::descriptor::view(table + u64::from(offset) * 4).map(|v| {
+                if check { crate::descriptor::host::placed_texture(&v).unwrap_or(v) } else { v }
+            });
+            let resource = match (kind, view) {
                 (ResourceType::Srv, Some(View::Shader(r, _)))
                 | (ResourceType::Uav, Some(View::Unordered(r, ..))) => r,
                 _ => return Err(no_view),
@@ -67,15 +93,43 @@ impl State {
             "no image UAV in the table",
             "the image has no host copy",
         )?;
+        let stencil_at = |(slot, offset): (u8, u32)| match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) => stencil_view(crate::descriptor::view(table + u64::from(offset) * 4)),
+            _ => false,
+        };
         let depth = match places.depth {
             Some(at) => {
-                let (seen, depth) = entry(
-                    ResourceType::Srv,
-                    at,
-                    "the depth's table is not set",
-                    "no depth SRV in the table",
-                    "the depth has no host copy",
-                )?;
+                let stencil = check && stencil_at(at);
+                let other = other_depth(check, stencil, || {
+                    t.used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                        .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
+                        .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords), "", "", "").ok())
+                        .find(|(d, _)| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                });
+                if stencil {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        let taken = other.as_ref().map(|(d, _)| (d.Width, d.Height, d.Format.0));
+                        tracing::info!(
+                            place = ?at,
+                            ?taken,
+                            "stand-in: the resolve's depth place names a stencil plane; another depth view of its tables is taken \
+                             (VICTORY_AMBIENT_DEPTH_CHECK=1, said once; none: the place as before)"
+                        );
+                    });
+                }
+                let (seen, depth) = match other {
+                    Some(found) => found,
+                    None => entry(
+                        ResourceType::Srv,
+                        at,
+                        "the depth's table is not set",
+                        "no depth SRV in the table",
+                        "the depth has no host copy",
+                    )?,
+                };
                 if (seen.Width, seen.Height) != (of.Width, of.Height) {
                     return Err("depth dimensions differ");
                 }
@@ -100,5 +154,20 @@ impl State {
             return Err(crate::ambient::not_recorded());
         }
         Ok(places.elsewhere)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::other_depth;
+
+    /// Only with the check on and the usual place a stencil plane is another
+    /// depth taken; else (or when none fits) the usual place.
+    #[test]
+    fn another_depth_only_for_a_stencil_plane_with_the_check() {
+        assert_eq!(other_depth(true, true, || Some(7)), Some(7));
+        assert_eq!(other_depth(true, true, || None::<u32>), None);
+        assert_eq!(other_depth(false, true, || Some(7)), None);
+        assert_eq!(other_depth(true, false, || Some(7)), None);
     }
 }

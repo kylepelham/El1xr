@@ -15,6 +15,13 @@
 //!   writes). The compare's ranges are placed before the sync list is
 //!   recorded instead of after; nothing the sync list reads or writes is
 //!   touched by that. Same commands in both lists.
+//! - `VICTORY_SYNC_MASKS_LEAST=<n>` (with `VICTORY_UNDER_WRITES_MASKS=1`):
+//!   the sync list sends a 4 KiB block's changed ranges up by one masked
+//!   pass when `n` or more of them lie in it (1: every range under 8 KiB),
+//!   instead of one `CopyBufferRegion` each; unset or 0: as
+//!   `VICTORY_UNDER_WRITES_MASKS_LEAST` (4). The same bytes go up either way
+//!   and no byte between them is written (`host_tests::mask_tests`). The
+//!   sync record was 1.7-1.8 ms a frame for ~6,000 ranges.
 //!
 //! Not in the cache key: no shader or pipeline output changes.
 
@@ -29,6 +36,7 @@ fn count(v: Option<&str>) -> u64 {
 
 static STALE_WIDE_MIN: Live = Live::new("VICTORY_STALE_WIDE_MIN", count);
 static CHECK_ASIDE: Live = Live::flag("VICTORY_CARD_CHECK_ASIDE");
+static SYNC_MASKS_LEAST: Live = Live::new("VICTORY_SYNC_MASKS_LEAST", count);
 
 /// The fewest copies a stale merge sends to the kept threads.
 pub(crate) fn stale_wide_min() -> usize {
@@ -37,6 +45,12 @@ pub(crate) fn stale_wide_min() -> usize {
 
 pub(crate) fn check_aside() -> bool {
     CHECK_ASIDE.get_bool()
+}
+
+/// `VICTORY_SYNC_MASKS_LEAST`, if set above 0.
+pub(crate) fn masks_least() -> Option<usize> {
+    let n = SYNC_MASKS_LEAST.get() as usize;
+    (n > 0).then_some(n)
 }
 
 /// The finer parts, summed since the last frame line (microseconds, or
@@ -64,9 +78,17 @@ pub(crate) enum F {
     ExecLists,
     /// The rest of `exec_submit`: signals, the card clock, the writes noted.
     ExecRest,
+    /// `CopyBufferRegion` calls recorded into sync lists.
+    SyncCopies,
+    /// Fills of upload memory cut by `VICTORY_WIDE_COPY`.
+    WideFills,
+    /// The pieces they became.
+    WidePieces,
+    /// Title copies cut by `VICTORY_WIDE_COPY`.
+    WideSteps,
 }
 
-const N: usize = F::ExecRest as usize + 1;
+const N: usize = F::WideSteps as usize + 1;
 static STATS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
 #[inline]
@@ -109,13 +131,19 @@ pub(crate) fn log(frames: f64) {
     let per = |f: F| s[f as usize] as f64 / frames;
     tracing::info!(
         "card_before, stale_flights and exec_submit finer per frame (VICTORY_CARD_PROF, VICTORY_STALE_WIDE_MIN={}, \
-         VICTORY_CARD_CHECK_ASIDE={}): sync list reset {:.2} ms, close {:.2} ms; compare list reset {:.2} ms, close {:.2} ms; \
+         VICTORY_CARD_CHECK_ASIDE={}, VICTORY_SYNC_MASKS_LEAST={}, VICTORY_WIDE_COPY={}, VICTORY_RESULT_RING={}): sync list reset {:.2} ms, \
+         close {:.2} ms, {:.0} CopyBufferRegion; compare list reset {:.2} ms, close {:.2} ms; \
          {:.1} compare lists recorded aside; merges under writes {:.2} ms of their own work summed over the threads \
-         for {:.1} copies, {:.1} of them on the caller below the min; exec_submit ExecuteCommandLists {:.2} ms, rest {:.2} ms",
+         for {:.1} copies, {:.1} of them on the caller below the min; exec_submit ExecuteCommandLists {:.2} ms, rest {:.2} ms; \
+         wide copies: {:.1} fills cut into {:.1} pieces, {:.2} title copies cut",
         stale_wide_min(),
         u8::from(check_aside()),
+        masks_least().unwrap_or(0),
+        u8::from(crate::wide_copy::on()),
+        u8::from(crate::result_ring::on()),
         ms(F::SyncOpen),
         ms(F::SyncClose),
+        per(F::SyncCopies),
         ms(F::CheckOpen),
         ms(F::CheckClose),
         per(F::Aside),
@@ -124,6 +152,9 @@ pub(crate) fn log(frames: f64) {
         per(F::StaleSerial),
         ms(F::ExecLists),
         ms(F::ExecRest),
+        per(F::WideFills),
+        per(F::WidePieces),
+        per(F::WideSteps),
     );
 }
 

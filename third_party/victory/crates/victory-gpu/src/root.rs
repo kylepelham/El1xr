@@ -203,6 +203,17 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<RootSignature>(this)
 }
 
+/// Whether `this`, a word out of title memory, is a root signature of ours (its first word is
+/// read through the fault-safe reader, since the address may be anything).
+#[cfg(windows)]
+pub(crate) fn is_ours(this: This) -> bool {
+    let mut table = [0u8; size_of::<usize>()];
+    !this.is_null()
+        && this.is_aligned()
+        && crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == FUNCTIONS.0.as_ptr() as usize
+}
+
 /// IUnknown 3, object 4, device child 1.
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<ROOT_SIGNATURE, 24>());

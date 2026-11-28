@@ -106,10 +106,12 @@ pub fn run(
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,
     };
-    let with_dlls = WithTitleDlls {
+    let title_dlls = WithTitleDlls {
         inner: &resolver,
         dlls: &dlls,
     };
+    // VICTORY_BINK_OPEN_LOG=1: the title's video opens go through us.
+    let with_dlls = victory_hle::Interposed { inner: &title_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -169,6 +171,9 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // VICTORY_NO_WATCHDOG=1 (off without it): the title's 30 s watchdog disarmed.
+        // SAFETY: as above.
+        unsafe { victory_loader::no_watchdog::apply_asked(image.base(), size) };
         // The settings that can then change live (the in-game menu's).
         crate::live_hooks::register(take && upscale_mode.is_some());
         // VICTORY_UPSCALE_LIVE_TEST (off without it): live upscale changes on a timer.
