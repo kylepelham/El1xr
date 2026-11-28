@@ -77,7 +77,8 @@ impl Turns {
     }
 
     /// Whether the present with `ticket` has run.
-    pub(crate) fn done(&self, ticket: u64) -> bool {
+    #[cfg(test)]
+    fn done(&self, ticket: u64) -> bool {
         self.counts.lock().unwrap_or_else(|e| e.into_inner()).1 >= ticket
     }
 
