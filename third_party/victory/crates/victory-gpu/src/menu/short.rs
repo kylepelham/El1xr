@@ -18,6 +18,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BAKE_HELD_NULL", "Shows a bake input uploaded in the same pass before the bake draws."),
     ("VICTORY_BAKE_INPUTS", "Uploads a face or skin bake's textures before it, so faces are not black."),
     ("VICTORY_BAKE_KEEP_GONE", "A bake input whose memory is unmapped keeps its old texture, not null."),
+    ("VICTORY_BAKE_LOAD_SPREAD", "While loading, bake passes stop at 80 ms; helper threads take the rest."),
     ("VICTORY_BAKE_ONE_BUDGET", "Bake passes share one texture time budget, helper threads included."),
     ("VICTORY_BAKE_PUBLISH", "Shows textures a bake uploaded in its own list before the bake draws."),
     ("VICTORY_BAKE_REPLAY", "Redraws an incomplete face or skin bake once all its textures are current."),
