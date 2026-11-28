@@ -2891,7 +2891,6 @@ struct Deferred {
     san: crate::indirect::San,
     /// Work once the list has run (diagnostics: what read-back buffers
     /// hold, `HostList::defer_after`).
-    #[cfg(feature = "diagnostics")]
     after: Vec<Box<dyn Fn() + Send>>,
 }
 
@@ -6044,7 +6043,6 @@ impl HostList {
 
     /// Runs `work` once the list has run, with its read-backs
     /// (diagnostics: logging what a read-back buffer of ours holds).
-    #[cfg(feature = "diagnostics")]
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         // (Neptune) Title memory or a buffer changes at this place in the list: a table made
         // ready before it is made ready again after it (`crate::draw`).
