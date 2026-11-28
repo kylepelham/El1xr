@@ -266,6 +266,7 @@ fn the_switch_is_live_and_frames_are_summed_at_the_present() {
     settled(6);
     target(0x7123_4570);
     assert!(!ambient(2, false));
+    periodic::ran(periodic::Task::TexturesGone);
     frame_done(7_000_001);
     victory_core::settings::set("VICTORY_FLICKER_CATCH", "").unwrap();
     let s = summary_of(7_000_001).unwrap();
@@ -282,4 +283,20 @@ fn the_switch_is_live_and_frames_are_summed_at_the_present() {
     assert_ne!(s.settled & 1 << 6, 0);
     assert!(s.targets.contains(&(0x7123_4570, 1)));
     assert_ne!(s.ambient & 1 << 18, 0);
+    assert_ne!(s.periodic & 1 << periodic::Task::TexturesGone as u32, 0);
+}
+
+#[test]
+fn the_line_names_the_periodic_tasks_of_the_three_frames() {
+    use periodic::Task;
+    let bit = |t: Task| 1u32 << t as u32;
+    assert_eq!(
+        periodic::line(0, bit(Task::Sweep) | bit(Task::TexturesGone), Some(bit(Task::Snap))),
+        "periodic: dark=[sweep+textures_gone] before=[-] after=[snap]"
+    );
+    assert_eq!(
+        periodic::line(bit(Task::PrepPruned), bit(Task::SweepSettle), None),
+        "periodic: dark=[sweep_settle] before=[prep_pruned] after=[?]"
+    );
+    assert_eq!(periodic::names(bit(Task::SnapWriting) | bit(Task::LevelsAsked)), "levels_asked+snap_writing");
 }

@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub(crate) mod detect;
+pub(crate) mod periodic;
 #[cfg(windows)]
 pub(crate) mod pass;
 
@@ -362,6 +363,8 @@ pub(crate) struct Summary {
     pub(crate) why: Vec<(usize, &'static str)>,
     /// (pipeline, its indirect paths' bits), by pipeline.
     pub(crate) paths: Vec<(usize, u8)>,
+    /// Our periodic tasks run (bits of [`periodic::Task`]).
+    pub(crate) periodic: u32,
 }
 
 impl Default for Summary {
@@ -375,6 +378,7 @@ impl Default for Summary {
             targets: Vec::new(),
             why: Vec::new(),
             paths: Vec::new(),
+            periodic: 0,
         }
     }
 }
@@ -412,6 +416,7 @@ pub(crate) fn frame_done(frame: u64) {
     let counts = NOW.each_ref().map(|c| c.swap(0, Relaxed));
     let settled = SETTLED.swap(0, Relaxed);
     let ambient = AMBIENT.swap(0, Relaxed);
+    let periodic = periodic::take();
     let taken = FRAME
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -439,6 +444,7 @@ pub(crate) fn frame_done(frame: u64) {
         targets,
         why,
         paths,
+        periodic,
     });
     while ring.len() > RING {
         ring.pop_front();
@@ -756,7 +762,7 @@ pub(crate) fn report(event: &detect::Event) -> String {
         );
     };
     format!(
-        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}",
+        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}; {}",
         frame - 1,
         programs_diff(&before, &dark, after.as_ref(), &named),
         watched(&before, &dark, after.as_ref(), &named, watched_names()),
@@ -765,7 +771,8 @@ pub(crate) fn report(event: &detect::Event) -> String {
         settle_names(before.settled),
         ambient_names(dark.ambient),
         ambient_names(before.ambient),
-        targets_diff(&before, &dark)
+        targets_diff(&before, &dark),
+        periodic::line(before.periodic, dark.periodic, after.as_ref().map(|a| a.periodic))
     )
 }
 

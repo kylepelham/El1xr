@@ -302,6 +302,7 @@ fn sweep() {
     {
         return;
     }
+    crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::Sweep);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -4553,6 +4554,7 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + crate::sweep_every::every_ms() {
+            crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::SweepSettle);
             if sweep_aside::on() {
                 sweep_aside::ask();
             } else {
