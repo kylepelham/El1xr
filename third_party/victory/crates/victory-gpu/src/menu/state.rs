@@ -1,7 +1,7 @@
 //! (El1xr) The menu's state and navigation, with no OS calls: tabs from the registry's groups, the
 //! selected row, value stepping by kind, presets, and what a key, button or click does.
 
-use super::model::{Applied, Apply, FIRST, Info, Kind, MenuModel, first_pick, named};
+use super::model::{Applied, Apply, Info, Kind, MenuModel, OTHER, first_pick, named, sections};
 
 /// A tab: one of the registry's groups, or the presets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +80,27 @@ pub enum Row {
     Preset(usize),
     Save,
     Undo,
+    /// A section title in a sectioned tab: drawn, never selected.
+    Heading(&'static str),
+}
+
+/// Whether `row` can be selected (everything but a heading).
+pub fn selectable(row: &Row) -> bool {
+    !matches!(row, Row::Heading(_))
+}
+
+/// The first row that can be selected.
+pub fn first_selectable(rows: &[Row]) -> usize {
+    rows.iter().position(selectable).unwrap_or(0)
+}
+
+/// How many Down presses go from the first selectable row to row `to`.
+pub fn downs_to(rows: &[Row], to: usize) -> usize {
+    let from = first_selectable(rows);
+    rows.iter()
+        .enumerate()
+        .filter(|&(i, r)| i > from && i <= to && selectable(r))
+        .count()
 }
 
 /// What the user did, already decoded from keys, buttons or the mouse.
@@ -109,6 +130,8 @@ pub struct Menu {
     pub expert: bool,
     /// The last change's outcome, shown in the footer.
     pub status: Option<String>,
+    /// The last save of a restart change failed: the restart band says so.
+    pub unsaved: bool,
 }
 
 impl Default for Menu {
@@ -120,6 +143,7 @@ impl Default for Menu {
             scroll: 0,
             expert: false,
             status: None,
+            unsaved: false,
         }
     }
 }
@@ -151,6 +175,10 @@ impl Menu {
             if action == Action::Toggle {
                 self.open = true;
                 self.status = None;
+                let rows = self.rows(model);
+                if rows.get(self.selected).is_none_or(|r| !selectable(r)) {
+                    self.selected = first_selectable(&rows);
+                }
                 return true;
             }
             return false;
@@ -158,8 +186,20 @@ impl Menu {
         let rows = self.rows(model);
         match action {
             Action::Toggle | Action::Close => self.open = false,
-            Action::Up => self.selected = self.selected.saturating_sub(1),
-            Action::Down => self.selected = (self.selected + 1).min(rows.len().saturating_sub(1)),
+            Action::Up => {
+                if let Some(r) = (0..self.selected).rev().find(|&r| selectable(&rows[r])) {
+                    self.selected = r;
+                    // Bring the section title above into view with its first row.
+                    if r > 0 && !selectable(&rows[r - 1]) {
+                        self.scroll = self.scroll.min(r - 1);
+                    }
+                }
+            }
+            Action::Down => {
+                if let Some(r) = (self.selected + 1..rows.len()).find(|&r| selectable(&rows[r])) {
+                    self.selected = r;
+                }
+            }
             Action::Left | Action::Right => {
                 let dir = if action == Action::Left { -1 } else { 1 };
                 match rows.get(self.selected) {
@@ -181,7 +221,7 @@ impl Menu {
                 Some(&Row::Preset(p)) => self.apply_preset(model, p),
                 Some(Row::Save) => self.status = Some(save_status(model.save())),
                 Some(Row::Undo) => self.undo(model),
-                None => return false,
+                Some(Row::Heading(_)) | None => return false,
             },
             Action::NextTab | Action::PrevTab => {
                 let tabs = self.tabs(model);
@@ -192,16 +232,16 @@ impl Menu {
                 } else {
                     (at + n - 1) % n
                 };
-                self.select_tab(tabs[next]);
+                self.select_tab(model, tabs[next]);
             }
             Action::SelectTab(tab) => {
                 if tab == self.tab || !self.tabs(model).contains(&tab) {
                     return false;
                 }
-                self.select_tab(tab);
+                self.select_tab(model, tab);
             }
             Action::SelectRow(row) => {
-                if row >= rows.len() || row == self.selected {
+                if row >= rows.len() || row == self.selected || !selectable(&rows[row]) {
                     return false;
                 }
                 self.selected = row;
@@ -210,16 +250,16 @@ impl Menu {
                 self.expert = !self.expert;
                 let tabs = self.tabs(model);
                 if !tabs.contains(&self.tab) {
-                    self.select_tab(tabs[0]);
+                    self.select_tab(model, tabs[0]);
                 }
             }
         }
         true
     }
 
-    fn select_tab(&mut self, tab: Tab) {
+    fn select_tab(&mut self, model: &dyn MenuModel, tab: Tab) {
         self.tab = tab;
-        self.selected = 0;
+        self.selected = first_selectable(&rows(model, tab, self.expert));
         self.scroll = 0;
     }
 
@@ -237,7 +277,11 @@ impl Menu {
 
     fn step(&mut self, model: &mut dyn MenuModel, i: usize, dir: i32) {
         let info = model.infos()[i];
-        let current = model.get(info.name).unwrap_or_default();
+        let current = model
+            .get(info.name)
+            .filter(|v| !v.is_empty())
+            .or_else(|| model.effective(info.name))
+            .unwrap_or_default();
         let Some(next) = step_value(info.name, info.kind, &current, dir) else {
             self.status = Some(format!("{} is edited in the settings file", info.label));
             return;
@@ -247,16 +291,41 @@ impl Menu {
         }
     }
 
+    /// Sets one value. A change that waits for the next start is written to the settings file at
+    /// once: that start is when it counts.
     fn set(&mut self, model: &mut dyn MenuModel, info: Info, value: &str) {
         let shown = shown(info.name, info.kind, value);
         self.status = Some(match model.set(info.name, value) {
             Ok(Applied::Now) => format!("{}: {shown}", info.label),
-            Ok(Applied::OnRestart) if model.apply_of(info.name) == Apply::Retranslate => {
-                format!("{}: {shown} after a restart and shader rebuild", info.label)
+            Ok(Applied::OnRestart) => {
+                let when = if model.apply_of(info.name) == Apply::Retranslate {
+                    "at the next start, shaders rebuilt"
+                } else {
+                    "at the next start"
+                };
+                format!("{}: {shown} {when}{}", info.label, self.keep(model))
             }
-            Ok(Applied::OnRestart) => format!("{}: {shown} after a restart", info.label),
             Err(e) => e.to_string(),
         });
+    }
+
+    /// Saves the settings file for changes that wait for the next start; the status suffix.
+    fn keep(&mut self, model: &mut dyn MenuModel) -> String {
+        match model.save() {
+            Ok(()) => {
+                self.unsaved = false;
+                ", saved".into()
+            }
+            Err(e) => {
+                self.unsaved = true;
+                format!("; {}", save_status(Err(e)).to_lowercase())
+            }
+        }
+    }
+
+    /// Whether any of `names` waits for the next start.
+    fn any_restart(model: &dyn MenuModel, names: &[&str]) -> bool {
+        names.iter().any(|n| model.apply_of(n) != Apply::Live)
     }
 
     fn apply_preset(&mut self, model: &mut dyn MenuModel, p: usize) {
@@ -266,10 +335,16 @@ impl Menu {
             .iter()
             .filter(|(n, v)| model.set(n, v).is_err())
             .count();
-        self.status = Some(if failed == 0 {
-            format!("{} preset applied", preset.name)
+        let names: Vec<&str> = preset.values.iter().map(|(n, _)| *n).collect();
+        let kept = if Self::any_restart(model, &names) {
+            self.keep(model)
         } else {
-            format!("{} preset: {failed} values refused", preset.name)
+            String::new()
+        };
+        self.status = Some(if failed == 0 {
+            format!("{} preset applied{kept}", preset.name)
+        } else {
+            format!("{} preset: {failed} values refused{kept}", preset.name)
         });
     }
 
@@ -284,25 +359,35 @@ impl Menu {
         for name in &changed {
             let _ = model.set(name, "");
         }
+        let kept = if Self::any_restart(model, &changed) {
+            self.keep(model)
+        } else {
+            String::new()
+        };
         self.status = Some(match changed.len() {
             0 => "Nothing to undo".into(),
-            n => format!("{n} changes undone"),
+            n => format!("{n} changes undone{kept}"),
         });
     }
 }
 
-/// What SAVE says: a read-only file or folder in words, other errors as the OS gives them.
+/// What SAVE says: a read-only file or folder and a run without a file in words, other errors as
+/// the OS gives them.
 fn save_status(saved: std::io::Result<()>) -> String {
     match saved {
         Ok(()) => "Settings saved".into(),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             "Not saved: the settings file or its folder is read-only".into()
         }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            "Not saved: no settings file in this run".into()
+        }
         Err(e) => format!("Not saved: {e}"),
     }
 }
 
-/// The rows of `tab`: a group's listed settings, [`FIRST`] ones first.
+/// The rows of `tab`: a group's listed settings in the registry's order, or under its section
+/// headings when it has sections (the rest under [`OTHER`]).
 pub fn rows(model: &dyn MenuModel, tab: Tab, expert: bool) -> Vec<Row> {
     let group = match tab {
         Tab::Presets => {
@@ -312,16 +397,34 @@ pub fn rows(model: &dyn MenuModel, tab: Tab, expert: bool) -> Vec<Row> {
         Tab::Group(g) => g,
     };
     let infos = model.infos();
-    let mut at: Vec<usize> = (0..infos.len())
+    let at: Vec<usize> = (0..infos.len())
         .filter(|&i| infos[i].group == group && listed(&infos[i], expert))
         .collect();
-    at.sort_by_key(|&i| {
-        FIRST
+    let Some(sections) = sections(group) else {
+        return at.into_iter().map(Row::Setting).collect();
+    };
+    let mut out = Vec::new();
+    let mut used = vec![false; infos.len()];
+    for &(title, names) in sections {
+        let found: Vec<usize> = names
             .iter()
-            .position(|&n| n == infos[i].name)
-            .unwrap_or(FIRST.len())
-    });
-    at.into_iter().map(Row::Setting).collect()
+            .filter_map(|n| at.iter().copied().find(|&i| infos[i].name == *n))
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        out.push(Row::Heading(title));
+        for i in found {
+            used[i] = true;
+            out.push(Row::Setting(i));
+        }
+    }
+    let rest: Vec<usize> = at.into_iter().filter(|&i| !used[i]).collect();
+    if !rest.is_empty() {
+        out.push(Row::Heading(OTHER));
+        out.extend(rest.into_iter().map(Row::Setting));
+    }
+    out
 }
 
 /// The value one step from `current` in direction `dir` (negative: down), `None` for text.
@@ -409,6 +512,10 @@ pub fn shown(name: &str, kind: Kind, value: &str) -> String {
                 .unwrap_or_default()
         }
         Kind::Int { min: 0, .. } if value == "0" => "Off".to_string(),
+        Kind::Float { step, .. } => match value.trim().parse::<f64>() {
+            Ok(v) => format!("{v:.*}", decimals(step).max(2)),
+            Err(_) => value.to_string(),
+        },
         _ => value.to_string(),
     }
 }
@@ -497,27 +604,52 @@ mod tests {
         assert_eq!(rows(&model, Tab::Presets, false).last(), Some(&Row::Undo));
     }
 
+    /// The Display tab comes in headed sections, resolution and upscaling first; its settings no
+    /// section names follow under Other; Down skips the titles.
     #[test]
     fn the_display_tab_starts_with_the_upscaler_rows() {
         let model = Registry::default();
-        let names: Vec<&str> = rows(&model, Tab::DISPLAY, false)
+        let display = rows(&model, Tab::DISPLAY, false);
+        let names: Vec<&str> = display
             .iter()
             .take(5)
             .map(|r| match r {
                 Row::Setting(i) => model.infos()[*i].name,
+                Row::Heading(h) => h,
                 _ => "",
             })
             .collect();
         assert_eq!(
             names,
             [
+                "Resolution and upscaling",
                 "VICTORY_RESOLUTION",
                 "VICTORY_UPSCALE",
                 "VICTORY_UPSCALE_QUALITY",
                 "VICTORY_DLSS_SHARPNESS",
-                "VICTORY_FRAME_GEN"
             ]
         );
+        let headings: Vec<&str> = display
+            .iter()
+            .filter_map(|r| match r {
+                Row::Heading(h) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            &headings[..5],
+            ["Resolution and upscaling", "Frame pacing", "Screen and loading", "Lighting", "Overrides"]
+        );
+        assert!(display.windows(2).all(|w| selectable(&w[0]) || selectable(&w[1])), "no empty section");
+        let overlay = row_of(&model, Tab::DISPLAY, "VICTORY_OVERLAY");
+        let mut m = Menu::default();
+        let mut model = Registry::default();
+        m.act(&mut model, Action::Toggle);
+        for _ in 0..downs_to(&display, overlay) {
+            m.act(&mut model, Action::Down);
+        }
+        assert_eq!(m.selected, overlay);
+        assert!(!m.act(&mut model, Action::SelectRow(overlay - 1)) || selectable(&display[overlay - 1]));
     }
 
     #[test]
@@ -525,13 +657,14 @@ mod tests {
         let mut model = Registry::default();
         let mut m = opened(&mut model);
         m.act(&mut model, Action::Up);
-        assert_eq!(m.selected, 0);
+        assert_eq!(m.selected, 1, "row 0 is a section title");
+        assert_eq!(rows(&model, Tab::DISPLAY, false)[0], Row::Heading("Resolution and upscaling"));
         for _ in 0..200 {
             m.act(&mut model, Action::Down);
         }
         assert_eq!(m.selected, m.rows(&model).len() - 1);
         m.act(&mut model, Action::NextTab);
-        assert_eq!((m.tab, m.selected), (Tab::Group("Submission"), 0));
+        assert_eq!((m.tab, m.selected), (Tab::Group("Submission"), 0), "no sections there");
         m.act(&mut model, Action::PrevTab);
         m.act(&mut model, Action::PrevTab);
         assert_eq!(
@@ -657,7 +790,7 @@ mod tests {
         assert_eq!(model.get("VICTORY_FRAME_GEN").as_deref(), Some("fsr"));
         assert_eq!(
             m.status.as_deref(),
-            Some("Frame generation: FSR after a restart")
+            Some("Frame generation: FSR at the next start, saved")
         );
         assert_eq!(model.pending_restart(), ["VICTORY_FRAME_GEN"]);
 
@@ -667,7 +800,7 @@ mod tests {
         m.act(&mut model, Action::Activate);
         assert_eq!(
             m.status.as_deref(),
-            Some("Scc minmax: On after a restart and shader rebuild")
+            Some("Scc minmax: On at the next start, shaders rebuilt, saved")
         );
         assert_eq!(model.pending_restart().len(), 2);
 
@@ -683,7 +816,7 @@ mod tests {
         m.act(&mut model, Action::SelectTab(Tab::Presets));
         m.act(&mut model, Action::SelectRow(0));
         m.act(&mut model, Action::Activate);
-        assert_eq!(m.status.as_deref(), Some("Quality preset applied"));
+        assert_eq!(m.status.as_deref(), Some("Quality preset applied, saved"));
         assert_eq!(model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("quality"));
         assert_eq!(model.get("VICTORY_UPSCALE").as_deref(), Some("dlss"));
         let presets = model.presets().len();
@@ -696,7 +829,7 @@ mod tests {
         );
         m.act(&mut model, Action::SelectRow(presets + 1));
         m.act(&mut model, Action::Activate);
-        assert_eq!(m.status.as_deref(), Some("5 changes undone"));
+        assert_eq!(m.status.as_deref(), Some("5 changes undone, saved"));
         assert!(model.pending_restart().is_empty());
         assert_eq!(
             model.get("VICTORY_UPSCALE"),
@@ -723,7 +856,7 @@ mod tests {
         assert_eq!(model.get(name).as_deref(), Some("off"));
         m.act(&mut model, Action::Right);
         assert_eq!(model.get(name).as_deref(), Some("on"));
-        assert_eq!(m.status.as_deref(), Some("Ray tracing: On after a restart"));
+        assert_eq!(m.status.as_deref(), Some("Ray tracing: On at the next start, saved"));
         assert!(model.pending_restart().contains(&name));
         model.set(name, "").unwrap();
         assert!(!model.pending_restart().contains(&name));
@@ -742,7 +875,7 @@ mod tests {
             Some("Not saved: the settings file or its folder is read-only")
         );
         let none = std::io::Error::new(std::io::ErrorKind::Unsupported, "no settings file (VICTORY_SETTINGS_FILE=none)");
-        assert_eq!(save_status(Err(none)), "Not saved: no settings file (VICTORY_SETTINGS_FILE=none)");
+        assert_eq!(save_status(Err(none)), "Not saved: no settings file in this run");
     }
 
     #[test]

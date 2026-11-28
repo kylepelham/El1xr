@@ -670,8 +670,7 @@ mod tests {
             d.tick(at + 30, &[], 0, 0);
             at += 60;
         };
-        tick(&mut d, &[Key::Left], 0);
-        tick(&mut d, &[Key::Left], 0);
+        // Unset reads as the title's 3840x2160: one step down is 2560x1440.
         tick(&mut d, &[Key::Left], 0);
         assert_eq!(d.model.get("VICTORY_RESOLUTION").as_deref(), Some("2560x1440"));
         tick(&mut d, &[], DOWN);
@@ -679,9 +678,13 @@ mod tests {
         tick(&mut d, &[Key::Right], 0);
         assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("dlss"));
         tick(&mut d, &[], DOWN);
+        // Unset reads as DLSS's Quality: up to DLAA and back chooses Quality.
         tick(&mut d, &[Key::Right], 0);
+        assert_eq!(d.model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("dlaa"));
+        tick(&mut d, &[Key::Left], 0);
         assert_eq!(d.model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("quality"));
-        for (at, pad) in [(1150, DOWN), (1180, 0), (1210, DOWN), (1240, 0)] {
+        // Sharpness, DLSS model, then Frame generation.
+        for (at, pad) in [(1150, DOWN), (1180, 0), (1210, DOWN), (1240, 0), (1270, DOWN), (1300, 0)] {
             d.tick(at, &[], pad, 0);
         }
         d.tick(1360, &[Key::Enter], 0, 0);

@@ -54,6 +54,12 @@ pub fn detail(
     let (w, h) = target;
     if name == "VICTORY_RESOLUTION" {
         let chosen = get(name).unwrap_or_default();
+        if chosen.trim().is_empty() && plan.as_ref().is_some_and(|p| p.defaulted) {
+            let monitor = native().map_or(String::new(), |(mw, mh)| format!(" {mw}x{mh}"));
+            return Some(format!(
+                "Not chosen: this monitor's{monitor}, output {w}x{h}; a choice is kept for the next start"
+            ));
+        }
         return Some(if chosen.trim().eq_ignore_ascii_case("native") {
             match native() {
                 Some((mw, mh)) => format!(
@@ -62,7 +68,7 @@ pub fn detail(
                 None => format!("Native: the monitor's size is unknown, output {w}x{h}"),
             }
         } else if chosen.is_empty() {
-            format!("Default: the title's {w}x{h}")
+            format!("Not chosen: the title's {w}x{h}; a choice is kept for the next start")
         } else {
             format!("Output {w}x{h}; the swap chain follows")
         });
@@ -90,6 +96,33 @@ pub fn detail(
         &upscale,
         quality.as_deref().filter(|q| !q.is_empty()),
     ))
+}
+
+/// The value an unset `name` stands for: Resolution's output size, and Quality's mode while an
+/// upscaler is on.
+pub fn effective(
+    name: &str,
+    get: impl Fn(&str) -> Option<String>,
+    native: impl Fn() -> Option<(u32, u32)>,
+) -> Option<String> {
+    if get(name).is_some_and(|v| !v.trim().is_empty()) {
+        return None;
+    }
+    match name {
+        "VICTORY_RESOLUTION" => {
+            let plan = render_plan::plan(&get, &native);
+            let (w, h) = plan
+                .and_then(|p| p.output)
+                .or_else(|| get("VICTORY_OUTPUT").as_deref().and_then(render_plan::parse_mode))
+                .unwrap_or(TITLE_OUTPUT);
+            Some(format!("{w}x{h}"))
+        }
+        "VICTORY_UPSCALE_QUALITY" => {
+            let upscale = get("VICTORY_UPSCALE").unwrap_or_default();
+            matches!(upscale.trim(), "stretch" | "dlss").then(|| render_plan::DEFAULT_QUALITY.to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -160,8 +193,30 @@ mod tests {
         assert_eq!(detail("VICTORY_UPSCALE_QUALITY", &v, MONITOR), None);
         assert_eq!(
             detail("VICTORY_RESOLUTION", &v, MONITOR).unwrap(),
-            "Default: the title's 3840x2160"
+            "Not chosen: the title's 3840x2160; a choice is kept for the next start"
         );
+    }
+
+    /// Unset values read as what they stand for: the title's 4K, the monitor's size with
+    /// `VICTORY_NATIVE_DEFAULT=1`, DLSS's Quality while it is on; a chosen value is its own.
+    #[test]
+    fn unset_rows_read_as_the_size_and_mode_they_give() {
+        assert_eq!(effective("VICTORY_RESOLUTION", with(&[]), MONITOR).as_deref(), Some("3840x2160"));
+        let auto = with(&[("VICTORY_NATIVE_DEFAULT", "1"), ("VICTORY_UPSCALE", "dlss")]);
+        assert_eq!(effective("VICTORY_RESOLUTION", &auto, MONITOR).as_deref(), Some("2560x1440"));
+        assert_eq!(effective("VICTORY_UPSCALE_QUALITY", &auto, MONITOR).as_deref(), Some("quality"));
+        assert_eq!(
+            detail("VICTORY_RESOLUTION", &auto, MONITOR).unwrap(),
+            "Not chosen: this monitor's 2560x1440, output 2560x1440; a choice is kept for the next start"
+        );
+        assert_eq!(
+            detail("VICTORY_UPSCALE_QUALITY", &auto, MONITOR).unwrap(),
+            "Quality: renders 1706x960 -> 2560x1440"
+        );
+        let chosen = with(&[("VICTORY_NATIVE_DEFAULT", "1"), ("VICTORY_RESOLUTION", "1920x1080")]);
+        assert_eq!(effective("VICTORY_RESOLUTION", &chosen, MONITOR), None);
+        assert_eq!(effective("VICTORY_UPSCALE_QUALITY", with(&[("VICTORY_UPSCALE", "off")]), MONITOR), None);
+        assert_eq!(effective("VICTORY_OVERLAY", with(&[]), MONITOR), None);
     }
 
     #[cfg(windows)]
