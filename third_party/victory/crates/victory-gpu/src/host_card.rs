@@ -296,17 +296,24 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
+    ///
+    /// `defer` (`VICTORY_CARD_RECORD_SEND`): the two lists are put in the
+    /// plan unrecorded and their recordings given back, to be recorded
+    /// before the submission's lists go to the queue ([`super::card_rec`]).
     pub(super) fn card_before(
         &self,
         runs: &[&HostList],
         flown: bool,
+        defer: bool,
     ) -> (
         Option<CardPlan>,
         Option<std::sync::MutexGuard<'static, u64>>,
+        Option<super::card_rec::Pending>,
     ) {
+        use super::card_rec::{CheckRec, Pending, SyncRec};
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return (None, None);
+            return (None, None, None);
         }
         use crate::card_prof::P;
         let mut lap = crate::card_prof::Lap::new();
@@ -402,12 +409,12 @@ impl Host {
         let (mut dirty, uploads) = crate::shadow::card_dirty(sent_as);
         lap.mark(P::Dirty);
         if declared.is_empty() && dirty.is_empty() && uploads.is_empty() {
-            return (None, None);
+            return (None, None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         lap.mark(P::Work);
         let Some(work) = work.as_mut() else {
-            return (None, None);
+            return (None, None, None);
         };
         if crate::card_prof::on() {
             crate::card_prof::add(P::Plans, 1);
@@ -455,6 +462,8 @@ impl Host {
         let mut checked: Option<CheckRecorded> = None;
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut sync_list: Option<ID3D12CommandList> = None;
+        let mut pending_sync: Option<(SyncRec, Prelude)> = None;
+        let mut pending_check: Option<(CheckRec, Prelude)> = None;
         // (Neptune) The masks this plan's send reads (`under_writes_masks`).
         let mut masks: Option<(ID3D12Resource, usize, u64)> = None;
         if !dirty.is_empty() || !uploads.is_empty() {
@@ -463,7 +472,6 @@ impl Host {
                     "no host list to bring host copies in the card's memory up to date"
                 ));
             };
-            let (allocator, list) = &sync;
             // (Neptune) Per copy, what goes up as copies and what by mask
             // (`under_writes_masks`): the blocks in runs that follow one
             // another (first block, blocks, where their masks begin), the
@@ -530,234 +538,27 @@ impl Host {
                 sends.resize_with(dirty.len(), || (None, Vec::new()));
             }
             lap.mark(P::Masks);
-            // SAFETY: the list's last run finished (it ran ahead of a
-            // submission that was waited for, and came back after that);
-            // live buffers, and the ranges lie in them.
-            let record = || unsafe {
-                let mut t = crate::prep_cut::now();
-                (|| -> windows::core::Result<ID3D12CommandList> {
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    crate::prep_cut::lap(crate::prep_cut::F::SyncOpen, &mut t);
-                    crate::gpucost::begin(list, crate::gpucost::CARD_SYNC);
-                    // Resolve each dirty copy's card sides once and execute in
-                    // 3 batched phases (Copy -> CARD_PATCH -> Rehash) to
-                    // collapse per-buffer barriers and compute PSO binds.
-                    let mut items = Vec::with_capacity(dirty.len());
-                    let mut total_bytes = 0u64;
-                    let mut total_ranges = 0u64;
-                    for ((shadow, ranges), (copies_opt, masked)) in dirty.iter().zip(&sends) {
-                        let Some((Some(staging), before, size)) = shadow.card_sides() else {
-                            continue;
-                        };
-                        let copies = copies_opt.as_deref().unwrap_or(ranges.as_slice());
-                        crate::prep_cut::add(crate::prep_cut::F::SyncCopies, copies.len() as u64);
-                        for &(a, b) in copies {
-                            list.CopyBufferRegion(
-                                &shadow.buffer,
-                                a as u64,
-                                staging,
-                                a as u64,
-                                (b - a) as u64,
-                            );
-                        }
-                        total_bytes += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
-                        total_ranges += ranges.len() as u64;
-                        let state = (!copies.is_empty()).then_some(D3D12_RESOURCE_STATE_COPY_DEST);
-                        items.push((shadow, ranges, staging, before, size, masked, state));
-                    }
-                    // (Neptune) Transient windows: from their chunks, in the order copied. No
-                    // masks, no compare, nothing hashed: shaders do not write them.
-                    for (shadow, parts) in &uploads {
-                        crate::prep_cut::add(crate::prep_cut::F::SyncCopies, parts.len() as u64);
-                        for (a, b, chunk) in parts {
-                            list.CopyBufferRegion(
-                                &shadow.buffer,
-                                *a as u64,
-                                chunk.buffer(),
-                                chunk.offset,
-                                (b - a) as u64,
-                            );
-                            crate::windowup::SENT.fetch_add((b - a) as u64, Ordering::Relaxed);
-                        }
-                        total_bytes += parts.iter().map(|&(a, b, _)| (b - a) as u64).sum::<u64>();
-                        total_ranges += parts.len() as u64;
-                    }
-                    if total_bytes > 0 || total_ranges > 0 {
-                        crate::shadow::CARD_STATS[0].fetch_add(total_bytes, Ordering::Relaxed);
-                        crate::shadow::CARD_STATS[1].fetch_add(total_ranges, Ordering::Relaxed);
-                    }
-                    // Phase 2: masked CARD_PATCH dispatches (batched barriers + single PSO bind).
-                    crate::gpucost::at(list, crate::gpucost::CARD_PATCH);
-                    if let (Some((root, pso)), Some((mask_buffer, _, _))) =
-                        (work.patch.as_ref(), masks.as_ref())
-                    {
-                        let mut to_uav: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                        let mut any_masked = false;
-                        for (shadow, _, _, _, _, masked, state) in &mut items {
-                            if !masked.is_empty() {
-                                any_masked = true;
-                                if let Some(from) = *state {
-                                    to_uav.push(transition(
-                                        &shadow.buffer,
-                                        from,
-                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                    ));
-                                }
-                                *state = Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                            }
-                        }
-                        if !to_uav.is_empty() {
-                            list.ResourceBarrier(&to_uav);
-                        }
-                        if any_masked {
-                            list.SetComputeRootSignature(root);
-                            list.SetPipelineState(pso);
-                            list.SetComputeRootShaderResourceView(
-                                2,
-                                mask_buffer.GetGPUVirtualAddress(),
-                            );
-                            for (shadow, _, staging, _, _, masked, _) in &items {
-                                if masked.is_empty() {
-                                    continue;
-                                }
-                                list.SetComputeRootShaderResourceView(
-                                    1,
-                                    staging.GetGPUVirtualAddress(),
-                                );
-                                list.SetComputeRootUnorderedAccessView(
-                                    3,
-                                    shadow.buffer.GetGPUVirtualAddress(),
-                                );
-                                for &(table_at, blocks, _) in *masked {
-                                    let constants = [table_at as u32, blocks as u32];
-                                    list.SetComputeRoot32BitConstants(
-                                        0,
-                                        2,
-                                        constants.as_ptr().cast(),
-                                        0,
-                                    );
-                                    list.Dispatch(16 * blocks as u32, 1, 1);
-                                }
-                            }
-                        }
-                    }
-                    // Phase 3: batched barriers (`COPY_DEST`/`UAV` -> `COMMON` for read-only
-                    // copies and transient uploads, since `sync` is batched into the same
-                    // `ExecuteCommandLists` as the title's lists; `COPY_DEST`/`UAV` ->
-                    // `NON_PIXEL_SHADER_RESOURCE` for copies with `before`) followed by a
-                    // single rehash PSO bind and a final `NON_PIXEL_SHADER_RESOURCE` -> `COMMON`.
-                    crate::gpucost::at(list, crate::gpucost::CARD_REHASH);
-                    let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                    let mut any_rehash = false;
-                    for (shadow, _, _, before, _, _, state) in &items {
-                        if before.is_some() {
-                            any_rehash = true;
-                            if let Some(from) = *state {
-                                post_barriers.push(transition(
-                                    &shadow.buffer,
-                                    from,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                ));
-                            }
-                        } else if let Some(from) = *state {
-                            post_barriers.push(transition(
-                                &shadow.buffer,
-                                from,
-                                D3D12_RESOURCE_STATE_COMMON,
-                            ));
-                        }
-                    }
-                    for (shadow, parts) in &uploads {
-                        if !parts.is_empty() {
-                            post_barriers.push(transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_COMMON,
-                            ));
-                        }
-                    }
-                    if !post_barriers.is_empty() {
-                        list.ResourceBarrier(&post_barriers);
-                    }
-                    if any_rehash {
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootUnorderedAccessView(
-                            3,
-                            work.differs.0.GetGPUVirtualAddress(),
-                        );
-                        let join = rehash_runs() || under_writes_runs() > 512;
-                        let mut pass_count = 0u64;
-                        let mut piece_count = 0u64;
-                        let mut rehash_done: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                        for (shadow, ranges, _, before, size, _, state) in &items {
-                            let Some(before) = before else {
-                                continue;
-                            };
-                            list.SetComputeRootShaderResourceView(
-                                1,
-                                shadow.buffer.GetGPUVirtualAddress(),
-                            );
-                            list.SetComputeRootUnorderedAccessView(
-                                2,
-                                before.GetGPUVirtualAddress(),
-                            );
-                            let runs: Vec<crate::shadow::CardSpan> =
-                                if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                                    vec![shadow.card_run(0, usize::MAX)]
-                                } else if join {
-                                    crate::shadow::joined_piece_runs_iter(
-                                        ranges.iter().map(|&(a, b)| shadow.card_run(a, b)),
-                                    )
-                                } else {
-                                    ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                                };
-                            let touched = state.is_some() || !runs.is_empty();
-                            pass_count += runs.len() as u64;
-                            piece_count += runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>();
-                            for run in runs {
-                                let constants =
-                                    [run.first, run.skew, *size as u32, run.pieces, 0, 0];
-                                list.SetComputeRoot32BitConstants(
-                                    0,
-                                    6,
-                                    constants.as_ptr().cast(),
-                                    0,
-                                );
-                                list.Dispatch(run.pieces.min(65_535), 1, 1);
-                            }
-                            if touched {
-                                rehash_done.push(transition(
-                                    &shadow.buffer,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                    D3D12_RESOURCE_STATE_COMMON,
-                                ));
-                            }
-                        }
-                        if !rehash_done.is_empty() {
-                            list.ResourceBarrier(&rehash_done);
-                        }
-                        CARD_PASSES[0].fetch_add(pass_count, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(piece_count, Ordering::Relaxed);
-                    }
-                    crate::gpucost::end(list);
-                    crate::prep_cut::restart(&mut t);
-                    list.Close()?;
-                    crate::prep_cut::lap(crate::prep_cut::F::SyncClose, &mut t);
-                    list.cast()
-                })()
-            };
+            let rec = SyncRec::new(work, &mut dirty, sends, &uploads, masks.as_ref(), &whole);
+            // SAFETY (both recordings): the list's last run finished (it ran
+            // ahead of a submission that was waited for, and came back after
+            // that); live buffers, and the ranges lie in them.
             let recorded = match &early {
+                _ if defer => {
+                    pending_sync = Some((rec, sync.clone()));
+                    sync.1.cast()
+                }
                 Some((ranges, Some(check))) => {
                     crate::prep_cut::add(crate::prep_cut::F::Aside, 1);
-                    let (recorded, check) = crate::prep_cut::both_out(record, || {
-                        record_check(work, ranges, early_keep, flown, check)
-                    });
+                    let check_rec = CheckRec::new(work, ranges, early_keep, flown);
+                    let inflight = check_rec.inflight();
+                    let (recorded, check) = crate::prep_cut::both_out(
+                        || unsafe { rec.record(&sync) },
+                        || (unsafe { check_rec.record(check) }, inflight),
+                    );
                     checked = Some(check);
                     recorded
                 }
-                _ => record(),
+                _ => unsafe { rec.record(&sync) },
             };
             match recorded {
                 Ok(cmd) => sync_list = Some(cmd),
@@ -818,7 +619,19 @@ impl Host {
             let keep = if checked.is_some() { early_keep } else { keep_of(&work.snap, flown) };
             let (recorded, inflight) = match checked {
                 Some(done) => done,
-                None => record_check(work, &plan.ranges, keep, flown, &check),
+                None => {
+                    let rec = CheckRec::new(work, &plan.ranges, keep, flown);
+                    let inflight = rec.inflight();
+                    if defer {
+                        pending_check = Some((rec, check.clone()));
+                        (check.1.cast(), inflight)
+                    } else {
+                        // SAFETY: the list's last run finished (its submission
+                        // was waited for, and it came back after that); live
+                        // buffers; the compare's own root signature.
+                        (unsafe { rec.record(&check) }, inflight)
+                    }
+                }
             };
             match recorded {
                 Ok(list) => plan.check = Some(list),
@@ -835,7 +648,11 @@ impl Host {
         }
         lap.mark(P::Check);
         work.out += 1;
-        (Some(plan), order)
+        let pending = (pending_sync.is_some() || pending_check.is_some()).then_some(Pending {
+            sync: pending_sync,
+            check: pending_check,
+        });
+        (Some(plan), order, pending)
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -1578,149 +1395,4 @@ fn keep_of(snap: &Option<CardSnap>, flown: bool) -> Option<(&CardSnap, u32)> {
     snap.as_ref()
         .filter(|_| flown && !SNAP_OFF.load(Ordering::Acquire))
         .map(|snap| (snap, SNAP_DONE.load(Ordering::Acquire)))
-}
-
-/// Records `card_before`'s compare of `ranges` into `check`.
-fn record_check(
-    work: &CardWork,
-    ranges: &[CardRange],
-    keep: Option<(&CardSnap, u32)>,
-    flown: bool,
-    check: &Prelude,
-) -> CheckRecorded {
-    use std::sync::Arc;
-    let (allocator, list) = check;
-    let mut inflight_out = None;
-    let mut t = crate::prep_cut::now();
-    // SAFETY: the list's last run finished (its submission was
-    // waited for, and it came back after that); live buffers; the
-    // compare's own root signature.
-    let recorded = unsafe {
-        (|| -> windows::core::Result<ID3D12CommandList> {
-            allocator.Reset()?;
-            list.Reset(allocator, None)?;
-            crate::prep_cut::lap(crate::prep_cut::F::CheckOpen, &mut t);
-            crate::gpucost::begin(list, crate::gpucost::CARD_CHECK);
-            // What the submission's shaders wrote, first.
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
-            match keep {
-                Some((snap, _)) => {
-                    list.SetComputeRootSignature(&snap.root);
-                    list.SetPipelineState(&snap.pso);
-                    list.SetComputeRootUnorderedAccessView(
-                        4,
-                        snap.buffer.GetGPUVirtualAddress(),
-                    );
-                }
-                None => {
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                }
-            }
-            let (snap_base, snap_slots, words) =
-                keep.map_or((0, 0, 6), |(snap, base)| (base, snap.slots, 8));
-            list.SetComputeRootUnorderedAccessView(
-                3,
-                work.differs.0.GetGPUVirtualAddress(),
-            );
-            let key = |r: &CardRange| {
-                let copy = Arc::as_ptr(&r.shadow) as usize;
-                r.compared
-                    .then_some((copy, r.span.first, r.span.pieces, r.at))
-            };
-            for (i, first, pieces, at) in
-                crate::card_share::passes(ranges.iter().map(key))
-            {
-                let r = &ranges[i];
-                let Some((_, Some(before), size)) = r.shadow.card_sides() else {
-                    continue;
-                };
-                let constants = [
-                    first,
-                    r.span.skew,
-                    size as u32,
-                    pieces,
-                    at * 4,
-                    if flown { 2 } else { 1 },
-                    snap_base,
-                    snap_slots,
-                ];
-                list.SetComputeRoot32BitConstants(0, words, constants.as_ptr().cast(), 0);
-                list.SetComputeRootShaderResourceView(
-                    1,
-                    r.shadow.buffer.GetGPUVirtualAddress(),
-                );
-                list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                list.Dispatch(pieces.min(65_535), 1, 1);
-                CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
-            }
-            // The fetch inside the flight (`inflight_fetch`): behind
-            // every compare of the list, the pieces they flagged go
-            // to slots in the PC's memory.
-            if flown && let Some(inflight) = &work.inflight {
-                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                            pResource: std::mem::ManuallyDrop::new(None),
-                        }),
-                    },
-                }]);
-                list.SetComputeRootSignature(&inflight.root);
-                list.SetPipelineState(&inflight.pso);
-                list.SetComputeRootUnorderedAccessView(
-                    2,
-                    work.differs.0.GetGPUVirtualAddress(),
-                );
-                list.SetComputeRootUnorderedAccessView(
-                    3,
-                    inflight.table.0.GetGPUVirtualAddress(),
-                );
-                list.SetComputeRootUnorderedAccessView(
-                    4,
-                    inflight.fetched.0.GetGPUVirtualAddress(),
-                );
-                let mut every = true;
-                for r in ranges.iter().filter(|r| r.compared) {
-                    let Some((_, Some(_), size)) = r.shadow.card_sides() else {
-                        every = false;
-                        continue;
-                    };
-                    let groups = r.span.pieces.clamp(1, 65535);
-                    let constants = [
-                        r.span.first,
-                        r.span.skew,
-                        size as u32,
-                        r.span.pieces,
-                        r.at * 4,
-                        inflight.landed,
-                        inflight.fetched.2,
-                        groups,
-                    ];
-                    list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    list.SetComputeRootShaderResourceView(
-                        1,
-                        r.shadow.buffer.GetGPUVirtualAddress(),
-                    );
-                    list.Dispatch(groups, 1, 1);
-                }
-                inflight_out = Some((every, inflight.landed));
-            }
-            crate::gpucost::end(list);
-            crate::prep_cut::restart(&mut t);
-            list.Close()?;
-            crate::prep_cut::lap(crate::prep_cut::F::CheckClose, &mut t);
-            list.cast()
-        })()
-    };
-    (recorded, inflight_out)
 }
