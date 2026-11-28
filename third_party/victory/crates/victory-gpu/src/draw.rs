@@ -1846,6 +1846,10 @@ impl State {
         if kind == victory_shader::emit::USER_THREAD_LIMIT {
             return crate::rt_diag::thread_limit();
         }
+        // The spliced glass trace takes its ray queries only with both host top levels bound.
+        if kind == victory_shader::emit::USER_GLASS_NATIVE {
+            return u32::from(self.glass_tlas.is_some());
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }

@@ -130,7 +130,21 @@ impl<'a> Lower<'a> {
             .find(|n| n.0 == site)
             .map(|n| n.1)
             .ok_or("an untracked ray-tracing structure")?;
+        if let BvhNodes::Native(marker) = nodes {
+            // The glass splice's ray query: the ray's origin, direction and
+            // extent; the node pointer and inverse direction are not read.
+            let guard = self.guard(b, i)?;
+            let mut x = Vec::with_capacity(7);
+            for &r in &regs[1 + usize::from(wide)..8 + usize::from(wide)] {
+                let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
+                let v = self.i32_of(v)?;
+                x.push(self.as_float(v));
+            }
+            self.glass_query(inst, dst, guard, marker, [x[1], x[2], x[3]], [x[4], x[5], x[6]], x[0]);
+            return Ok(());
+        }
         let (sort, barycentrics) = match nodes {
+            BvhNodes::Native(_) => unreachable!("the marker returned above"),
             BvhNodes::Resource => (true, true),
             BvhNodes::Memory { word1, word3 } => (
                 word1 & bvh::BOX_SORT != 0,
@@ -191,6 +205,7 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
                 NodeAt::Buffer { handle, byte }
             }
+            BvhNodes::Native(_) => unreachable!("the marker returned above"),
             BvhNodes::Memory { .. } => {
                 let Operand::Scalar { code, .. } = *rsrc else {
                     return Err("a ray-tracing structure descriptor not in SGPRs");
