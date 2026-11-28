@@ -62,6 +62,11 @@ pub(super) fn blocks_alive() -> [u64; 3] {
     ALIVE.each_ref().map(|a| a.load(Ordering::Relaxed))
 }
 
+/// (El1xr) Card, shared, upload: bytes held by pieces in use and bytes still cuttable.
+pub(super) fn usage() -> [[u64; 2]; 3] {
+    [&CARD, &SHARED, &UPLOAD].map(|pool| lock(pool).usage())
+}
+
 /// (El1xr) The shared and upload pools' rested pieces freed and every empty
 /// block let go (`VICTORY_UPLOAD_CAP_MB`): the blocks let go.
 pub(super) fn trim(at: u64, finished: u64) -> u64 {
