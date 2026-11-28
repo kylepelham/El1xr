@@ -1654,6 +1654,24 @@ pub(crate) fn shader_heap_slot(handle: u64) -> Option<(u64, u32)> {
     shader_slot(handle).map(|(heap, index)| (heap.start, index))
 }
 
+/// (#115, `crate::heap_find`) What the host slot of title slot `index` of
+/// the shader-visible heap starting at `heap` shows against the title's
+/// record there ([`host::HostHeap::made_state`]).
+#[cfg(windows)]
+pub(crate) fn host_slot_state(heap: u64, index: u32, record: [u32; 3]) -> &'static str {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps.iter().find(|h| h.0 == heap) else {
+        return "no_heap";
+    };
+    // SAFETY: registered heaps are live (removed when dropped, which waits
+    // for this list's lock).
+    let heap = unsafe { &*(at as *const Heap) };
+    match heap.host.get() {
+        Some(Some(host)) => host.made_state(index, record),
+        _ => "no_host_heap",
+    }
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.
