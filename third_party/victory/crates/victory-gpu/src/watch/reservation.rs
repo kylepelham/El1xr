@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// (worldstream) `VICTORY_ASK_OUTSIDE=1`: the asking's kernel calls made without the journal's lock.
+pub(super) mod outside;
+
 pub(super) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -246,6 +249,10 @@ fn ask_timed(ranges: &[(usize, usize)], started: std::time::Instant) {
     });
     add(split::PIECES, pieces.len() as u64);
     add_us(split::FILTER_US, started);
+    if outside::on() {
+        outside::ask(&pieces);
+        return;
+    }
     let locking = std::time::Instant::now();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     add_us(split::LOCK_US, locking);
@@ -302,11 +309,22 @@ pub(super) fn completed_write(at: usize, len: usize) {
     }
 }
 
-fn run(j: &mut Journal, mut pieces: &[(usize, usize)]) {
+fn run(j: &mut Journal, pieces: &[(usize, usize)]) {
     j.ahead_asked = next_asking();
     j.ahead.clear();
     j.ordered = true;
     j.kept = !pieces.is_empty();
+    j.ahead = plan(pieces, |first, last| ask_kernel(j, first, last));
+}
+
+/// The groups `pieces` are asked about in, each asked with `ask` (true: the
+/// kernel answered for it): the ranges answered for, in order, as `ahead`.
+fn plan(mut pieces: &[(usize, usize)], mut ask: impl FnMut(usize, usize) -> bool) -> Vec<(usize, usize)> {
+    let mut ahead: Vec<(usize, usize)> = Vec::new();
+    let covered = |ahead: &[(usize, usize)], first: usize, last: usize| {
+        let i = ahead.partition_point(|&(_, end)| end < last);
+        ahead.get(i).is_some_and(|&(start, _)| start <= first)
+    };
     let mut allocation = None;
     while let Some(&(first, end)) = pieces.first() {
         if allocation.is_none_or(|(a, b, _)| first < a || first >= b) {
@@ -334,22 +352,23 @@ fn run(j: &mut Journal, mut pieces: &[(usize, usize)]) {
             && last <= limit
             && last - first <= AHEAD_MAX
             && !known_view(first * PAGE)
-            && ask_kernel(j, first, last)
+            && ask(first, last)
         {
-            keep(&mut j.ahead, &pieces[..n]);
+            keep(&mut ahead, &pieces[..n]);
         } else if private && n > 1 {
             for &piece in &pieces[..n] {
                 if piece.1 - piece.0 <= AHEAD_MAX
-                    && !covered(j, piece.0, piece.1)
+                    && !covered(&ahead, piece.0, piece.1)
                     && !known_view(piece.0 * PAGE)
-                    && ask_kernel(j, piece.0, piece.1)
+                    && ask(piece.0, piece.1)
                 {
-                    keep(&mut j.ahead, &[piece]);
+                    keep(&mut ahead, &[piece]);
                 }
             }
         }
         pieces = &pieces[n..];
     }
+    ahead
 }
 
 #[cfg(test)]
