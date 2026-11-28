@@ -11,13 +11,18 @@
 //!
 //! `VICTORY_MOD_MENU_SELFTEST=1` queues one read of the title's frame-rate native at the first
 //! game tick after the table is built and logs `mod menu: selftest ...` with the result.
+//! `VICTORY_MOD_MENU_CENSUS=1` counts calls per native ([`census`]) and logs the busiest every
+//! [`CENSUS_EVERY`]; `VICTORY_MOD_MENU_PROBE=1` logs the trainer's reads ([`probe`]).
 
+pub mod census;
 pub mod model;
 pub mod natives;
+pub mod probe;
 pub mod queue;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use natives::Scan;
 use queue::{Call, Outcome, Queue};
@@ -51,6 +56,17 @@ static TABLE: OnceLock<Result<Table, String>> = OnceLock::new();
 pub(crate) static QUEUE: LazyLock<Queue> = LazyLock::new(Queue::default);
 static SELFTEST_QUEUED: AtomicBool = AtomicBool::new(false);
 static TICKS: AtomicUsize = AtomicUsize::new(0);
+static CENSUS: OnceLock<census::Census> = OnceLock::new();
+static CENSUS_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+static PROBE: LazyLock<Mutex<probe::Probe>> = LazyLock::new(Mutex::default);
+
+/// How often the census logs, and how many natives each time.
+pub const CENSUS_EVERY: Duration = Duration::from_secs(30);
+const CENSUS_TOP: usize = 40;
+
+fn flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.trim() == "1")
+}
 
 /// Builds the native table from the title image mapped at `base` (`size` bytes) and logs what it
 /// found. Call once, after mapping and before the title runs.
@@ -74,6 +90,20 @@ pub unsafe fn init(base: usize, size: usize) {
                 "mod menu: natives found {}",
                 scan.natives.len()
             );
+            if flag("VICTORY_MOD_MENU_CENSUS") {
+                // SAFETY: the caller's contract (the title has not started).
+                match unsafe { census::install(base, size, &scan.natives) } {
+                    Ok(c) => {
+                        tracing::info!(
+                            skipped = c.skipped,
+                            "mod menu: census hooked {} natives",
+                            c.hooked
+                        );
+                        let _ = CENSUS.set(c);
+                    }
+                    Err(e) => tracing::warn!("mod menu: census off ({e})"),
+                }
+            }
             Ok(Table { base, scan })
         }
         Err(e) => {
@@ -107,6 +137,7 @@ pub fn game_tick() {
         };
         QUEUE.push(call);
     }
+    side_logs();
     if QUEUE.idle() {
         return;
     }
@@ -133,6 +164,51 @@ pub fn game_tick() {
             ),
         }
     }
+}
+
+/// The census and probe lines, on their own clocks.
+fn side_logs() {
+    if CENSUS.get().is_none() && !probe_on() {
+        return;
+    }
+    let now = Instant::now();
+    if let Some(c) = CENSUS.get() {
+        let mut last = CENSUS_LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| now - t >= CENSUS_EVERY) {
+            let first = last.is_none();
+            *last = Some(now);
+            let (calls, ran, top) = c.report(CENSUS_TOP);
+            if !first {
+                let top: Vec<String> = top.iter().map(|(h, n)| format!("{h:016x}={n}")).collect();
+                tracing::info!(
+                    "mod menu: census {}s calls={calls} natives={ran} top {}",
+                    CENSUS_EVERY.as_secs(),
+                    top.join(" ")
+                );
+            }
+        }
+    }
+    if probe_on() {
+        static PLAN: LazyLock<Option<probe::SetPlan>> = LazyLock::new(|| {
+            std::env::var("VICTORY_MOD_MENU_PROBE_SET")
+                .ok()
+                .and_then(|v| probe::parse_set(&v))
+        });
+        let lines = PROBE.lock().unwrap_or_else(|e| e.into_inner()).tick(
+            now,
+            model::OPTIONS,
+            &QUEUE,
+            PLAN.as_ref(),
+        );
+        for line in lines {
+            tracing::info!("{line}");
+        }
+    }
+}
+
+fn probe_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| flag("VICTORY_MOD_MENU_PROBE"));
+    *ON
 }
 
 fn selftest() -> bool {
