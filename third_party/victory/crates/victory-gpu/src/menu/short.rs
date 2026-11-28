@@ -207,6 +207,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_UPSCALE_OFF_STRETCH", "Turning the upscaler off live stretches the image until the next start."),
     ("VICTORY_VIEWS_REMADE_QUIET", "Applies mip view changes at once instead of waiting for idle."),
     ("VICTORY_VIEWS_REMADE_SAFE", "Shows a texture's new mip only once no list on the card can read it."),
+    ("VICTORY_VOLUMETRICS_WIDE", "Untiled water volumetrics run wave-wide on 32-lane cards, not refused."),
     ("VICTORY_WAIT_SPIN", "How long a thread spins for helpers before sleeping, in microseconds."),
     ("VICTORY_WATER_LIGHT", "Draws the water's tiled lights; off removes dark blocks on open water."),
     ("VICTORY_WATER_TILE_SLOTS", "Fixes dark blocks on water around boats and piers."),
