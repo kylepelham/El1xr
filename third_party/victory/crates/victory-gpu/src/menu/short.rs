@@ -65,6 +65,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
     ("VICTORY_FETCH_CHECK", "Relay fetches are hashed and fetched again if torn (black skin)."),
     ("VICTORY_FIXED_TRIPS", "Loops with a count fixed in code run to their end, not a stage cap."),
+    ("VICTORY_FLICKER_CATCH_REGION", "Also catches a small screen region going dark for one frame."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
     ("VICTORY_FLUSH_ONE_PASS", "Runs a wide flush in one pass on helper threads, without barriers."),
     ("VICTORY_FLUSH_PASS_MERGE", "Runs a long refresh in the same flush pass as its copy's other steps."),

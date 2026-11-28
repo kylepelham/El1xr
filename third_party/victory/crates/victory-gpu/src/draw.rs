@@ -17,6 +17,8 @@ mod draw_dump;
 mod heap_find;
 #[cfg(windows)]
 mod exposure_watch;
+#[cfg(windows)]
+mod flicker_region;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2153,6 +2155,10 @@ impl State {
         #[cfg(windows)]
         if crate::exposure_watch::on() {
             self.exposure_watch(list, p, compute);
+        }
+        #[cfg(windows)]
+        if crate::flicker_catch::region::on() {
+            self.flicker_region(p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
