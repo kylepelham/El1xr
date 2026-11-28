@@ -842,6 +842,7 @@ pub(crate) fn take_dropped() -> u64 {
         );
     }
     crate::drop_why::line(crate::queue::frame_count());
+    crate::pieces_diag::line(crate::queue::frame_count());
     crate::indirect_fit::line(crate::queue::frame_count());
     DROPPED.swap(0, Ordering::Relaxed)
 }

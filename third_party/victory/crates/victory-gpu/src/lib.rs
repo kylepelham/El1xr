@@ -76,6 +76,8 @@ mod hang_watch;
 mod raw_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pieces_diag;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
