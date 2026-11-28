@@ -577,13 +577,14 @@ impl Lower<'_> {
         Ok(())
     }
 
-    /// (`VICTORY_SHADOW_RASTER_TILES`) A sun shadow tile's flags `v` as
-    /// `crate::emit::shadow_raster::rewrite` leaves them at `level`.
+    /// (`VICTORY_SHADOW_RASTER_TILES`) A sun shadow tile's flags `v` with no traced place: at
+    /// level 1 if it has a raster place, at level 2 moved to the raster path if it was traced.
     fn shadow_raster_rewrite(&mut self, level: u8, v: V) -> V {
+        use crate::emit::shadow_raster::{RASTER, TRACED};
         let c = self.cur;
-        let (raster, traced) = (self.s.m.i32(1), self.s.m.i32(0x2004));
+        let (raster, traced) = (self.s.m.i32(RASTER), self.s.m.i32(TRACED));
         let zero = self.s.m.i32(0);
-        let keep = self.s.m.i32(!0x2004);
+        let keep = self.s.m.i32(!TRACED);
         let cleared = self.s.m.bin(c, Bin::And, v, keep);
         let (test, then) = if level == 1 {
             (raster, cleared)

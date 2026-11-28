@@ -41,9 +41,9 @@ const PROGRAMS: [(&[u8], usize); 2] = [
 ];
 
 /// The tile has a raster place.
-const RASTER: u32 = 1;
+pub(super) const RASTER: u32 = 1;
 /// The tile has a traced place: bit 2, or bit 13 (the leak-plug forms).
-const TRACED: u32 = 0x2004;
+pub(super) const TRACED: u32 = 0x2004;
 
 /// The switch's level: 1 or 2; `None` when unset, `0` or unparsable.
 fn parse(value: Option<&str>) -> Option<u8> {
@@ -70,8 +70,10 @@ pub fn shadow_raster_key() -> Option<String> {
     level().map(|l| format!("VICTORY_SHADOW_RASTER_TILES={l}"))
 }
 
-/// The flags a tile's word `v` holds after the rewrite at `level`.
-pub(super) fn rewrite(level: u8, v: u32) -> u32 {
+/// The flags a tile's word `v` holds after the rewrite at `level` (what the emitted code does:
+/// `Lower::shadow_raster_rewrite`).
+#[cfg(test)]
+fn rewrite(level: u8, v: u32) -> u32 {
     let cleared = v & !TRACED;
     match level {
         1 if v & RASTER != 0 => cleared,
