@@ -126,6 +126,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if victory_shader::emit::mask_elsewhere() {
         h.update(b"VICTORY_MASK_ELSEWHERE=1");
     }
+    if victory_shader::emit::div_inf_zero() {
+        h.update(b"VICTORY_DIV_INF_ZERO=1");
+    }
     if let Some(key) = victory_shader::emit::miss_sky_key() {
         h.update(key.as_bytes());
     }
