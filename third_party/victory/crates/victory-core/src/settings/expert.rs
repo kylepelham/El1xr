@@ -284,6 +284,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_RESINFO_MIP_BOUNDS", Apply::Retranslate),
     ("VICTORY_RESINFO_MSAA", Apply::Retranslate),
     ("VICTORY_RESINFO_SHAPE", Apply::Retranslate),
+    ("VICTORY_RESULT_RING", Apply::Live),
     ("VICTORY_REUPLOAD_WHEN_FULL", Apply::Restart),
     ("VICTORY_RIPE_BLOCKS", Apply::Restart),
     ("VICTORY_ROOT_BIND_CACHE", Apply::Restart),
@@ -346,6 +347,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
     // a flip would compare against stale state and miss changed records (wrong descriptors).
     ("VICTORY_SYNC_IN_PLACE", Apply::Restart),
+    ("VICTORY_SYNC_MASKS_LEAST", Apply::Live),
     ("VICTORY_TABLED_REREAD", Apply::Live),
     ("VICTORY_TABLED_TEXTURES", Apply::Restart),
     ("VICTORY_TABLES_BY_CONTENT", Apply::Restart),
@@ -412,6 +414,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_WAVE_WIDE_ONLY", Apply::Retranslate),
     ("VICTORY_WAVE_ZERO_MASK", Apply::Retranslate),
     ("VICTORY_WIDE_BACK", Apply::Restart),
+    ("VICTORY_WIDE_COPY", Apply::Live),
     ("VICTORY_WINDOW_REBAR", Apply::Restart),
     ("VICTORY_WRITE_SKIP", Apply::Restart),
     ("VICTORY_XMA_DUMP", Apply::Restart),

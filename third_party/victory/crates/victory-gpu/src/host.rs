@@ -1911,8 +1911,8 @@ struct CardWork {
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
     /// The dwords of `differs` taken by plans whose results were not read
-    /// yet.
-    taken: u32,
+    /// yet ([`crate::result_ring`]).
+    taken: crate::result_ring::Ring,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
     /// (Neptune) With [`relay_own_queue`]: the compare that keeps the
@@ -2648,6 +2648,8 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// Its stretch of the compare's results ([`crate::result_ring`]).
+    results: (u32, u32),
 }
 
 /// (Neptune) Title memory declared as written by shaders in this frame or
@@ -6386,7 +6388,17 @@ impl HostList {
                     }
                     batch.title_copy(dst, src, len);
                     crate::port::copied(dst, src, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if crate::wide_copy::cut_step(dst, src, len) {
+                        crate::wide_copy::copy_pieces(
+                            dst as *mut u8,
+                            src as *const u8,
+                            len,
+                            crate::wide_copy::STEP_PIECE,
+                            |d, s, n| copy_mapped(d, s, n, true),
+                        );
+                    } else {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     if check_heap_writes
@@ -6770,7 +6782,8 @@ impl Batch {
             None
         };
         let no_lazy = _lazy_hold.is_some();
-        if wide_refresh() && total_bytes >= 32 * 1024 && self.pending_fills.len() >= 8 {
+        let cut = crate::wide_copy::on() && crate::wide_copy::split_fills(&mut self.pending_fills);
+        if wide_refresh() && total_bytes >= 32 * 1024 && (self.pending_fills.len() >= 8 || cut) {
             let fills = std::sync::Arc::new(std::mem::take(&mut self.pending_fills));
             let total = fills.len();
             let chunk = (total / 24).clamp(1, 32);
