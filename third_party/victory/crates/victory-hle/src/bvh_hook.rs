@@ -234,8 +234,8 @@ extern "C" fn batched(this: *mut u8, list: *mut u8, count: u32, descs: *const u8
             // SAFETY: as above.
             unsafe { read_inputs(d.add(8), "batched", show) };
             if victory_gpu::native_rt::on() {
-                // SAFETY: as above; the destination first.
-                if let Some(b) = unsafe { parse(field::<u64>(d, 0), d.add(8)) } {
+                // SAFETY: as above; the destination first, an update's source at 32.
+                if let Some(b) = unsafe { parse(field::<u64>(d, 0), field::<u64>(d, 32), d.add(8)) } {
                     builds.push(b);
                 }
             }
@@ -468,12 +468,13 @@ unsafe fn build_ranges(d: *const u8, out: &mut Vec<u64>) {
     }
 }
 
-/// The build `inputs` describe, for the host's own structures
-/// ([`victory_gpu::native_rt`]); `None` for a layout it does not take.
+/// The build `inputs` describe into `dest` (an update: from `source`), for
+/// the host's own structures ([`victory_gpu::native_rt`]); `None` for a
+/// layout it does not take.
 ///
 /// # Safety
 /// `inputs` points to the title's inputs structure.
-unsafe fn parse(dest: u64, inputs: *const u8) -> Option<victory_gpu::native_rt::Build> {
+unsafe fn parse(dest: u64, source: u64, inputs: *const u8) -> Option<victory_gpu::native_rt::Build> {
     use victory_gpu::native_rt::Build;
     if inputs.is_null() {
         return None;
@@ -492,6 +493,7 @@ unsafe fn parse(dest: u64, inputs: *const u8) -> Option<victory_gpu::native_rt::
         // Top level: `descs` is the instances' GPU address (an array).
         return (layout == 0).then_some(Build::Top {
             dest,
+            source,
             flags,
             count: n,
             instances: descs,
@@ -514,6 +516,7 @@ unsafe fn parse(dest: u64, inputs: *const u8) -> Option<victory_gpu::native_rt::
     }
     Some(Build::Bottom {
         dest,
+        source,
         flags,
         geometries,
     })
@@ -583,8 +586,8 @@ extern "C" fn rehydrate(
             .filter_map(|i| {
                 // SAFETY: `count` standard build descriptions.
                 let d = unsafe { descs.add(i * BUILD_DESC_SIZE) };
-                // SAFETY: as above; inputs at byte 8.
-                unsafe { parse(field::<u64>(d, 0), d.add(8)) }
+                // SAFETY: as above; inputs at byte 8, an update's source at 32.
+                unsafe { parse(field::<u64>(d, 0), field::<u64>(d, 32), d.add(8)) }
             })
             .collect();
         victory_gpu::native_rt::build(list.cast_const().cast(), &builds);
@@ -656,16 +659,17 @@ mod tests {
         inputs[8..12].copy_from_slice(&2u32.to_le_bytes());
         inputs[16..24].copy_from_slice(&(geo.as_ptr() as u64).to_le_bytes());
         // SAFETY: both structures live on this stack frame.
-        let b = unsafe { parse(0xabc0, inputs.as_ptr()) };
+        let b = unsafe { parse(0xabc0, 0xdef0, inputs.as_ptr()) };
         let Some(victory_gpu::native_rt::Build::Bottom {
             dest,
+            source,
             flags,
             geometries,
         }) = b
         else {
             panic!("not a bottom level: {b:?}");
         };
-        assert_eq!((dest, flags, geometries.len()), (0xabc0, 4, 2));
+        assert_eq!((dest, source, flags, geometries.len()), (0xabc0, 0xdef0, 4, 2));
         let g = geometries[1];
         assert!(g.opaque);
         assert_eq!(
@@ -720,22 +724,23 @@ mod tests {
         inputs[8..12].copy_from_slice(&1u32.to_le_bytes());
         inputs[16..24].copy_from_slice(&(geo.as_ptr() as u64).to_le_bytes());
         // SAFETY: both structures live on this stack frame.
-        assert!(unsafe { parse(0x10, inputs.as_ptr()) }.is_none());
+        assert!(unsafe { parse(0x10, 0, inputs.as_ptr()) }.is_none());
         // Top level with an array of pointers: not taken.
         let mut top = [0u8; INPUTS_SIZE];
         top[8..12].copy_from_slice(&3u32.to_le_bytes());
         top[12..16].copy_from_slice(&1u32.to_le_bytes());
         // SAFETY: as above.
-        assert!(unsafe { parse(0x20, top.as_ptr()) }.is_none());
+        assert!(unsafe { parse(0x20, 0, top.as_ptr()) }.is_none());
         // Top level as an array: the instances' address and count.
         top[12..16].copy_from_slice(&0u32.to_le_bytes());
         top[16..24].copy_from_slice(&0x5000u64.to_le_bytes());
         // SAFETY: as above.
-        let t = unsafe { parse(0x20, top.as_ptr()) };
+        let t = unsafe { parse(0x20, 0x20, top.as_ptr()) };
         assert!(matches!(
             t,
             Some(victory_gpu::native_rt::Build::Top {
                 dest: 0x20,
+                source: 0x20,
                 count: 3,
                 instances: 0x5000,
                 ..
