@@ -459,7 +459,8 @@ impl Painter {
                 self.apply_class(bm, l.badge(r), model.apply_of(info.name));
                 let value = model.get(info.name).unwrap_or_default();
                 self.value(bm, l, l.value(r), info.name, info.kind, &value, selected);
-                let help = match (info.help, info.label == info.name) {
+                let detail = model.detail(info.name);
+                let help = match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
                     (help, true) => help.to_string(),
                     ("", false) => info.name.to_string(),
                     (help, false) => format!("{help}   {}", info.name),

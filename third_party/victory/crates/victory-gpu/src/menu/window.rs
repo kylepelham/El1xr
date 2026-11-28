@@ -657,32 +657,47 @@ mod tests {
         let mid = (small.h / 2 * small.w + small.w / 2) * 4 + 3;
         assert!(small.px[mid] > 200, "the panel is nearly opaque");
         assert_eq!(small.px[3], 0, "the corner is clear");
-        // DLSS on (live), then frame generation (restart): the band shows; the 4K picture is the
-        // 1080 one at twice the size.
-        d.tick(30, &[Key::Right], 0, 0);
-        d.tick(60, &[], 0, 0);
-        d.tick(90, &[Key::Right], 0, 0);
-        d.tick(120, &[], 0, 0);
+        // Resolution 2560x1440 (restart), DLSS (live here) at Quality (restart), then frame
+        // generation (restart): the band shows; the 4K picture is the 1080 one at twice the size.
+        let mut at = 30;
+        let mut tick = |d: &mut Driver, keys: &[Key], pad: u32| {
+            d.tick(at, keys, pad, 0);
+            d.tick(at + 30, &[], 0, 0);
+            at += 60;
+        };
+        tick(&mut d, &[Key::Left], 0);
+        tick(&mut d, &[Key::Left], 0);
+        tick(&mut d, &[Key::Left], 0);
+        assert_eq!(d.model.get("VICTORY_RESOLUTION").as_deref(), Some("2560x1440"));
+        tick(&mut d, &[], DOWN);
+        tick(&mut d, &[Key::Right], 0);
+        tick(&mut d, &[Key::Right], 0);
         assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("dlss"));
-        for (at, pad) in [(150, DOWN), (180, 0), (210, DOWN), (240, 0), (270, DOWN), (300, 0), (330, DOWN)] {
+        tick(&mut d, &[], DOWN);
+        tick(&mut d, &[Key::Right], 0);
+        assert_eq!(d.model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("quality"));
+        for (at, pad) in [(1150, DOWN), (1180, 0), (1210, DOWN), (1240, 0)] {
             d.tick(at, &[], pad, 0);
         }
-        d.tick(360, &[Key::Enter], 0, 0);
-        assert_eq!(d.model.pending_restart(), ["VICTORY_FRAME_GEN"]);
+        d.tick(1360, &[Key::Enter], 0, 0);
+        assert_eq!(
+            d.model.pending_restart(),
+            ["VICTORY_FRAME_GEN", "VICTORY_RESOLUTION", "VICTORY_UPSCALE_QUALITY"]
+        );
         let big = save("menu_display_4k.png", &mut d, 3840, 2160);
         assert_eq!((big.w, big.h), (small.w * 2, small.h * 2));
-        d.tick(400, &[], PAD_RB, 0);
+        d.tick(1400, &[], PAD_RB, 0);
         assert_eq!(d.menu.tab, Tab::Group("Submission"));
         save("menu_submission_1080.png", &mut d, 1920, 1080);
-        d.tick(430, &[Key::Expert], 0, 0);
-        d.tick(460, &[], 0, 0);
+        d.tick(1430, &[Key::Expert], 0, 0);
+        d.tick(1460, &[], 0, 0);
         assert!(d.menu.expert);
         d.menu.tab = Tab::Group(super::super::state::EXPERIMENTAL);
         save("menu_experimental_1080.png", &mut d, 1920, 1080);
         d.menu.tab = Tab::Presets;
         d.menu.selected = 1;
         save("menu_presets_1440.png", &mut d, 2560, 1440);
-        for name in ["VICTORY_UPSCALE", "VICTORY_FRAME_GEN"] {
+        for name in ["VICTORY_RESOLUTION", "VICTORY_UPSCALE", "VICTORY_UPSCALE_QUALITY", "VICTORY_FRAME_GEN"] {
             d.model.set(name, "").unwrap();
         }
         assert!(d.model.pending_restart().is_empty());

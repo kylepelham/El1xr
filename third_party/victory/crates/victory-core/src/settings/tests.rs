@@ -234,6 +234,29 @@ fn saved_files_read_back_the_same() {
     assert!(problems.is_empty());
 }
 
+/// The menu's resolution rows reach the file and, read back, plan the same render size.
+#[test]
+fn resolution_and_quality_save_and_plan_the_same_after_a_read() {
+    let resolution = info("VICTORY_RESOLUTION").unwrap();
+    let quality = info("VICTORY_UPSCALE_QUALITY").unwrap();
+    assert_eq!((resolution.group, quality.group), ("Display", "Display"));
+    assert_eq!((resolution.apply, quality.apply), (Apply::Restart, Apply::Restart));
+    assert!(valid(resolution.kind, "2560x1440") && valid(resolution.kind, "native") && !valid(resolution.kind, "1600x900"));
+    assert!(valid(quality.kind, "ultra_performance") && !valid(quality.kind, "ultra"));
+    let mut values = BTreeMap::new();
+    values.insert("VICTORY_RESOLUTION".to_string(), "2560x1440".to_string());
+    values.insert("VICTORY_UPSCALE".to_string(), "dlss".to_string());
+    values.insert("VICTORY_UPSCALE_QUALITY".to_string(), "quality".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    write_file(&path, &values).unwrap();
+    let (back, problems) = parse_file(&std::fs::read_to_string(&path).unwrap());
+    assert!(problems.is_empty());
+    assert_eq!(back, values);
+    let plan = crate::render_plan::plan(|n| back.get(n).cloned(), || None).unwrap();
+    assert_eq!((plan.output, plan.render), (Some((2560, 1440)), Some((1706, 960))));
+}
+
 /// A read-only settings file is not replaced, and no temporary file is left beside it.
 #[test]
 fn a_read_only_file_is_refused_and_left_as_it_was() {

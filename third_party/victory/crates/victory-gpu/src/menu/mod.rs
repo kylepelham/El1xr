@@ -11,6 +11,7 @@
 //! are the registry's groups, each row's LIVE / RESTART / REBUILD tag is `apply_of`, changes go
 //! through `settings::set`, and SAVE writes the settings file.
 
+pub mod display;
 pub mod input;
 pub mod layout;
 pub mod model;
@@ -25,6 +26,7 @@ mod window;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::Relaxed};
 
+pub use display::primary_display_size;
 use input::{CHORD, Inputs, Key};
 use layout::Hit;
 use model::MenuModel;
@@ -268,12 +270,12 @@ mod tests {
         assert_eq!(d.menu.selected, 3);
         d.tick(90, &[], 0, 120);
         assert_eq!(d.menu.selected, 2);
-        assert!(d.click(Some(Hit::ValueRight(0))));
+        assert!(d.click(Some(Hit::ValueRight(1))));
         assert_eq!(
             (d.menu.selected, d.model.get("VICTORY_UPSCALE").as_deref()),
-            (0, Some("stretch"))
+            (1, Some("stretch"))
         );
-        assert!(d.click(Some(Hit::ValueLeft(0))));
+        assert!(d.click(Some(Hit::ValueLeft(1))));
         assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("off"));
         assert!(d.click(Some(Hit::Tab(state::Tab::Presets))));
         assert!(d.click(Some(Hit::ValueLeft(0))));
