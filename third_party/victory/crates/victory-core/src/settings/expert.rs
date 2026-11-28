@@ -400,6 +400,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STREAMLINE_DIR", Apply::Restart),
     ("VICTORY_STRICT_JOINS", Apply::Retranslate),
     ("VICTORY_SUBMIT_CHUNKS", Apply::Restart),
+    ("VICTORY_SWAP_WATCH", Apply::Live),
     ("VICTORY_SWEEP", Apply::Restart),
     ("VICTORY_SWEEP_EVERY_MS", Apply::Restart),
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
