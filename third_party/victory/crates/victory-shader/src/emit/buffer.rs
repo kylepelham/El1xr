@@ -444,7 +444,12 @@ impl Lower<'_> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            // `VICTORY_TBUFFER_D16=1`: two 16-bit channels a VGPR.
+            if name.contains("_format_d16_") && super::isa_fixes::Fix::TbufferD16.on() {
+                xs = self.d16_pack(inst, reg, f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

@@ -2876,3 +2876,140 @@ fn sdwa_16bit_word0_sext_sign_extends_and_refuses_reserved_unused() {
     });
     assert!(err.is_err(), "reserved dst_unused=3 must be refused");
 }
+
+/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
+const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+        0x80 << 24 | (op as u32 >> 3 & 1) << 21 | (srsrc as u32 >> 2 & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+#[test]
+fn v_dot2_f32_f16_negates_its_accumulator_once() {
+    use lower::isa_fixes::Fix;
+    // v_dot2_f32_f16 v0, v1, v2, -v3 (neg_lo[2]): 1*3 + 2*4 - 5 = 6 (ISA: neg applies to
+    // src2 once; the reference interpreter runs no dot2 modifier). Off: +5, 16.
+    let [w0, w1] = vop3p(0x013, 0, vgpr(1), vgpr(2), vgpr(3));
+    let input = [[0x4000_3C00u32, 0x4400_4200, 5.0f32.to_bits(), 0]];
+    for fixed in [true, false] {
+        let shader = build_cs_with(Fix::Dot2AccNeg, fixed, &[w0, w1 | 4 << 29], 1);
+        run_cases(&shader, &input, |backend, _, _, got| {
+            let want = if fixed { 6.0f32 } else { 16.0 };
+            assert_eq!(got, want.to_bits(), "{backend}: v_dot2_f32_f16 -acc (fixed: {fixed})");
+        });
+    }
+}
+
+#[test]
+fn s_lshl_add_sets_scc_to_the_carry_of_the_wide_sum() {
+    use lower::isa_fixes::Fix;
+    // The reference interpreter (`rdna2_exec_bits.py` `lshl_add`): SCC = ((S0 << n) + S1) >> 32
+    // != 0, the shift taken in 64 bits. Off: SCC = D != 0.
+    let cases: [[u32; 4]; 8] = [
+        [5, 3, 0, 0],
+        [0, 0, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [0x4000_0000, 0xC000_0000, 0, 0],
+        [0x7FFF_FFFF, 2, 0, 0],
+        [0x0FFF_FFFF, 0xF000_0000, 0, 0],
+        [0x1000_0000, 0, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+    ];
+    for n in 1..=4u8 {
+        for fixed in [true, false] {
+            let body = [
+                sop2(0x2D + n, 12, 0, 1),
+                sop2(10, 13, 129, 128),   // s_cselect_b32 s13, 1, 0
+                vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+            ];
+            let shader = build_cs_with(Fix::SccShiftAdd, fixed, &body, 1);
+            run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+                let wide = (u64::from(a) << n) + u64::from(b);
+                let want = if fixed { wide >> 32 != 0 } else { wide as u32 != 0 };
+                assert_eq!(got, u32::from(want), "{backend}: s_lshl{n}_add_u32 {a:#x}, {b:#x} (fixed: {fixed})");
+            });
+        }
+    }
+}
+
+#[test]
+fn tbuffer_d16_loads_pack_two_channels_a_vgpr() {
+    use lower::isa_fixes::Fix;
+    let (x, xy) = (8u8, 9u8);
+    // (opcode, format, dword stored, the result as `rdna2_buffer_d16.py` gives it). v0 holds
+    // 0xA5A5_xxxx first: d16_x fills the low half and keeps the high one.
+    let cases: &[(u8, u8, u32, u32)] = &[
+        (xy, 29, 0x4000_3C00, 0x4000_3C00), // 16_16_FLOAT: the halves as stored
+        (xy, 27, 0xBEEF_1234, 0xBEEF_1234), // 16_16_UINT: the low 16 bits
+        (xy, 23, 0xFFFF_0000, 0x3C00_0000), // 16_16_UNORM: 0.0 and 1.0 as f16
+        (x, 13, 0x4000_3C00, 0xA5A5_3C00),  // 16_FLOAT, one channel
+    ];
+    for &(op, format, stored, want) in cases {
+        let mut body = vec![vop1(0x001, 0, vgpr(2))]; // v_mov_b32 v0, v2
+        body.extend(buffer_store_dword(1, 8, 0));
+        body.extend(mtbuf(op, 0, 8, format));
+        let shader = build_cs_with(Fix::TbufferD16, true, &body, 1);
+        run_cases(&shader, &[[stored, 0xA5A5_5A5A, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: d16 op {op} format {format} of {stored:#010x} = {got:#010x}");
+        });
+    }
+    // Off: the destination takes the first channel as a whole float (the second is dropped:
+    // the decoder gives the load one VGPR, and the write past it goes nowhere). The VGPR after
+    // the destination keeps its value either way.
+    for fixed in [true, false] {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf(xy, 0, 8, 29));
+        let loaded = build_cs_with(Fix::TbufferD16, fixed, &body, 1);
+        body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        let next = build_cs_with(Fix::TbufferD16, fixed, &body, 1);
+        run_cases(&loaded, &[[0x4000_3C00, 0, 0, 0]], |backend, _, _, got| {
+            let want = if fixed { 0x4000_3C00 } else { 1.0f32.to_bits() };
+            assert_eq!(got, want, "{backend}: a d16_xy load of 16_16_FLOAT (fixed: {fixed})");
+        });
+        run_cases(&next, &[[0x4000_3C00, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, 0x4000_3C00, "{backend}: v1 after a d16_xy load into v0 (fixed: {fixed})");
+        });
+    }
+}
+
+/// Codes of a normalized field to try: every code up to 10 bits; for 16 a stride, the codes
+/// an RX 6700 XT's division missed (257, 261, ...) and the ends.
+fn normalized_codes(bits: u32) -> Vec<u32> {
+    if bits <= 10 {
+        return (0..1 << bits).collect();
+    }
+    let edges = [1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF];
+    (0..=0xFFFF).step_by(257).chain(edges).collect()
+}
+
+/// The quotient nearest `code / (2^bits - 1)` (SNORM: of the signed code over `2^(bits-1) - 1`,
+/// at least -1), as the reference interpreter's `unorm_bits`/`snorm_bits`: a correctly
+/// rounded division never ties (the quotient's bits repeat without end).
+fn normalized_reference(code: u32, bits: u32, signed: bool) -> u32 {
+    if signed {
+        let top = (1i32 << (bits - 1)) - 1;
+        let s = ((code << (32 - bits)) as i32) >> (32 - bits);
+        (s.max(-top) as f32 / top as f32).to_bits()
+    } else {
+        (code as f32 / ((1u32 << bits) - 1) as f32).to_bits()
+    }
+}
+
+#[test]
+fn normalized_buffer_fields_load_the_nearest_float() {
+    use lower::isa_fixes::Fix;
+    // (format, bits, signed): 8_UNORM, 8_SNORM, 16_UNORM, 16_SNORM, 2_10_10_10_UNORM and
+    // _SNORM (x: 10 bits), 10_10_10_2_UNORM and _SNORM (x: 2 bits).
+    let formats = [(1u8, 8u32, false), (2, 8, true), (7, 16, false), (8, 16, true), (50, 10, false), (51, 10, true), (44, 2, false), (45, 2, true)];
+    for (format, bits, signed) in formats {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf(0, 0, 8, format));
+        let shader = build_cs_with(Fix::NormNearest, true, &body, 1);
+        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, _, [a, ..], got| {
+            let want = normalized_reference(a, bits, signed);
+            assert_eq!(got, want, "{backend}: format {format} code {a:#x} = {got:#010x}, want {want:#010x}");
+        });
+    }
+}

@@ -219,7 +219,9 @@ impl<'a> Lower<'a> {
                 } else {
                     f(self, 2)?
                 };
-                if v.neg >> 2 & 1 != 0 {
+                // `fsrc` negated src2 already (`VICTORY_DOT2_ACC_NEG=1`: not again).
+                let neg_again = name == "v_dot2c_f32_f16" || !super::isa_fixes::Fix::Dot2AccNeg.on();
+                if v.neg >> 2 & 1 != 0 && neg_again {
                     acc = self.s.m.bin(c, Bin::Sub, z, acc);
                 }
 
