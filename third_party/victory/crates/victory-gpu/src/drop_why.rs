@@ -35,6 +35,8 @@ const NAMED: usize = 8;
 
 thread_local! {
     static WHY: Cell<&'static str> = const { Cell::new("") };
+    /// The reason the last count took ([`why_now`]).
+    static LAST: Cell<&'static str> = const { Cell::new("") };
     /// The title pipeline of the draw or dispatch being recorded.
     static PIPELINE: Cell<usize> = const { Cell::new(0) };
     /// The signature of the indirect execution being recorded.
@@ -119,7 +121,21 @@ static FRAMES_AT: AtomicU64 = AtomicU64::new(0);
 /// Whether reasons are noted: counted here, or kept by the flicker
 /// catcher.
 fn noting() -> bool {
-    on() || crate::flicker_catch::on()
+    on() || crate::flicker_catch::on() || crate::skin_watch::on()
+}
+
+/// Why the draw or dispatch being prepared on this thread failed: the reason noted, else the
+/// one the last count took (`crate::skin_watch`).
+pub(crate) fn why_now() -> &'static str {
+    match WHY.get() {
+        "" => LAST.get(),
+        why => why,
+    }
+}
+
+/// Forgets the reason the last count took.
+pub(crate) fn clear_last() {
+    LAST.set("");
 }
 
 /// Notes why the draw or dispatch being prepared on this thread fails.
@@ -181,6 +197,7 @@ pub(crate) fn count_of(site: &'static str, this: usize) {
 /// Counts a drop at `site` for the reason and pipeline last noted on this
 /// thread.
 pub(crate) fn count(site: &'static str) {
+    LAST.set(WHY.get());
     if !on() {
         // Noted for the flicker catcher only: taken.
         WHY.set("");
