@@ -51,6 +51,10 @@ mod boot_prof;
 #[cfg(windows)]
 mod bake_check;
 #[cfg(windows)]
+mod bake_fresh;
+#[cfg(windows)]
+mod bake_name;
+#[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]
 mod bake_publish;
