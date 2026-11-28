@@ -5253,6 +5253,10 @@ impl HostList {
         self.twins_to_depth();
         self.textures_back();
         self.indirect_args_back();
+        let used = self.deferred().budget_zeroed;
+        if let Some(Some((_, _, gpu))) = self.budget.get().filter(|_| used) {
+            crate::indirect::card_budget::end_run(&self.list, *gpu);
+        }
         crate::gpucost::end(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -6277,6 +6281,7 @@ impl HostList {
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
+            crate::indirect::card_budget::begin_run(*gpu);
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
@@ -6306,7 +6311,7 @@ impl HostList {
                 }
             }), true));
         }
-        Some(*gpu)
+        Some(crate::indirect::card_budget::card(*gpu).unwrap_or(*gpu))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -8156,6 +8161,7 @@ impl Meter {
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2), of which {split_raw:.0} dispatches in one piece (VICTORY_SPLIT_RAW=1)"
             );
             crate::indirect::split_ahead::line(frames);
+            crate::indirect::card_budget::line(frames);
             let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4]
                 .map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + raw + fell > 0.0 {
@@ -8651,6 +8657,7 @@ impl Host {
                 .then(|| crate::screenshot::read_back(&self.device, list, texture))
                 .flatten();
             let snap = crate::snap::record(&self.device, list, texture, frame);
+            let report = crate::report::record(&self.device, list, texture, frame);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -8714,6 +8721,7 @@ impl Host {
                 crate::flicker_catch::pass::sent(caught, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
+            crate::report::sent(report, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {
                 crate::screenshot::finish(shot);
             }

@@ -22,21 +22,39 @@ fn the_switch_and_the_names_read_as_meant() {
     assert_eq!(pass_among(b"CS_AlphaTransmissionDepthTileMipDilate_7f", NAMES.len()), Some(6));
     assert_eq!(pass_among(b"CS_TransmissionVolumetrics", NAMES.len()), Some(5));
     assert_eq!(pass_among(b"CS_MainBlur_446b3af2_Wrapped", NAMES.len()), Some(12));
-    assert_eq!(POST.len(), NAMES.len() - BASE);
+    assert_eq!(POST.len(), POST_END - BASE);
+    assert_eq!(POST.last(), Some(&"CS_BilateralBlur"));
+    assert_eq!(GLASS.len(), NAMES.len() - POST_END);
+    // The glass chain only with its switch; the pyramid's first stage by the title's spelling.
+    let prefilter = b"..CS_AlphTransmissionPrefilterMip_610a2fad_Wrapped..";
+    assert_eq!(pass_among(prefilter, POST_END), None);
+    assert_eq!(pass_among(prefilter, NAMES.len()), Some(15));
+    assert_eq!(pass_among(b"CS_RayMiss_de6b91a6_Wrapped", NAMES.len()), Some(17));
+    assert_eq!(pass_among(b"CS_ScreenProbe_RayMiss_80a88544_Wrapped", NAMES.len()), None);
+    assert_eq!(pass_among(b"CS_SpatialFilterAlpha_08e7839f", NAMES.len()), Some(23));
+    assert_eq!(pass_among(b"CS_SpatialFilter_Std_be0b86ce", NAMES.len()), Some(24));
     assert_eq!(kind_of(26), Some(Kind::Float3));
     assert_eq!(kind_of(10), Some(Kind::Float4));
     assert_eq!(kind_of(41), Some(Kind::Float1));
     assert_eq!(kind_of(28), None);
     let mut found = [[0u32; 2]; NAMES.len()];
     found[2] = [3, 1];
-    assert_eq!(line(&found), "NaN/inf texels: CS_TAA2_Resolve nan=3 inf=1");
+    assert_eq!(line(&found, 0), "NaN/inf texels: CS_TAA2_Resolve nan=3 inf=1");
+    found[18] = [0, 2];
+    assert_eq!(
+        line(&found, 19),
+        "NaN/inf texels: CS_TAA2_Resolve nan=3 inf=1, CS_ResolveScreenSpace nan=0 inf=2 first=CS_ResolveScreenSpace"
+    );
+    assert_eq!(first_at(0) as u64, COUNT_BYTES - RING * 4);
+    assert_eq!(first_at(RING - 1) as u64, COUNT_BYTES - 4);
 }
 
 const W: u32 = 20;
 const H: u32 = 12;
 
 /// Runs the pass on WARP over a `format` image whose texels are `texel(x, y)` (`channels`
-/// floats each): the counts at entry 3 and the image after.
+/// floats each): the counts at entry 3 and the image after. The pass tags ring frame 1's
+/// first-writer word with 9 if it finds any.
 fn on_warp(
     format: DXGI_FORMAT,
     kind: Kind,
@@ -217,6 +235,8 @@ fn on_warp(
             3,
             scrub,
             counts.GetGPUVirtualAddress(),
+            first_at(1),
+            9,
         );
         let back = committed(
             D3D12_HEAP_TYPE_READBACK,
@@ -257,8 +277,11 @@ fn on_warp(
         }
         let words = read.add(bytes as usize).cast::<u32>();
         let found = [words.add(6).read(), words.add(7).read()];
+        let tag_word = first_at(1) as usize / 4;
+        let tag = words.add(tag_word).read();
+        assert_eq!(tag, if found != [0, 0] { 9 } else { 0 }, "the first writer is tagged");
         let others = (0..(COUNT_BYTES / 4) as usize)
-            .filter(|&i| i != 6 && i != 7)
+            .filter(|&i| i != 6 && i != 7 && i != tag_word)
             .all(|i| words.add(i).read() == 0);
         assert!(others, "counts only at the entry asked");
         back.Unmap(0, None);

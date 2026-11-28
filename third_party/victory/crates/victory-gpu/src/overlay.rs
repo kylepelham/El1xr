@@ -265,7 +265,7 @@ fn sample(cpu: &mut Cpu, gpu: Option<&Gpu3d>, adapter: Option<&IDXGIAdapter3>, n
 }
 
 /// Whether a window of this process is in front.
-fn ours_in_front() -> bool {
+pub(crate) fn ours_in_front() -> bool {
     let mut pid = 0u32;
     // SAFETY: plain queries.
     unsafe {
@@ -457,7 +457,8 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let big_h = g.measure(BIG, "0").1;
     let small_h = g.measure(SMALL, "Ag").1 + px(1.0);
     let sep = px(9.0);
-    let h = pad + big_h + sep + rows.len() as i32 * row_h + sep + hardware.len() as i32 * small_h + pad - px(1.0);
+    let graph_h = if crate::report::graph_on() { px(40.0) + sep } else { 0 };
+    let h = pad + big_h + sep + rows.len() as i32 * row_h + graph_h + sep + hardware.len() as i32 * small_h + pad - px(1.0);
     let mut bm = Bitmap::new(w as usize, h as usize);
     bm.fill_round((0, 0, w as usize, h as usize), 10.0 * s, BG, 218);
 
@@ -480,6 +481,13 @@ pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
         g.draw(&mut bm, ROW, label, pad, y, DIM);
         g.draw(&mut bm, ROW, value, right(ROW, value), y, WHITE);
         y += row_h;
+    }
+    if graph_h > 0 {
+        y += sep / 2;
+        let gw = (w - 2 * pad) as usize;
+        let ms = crate::report::last_ms(gw);
+        crate::report::graph::draw(&mut bm, (pad as usize, y as usize, gw, px(40.0) as usize), &ms);
+        y += graph_h - sep / 2;
     }
     y += sep / 2 - 1;
     line(&mut bm, y);

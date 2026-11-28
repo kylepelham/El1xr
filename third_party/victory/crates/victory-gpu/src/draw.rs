@@ -902,6 +902,30 @@ pub(crate) fn forget_heap_ranges(id: u64) {
     drop(ranges);
 }
 
+/// What the heap-buffers pass does with a slot showing buffer view `view`:
+/// keeps it on the copy making the view `resolved`, else on the one
+/// `buffer_copy` finds; with none, an orphan if the view reads any bytes.
+fn heap_buffer_look(
+    view: &crate::descriptor::View,
+    resolved: Option<crate::descriptor::host::BufferCopy>,
+) -> crate::heap_pass_split::Look<(std::sync::Arc<crate::shadow::Shadow>, u32)> {
+    use crate::heap_pass_split::Look;
+    let made = resolved.is_some();
+    let stride = crate::descriptor::host::view_stride(view).unwrap_or(0);
+    match resolved.or_else(|| crate::descriptor::host::buffer_copy(view)) {
+        Some((copy, address, len)) => Look::Keep {
+            copy: (copy, stride),
+            from: address,
+            to: address + len,
+            made,
+        },
+        None if crate::descriptor::host::buffer_range(view).is_some_and(|(_, len)| len > 0) => {
+            Look::Orphan
+        }
+        None => Look::Forget,
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn the_texture_budgets_are_live() {
@@ -2877,6 +2901,8 @@ impl State {
         let ranges = heaps
             .entry(host.id())
             .or_insert_with(|| PickedRanges::new(crate::heap_pass::full_pass()));
+        // `VICTORY_HEAP_NET_IN_PLACE`: a look at every slot keeps what is known.
+        ranges.set_net_in_place(crate::heap_pass_split::net_in_place());
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
         // Always take dirty pages (including on pass 0) so `buffer_written`
@@ -2926,80 +2952,119 @@ impl State {
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        if slots.len() >= crate::buffer_ahead::LEAST && crate::buffer_ahead::on() {
+        let mut times = crate::heap_pass_split::Times {
+            plan: started.elapsed().as_micros() as u64,
+            ..Default::default()
+        };
+        let all = ranges.last_all();
+        use crate::heap_pass_split::Look;
+        // `VICTORY_HEAP_PASS_SPLIT`: the slots that show their view already are
+        // looked at on helper threads first (`heap_pass_split`), and taken in
+        // below, in order, as the others are made.
+        let looking = std::time::Instant::now();
+        let threads = crate::heap_pass_split::threads_for(slots.len());
+        let pre = if threads > 1 {
+            // `heap.handle`, as the heap object is not shared with threads.
+            let (first, step, count) = (heap.start, heap.slot_stride() as u64, heap.count());
+            crate::heap_pass_split::pre_look(&slots, threads, |index| {
+                let handle = (step > 0 && index < count).then(|| first + u64::from(index) * step)?;
+                let (key, view) = host.shown_already(index, handle)?;
+                Some((key, heap_buffer_look(&view, None)))
+            })
+        } else {
+            Vec::new()
+        };
+        times.look = looking.elapsed().as_micros() as u64;
+        let ahead = std::time::Instant::now();
+        let left = |n: usize| pre.get(n).is_none_or(Option::is_none);
+        if (0..slots.len()).filter(|&n| left(n)).count() >= crate::buffer_ahead::LEAST
+            && crate::buffer_ahead::on()
+        {
             crate::buffer_ahead::make(
                 slots
                     .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?))
+                    .enumerate()
+                    .filter(|&(n, _)| left(n))
+                    .filter_map(|(_, &i)| crate::descriptor::view(heap.handle(i)?))
                     .collect(),
             );
         }
-        for (n, &index) in slots.iter().enumerate() {
-            let Some(handle) = heap.handle(index) else {
-                ranges.forget(index);
-                continue;
-            };
-            let record = crate::descriptor::record_at(handle);
-            let entry = crate::descriptor::record_entry(record);
-            let Some((view, resolved)) = host.mirror_heap_buffer(index, handle) else {
-                ranges.forget(index);
-                continue;
-            };
-            // Whether making the view just resolved the copy the slot reads
-            // (`buffer_copy`): the slot then shows that copy, as it was put
-            // in `kept` with it.
-            #[cfg(feature = "diagnostics")]
-            let made = resolved.is_some();
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| {
-                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
-                    })
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(
-                    why,
-                    slot = index,
-                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
-                );
-                crate::host::log_removal_context();
-            }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find: the one making the view just
-            // resolved, when it did, and only otherwise looked up again.
-            let (shadow, address, len) = match resolved {
-                Some(copy) => copy,
-                None => match crate::descriptor::host::buffer_copy(&view) {
-                    Some(copy) => copy,
-                    None => {
-                        if crate::descriptor::host::buffer_range(&view)
-                            .is_some_and(|(_, len)| len > 0)
-                        {
-                            ranges.orphan(index, record, entry);
-                        } else {
-                            ranges.forget(index);
+        times.ahead = ahead.elapsed().as_micros() as u64;
+        let keeping = std::time::Instant::now();
+        // The record each slot's look went by: read before the view is made
+        // (or when a look beside is found still shown), so that a write
+        // racing the pass leaves the slot's record changed for the next one.
+        let seen = std::cell::Cell::new(None);
+        let counts = crate::heap_pass_split::run(
+            &slots,
+            pre,
+            |index, key| {
+                seen.set(heap.handle(index).and_then(|h| host.shows_key(index, h, key)));
+                seen.get().is_some()
+            },
+            |index| {
+                let Some(handle) = heap.handle(index) else {
+                    seen.set(None);
+                    return Look::Forget;
+                };
+                seen.set(Some(crate::descriptor::record_at(handle)));
+                let Some((view, resolved)) = host.mirror_heap_buffer(index, handle) else {
+                    return Look::Forget;
+                };
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find: the one making the view just
+                // resolved, when it did, and only otherwise looked up again.
+                heap_buffer_look(&view, resolved)
+            },
+            |n, index, look| {
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| {
+                            crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                        })
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(
+                        why,
+                        slot = index,
+                        "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                    );
+                    crate::host::log_removal_context();
+                }
+                let Some(record) = seen.take() else {
+                    ranges.forget(index);
+                    return;
+                };
+                let entry = crate::descriptor::record_entry(record);
+                match look {
+                    Look::Forget => ranges.forget(index),
+                    Look::Orphan => ranges.orphan(index, record, entry),
+                    Look::Keep { copy: (copy, stride), from, to, made } => {
+                        // Whether making the view just resolved the copy the
+                        // slot reads: the slot then shows that copy.
+                        #[cfg(feature = "diagnostics")]
+                        if !made && host.shows(index, &copy.buffer) == Some(false) {
+                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
                         }
-                        continue;
+                        #[cfg(not(feature = "diagnostics"))]
+                        let _ = made;
+                        if victory_shader::emit::heap_buffer_address() {
+                            host.write_buffer_range_shadow(index, &copy, from, to - from, stride);
+                        }
+                        let key = std::sync::Arc::as_ptr(&copy) as usize;
+                        ranges.keep(index, key, &copy, [from, to], record, entry);
                     }
-                },
-            };
-            #[cfg(feature = "diagnostics")]
-            if !made && host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-            }
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            if victory_shader::emit::heap_buffer_address() {
-                host.write_buffer_range_shadow(index, &shadow, address, len, &view);
-            }
-            ranges.keep(index, key, &shadow, [address, address + len], record, entry);
-        }
+                }
+            },
+        );
+        times.keep = keeping.elapsed().as_micros() as u64;
         let views = ranges.views() as u32;
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -3020,6 +3085,7 @@ impl State {
         });
         let mut copies = 0usize;
         let mut bytes = 0u64;
+        let spanning = std::time::Instant::now();
         {
             let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
             let whole = whole.get_or_insert_with(Default::default);
@@ -3043,6 +3109,8 @@ impl State {
             });
         }
         drop(kept);
+        times.spans = spanning.elapsed().as_micros() as u64;
+        crate::heap_pass_split::line(slots.len(), all, threads, counts, copies, times);
         let textures_began = std::time::Instant::now();
         {
             let _hitch = crate::hitch::span(crate::hitch::Phase::HeapTextures);
