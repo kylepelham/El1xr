@@ -115,7 +115,7 @@ pub fn blocked() -> bool {
 /// Called by the HLE at each input poll with the first pad's buttons (GameInput bits), left
 /// stick and triggers; returns whether the title's input is blocked.
 pub fn feed_pad(buttons: u32, stick_x: f32, stick_y: f32, left_trigger: f32, right_trigger: f32) -> bool {
-    if !enabled() && !crate::modmenu::enabled() {
+    if !enabled() && !crate::modmenu::enabled() && !report_chord_on() {
         return false;
     }
     let bits = buttons | input::stick_bits(stick_x, stick_y) | input::trigger_bits(left_trigger, right_trigger);
@@ -126,13 +126,26 @@ pub fn feed_pad(buttons: u32, stick_x: f32, stick_y: f32, left_trigger: f32, rig
 }
 
 /// The buttons the title sees: with the menu on, View and Menu held together are the menu's
-/// chord; with the trainer on, both stick clicks are its own.
+/// chord; with the trainer on, both stick clicks are its own; with the report key on
+/// (`VICTORY_REPORT_KEY`), View + RS.
 pub fn chord_mask(buttons: u32) -> u32 {
-    mask_chords(buttons, enabled(), crate::modmenu::enabled())
+    mask_chords(buttons, enabled(), crate::modmenu::enabled(), report_chord_on())
 }
 
-fn mask_chords(mut buttons: u32, settings: bool, trainer: bool) -> u32 {
-    for (on, chord) in [(settings, CHORD), (trainer, TRAINER_CHORD)] {
+/// The first pad's buttons as last fed (for the report key's chord).
+pub(crate) fn pad_held() -> u32 {
+    PAD_DOWN.load(Relaxed)
+}
+
+fn report_chord_on() -> bool {
+    #[cfg(windows)]
+    return crate::report::keyed();
+    #[cfg(not(windows))]
+    false
+}
+
+fn mask_chords(mut buttons: u32, settings: bool, trainer: bool, report: bool) -> u32 {
+    for (on, chord) in [(settings, CHORD), (trainer, TRAINER_CHORD), (report, input::REPORT_CHORD)] {
         if on && buttons & chord == chord {
             buttons &= !chord;
         }
@@ -359,11 +372,15 @@ mod tests {
     #[test]
     fn chords_are_masked_per_menu_and_one_menu_never_opens_over_the_other() {
         use super::input::{PAD_LS, PAD_RS};
-        assert_eq!(mask_chords(CHORD | PAD_A, true, false), PAD_A);
-        assert_eq!(mask_chords(CHORD | PAD_A, false, true), CHORD | PAD_A);
-        assert_eq!(mask_chords(TRAINER_CHORD, true, false), TRAINER_CHORD);
-        assert_eq!(mask_chords(TRAINER_CHORD | CHORD, true, true), 0);
-        assert_eq!(mask_chords(PAD_LS, true, true), PAD_LS, "one stick click is the title's");
+        use super::input::{PAD_VIEW, REPORT_CHORD};
+        assert_eq!(mask_chords(CHORD | PAD_A, true, false, false), PAD_A);
+        assert_eq!(mask_chords(CHORD | PAD_A, false, true, false), CHORD | PAD_A);
+        assert_eq!(mask_chords(TRAINER_CHORD, true, false, false), TRAINER_CHORD);
+        assert_eq!(mask_chords(TRAINER_CHORD | CHORD, true, true, false), 0);
+        assert_eq!(mask_chords(PAD_LS, true, true, true), PAD_LS, "one stick click is the title's");
+        assert_eq!(mask_chords(REPORT_CHORD | PAD_A, false, false, true), PAD_A, "View + RS is the report key's");
+        assert_eq!(mask_chords(REPORT_CHORD, true, true, false), REPORT_CHORD);
+        assert_eq!(mask_chords(PAD_VIEW, true, true, true), PAD_VIEW);
         let (mut keys, mut pad) = (vec![Key::Hotkey], CHORD | PAD_RS);
         while_other_open(true, &mut keys, &mut pad);
         assert!(keys.is_empty() && pad == 0);

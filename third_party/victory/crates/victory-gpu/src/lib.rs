@@ -158,6 +158,8 @@ mod fetch_check;
 #[cfg(windows)]
 mod relay_runs;
 #[cfg(windows)]
+pub mod report;
+#[cfg(windows)]
 mod screenshot;
 #[cfg(windows)]
 mod snap;

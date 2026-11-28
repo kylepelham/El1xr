@@ -107,9 +107,23 @@ fn note(
 
 /// Whether the title wrote a null view on purpose: a shader view of no
 /// resource (D3D12's null descriptor, with the description saying its
-/// kind). Made, it reads zeros, as the title meant.
+/// kind), or a placed texture view at address 0 (unallocated placeholder).
+/// Made, it reads zeros, as the title meant.
 pub(crate) fn title_null(view: &View) -> bool {
-    matches!(view, View::Shader(0, _))
+    match view {
+        View::Shader(0, _) => true,
+        View::Placed(false, _, desc) => desc[10] == 0 && desc[11] == 0,
+        _ => false,
+    }
+}
+
+/// Slot `index` of heap `heap` no longer holds a texture view (cleared or
+/// overwritten with a non-texture): it waits for nothing.
+pub(crate) fn cleared(heap: usize, index: u32) {
+    let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = waits.as_mut() {
+        w.remove(&(heap, index));
+    }
 }
 
 /// Slot `index` of heap `heap` shows the null view the title wrote: it
@@ -273,7 +287,31 @@ mod tests {
         assert!(title_null(&View::Shader(0, Some(d))));
         assert!(title_null(&View::Shader(0, None)));
         assert!(!title_null(&View::Shader(0x1234, Some(d))));
-        assert!(!title_null(&View::Placed(false, [0; 14], [0; 16])));
+        assert!(title_null(&View::Placed(false, [0; 14], [0; 16])));
+        let mut live = [0u32; 16];
+        live[10] = 0x1000;
+        assert!(!title_null(&View::Placed(false, [0; 14], live)));
+        assert!(!title_null(&View::Placed(true, [0; 14], [0; 16])));
+    }
+
+    #[test]
+    fn clearing_a_slot_removes_its_wait() {
+        let key = (0x7e57_a6e5usize, 42u32);
+        {
+            let mut waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+            note(
+                waits.get_or_insert_with(HashMap::new),
+                key,
+                Kind::Null,
+                &View::Shader(0x10, None),
+                None,
+                1000,
+            );
+            assert!(waits.as_ref().unwrap().contains_key(&key));
+        }
+        cleared(key.0, key.1);
+        let waits = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!waits.as_ref().unwrap().contains_key(&key));
     }
 
     #[test]

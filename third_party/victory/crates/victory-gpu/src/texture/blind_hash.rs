@@ -222,6 +222,8 @@ mod tests {
         assert_eq!(parse_every(Some("x")), 8);
         assert_eq!(parse_every(Some("0")), 1);
         assert_eq!(parse_every(Some("64")), 64);
+        let default = victory_core::settings::info("VICTORY_TEXTURE_HASH_EVERY").unwrap().default;
+        assert_eq!(default.parse::<u64>().ok(), Some(parse_every(None)));
     }
 
     #[test]
