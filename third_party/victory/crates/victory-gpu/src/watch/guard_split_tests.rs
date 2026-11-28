@@ -40,6 +40,7 @@ struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
         DIRTY4K_IN_TEST.set(u8::MAX);
+        super::super::holes::KEPT_FORCED.set(None);
         NOTE_ONCE_FORCED.set(None);
         PUBLISH_TRY_FORCED.set(None);
         super::super::PORT_GUARD_IN_TEST.set(false);
@@ -548,4 +549,169 @@ fn a_missed_try_leaves_the_holders_claim() {
     assert!(BUSY.try_set(block), "dropped with its owner");
     BUSY.clear(block);
     release(at, 1);
+}
+
+/// A reserved pagefile section's view of `blocks` blocks with only `committed` committed, known
+/// to the guards as title view memory (the other blocks are uncommitted holes).
+fn holed_view(blocks: usize, committed: &[std::ops::Range<usize>]) -> View {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MapViewOfFile, PAGE_READWRITE, SEC_RESERVE,
+        VirtualAlloc,
+    };
+    use super::super::BLOCK;
+    let len = blocks * BLOCK;
+    // SAFETY: a fresh reserved pagefile section and one view of it, closed by `View`'s drop.
+    unsafe {
+        let section = CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE | SEC_RESERVE,
+            0,
+            len as u32,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null());
+        let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+        assert_ne!(at, 0);
+        for r in committed {
+            let p = VirtualAlloc((at + r.start * BLOCK) as *const _, r.len() * BLOCK, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+        }
+        crate::inplace::title_memory_view(at, len, section as usize, 0);
+        View { section, at, len }
+    }
+}
+
+/// (#88, b5 part M) `VICTORY_GUARD_HOLES_KEPT=1`: the same writes over a view with holes tell
+/// the same pages with and without the switch, with far fewer `VirtualQuery`s; a block of a
+/// kept hole committed (and told) is guarded and its writes told in the same frame.
+#[test]
+fn kept_holes_tell_the_same_pages_with_fewer_queries() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    use super::super::BLOCK;
+    let _reset = Reset;
+    super::super::PORT_GUARD_IN_TEST.set(true);
+    let mut told = Vec::new();
+    let mut queries = Vec::new();
+    for kept in [false, true] {
+        super::super::holes::KEPT_FORCED.set(Some(kept));
+        // Holes [2, 5) and [7, 12) between committed blocks.
+        let view = holed_view(14, &[0..2, 5..7, 12..14]);
+        let (mut since, _) = view.refresh(0);
+        let before = super::super::tests::syscall_counts().1;
+        let mut pages = Vec::new();
+        for round in 0..24u8 {
+            for b in [0, 5, 12, 13] {
+                if (b + round as usize) % 3 != 0 {
+                    view.write(b, round);
+                }
+            }
+            let (asked, p) = view.refresh(since);
+            since = asked;
+            pages.push(p);
+        }
+        queries.push(super::super::tests::syscall_counts().1 - before);
+        // Commit a block of the hole [7, 12), as `XMemVirtualAlloc` does, and write it.
+        let at = view.at + 9 * BLOCK;
+        // SAFETY: inside our reserved view.
+        assert!(!unsafe { VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        crate::title_pages_committed(at, BLOCK);
+        let (asked, _) = view.refresh(since);
+        view.write(9, 7);
+        let (_, p) = view.refresh(asked);
+        assert!(p.contains(&(9 * BLOCK / PAGE)), "kept={kept}: the committed block's write was told: {p:?}");
+        pages.push(p);
+        told.push(pages);
+    }
+    assert_eq!(told[0], told[1], "the same pages told");
+    assert!(queries[1] * 2 < queries[0], "queries off {} vs kept {}", queries[0], queries[1]);
+}
+
+/// The kept-holes table: a run is kept for its frame, never when free, never when the runtime
+/// told of a change while it was asked about, and forgotten where told.
+#[test]
+fn kept_holes_follow_frames_and_what_is_told() {
+    use super::super::holes::{forget_in_table, kept_end as kept_end_in, kept_table};
+    let table = kept_table();
+    let kept_end = |b, f, span: &mut dyn FnMut(usize) -> (usize, bool)| kept_end_in(&table, b, f, span);
+    let forget = |at, len| forget_in_table(&table, at, len);
+    let b = 100usize;
+    let frame = 7;
+    let mut asked = 0;
+    let mut ask = |end: usize, reserved: bool| {
+        asked += 1;
+        (end, reserved)
+    };
+    assert_eq!(kept_end(b, frame, &mut |_| ask(b + 4, true)), b + 4);
+    assert_eq!(kept_end(b + 2, frame, &mut |_| ask(b + 9, true)), b + 4, "kept");
+    assert_eq!(kept_end(b + 2, frame + 1, &mut |_| ask(b + 3, true)), b + 3, "a new frame asks again");
+    assert_eq!(kept_end(b + 2, frame, &mut |_| ask(b + 9, true)), b + 9, "an older frame is not kept");
+    assert_eq!(kept_end(b + 2, frame + 1, &mut |_| ask(b + 9, true)), b + 3, "kept for its frame");
+    forget((b + 2) * super::super::BLOCK, 1);
+    assert_eq!(kept_end(b + 2, frame + 1, &mut |_| ask(b + 2, false)), b + 2, "forgotten where told");
+    assert_eq!(kept_end(b + 5, frame + 1, &mut |_| ask(b + 8, false)), b + 8);
+    assert_eq!(kept_end(b + 5, frame + 1, &mut |_| ask(b + 6, false)), b + 6, "a free run is not kept");
+    // Told while asking: not kept.
+    let at = (b + 20) * super::super::BLOCK;
+    assert_eq!(
+        kept_end(b + 20, frame + 1, &mut |_| {
+            forget(at, 1);
+            (b + 30, true)
+        }),
+        b + 30
+    );
+    assert_eq!(kept_end(b + 20, frame + 1, &mut |_| ask(b + 21, true)), b + 21, "told while asked");
+    assert_eq!(asked, 7);
+}
+
+/// (#88) 16 threads checking one view with holes, as the refresh threads of a flush do: a
+/// check's time and its `VirtualQuery`s, `VICTORY_GUARD_HOLES_KEPT` off and on, alternated.
+/// `cargo test --release -p victory-gpu --lib bench_holes_kept -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_holes_kept() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const THREADS: usize = 16;
+    const CHECKS: usize = 2000;
+    let _reset = Reset;
+    // Committed blocks between holes, as streamed buffers lie: 6 holes in 32 blocks.
+    let view = holed_view(32, &[0..2, 5..8, 11..12, 15..20, 24..25, 28..29, 31..32]);
+    for round in 0..4 {
+        for kept in [false, true] {
+            let busy = AtomicU64::new(0);
+            let queries = AtomicU64::new(0);
+            let start = Barrier::new(THREADS);
+            let wall = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..THREADS {
+                    let (view, busy, queries, start) = (&view, &busy, &queries, &start);
+                    s.spawn(move || {
+                        super::super::PORT_GUARD_IN_TEST.set(true);
+                        super::super::holes::KEPT_FORCED.set(Some(kept));
+                        start.wait();
+                        let q = super::super::tests::syscall_counts().1;
+                        let t0 = std::time::Instant::now();
+                        for i in 0..CHECKS {
+                            // A write now and then, so checks walk as well as settle early.
+                            if i % 64 == t % 64 {
+                                view.write([0, 5, 15][t % 3], i as u8);
+                            }
+                            let _ = super::super::writes(view.at, view.at + view.len, true);
+                        }
+                        busy.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                        queries.fetch_add(super::super::tests::syscall_counts().1 - q, Relaxed);
+                    });
+                }
+            });
+            let checks = (THREADS * CHECKS) as f64;
+            eprintln!(
+                "round {round} kept={kept}: {:.2} us a check, {:.2} queries a check, wall {:.1} ms",
+                busy.load(Relaxed) as f64 / (checks * 1000.0),
+                queries.load(Relaxed) as f64 / checks,
+                wall.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
 }

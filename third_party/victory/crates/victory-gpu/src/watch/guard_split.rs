@@ -185,7 +185,8 @@ pub(super) fn log(frames: f64) {
     tracing::info!(
         "guard path split per frame (VICTORY_FLUSH_PROF, VICTORY_GUARD_NOTE_ONCE={}): \
          shared lock {:.0} holds, {:.2} ms waiting; checks before the walk {:.2} ms ({:.0} calls, \
-         {:.0} answered there; their hole queries {:.0} in {:.2} ms); \
+         {:.0} answered there; their hole queries {:.0} in {:.2} ms; holes kept {:.0}, \
+         VICTORY_GUARD_HOLES_KEPT={}); \
          walk {:.2} ms (alias lookups {:.2} ms; its VirtualProtects are the split line's); \
          noting after it {:.2} ms (publish {:.2} ms, {:.1} blocks left unpublished, \
          VICTORY_GUARD_PUBLISH_TRY={}); VirtualQuery {:.0} in {:.2} ms (all threads); \
@@ -200,6 +201,8 @@ pub(super) fn log(frames: f64) {
         per(S::PreSettled),
         per(S::PreHoleCalls),
         ms(S::PreHoleNs) / 1000.0,
+        super::holes::KEPT_HITS.swap(0, Relaxed) as f64 / frames,
+        u8::from(super::holes::kept_on()),
         ms(S::WalkUs),
         ms(S::AliasUs),
         ms(S::NoteUs),

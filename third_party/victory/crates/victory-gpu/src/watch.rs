@@ -4626,18 +4626,29 @@ fn protect_here(
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    uncommitted_span(block).0
+}
+
+/// [`uncommitted_end`], and whether the run is reserved (not free).
+fn uncommitted_span(block: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION};
     let Some(addr) = block.checked_mul(BLOCK) else {
-        return block;
+        return (block, false);
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let n = os_virtual_query(addr, &mut info);
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK, info.State == MEM_RESERVE)
     } else {
-        block
+        (block, false)
     }
+}
+
+/// The title's memory `[at, at + len)` was committed by an ordinary call (no mapping changed):
+/// the guards forget any uncommitted run they keep there (`VICTORY_GUARD_HOLES_KEPT`).
+pub fn title_pages_committed(at: usize, len: usize) {
+    holes::forget(at, len);
 }
 
 /// Restores `PAGE_READWRITE` for contiguous blocks `[from, to)` in a single
@@ -6411,7 +6422,7 @@ mod tests {
         }
     }
 
-    fn syscall_counts() -> (u64, u64) {
+    pub(super) fn syscall_counts() -> (u64, u64) {
         (
             OS_VIRTUAL_PROTECT_CALLS.with(|c| c.get()),
             OS_VIRTUAL_QUERY_CALLS.with(|c| c.get()),
