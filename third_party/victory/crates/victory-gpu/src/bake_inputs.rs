@@ -83,6 +83,16 @@ pub(crate) fn slots(params: &[u32; PARAM_DWORDS], record: impl Fn(u64) -> Option
     out
 }
 
+/// The byte offset and length in the records buffer of the run of records the draw composes.
+pub(crate) fn records_bytes(params: &[u32; PARAM_DWORDS]) -> (u64, u64) {
+    let (first, end) = (params[FIRST], params[END].min(params[COUNT]));
+    let end = end.min(first.saturating_add(MAX_RECORDS));
+    (
+        u64::from(first) * RECORD,
+        u64::from(end.saturating_sub(first)) * RECORD,
+    )
+}
+
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum C {
@@ -143,6 +153,22 @@ fn line(c: &[u64; N]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_BAKE_REPLAY` hashes the run of records the draw composes: dword 30 up to the
+    /// lesser of dword 31 and dword 0, at most 128 records of 304 bytes.
+    #[test]
+    fn the_run_of_records_a_draw_composes() {
+        let mut p = [0u32; PARAM_DWORDS];
+        p[FIRST] = 2;
+        p[END] = 5;
+        p[COUNT] = 4;
+        assert_eq!(records_bytes(&p), (2 * RECORD, 2 * RECORD));
+        p[COUNT] = 1;
+        assert_eq!(records_bytes(&p), (2 * RECORD, 0));
+        p[COUNT] = 1000;
+        p[END] = 1000;
+        assert_eq!(records_bytes(&p).1, u64::from(MAX_RECORDS) * RECORD);
+    }
 
     #[test]
     fn the_switch_is_live() {

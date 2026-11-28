@@ -203,6 +203,20 @@ impl State {
     /// The title slots bake draw `p` reads textures from (`crate::bake_inputs`): from its
     /// parameter constants and records, found through user data word 9.
     pub(super) fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
+        let (params, base, len) = self.bake_input_params(p)?;
+        Some(slots(&params, |off| {
+            (off.saturating_add(4) <= len)
+                .then(|| words(base.checked_add(off)?, 1))
+                .flatten()
+                .map(|w| w[0])
+        }))
+    }
+
+    /// Bake draw `p`'s parameter dwords, and its records buffer's title address and length.
+    pub(super) fn bake_input_params(
+        &self,
+        p: &HostPipeline,
+    ) -> Option<([u32; PARAM_DWORDS], u64, u64)> {
         // (`VICTORY_BAKE_BY_NAME`: also a bake program by name, its offset by family.)
         let (stage, offsets) = p
             .stages
@@ -234,12 +248,7 @@ impl State {
             }
             _ => crate::descriptor::host::buffer_range(&records)?,
         };
-        Some(slots(&params, |off| {
-            (off.saturating_add(4) <= len)
-                .then(|| words(base.checked_add(off)?, 1))
-                .flatten()
-                .map(|w| w[0])
-        }))
+        Some((params, base, len))
     }
 }
 

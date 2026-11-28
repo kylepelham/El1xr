@@ -2854,6 +2854,15 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_BAKE_REPLAY=1|2`: incomplete bakes whose inputs arrived drawn again; a bake
+        // draw is noted when drawn.
+        if crate::bake_replay::mode() > 0 {
+            if !p.is_bake {
+                Self::bake_replay_run();
+            } else if !compute {
+                bake_replay::BAKE.set(Some(false));
+            }
+        }
         // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
         if !compute && crate::material_demand::on() {
             self.material_textures(p);
@@ -4256,6 +4265,9 @@ impl State {
                 }
                 Err(_) => false,
             };
+        if crate::bake_replay::mode() > 0 {
+            self.bake_replay_drawn(ran, bake_replay::Again::Mesh(x));
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("mesh", self.pipeline);
@@ -4968,6 +4980,10 @@ impl State {
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
         }
+        if crate::bake_replay::mode() > 0 {
+            let again = bake_replay::Again::Draw(vertices, instances, first, first_instance);
+            self.bake_replay_drawn(ran && !rects, again);
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("draw", self.pipeline);
@@ -5087,6 +5103,10 @@ impl State {
         }
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
+        }
+        if crate::bake_replay::mode() > 0 {
+            let again = bake_replay::Again::Indexed(indices, instances, first, base, first_instance);
+            self.bake_replay_drawn(ran, again);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -5838,6 +5858,7 @@ mod bake_pass;
 mod bake_check;
 mod bake_fresh;
 mod bake_publish;
+mod bake_replay;
 mod material_pass;
 mod skin_views;
 
