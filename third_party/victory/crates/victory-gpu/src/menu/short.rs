@@ -3,6 +3,7 @@
 
 /// `(name, line)`, sorted by name.
 pub const SHORT: &[(&str, &str)] = &[
+    ("VICTORY_ACTIVATE_RAYS", "Runs the screen probes' ray picking even when every ray is a miss."),
     ("VICTORY_ALIAS_DIRECT", "Copies between aliased texture formats directly, not through a buffer."),
     ("VICTORY_ALIAS_PINS", "Keeps alias copy sources alive, fixing random or specked surfaces."),
     ("VICTORY_ALIAS_RUNS", "Maps a run of alias pages with one view instead of one per page."),
@@ -134,6 +135,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_PREPARE_FENCED", "Frees staging buffers only after earlier submissions have finished."),
     ("VICTORY_PREPARE_PRUNE_SAFE", "Keeps uploaded textures bound and frees prepared ones later."),
     ("VICTORY_PRESENT_OWN_FRAME", "A present waits for its own frame's work to finish first."),
+    ("VICTORY_PROBE_TRACE", "Runs the screen probes' ray traces as clean misses, not stale records."),
     ("VICTORY_QUAD_HELPERS", "Pixel quad reads include helper lanes, fixing lines along edges."),
     ("VICTORY_RAW_CHECK", "Skips indirect draws whose records exceed the limits."),
     ("VICTORY_READ_BACK_POOL", "Reuses read-back buffers across lists instead of making new ones."),
