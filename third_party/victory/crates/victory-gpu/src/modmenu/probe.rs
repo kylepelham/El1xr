@@ -281,7 +281,8 @@ mod tests {
         let q = Queue::default();
         let mut p = Probe::default();
         let t0 = Instant::now();
-        let plan = parse_set("P_OWN=0@10;P_SET=3@20").unwrap();
+        // P_OWN=1 as the other test sets it: the two share its flag and run at once.
+        let plan = parse_set("P_OWN=1@10;P_SET=3@20").unwrap();
         let at = |p: &mut Probe, s: u64| -> Vec<String> {
             p.tick(t0 + Duration::from_secs(s), OPTS, &q, Some(&plan))
                 .into_iter()
@@ -289,7 +290,7 @@ mod tests {
                 .collect()
         };
         assert!(at(&mut p, 0).is_empty());
-        assert_eq!(at(&mut p, 11), vec!["mod menu: probe set P_OWN=0 (own state)"]);
+        assert_eq!(at(&mut p, 11), vec!["mod menu: probe set P_OWN=1 (own state)"]);
         assert!(at(&mut p, 12).is_empty(), "once");
         assert_eq!(at(&mut p, 21).len(), 1);
         assert!(at(&mut p, 40).is_empty());

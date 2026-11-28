@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use super::queue::{Call, Outcome, Queue, Script};
-use super::{finder, stats, teleport};
+use super::{finder, stats, teleport, vehicle, weather};
 use crate::menu::model::{Applied, Apply, Info, Kind, MenuModel, SetError};
 
 /// What an option does.
@@ -238,6 +238,50 @@ pub const OPTIONS: &[Opt] = &[
     },
     Opt {
         info: info(
+            "MOD_WEATHER_NOW",
+            "World",
+            "Weather now (unverified)",
+            "The weather type the title is moving to (its next type), by name when known.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: weather::NATIVE_WEATHER_NEXT,
+            args: &[],
+            script: None,
+            show: weather::show,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_WEATHER",
+            "World",
+            "Weather (unverified)",
+            "Sets the weather to a type the title has (next: the one after the current type) through the setter Find weather found.",
+            Kind::Choice(weather::CHOICES),
+        ),
+        effect: Effect::Own {
+            get: weather::row_get,
+            set: weather::row_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_WEATHER_FIND",
+            "World",
+            "Find weather (unverified)",
+            "Tries each weather setter with a type from the title's table, keeps the one the weather getter reads back, then puts the weather back.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::weather_get,
+            set: finder::weather_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
             "MOD_PLAYER_COORDS",
             "Player",
             "Position",
@@ -381,6 +425,34 @@ pub const OPTIONS: &[Opt] = &[
         effect: Effect::Own {
             get: finder::stats_get,
             set: finder::stats_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_VEHICLE_SPAWN",
+            "Player",
+            "Spawn vehicle (unverified)",
+            "Spawns the model Find vehicle found 4 m ahead of the player and reads its position back.",
+            Kind::Choice(vehicle::SPAWN_CHOICES),
+        ),
+        effect: Effect::Own {
+            get: vehicle::spawn_get,
+            set: vehicle::spawn_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_VEHICLE_FIND",
+            "Player",
+            "Find vehicle (unverified)",
+            "Tries model request, loaded and create natives with candidate models and keeps the chain whose new entity reads back where it was asked to stand.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::vehicle_get,
+            set: finder::vehicle_set,
         },
         verified: false,
     },
@@ -560,6 +632,20 @@ pub const OPTIONS: &[Opt] = &[
         effect: Effect::Own {
             get: finder::get_get,
             set: finder::get_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_FIND_ALL",
+            "Status",
+            "Find all (unverified)",
+            "Runs Find teleport, Find stats, Find weather and Find vehicle in turn and saves what they found to the settings file, so later launches skip the search.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::all_get,
+            set: finder::all_set,
         },
         verified: false,
     },
@@ -932,7 +1018,7 @@ mod tests {
             "no ped, no read"
         );
         assert!(
-            working_status().starts_with("7 of 23 confirmed"),
+            working_status().starts_with("7 of 29 confirmed"),
             "{}",
             working_status()
         );

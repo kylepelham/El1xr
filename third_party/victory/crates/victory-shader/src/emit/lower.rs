@@ -160,13 +160,16 @@ mod lds_first;
 mod code_table;
 /// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
 #[path = "isa_fixes.rs"]
-pub(super) mod isa_fixes;
+pub(crate) mod isa_fixes;
 /// Normalized fields to the nearest float, tbuffer d16 packing (two of the fixes' switches).
 #[path = "isa_bundle.rs"]
 mod isa_bundle;
 /// Compute samples' implicit level from the lane quads (`VICTORY_COMPUTE_QUAD_LOD=1`).
 #[path = "quad_lod.rs"]
 mod quad_lod;
+/// Loops whose count the code fixes run to their end (`VICTORY_FIXED_TRIPS=1`).
+#[path = "trips.rs"]
+mod trips;
 /// The lanes past a `DispatchX` thread count store nothing (`VICTORY_DISPATCHX_MASK=1`).
 #[path = "thread_limit.rs"]
 pub(super) mod thread_limit;
@@ -505,6 +508,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Back edges per entry of the loops whose count the code fixes ([`trips`], by IR header;
+    /// empty unless `VICTORY_FIXED_TRIPS=1`): their limit is that count.
+    trips: HashMap<usize, u32>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
@@ -1497,6 +1503,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            trips: HashMap::new(),
             traces: p
                 .blocks
                 .iter()
@@ -2324,6 +2331,9 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.new_block()
             });
+        }
+        if isa_fixes::Fix::FixedTrips.on() {
+            self.trips = trips::trips(p, &self.rpo);
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
@@ -8411,6 +8421,7 @@ impl<'a> Lower<'a> {
         // stop reading data that is not there yet.)
         // (`VICTORY_LOOP_ROOM` raises them, `loop_keep`.)
         let limit = self.loop_cap();
+        let limit = trips::counted_limit(limit, super::loop_limit(), self.trips.get(&to).copied());
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
