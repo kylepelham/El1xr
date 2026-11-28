@@ -1366,6 +1366,8 @@ pub(crate) mod find_facts;
 pub(crate) mod idle_sweep;
 #[cfg(windows)]
 pub(crate) mod card_kept;
+#[cfg(all(test, windows))]
+mod class_depth_tests;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =

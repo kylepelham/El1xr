@@ -5547,6 +5547,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(self, &depth.texture, &plane.texture);
+        crate::tile_args_watch::plane_drawn(std::ptr::from_ref(twin) as usize, self.ops.id());
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5643,6 +5644,7 @@ impl HostList {
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            crate::tile_args_watch::twin_written(std::sync::Arc::as_ptr(&u.twin) as usize, self.ops.id());
             self.changes.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -8480,6 +8482,7 @@ impl Meter {
                 ram_mb = self.ram_mb
             );
             crate::defrag::log_progress();
+            crate::loop_cap::log();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

@@ -17,6 +17,8 @@ mod draw_dump;
 mod heap_find;
 #[cfg(windows)]
 mod exposure_watch;
+#[cfg(windows)]
+mod flicker_region;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -1894,6 +1896,10 @@ impl State {
         if kind == victory_shader::emit::USER_THREAD_LIMIT {
             return crate::rt_diag::thread_limit();
         }
+        // Per stage, set by `bind` (`Shader::loop_cap`).
+        if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+            return 0;
+        }
         // The spliced traces (glass, shadow) take their ray queries only with their host top
         // levels bound.
         if kind == victory_shader::emit::USER_GLASS_NATIVE {
@@ -2150,6 +2156,10 @@ impl State {
         if crate::exposure_watch::on() {
             self.exposure_watch(list, p, compute);
         }
+        #[cfg(windows)]
+        if crate::flicker_catch::region::on() {
+            self.flicker_region(p, compute);
+        }
         // Textures picked by index, before anything asks for them.
         {
             let _lap = BindLap::start(1);
@@ -2259,8 +2269,11 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                        values[u.index as usize] = if kind == victory_shader::emit::USER_LOOP_CAP_ID {
+                            stage.shader.loop_cap()
+                        } else {
+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref())
+                        };
                         continue;
                     }
                     let fresh = made
@@ -2420,6 +2433,13 @@ impl State {
                     if let Some(gpu) = crate::defrag::bind_defrag_counter(&list.list)
                         && compute
                     {
+                        self.bind_resource(list, compute, param, RootResource::Uav(gpu));
+                    }
+                    continue;
+                }
+                if slot == victory_shader::emit::SLOT_LOOP_CAP {
+                    // Ours: where shaders count lanes stopped at a loop's limit.
+                    if let Some(gpu) = crate::loop_cap::bind() {
                         self.bind_resource(list, compute, param, RootResource::Uav(gpu));
                     }
                     continue;
@@ -3965,6 +3985,9 @@ impl State {
         if watch {
             self.skin_watch_plain(true, ran);
         }
+        if ran && crate::tile_args_watch::on() {
+            self.tile_args_producer(list);
+        }
         crate::consumer_gate::after(role, ran);
     }
 
@@ -5038,7 +5061,7 @@ impl State {
                             // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
                                 let record = crate::descriptor::record_at(table + u64::from(k) * 32);
-                                let listed = (crate::descriptor::host::view_cache::on()
+                                let listed = (crate::descriptor::host::view_cache::any_on()
                                     && host.make_cached(record, index))
                                     || crate::descriptor::host::list_views()
                                         && host.make_listed(self.recording, record, index);
@@ -5416,6 +5439,9 @@ impl State {
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
         if let Some(w) = watch {
             self.skin_watch_after(list, w, ran);
+        }
+        if ran && kind == 2 && crate::tile_args_watch::on() {
+            self.tile_args_producer(list);
         }
         if ran
             && kind == 2
@@ -5814,6 +5840,13 @@ impl State {
                     || crate::pipeline::shaders_of(self.pipeline as This),
                 );
             }
+            // (El1xr) `VICTORY_TILE_ARGS_WATCH`: a skin lighting draw's record as the card reads it.
+            if crate::tile_args_watch::on() {
+                let path = if after_writer { "sanitized" } else { "raw" };
+                let read = tile_args_watch::Read { path, buffer: (&args.buffer, args.offset(arguments)), argument: after_writer };
+                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
+            }
             if !idle {
                 // SAFETY: an open list with everything set; the list keeps the host copies
                 // alive, and the signature is cached.
@@ -5930,6 +5963,10 @@ impl State {
                     CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                     DISPATCHED.fetch_add(1, Ordering::Relaxed);
                     return true;
+                }
+                if crate::tile_args_watch::on() {
+                    let read = tile_args_watch::Read { path: "ahead", buffer: (&slots, at), argument: true };
+                    self.tile_args_watch(list, p, read, &args, None, (kind, stride, max), arguments);
                 }
                 // SAFETY: an open list with everything set; the list keeps its
                 // ahead buffers, and the signature is cached.
@@ -6100,6 +6137,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        if crate::tile_args_watch::on() && parts.is_none() {
+            let read = tile_args_watch::Read { path: "clamped", buffer: (&bounded, at), argument: true };
+            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
+        }
         if !idle {
             // SAFETY: an open list with everything set; the scratch buffer and
             // host copies are kept alive by the list, and the signature is cached.
@@ -6185,6 +6227,7 @@ mod face_watch;
 mod material_pass;
 mod skin_views;
 mod skin_watch;
+mod tile_args_watch;
 mod zero_views;
 mod hdr_views;
 

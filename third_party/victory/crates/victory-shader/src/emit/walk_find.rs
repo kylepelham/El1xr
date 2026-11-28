@@ -18,8 +18,8 @@
 //! For each walk this gives the skip and its comparison, where the skip goes, the loop's head,
 //! the node tests, and the ray as the first node test takes it: its registers taken back
 //! through the set-up's plain copies to the ones live at the skip (what a splice's arm reads).
-//! Where the walk's results are read after it (a splice's `resume` and outputs) is not found
-//! here.
+//! Where the walk's results are read after it (a splice's `resume` and outputs) is found by
+//! [`super::walk_splice`].
 
 use crate::gfx10::{self, Encoding, Fields, Instruction, Operand};
 
@@ -46,7 +46,7 @@ pub(super) struct Found {
     pub extent: u8,
 }
 
-fn is_test(i: &Instruction) -> bool {
+pub(super) fn is_test(i: &Instruction) -> bool {
     i.encoding == Encoding::Mimg
         && matches!(
             i.name(),
@@ -54,14 +54,14 @@ fn is_test(i: &Instruction) -> bool {
         )
 }
 
-fn is_branch(i: &Instruction) -> bool {
+pub(super) fn is_branch(i: &Instruction) -> bool {
     i.encoding == Encoding::Sopp
         && i.name()
             .is_some_and(|n| n == "s_branch" || n.starts_with("s_cbranch_"))
 }
 
 /// A SOPP branch's target.
-fn target(i: &Instruction) -> usize {
+pub(super) fn target(i: &Instruction) -> usize {
     let next = i.offset as i64 + 4;
     (next + 4 * i64::from(i.words[0] as u16 as i16)) as usize
 }
@@ -75,7 +75,7 @@ fn vgpr(o: &Operand) -> Option<u8> {
 }
 
 /// The node test's address VGPRs, one per dword (a range is split).
-fn addresses(i: &Instruction) -> Option<(Vec<u8>, bool)> {
+pub(super) fn addresses(i: &Instruction) -> Option<(Vec<u8>, bool)> {
     let Fields::Image { addr, a16, .. } = i.fields(false) else {
         return None;
     };
