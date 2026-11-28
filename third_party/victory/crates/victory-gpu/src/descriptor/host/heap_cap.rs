@@ -24,7 +24,10 @@
 //!   (`VICTORY_HEAP_CAP_LOG=1` gives the log alone, with or without the
 //!   switch): views the title makes there, pages it writes there, and every
 //!   [`SCAN_EVERY`] frames the records it holds there and how many name a
-//!   live view.
+//!   live view; its lines add the most dynamic slots taken at once.
+//! - `3`: title slots past the host heap's read their own views, packed
+//!   into host slots taken from the dynamic ones, through a table
+//!   ([`super::heap_remap`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -35,7 +38,7 @@ pub(crate) const SCAN_EVERY: u64 = 300;
 fn parse(value: Option<&str>) -> u8 {
     value
         .and_then(|v| v.trim().parse::<u8>().ok())
-        .map_or(0, |n| n.min(2))
+        .map_or(0, |n| n.min(3))
 }
 
 fn mode() -> u8 {
@@ -48,13 +51,33 @@ pub(crate) fn on() -> bool {
     mode() >= 1
 }
 
+/// Whether title slots past the host heap read their own views
+/// (`VICTORY_HEAP_CAP=3`).
+pub(crate) fn remap_on() -> bool {
+    mode() == 3
+}
+
 /// Whether title slots past the host heap are logged.
 pub(crate) fn log_on() -> bool {
     static LOG: OnceLock<bool> = OnceLock::new();
     *LOG.get_or_init(|| {
-        mode() >= 2 || std::env::var("VICTORY_HEAP_CAP_LOG").is_ok_and(|v| v.trim() == "1")
+        mode() == 2 || std::env::var("VICTORY_HEAP_CAP_LOG").is_ok_and(|v| v.trim() == "1")
     })
 }
+
+/// Dynamic slots now free (`HostHeap::dynamic`) of `dynamic`: the most
+/// taken at once since the last line and ever (the reserved ones left out).
+pub(super) fn note_free(free: u32, dynamic: u32) {
+    if !on() {
+        return;
+    }
+    let taken = u64::from(dynamic.saturating_sub(free).saturating_sub(RESERVED.load(Relaxed)));
+    super::heap_remap::PEAK_TAKEN[0].fetch_max(taken, Relaxed);
+    super::heap_remap::PEAK_TAKEN[1].fetch_max(taken, Relaxed);
+}
+
+/// Dynamic slots [`reserve`] kept out.
+static RESERVED: AtomicU32 = AtomicU32::new(0);
 
 /// The slot past the title's on a host view heap whose last (null) slot is
 /// `null`, with `dynamic` slots: `null - dynamic`, where a title heap larger
@@ -75,6 +98,12 @@ pub(crate) fn tell_translator(null: u32) {
         None
     };
     victory_shader::emit::set_title_view_limit(slot.unwrap_or(0));
+    let len = if slot.is_some() && remap_on() {
+        victory_shader::emit::REMAP_LEN
+    } else {
+        0
+    };
+    victory_shader::emit::set_title_remap_len(len);
     if let Some(slot) = slot {
         tracing::info!(
             title_null = slot,
@@ -99,7 +128,8 @@ pub(crate) fn reserved_of(title_null: u32, first_dynamic: u32, dynamic: u32) -> 
 }
 
 /// Keeps the dynamic slot at the translator's title null slot out of
-/// `taken`'s free slots; how many it took (0 or 1).
+/// `taken`'s free slots, and with `=3` the packed slots after it
+/// ([`super::heap_remap::compact_of`]); how many it took.
 pub(super) fn reserve(
     taken: &mut super::DynamicBits,
     sampler: bool,
@@ -113,14 +143,27 @@ pub(super) fn reserve(
     let Some(at) = reserved_of(title_null, first_dynamic, dynamic) else {
         return 0;
     };
-    taken.set_taken(at as usize, 1);
+    let n = if remap_on() {
+        1 + super::heap_remap::compact_of(super::heap_remap::compact_slots(), at, dynamic)
+    } else {
+        1
+    };
+    taken.set_taken(at as usize, n as usize);
+    RESERVED.store(n, Relaxed);
     tracing::info!(
         title_null,
         first_dynamic,
         dynamic,
+        reserved = n,
         "heap cap: host view slot {title_null} kept null; title slots {first_dynamic} and up have no host slot"
     );
-    1
+    n
+}
+
+/// The root SRV of the `=3` remap table for a list drawing with `host`'s
+/// heap (`draw.rs`, `victory_shader::emit::SLOT_REMAP`).
+pub(crate) fn remap_root(list: &crate::host::HostList, host: &super::HostHeap) -> Option<u64> {
+    super::heap_remap::root(list, host)
 }
 
 /// Counts of title slots past the host heap since the last line: views
@@ -134,6 +177,9 @@ static WRITTEN_RANGE: [AtomicU32; 2] = [AtomicU32::new(u32::MAX), AtomicU32::new
 /// A view the title made at slot `index`, past the host heap's `count`
 /// title slots (`HostHeap::slot_in_bounds`).
 pub(super) fn made_past(index: u32, count: u32, for_draw: bool) {
+    if remap_on() {
+        super::heap_remap::dirty(index, index + 1);
+    }
     if !log_on() {
         return;
     }
@@ -179,13 +225,20 @@ pub(crate) fn note_writes(
     count: u32,
     title: u32,
 ) {
-    if !log_on() || count >= title {
+    let (log, remap) = (log_on(), remap_on());
+    if !(log || remap) || count >= title {
         return;
     }
     for &range in ranges {
         let Some((lo, hi)) = slots_past(range, start as usize, step as usize, count, title) else {
             continue;
         };
+        if remap {
+            super::heap_remap::dirty(lo, hi);
+        }
+        if !log {
+            continue;
+        }
         WRITTEN[0].fetch_add(
             range.1.saturating_sub(range.0).div_ceil(crate::watch::PAGE) as u64,
             Relaxed,
@@ -243,7 +296,11 @@ impl Scan {
 /// `null`: every [`SCAN_EVERY`] frames, the line of what was made and
 /// written past the host heap since the last, and a scan of the records
 /// there.
-pub(crate) fn watch(start: u64, step: u64, count: u32, title: u32, null: u32) {
+pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, null: u32) {
+    let count = host.count;
+    if remap_on() && count < title {
+        super::heap_remap::refresh(start, step, host, title);
+    }
     if !log_on() || count >= title || step != 32 {
         return;
     }
@@ -317,6 +374,8 @@ pub(crate) fn watch(start: u64, step: u64, count: u32, title: u32, null: u32) {
         written_pages_since = pages,
         written_slots_since = slots,
         written_range = ?(pages != 0).then_some(written_range),
+        dynamic_peak = super::heap_remap::PEAK_TAKEN[0].swap(0, Relaxed),
+        dynamic_peak_ever = super::heap_remap::PEAK_TAKEN[1].load(Relaxed),
         ms = started.elapsed().as_millis() as u64,
         "heap cap: title slots past the host heap"
     );
@@ -393,7 +452,8 @@ mod tests {
         assert_eq!(parse(Some("")), 0);
         assert_eq!(parse(Some("1")), 1);
         assert_eq!(parse(Some(" 2 ")), 2);
-        assert_eq!(parse(Some("9")), 2);
+        assert_eq!(parse(Some("3")), 3);
+        assert_eq!(parse(Some("9")), 3);
     }
 
     #[test]

@@ -13,13 +13,16 @@
 //! result (`mod menu: get sweep 1 ...`), and [`PASS_GAP`] later logs those that changed
 //! (`mod menu: get sweep 2 ...`). Health, armour and wanted level are read by some of them; the
 //! values (and what changes between passes) name them.
+//!
+//! Find stats (`MOD_FIND_STATS=run`): the pair finder ([`stats::PairFind`]) on the player ped, then
+//! on player 0; what it finds drives the health, armour and wanted rows.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use super::candidates;
+use super::{candidates, stats};
 use super::teleport::{self, Native, coords, dist, move_to, player, show};
 
 /// Where a teleport candidate is asked to put the player, from where the player stands.
@@ -285,6 +288,8 @@ impl GetSweep {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TP: Mutex<Option<TpFind>> = Mutex::new(None);
 static GET: Mutex<Option<GetSweep>> = Mutex::new(None);
+/// Find stats: the ped pass, then the player pass ([`stats::PairFind`]).
+static PAIRS: Mutex<Vec<stats::PairFind>> = Mutex::new(Vec::new());
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -314,8 +319,27 @@ pub fn tp_set(v: &str) {
 
 /// One lock at a time: the menu thread and the game thread both set and tick the finders.
 fn refresh() {
-    let on = lock(&TP).is_some();
-    ACTIVE.store(on || lock(&GET).is_some(), Relaxed);
+    let tp = lock(&TP).is_some();
+    let get = lock(&GET).is_some();
+    ACTIVE.store(tp || get || !lock(&PAIRS).is_empty(), Relaxed);
+}
+
+pub fn stats_set(v: &str) {
+    *lock(&PAIRS) = if v == "run" {
+        vec![stats::PairFind::ped(), stats::PairFind::player()]
+    } else {
+        Vec::new()
+    };
+    refresh();
+}
+
+pub fn stats_get() -> String {
+    let pairs = lock(&PAIRS);
+    if pairs.is_empty() {
+        return "off".into();
+    }
+    let s: Vec<String> = pairs.iter().map(stats::PairFind::status).collect();
+    format!("ped {}; player {}", s[0], s[1])
 }
 
 pub fn tp_get() -> String {
@@ -354,6 +378,17 @@ pub fn tick(call: &mut Native) {
     }
     if let Some(get) = lock(&GET).as_mut() {
         get.tick(Instant::now(), call, &mut log);
+    }
+    if let Some(pass) = lock(&PAIRS).iter_mut().find(|p| !p.done) {
+        pass.tick(call, &mut log);
+        if pass.done {
+            for line in stats::adopt(pass) {
+                log(line);
+            }
+            if let Some(line) = stats::restore(pass, call) {
+                log(line);
+            }
+        }
     }
 }
 

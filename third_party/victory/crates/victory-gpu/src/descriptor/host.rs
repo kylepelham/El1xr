@@ -18,11 +18,13 @@ mod buffer_format;
 mod copy_first;
 mod flicker;
 pub(crate) mod heap_cap;
+mod heap_remap;
 mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
 mod levels_wait;
 mod list_views;
+pub(crate) mod mirror_known;
 pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
@@ -1716,6 +1718,7 @@ impl HostHeap {
             "host descriptor heap made null"
         );
         heap_notices::born(h.id, h.sampler);
+        heap_remap::born(&h);
         Some(h)
     }
 
@@ -1890,6 +1893,7 @@ impl HostHeap {
         taken.set_taken(first, n);
         self.free
             .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        heap_cap::note_free(self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -3585,6 +3589,24 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         self.mirror_inner(index, handle, for_draw, true)
             .map(|(view, _)| view)
+    }
+
+    /// [`HostHeap::mirror`] for a draw, for a caller that has just looked up a view at `handle`
+    /// and does not want it back (`State::tables`, the title's own slot of a texture a table
+    /// reads). With `VICTORY_MIRROR_KNOWN=1` a slot that already shows the record's view is left
+    /// as it is without looking the view up a second time ([`mirror_known::shows`]); everything
+    /// else goes to `mirror` as before.
+    pub(crate) fn mirror_known(&self, index: u32, handle: u64) {
+        if mirror_known::on() && index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let shown = self.made_too[index as usize].load(std::sync::atomic::Ordering::Acquire);
+            if mirror_known::shows(record, shown) {
+                mirror_known::skipped();
+                return;
+            }
+        }
+        let _ = self.mirror(index, handle, true);
     }
 
     /// [`HostHeap::mirror`] for the pass over slots whose buffer view was

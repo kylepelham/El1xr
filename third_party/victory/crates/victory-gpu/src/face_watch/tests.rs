@@ -54,6 +54,26 @@ fn reasons_put_what_reads_zeros_first() {
     assert_eq!(reason(&a), None, "the bake result itself");
 }
 
+/// Batch 5 part Q: a slot read again from title memory lately, the bytes changed (or never
+/// read again before), reads `read_again` and says so; an unchanged or old read again is fine.
+#[test]
+fn a_slot_read_again_lately_with_other_bytes_is_named() {
+    let mut t = ok(8);
+    t.read_again = Some((3, Some(true)));
+    assert_eq!(reason(&t), Some("read_again"));
+    assert!(tex_text(&t).ends_with(" read_again=3f changed=yes"), "{}", tex_text(&t));
+    t.read_again = Some((3, None));
+    assert_eq!(reason(&t), Some("read_again"));
+    t.read_again = Some((3, Some(false)));
+    assert_eq!(reason(&t), None);
+    assert!(tex_text(&t).ends_with(" read_again=3f changed=no"));
+    t.read_again = Some((READ_AGAIN_FRAMES, Some(true)));
+    assert_eq!(reason(&t), None);
+    t.flags = crate::bake_check::STALE;
+    t.read_again = Some((1, Some(true)));
+    assert_eq!(reason(&t), Some("stale"), "a stale copy is named first");
+}
+
 #[test]
 fn a_slot_is_told_when_it_turns_bad_and_when_it_turns_good() {
     let mut b = Book::default();

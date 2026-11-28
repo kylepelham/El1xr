@@ -4,13 +4,14 @@
 //! [`SLOT_TLAS`] or [`SLOT_TLAS_NEAR`] in [`ROOT_CBV_SPACE`] (ray tracing
 //! tier 1.1).
 //!
-//! Groundwork only: no lowering calls these yet. The title walks its own
-//! console-format structures in its own compute programs and asks the
-//! hardware only for one node test at a time (`image_bvh*_intersect_ray`),
-//! so it cannot be handed a host top level without rewriting that walk.
+//! The title walks its own console-format structures in its own compute
+//! programs and asks the hardware only for one node test at a time
+//! (`image_bvh*_intersect_ray`), so a host top level takes a rewrite of that
+//! walk: the glass splice's markers (`glass_patch`, `lower::glass_query`)
+//! are the one lowering that calls these.
 //!
 //! Source: Linox-IDK/LNX-victory 44280ad213 (GPL-3.0-or-later).
-#![allow(dead_code)] // groundwork: no lowering emits ray queries yet
+#![allow(dead_code)] // not every committed-hit op is lowered yet
 
 use super::bitcode::{Attr, Md, V};
 use super::shader::{ROOT_CBV_SPACE, SLOT_TLAS, SLOT_TLAS_NEAR, Shader, flags};

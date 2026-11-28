@@ -115,6 +115,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if let Some(key) = victory_shader::emit::miss_sky_key() {
         h.update(key.as_bytes());
     }
+    if let Some(key) = victory_shader::emit::shadow_raster_key() {
+        h.update(key.as_bytes());
+    }
     if let Some(key) = crate::rt_hit_only::key() {
         h.update(key.as_bytes());
     }

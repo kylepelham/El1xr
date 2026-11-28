@@ -21,6 +21,7 @@ pub mod input;
 pub mod layout;
 pub mod model;
 pub mod selftest;
+pub mod short;
 pub mod state;
 
 #[cfg(windows)]
@@ -32,7 +33,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::Relaxed};
 
 pub use display::primary_display_size;
-use input::{CHORD, Inputs, Key};
+use input::{CHORD, Inputs, Key, TRAINER_CHORD};
 use layout::Hit;
 use model::MenuModel;
 use state::{Action, Menu, Row};
@@ -62,6 +63,9 @@ pub(crate) struct Spec {
     pub wheel: &'static AtomicI32,
     /// Runs `VICTORY_MENU_SELFTEST`.
     pub selftest: bool,
+    /// The pad buttons held together for a second that toggle it, and their name for the hints.
+    pub chord: u32,
+    pub chord_name: &'static str,
 }
 
 #[cfg(windows)]
@@ -75,6 +79,8 @@ static SETTINGS: Spec = Spec {
     pressed: &PAD_PRESSED,
     wheel: &WHEEL,
     selftest: true,
+    chord: CHORD,
+    chord_name: "View + Menu",
 };
 
 #[cfg(windows)]
@@ -88,6 +94,8 @@ static TRAINER: Spec = Spec {
     pressed: &TRAINER_PRESSED,
     wheel: &TRAINER_WHEEL,
     selftest: false,
+    chord: TRAINER_CHORD,
+    chord_name: "LS + RS",
 };
 
 const VK_F9: u8 = 0x78;
@@ -104,25 +112,40 @@ pub fn blocked() -> bool {
     BLOCKED.load(Relaxed) || TRAINER_BLOCKED.load(Relaxed)
 }
 
-/// Called by the HLE at each input poll with the first pad's buttons (GameInput bits) and left
-/// stick; returns whether the title's input is blocked.
-pub fn feed_pad(buttons: u32, stick_x: f32, stick_y: f32) -> bool {
+/// Called by the HLE at each input poll with the first pad's buttons (GameInput bits), left
+/// stick and triggers; returns whether the title's input is blocked.
+pub fn feed_pad(buttons: u32, stick_x: f32, stick_y: f32, left_trigger: f32, right_trigger: f32) -> bool {
     if !enabled() && !crate::modmenu::enabled() {
         return false;
     }
-    let bits = buttons | input::stick_bits(stick_x, stick_y);
+    let bits = buttons | input::stick_bits(stick_x, stick_y) | input::trigger_bits(left_trigger, right_trigger);
     let before = PAD_DOWN.swap(bits, Relaxed);
     PAD_PRESSED.fetch_or(bits & !before, Relaxed);
     TRAINER_PRESSED.fetch_or(bits & !before, Relaxed);
     blocked()
 }
 
-/// The buttons the title sees: with the menu on, View and Menu held together are the menu's chord.
+/// The buttons the title sees: with the menu on, View and Menu held together are the menu's
+/// chord; with the trainer on, both stick clicks are its own.
 pub fn chord_mask(buttons: u32) -> u32 {
-    if enabled() && buttons & CHORD == CHORD {
-        buttons & !CHORD
-    } else {
-        buttons
+    mask_chords(buttons, enabled(), crate::modmenu::enabled())
+}
+
+fn mask_chords(mut buttons: u32, settings: bool, trainer: bool) -> u32 {
+    for (on, chord) in [(settings, CHORD), (trainer, TRAINER_CHORD)] {
+        if on && buttons & chord == chord {
+            buttons &= !chord;
+        }
+    }
+    buttons
+}
+
+/// What a closed menu's window takes from the keys and pad while the other menu has the input:
+/// nothing, so one chord or hotkey never opens a second menu over the first.
+pub fn while_other_open(other_blocked: bool, keys: &mut Vec<Key>, pad: &mut u32) {
+    if other_blocked {
+        keys.clear();
+        *pad = 0;
     }
 }
 
@@ -207,6 +230,14 @@ impl Driver {
         }
     }
 
+    /// A driver toggled by `chord` and `hotkey`, which its hints name.
+    pub fn with_controls(model: Box<dyn MenuModel>, chord: u32, chord_name: &'static str, hotkey: String) -> Self {
+        let mut d = Driver::new(model);
+        d.inputs = Inputs::with_chord(chord);
+        d.menu.hints = state::Hints { hotkey, chord: chord_name, device: input::Device::Keys };
+        d
+    }
+
     /// Lays the menu out for a `w` x `h` game picture.
     pub fn layout(&mut self, w: i32, h: i32) -> layout::Layout {
         let tabs = self.menu.tabs(&*self.model);
@@ -236,6 +267,10 @@ impl Driver {
         let mut changed = false;
         for action in self.inputs.update(now, keys, pad) {
             changed |= self.act(action);
+        }
+        if self.menu.hints.device != self.inputs.last {
+            self.menu.hints.device = self.inputs.last;
+            changed |= self.menu.open;
         }
         if self.menu.open && wheel != 0 {
             let action = if wheel > 0 { Action::Up } else { Action::Down };
@@ -317,6 +352,36 @@ mod tests {
         assert!(!d.menu.open);
         d.tick(1200, &[], CHORD, 0);
         assert!(d.menu.open);
+    }
+
+    /// Each menu's chord is hidden from the title only while that menu is on; a closed menu takes
+    /// nothing while the other has the input; the trainer opens on its own chord only.
+    #[test]
+    fn chords_are_masked_per_menu_and_one_menu_never_opens_over_the_other() {
+        use super::input::{PAD_LS, PAD_RS};
+        assert_eq!(mask_chords(CHORD | PAD_A, true, false), PAD_A);
+        assert_eq!(mask_chords(CHORD | PAD_A, false, true), CHORD | PAD_A);
+        assert_eq!(mask_chords(TRAINER_CHORD, true, false), TRAINER_CHORD);
+        assert_eq!(mask_chords(TRAINER_CHORD | CHORD, true, true), 0);
+        assert_eq!(mask_chords(PAD_LS, true, true), PAD_LS, "one stick click is the title's");
+        let (mut keys, mut pad) = (vec![Key::Hotkey], CHORD | PAD_RS);
+        while_other_open(true, &mut keys, &mut pad);
+        assert!(keys.is_empty() && pad == 0);
+        let (mut keys, mut pad) = (vec![Key::Hotkey], PAD_A);
+        while_other_open(false, &mut keys, &mut pad);
+        assert_eq!((keys, pad), (vec![Key::Hotkey], PAD_A));
+        let mut trainer = Driver::with_controls(Box::new(Registry::default()), TRAINER_CHORD, "LS + RS", "F8".into());
+        trainer.tick(0, &[], CHORD, 0);
+        trainer.tick(1100, &[], CHORD, 0);
+        assert!(!trainer.menu.open, "View + Menu is the settings menu's");
+        trainer.tick(1130, &[], 0, 0);
+        trainer.tick(1160, &[], TRAINER_CHORD, 0);
+        trainer.tick(2200, &[], TRAINER_CHORD, 0);
+        assert!(trainer.menu.open);
+        assert_eq!(trainer.menu.hints.chord, "LS + RS");
+        assert_eq!(trainer.menu.hints.pairs().last().unwrap().0, "LS + RS hold");
+        trainer.tick(2230, &[Key::Esc], 0, 0);
+        assert_eq!(trainer.menu.hints.pairs()[0].0, "F8 / Esc", "keys used last: the key hints");
     }
 
     #[test]

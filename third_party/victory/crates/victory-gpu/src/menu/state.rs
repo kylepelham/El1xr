@@ -132,6 +132,57 @@ pub struct Menu {
     pub status: Option<String>,
     /// The last save of a restart change failed: the restart band says so.
     pub unsaved: bool,
+    /// What the footer's hints name.
+    pub hints: Hints,
+}
+
+/// The footer's hints: the menu's own hotkey and chord, for the device last used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hints {
+    pub hotkey: String,
+    pub chord: &'static str,
+    pub device: super::input::Device,
+}
+
+impl Hints {
+    /// The footer's (control, what it does) pairs for the device last used.
+    pub fn pairs(&self) -> Vec<(String, &'static str)> {
+        let owned = |list: &[(&str, &'static str)]| list.iter().map(|&(c, w)| (c.to_string(), w)).collect::<Vec<_>>();
+        match self.device {
+            super::input::Device::Keys => {
+                let mut v = vec![(format!("{} / Esc", self.hotkey), "close")];
+                v.extend(owned(&[
+                    ("\u{2191}\u{2193}", "select"),
+                    ("\u{2190}\u{2192}", "change"),
+                    ("Enter", "apply"),
+                    ("Q E", "tabs"),
+                    ("X", "expert"),
+                ]));
+                v
+            }
+            super::input::Device::Pad => {
+                let mut v = owned(&[
+                    ("A", "change"),
+                    ("B", "close"),
+                    ("LB RB", "tabs"),
+                    ("LT RT", "value"),
+                    ("Y", "expert"),
+                ]);
+                v.push((format!("{} hold", self.chord), "open, close"));
+                v
+            }
+        }
+    }
+}
+
+impl Default for Hints {
+    fn default() -> Self {
+        Hints {
+            hotkey: "F9".into(),
+            chord: "View + Menu",
+            device: super::input::Device::Keys,
+        }
+    }
 }
 
 impl Default for Menu {
@@ -144,6 +195,7 @@ impl Default for Menu {
             expert: false,
             status: None,
             unsaved: false,
+            hints: Hints::default(),
         }
     }
 }

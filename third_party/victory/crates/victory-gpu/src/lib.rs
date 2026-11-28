@@ -28,6 +28,8 @@ pub mod console;
 mod commitline;
 #[cfg(windows)]
 mod poolslack;
+#[cfg(windows)]
+mod staging_hold;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
@@ -74,6 +76,7 @@ mod bake_replay;
 mod bake_spread;
 #[cfg(windows)]
 mod bind_hash;
+mod table_prof;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]

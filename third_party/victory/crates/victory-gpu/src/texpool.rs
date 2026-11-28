@@ -35,6 +35,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 mod buffers;
+mod maker;
 mod reuse;
 #[cfg(test)]
 mod unmap_costs;
@@ -1270,14 +1271,19 @@ pub(crate) unsafe fn texture(
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let taken = take_from(
-        &TEXTURES,
-        Which::Texture,
-        info.SizeInBytes,
-        info.Alignment.max(1),
-        Ripe::now(),
-        || texture_block(device),
-    );
+    // `VICTORY_TEXTURE_BLOCK_THREAD=1`: blocks made and let go on a thread of their own.
+    let taken = if maker::on() {
+        maker::take(info.SizeInBytes, info.Alignment.max(1), Ripe::now())
+    } else {
+        take_from(
+            &TEXTURES,
+            Which::Texture,
+            info.SizeInBytes,
+            info.Alignment.max(1),
+            Ripe::now(),
+            || texture_block(device),
+        )
+    };
     let Some((piece, heap, _)) = taken else {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;

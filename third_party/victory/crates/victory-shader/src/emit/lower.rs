@@ -32,6 +32,11 @@ mod dot;
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// The glass splice's ray query (`VICTORY_NATIVE_GLASS`), a child module so it shares the
+/// emitter's state.
+#[path = "glass_query.rs"]
+mod glass_query;
+
 /// DPP16 and DPP8 operand lowering, a child module so it shares the emitter's state.
 #[path = "dpp.rs"]
 mod dpp;
@@ -2539,6 +2544,12 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // The glass splice's selector (`glass_splice::SELECTOR`): the host's word.
+                    None if n == super::glass_splice::SELECTOR => Val::I32(self.host_word(
+                        RootType::Other(super::shader::USER_GLASS_NATIVE),
+                        0,
+                        0,
+                    )),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -6646,6 +6657,48 @@ impl<'a> Lower<'a> {
         Ok(Some(v))
     }
 
+    /// (heapcap) A view index the title computed itself (root type
+    /// `ResourceHeap`), in the current block: as it is below
+    /// `title_view_limit`; at or past it, clamped to that limit (a null
+    /// slot), or with `title_remap_len` set the host slot the remap table
+    /// (`SLOT_REMAP`) gives. The table is read whatever the index (one
+    /// dword, the same for every index below the limit), the choice is a
+    /// select: no branch on the common path.
+    fn title_index(&mut self, index: V) -> V {
+        let c = self.cur;
+        let limit = super::shader::title_view_limit();
+        let len = super::shader::title_remap_len();
+        if limit == 0 || len == 0 {
+            return self.s.title_view_index(c, index);
+        }
+        let base = self.s.m.i32(limit);
+        let past = self.s.m.bin(c, Bin::Sub, index, base);
+        let last = self.s.m.i32(len);
+        let i32t = self.s.t.i32;
+        let k = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[past, last]);
+        self.s.m.tag(k, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, k, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_REMAP);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        let remapped = self.as_int(f);
+        let below = self.s.m.cmp(c, pred::IULT, index, base);
+        self.s.m.select(c, below, index, remapped)
+    }
+
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
@@ -6755,7 +6808,7 @@ impl<'a> Lower<'a> {
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         let index = self.s.m.bin(c, Bin::LShr, at, shift);
         Ok(if root == Some(RootType::ResourceHeap) && !sampler {
-            self.s.title_view_index(c, index)
+            self.title_index(index)
         } else {
             index
         })
@@ -6801,7 +6854,7 @@ impl<'a> Lower<'a> {
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         let index = self.s.m.bin(c, Bin::LShr, addr, shift);
         Ok(if root == Some(RootType::ResourceHeap) && !sampler {
-            self.s.title_view_index(c, index)
+            self.title_index(index)
         } else {
             index
         })

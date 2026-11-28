@@ -97,6 +97,11 @@ pub fn run(
         {
             victory_hle::modules::ffx::set_real_query(real);
         }
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxCreateContext")
+        {
+            victory_hle::modules::ffx::set_real_create(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
         victory_hle::runtime::set_image_size(dll.base(), dll.info().size_of_image as usize);
@@ -308,8 +313,9 @@ fn watch(base: usize, size: usize) {
     });
 }
 
-/// Intercepts only `amd_fidelityfx_loader_xbox.dll!ffxDispatch` and
-/// `ffxQuery` (its failed answers, `victory_hle::modules::ffx::query`) when
+/// Intercepts only `amd_fidelityfx_loader_xbox.dll!ffxDispatch`, `ffxQuery`
+/// (its failed answers, `victory_hle::modules::ffx::query`) and
+/// `ffxCreateContext` (passed on, its refusal noted) when
 /// opted in via `VICTORY_UPSCALE=stretch|dlss`; forwards all other imports
 /// unchanged.
 #[cfg(windows)]
@@ -325,6 +331,7 @@ impl victory_loader::ImportResolver for TakeDispatch<'_> {
                 match name.as_str() {
                     "ffxDispatch" => Some(victory_hle::modules::ffx::dispatch_address()),
                     "ffxQuery" => Some(victory_hle::modules::ffx::query_address()),
+                    "ffxCreateContext" => Some(victory_hle::modules::ffx::create_address()),
                     _ => None,
                 }
             }
@@ -517,7 +524,7 @@ mod tests {
         };
         let other = ImportSymbol::Name {
             hint: 0,
-            name: "ffxCreateContext".to_owned(),
+            name: "ffxDestroyContext".to_owned(),
         };
         let loader = victory_hle::modules::ffx::LOADER;
 
@@ -528,8 +535,8 @@ mod tests {
             Resolution::Found { address: 0x1234, provenance: Provenance::Title }
         ));
 
-        // Enabled: only amd_fidelityfx_loader_xbox.dll!ffxDispatch and
-        // ffxQuery are taken.
+        // Enabled: only amd_fidelityfx_loader_xbox.dll!ffxDispatch, ffxQuery
+        // and ffxCreateContext are taken.
         let on = super::TakeDispatch(&Inner, true);
         assert!(matches!(
             on.resolve(loader, &dispatch),
@@ -547,6 +554,19 @@ mod tests {
         ));
         assert!(matches!(
             off.resolve(loader, &query),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
+        ));
+        let create = ImportSymbol::Name {
+            hint: 0,
+            name: "ffxCreateContext".to_owned(),
+        };
+        assert!(matches!(
+            on.resolve(loader, &create),
+            Resolution::Found { address, provenance: Provenance::Hle }
+                if address == victory_hle::modules::ffx::create_address()
+        ));
+        assert!(matches!(
+            off.resolve(loader, &create),
             Resolution::Found { address: 0x1234, provenance: Provenance::Title }
         ));
         assert!(matches!(
