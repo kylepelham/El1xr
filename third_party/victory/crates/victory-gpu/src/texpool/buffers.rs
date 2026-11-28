@@ -69,6 +69,22 @@ pub(super) fn usage() -> [[u64; 2]; 3] {
     [&CARD, &SHARED, &UPLOAD].map(|pool| lock(pool).usage())
 }
 
+/// (El1xr) Empty blocks: card, shared, upload.
+pub(super) fn empties() -> [u64; 3] {
+    [&CARD, &SHARED, &UPLOAD].map(|pool| lock(pool).empties())
+}
+
+/// (El1xr) `VICTORY_POOL_SLACK_MB`: every kind's rested pieces freed and its empty
+/// blocks past `keep` let go: blocks let go per kind.
+pub(super) fn trim_slack(at: u64, finished: u64, keep: usize) -> [u64; 3] {
+    [Kind::Card, Kind::Shared, Kind::Upload].map(|kind| {
+        let freed = lock(kind.pool()).slack_trim(at, finished, keep);
+        let n = freed.len() as u64;
+        super::let_go(kind.which(), freed);
+        n
+    })
+}
+
 /// (El1xr) The shared and upload pools' rested pieces freed and every empty
 /// block let go (`VICTORY_UPLOAD_CAP_MB`): the blocks let go.
 pub(super) fn trim(at: u64, finished: u64) -> u64 {
@@ -355,7 +371,11 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
         kind.which(),
         len,
         u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
-        Ripe::ahead(if kind != Kind::Card && crate::commitline::upload_over_cap() { 1 } else { KEPT }),
+        Ripe::ahead(if kind != Kind::Card && crate::commitline::upload_over_cap() {
+            1
+        } else {
+            crate::poolslack::spares(KEPT)
+        }),
         || block(device, kind),
     );
     let Some((piece, mem, again)) = taken else {
