@@ -32,6 +32,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BLOCKED_INDEX", "Notes which list steps read game memory, so flight checks look at fewer."),
     ("VICTORY_BVH_NO_HIT", "Ray tests return a clean miss when the BVH builder is off."),
     ("VICTORY_CARD_AWAKE", "Sends small jobs while the card is idle to keep its clocks up."),
+    ("VICTORY_CARD_BATCH", "Fetches card-compared changes of settled submissions in one wait."),
     ("VICTORY_CARD_BLOCK_REUSE", "Zeroes and reuses returned card buffer pieces, keeping blocks smaller."),
     ("VICTORY_CARD_COMPARE_SHARE", "Hashes each shared piece once in the card's write compare."),
     ("VICTORY_CARD_COPY_CONSTANTS", "Constants read after a card copy in a list see what the copy wrote."),
