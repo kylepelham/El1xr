@@ -97,4 +97,29 @@ impl<'a> Lower<'a> {
         let nan = self.is_nan_f32(f);
         self.s.m.select(c, nan, f, held)
     }
+
+    /// A channel a listed compute program stores into a float image under
+    /// `VICTORY_CS_STORE_CLAMP` (`store_hold`): a NaN is 0, an infinity or a value past
+    /// ±[`HDR_MAX`] is ±[`HDR_MAX`].
+    pub(super) fn hold_store(&mut self, f: V) -> V {
+        let c = self.cur;
+        let min = self.s.m.f32((-HDR_MAX).to_bits());
+        let max = self.s.m.f32(HDR_MAX.to_bits());
+        let lo = self.binary(35, f, min); // FMax
+        let held = self.binary(36, lo, max); // FMin
+        let nan = self.is_nan_f32(f);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, nan, zero, held)
+    }
+
+    /// Whether any of `vals` is a NaN (an i1).
+    pub(super) fn any_nan(&mut self, vals: &[V]) -> V {
+        let c = self.cur;
+        let mut any = self.s.m.bool(false);
+        for &v in vals {
+            let nan = self.is_nan_f32(v);
+            any = self.s.m.bin(c, Bin::Or, any, nan);
+        }
+        any
+    }
 }

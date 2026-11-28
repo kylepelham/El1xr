@@ -17,7 +17,6 @@
   </style>
   <defs>
     <linearGradient id="cardbg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#120a24"/><stop offset="1" stop-color="#1b0f33"/></linearGradient>
-    <radialGradient id="glow" cx=".85" cy="1.05" r=".75"><stop offset="0" stop-color="#ff3d8b" stop-opacity=".22"/><stop offset=".5" stop-color="#9b5cff" stop-opacity=".08"/><stop offset="1" stop-color="#9b5cff" stop-opacity="0"/></radialGradient>
     <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <linearGradient id="sunsetv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <clipPath id="cardclip"><rect width="900" height="320" rx="18"/></clipPath>
@@ -25,7 +24,6 @@
   </defs>
   <g clip-path="url(#cardclip)">
     <rect width="900" height="320" fill="url(#cardbg)"/>
-    <rect width="900" height="320" fill="url(#glow)"/>
     <path d="M0 320L0 304L20 304L20 313L55 313L55 311L72 311L72 304L89 304L89 306L110 306L110 315L139 315L139 293L156 293L156 293L190 293L190 293L227 293L227 300L261 300L261 301L289 301L289 304L300 304L300 294L302 294L302 304L313 304L313 289L347 289L347 296L377 296L377 291L394 291L394 307L413 307L413 298L433 298L433 310L456 310L456 306L476 306L476 312L499 312L499 301L535 301L535 313L553 313L553 303L555 303L555 313L572 313L572 287L605 287L605 301L623 301L623 289L658 289L658 303L693 303L693 287L710 287L710 309L741 309L741 299L769 299L769 307L801 307L801 299L809 299L809 289L811 289L811 299L819 299L819 314L838 314L838 304L851 304L851 294L853 294L853 304L866 304L866 309L877 309L877 299L879 299L879 309L890 309L890 297L896 297L896 287L898 287L898 297L900 297L900 320Z" fill="#9b5cff" fill-opacity=".07"/>
     <rect width="900" height="4" fill="url(#sunset)"/>
   </g>

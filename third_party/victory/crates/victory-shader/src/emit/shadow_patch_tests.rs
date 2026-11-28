@@ -58,7 +58,8 @@ fn the_tables_agree() {
             Some(ShadowBinding {
                 hash: t.hash,
                 registers: t.structures,
-                per_wave: t.per_wave
+                per_wave: t.per_wave,
+                any: false,
             })
         );
         if t.per_wave {
@@ -657,7 +658,7 @@ fn triangles(
 
 /// Checkerboard's walk with an instance mask of 0xc0, to see the mask reach the query (the
 /// title's walk tests none: 0xff).
-const MASKED: Walk = Walk {
+const MASKED: Walk<'static> = Walk {
     mask: 0xc0,
     ..CHECKERBOARD.walks[0]
 };
