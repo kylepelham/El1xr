@@ -43,6 +43,7 @@ impl Drop for Reset {
         super::super::holes::KEPT_FORCED.set(None);
         NOTE_ONCE_FORCED.set(None);
         PUBLISH_TRY_FORCED.set(None);
+        super::super::guard4k::STAMP_FRESH_FORCED.set(None);
         super::super::PORT_GUARD_IN_TEST.set(false);
     }
 }
@@ -416,8 +417,9 @@ fn bench_publish_try() {
 /// than the asking it last took it at (as `Shadow::copy_stale`), and once the writers are quiet
 /// its copy is the memory. With `VICTORY_GUARD_PUBLISH_TRY` the crash's claim bug made writes to
 /// read-only blocks go unhandled here (the test process died); with `VICTORY_GUARD_4K` a page
-/// closed late in a walk was stamped with the walk's first asking, and lost writes.
-fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool) -> usize {
+/// closed late in a walk was stamped with the walk's first asking, and lost writes (still so
+/// with `VICTORY_GUARD_STAMP_FRESH` off).
+fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool, stamp_fresh: bool) -> usize {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     const BLOCKS: usize = 8;
@@ -430,6 +432,7 @@ fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool) -> usize {
         PUBLISH_TRY_FORCED.set(Some(publish_try));
         NOTE_ONCE_FORCED.set(Some(publish_try));
         super::super::guard4k::FORCED.with(|f| f.set(guard_4k));
+        super::super::guard4k::STAMP_FRESH_FORCED.set(Some(stamp_fresh));
     };
     setup();
     let view = View::new(BLOCKS);
@@ -520,7 +523,7 @@ fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool) -> usize {
 #[test]
 fn racing_refreshes_lose_nothing_blocks() {
     for publish_try in [false, true] {
-        let missed = racing_refreshes_lose_nothing(publish_try, false);
+        let missed = racing_refreshes_lose_nothing(publish_try, false, false);
         assert_eq!(missed, 0, "VICTORY_GUARD_PUBLISH_TRY={publish_try}, block guards");
     }
 }
@@ -528,9 +531,20 @@ fn racing_refreshes_lose_nothing_blocks() {
 #[test]
 fn racing_refreshes_lose_nothing_4k() {
     for publish_try in [false, true] {
-        let missed = racing_refreshes_lose_nothing(publish_try, true);
+        let missed = racing_refreshes_lose_nothing(publish_try, true, true);
         assert_eq!(missed, 0, "VICTORY_GUARD_PUBLISH_TRY={publish_try}, 4 KiB guards");
     }
+}
+
+/// `VICTORY_GUARD_STAMP_FRESH` off keeps the old walk-wide stamp, and its stale copies.
+#[test]
+fn racing_refreshes_stale_without_stamp_fresh() {
+    let missed: usize = [false, true]
+        .into_iter()
+        .map(|publish_try| racing_refreshes_lose_nothing(publish_try, true, false))
+        .sum();
+    eprintln!("VICTORY_GUARD_STAMP_FRESH=0: {missed} of 600 rounds stale");
+    assert!(missed > 0, "the walk-wide stamp lost no write in 600 rounds");
 }
 
 /// (Batch 5 part M's crash) A `try_get` that finds the block claimed leaves the holder's claim:

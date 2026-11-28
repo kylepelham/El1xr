@@ -3802,10 +3802,15 @@ fn guard_shared(
     let mut cursor = first;
     // (feedcard) `VICTORY_GUARD_4K=1`: blocks whose open 4 KiB pages were noted written alone.
     let mut pages_only: Vec<usize> = Vec::new();
-    // A fresh asking for each block's pages, taken after they are read-only again: one taken at
-    // the walk's first block predates a later block's close, and a refresh that copied that page
-    // at an asking in between would never take a write made before the close.
-    let mut now = next_asking;
+    // `VICTORY_GUARD_STAMP_FRESH=1`: a fresh asking for each block's pages (see `guard4k`).
+    let fresh = guard4k::stamp_fresh();
+    let mut asked = 0;
+    let mut now = || {
+        if fresh || asked == 0 {
+            asked = next_asking();
+        }
+        asked
+    };
 
     while cursor < last {
         if let Some(clean_end) = g.clean.run_end_in(cursor, last) {
