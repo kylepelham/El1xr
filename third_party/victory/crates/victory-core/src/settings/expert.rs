@@ -147,6 +147,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_GPU_COST_SLOW_MS", Apply::Live),
     ("VICTORY_GPU_TIMING", Apply::Restart),
     ("VICTORY_GROUP_SYNC", Apply::Retranslate),
+    ("VICTORY_GROUP_SYNC_FULL", Apply::Retranslate),
     ("VICTORY_GUARD_ASK", Apply::Restart),
     ("VICTORY_GUARD_HOLES", Apply::Restart),
     ("VICTORY_GUARD_OPEN_AHEAD", Apply::Restart),

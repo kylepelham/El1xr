@@ -2381,6 +2381,65 @@ fn automatic_barrier_flags_reach_the_emitted_shader() {
     }
 }
 
+/// `VICTORY_GROUP_SYNC_FULL` ([`super::sync_full`]): a program it names keeps the wait of a
+/// divergent barrier that `auto` drops on a host of 32-lane waves (mode 8, the fence only, to 9),
+/// and `VICTORY_GROUP_SYNC=0` still wins.
+#[test]
+fn a_named_program_keeps_the_wait_of_a_divergent_barrier() {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect(),
+    };
+    let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("IO");
+    let modes = |setting: u8, full: bool| {
+        let old_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+        let old_mode = super::TEST_GROUP_SYNC.replace(Some(setting));
+        let parts = lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let shader = if full {
+            super::sync_full::with_here_for_test(|| lower::lower(&parts))
+        } else {
+            lower::lower(&parts)
+        };
+        lower::TEST_HOST_WAVE.set(old_wave);
+        super::TEST_GROUP_SYNC.set(old_mode);
+        shader.expect("lower").barrier_modes
+    };
+    assert_eq!(modes(3, false), vec![8]);
+    assert_eq!(modes(3, true), vec![9]);
+    assert_eq!(modes(0, true), vec![8]);
+}
+
 /// A barrier entered by only part of a console wave must complete on a
 /// wave32 GPU without disabling uniform barriers or translation-added sync.
 #[test]

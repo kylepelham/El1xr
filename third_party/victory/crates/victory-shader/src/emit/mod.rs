@@ -112,6 +112,7 @@ mod ray_query_warp_tests;
 mod rect;
 mod sampler;
 mod shader;
+mod sync_full;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -191,7 +192,16 @@ pub fn loop_limit() -> u32 {
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
+///
+/// A program `VICTORY_GROUP_SYNC_FULL` names takes `2` unless the switch is `0`
+/// ([`sync_full`]).
 pub fn group_sync() -> u8 {
+    let mode = group_sync_setting();
+    if mode != 0 && sync_full::here() { 2 } else { mode }
+}
+
+/// `VICTORY_GROUP_SYNC`'s value ([`group_sync`]).
+fn group_sync_setting() -> u8 {
     #[cfg(test)]
     if let Some(mode) = TEST_GROUP_SYNC.get() {
         return mode;
@@ -366,11 +376,13 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    miss_sky::with_container(container, || match translate_retried(container) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
-            structure::without_live_quads(|| translate_retried(container))
-        }
-        other => other,
+    sync_full::with_container(container, || {
+        miss_sky::with_container(container, || match translate_retried(container) {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+                structure::without_live_quads(|| translate_retried(container))
+            }
+            other => other,
+        })
     })
 }
 
