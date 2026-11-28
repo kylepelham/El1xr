@@ -52,7 +52,7 @@ fn under(free: u64, floor: Option<u64>) -> bool {
 }
 
 /// Set, and the system's free commit is under it.
-fn pressed() -> bool {
+pub(crate) fn pressed() -> bool {
     let floor = slack();
     floor.is_some() && under(crate::commitline::free_commit(), floor)
 }
@@ -67,7 +67,7 @@ fn kept(n: usize, pressed: bool) -> usize {
 }
 
 /// The process's private bytes (what Windows charges it).
-fn private_bytes() -> u64 {
+pub(crate) fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
