@@ -204,6 +204,18 @@ pub(crate) fn on(role: Role) -> bool {
             ))
 }
 
+/// Whether the screen probes' rays find nothing ([`rays_find`] for the diffuse light), the
+/// stand-in set or not (`crate::zero_out`'s inject).
+pub(crate) fn probes_blind() -> bool {
+    !(crate::pipeline::builder_runs()
+        && rays_find(
+            Role::Resolve,
+            victory_core::settings::ray_tracing::on(),
+            crate::rt_hit_only::reflections_walk(),
+            crate::rt_hit_only::probes_walk(),
+        ))
+}
+
 /// With the structure builder running: whether the rays `role`'s stand-in
 /// stands in for find something. Turned on by its own switches, the builder
 /// lets every ray walk (the whole stand-in steps aside, as before).

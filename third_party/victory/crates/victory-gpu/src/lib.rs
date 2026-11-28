@@ -202,6 +202,7 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod wave_more;
+mod zero_out;
 #[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
