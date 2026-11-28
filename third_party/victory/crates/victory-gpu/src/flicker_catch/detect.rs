@@ -45,6 +45,15 @@ pub(crate) enum Event {
     /// Frames from `frame` on were black, `frames` of them (more than
     /// [`MOST`]).
     Black { frame: u64, frames: u32 },
+    /// (`VICTORY_FLICKER_CATCH_REGION`) Frame `frame` had `tiles` adjacent
+    /// tiles (fewer than a frame's flicker needs) go dark and back the
+    /// frame after: their mean luminance before and in the dark frame.
+    Region {
+        frame: u64,
+        tiles: Vec<usize>,
+        before: f32,
+        now: f32,
+    },
 }
 
 impl Event {
@@ -63,6 +72,22 @@ impl Event {
                 if frames == 1 { "" } else { "s" }
             ),
             Event::Black { frames, .. } => format!("whole frame black for {frames} frames"),
+            Event::Region {
+                ref tiles,
+                before,
+                now,
+                ..
+            } => {
+                let (xs, ys) = (tiles.iter().map(|&t| t % ACROSS), tiles.iter().map(|&t| t / ACROSS));
+                format!(
+                    "region dark: {} adjacent tiles of {TILES} (x {}-{}, y {}-{}), their luma {before:.0}->{now:.0}, back after 1 frame",
+                    tiles.len(),
+                    xs.clone().min().unwrap_or(0),
+                    xs.max().unwrap_or(0),
+                    ys.clone().min().unwrap_or(0),
+                    ys.max().unwrap_or(0)
+                )
+            }
         }
     }
 }
@@ -82,6 +107,53 @@ pub(crate) struct Detector {
     pending: Option<Pending>,
     /// A black run: its first frame and length.
     black: Option<(u64, u32)>,
+    /// (`VICTORY_FLICKER_CATCH_REGION`) Adjacent dark tiles that make a
+    /// region (0: regions not looked for), and a region waiting for the
+    /// frame after: its frame, tiles, their luminance before and now.
+    pub(crate) region: usize,
+    region_pending: Option<(u64, Vec<usize>, Vec<f32>, f32)>,
+}
+
+/// The largest group of `dark` tiles joined by their sides.
+pub(crate) fn largest_group(dark: &[usize]) -> Vec<usize> {
+    let mut is_dark = [false; TILES];
+    for &i in dark {
+        if i < TILES {
+            is_dark[i] = true;
+        }
+    }
+    let mut seen = [false; TILES];
+    let mut best = Vec::new();
+    for &start in dark {
+        if start >= TILES || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut group = vec![start];
+        let mut at = 0;
+        while at < group.len() {
+            let i = group[at];
+            at += 1;
+            let (x, y) = (i % ACROSS, i / ACROSS);
+            let sides = [
+                (x > 0).then(|| i - 1),
+                (x + 1 < ACROSS).then(|| i + 1),
+                (y > 0).then(|| i - ACROSS),
+                (y + 1 < DOWN).then(|| i + ACROSS),
+            ];
+            for j in sides.into_iter().flatten() {
+                if is_dark[j] && !seen[j] {
+                    seen[j] = true;
+                    group.push(j);
+                }
+            }
+        }
+        if group.len() > best.len() {
+            best = group;
+        }
+    }
+    best.sort_unstable();
+    best
 }
 
 fn mean(tiles: &[f32], of: &[usize]) -> f32 {
@@ -100,6 +172,18 @@ impl Detector {
             self.pending = None;
             self.black = None;
             self.last = None;
+            self.region_pending = None;
+        }
+        if let Some((first, group, before, now)) = self.region_pending.take() {
+            let back = group.iter().filter(|&&i| tiles[i] >= before[i] * BACK).count();
+            if back as f32 >= group.len() as f32 * BACK_SHARE {
+                events.push(Event::Region {
+                    frame: first,
+                    before: mean(&before, &group),
+                    tiles: group,
+                    now,
+                });
+            }
         }
         let black = tiles.iter().all(|&t| t < BLACK);
         match (&mut self.black, black) {
@@ -155,6 +239,12 @@ impl Detector {
                     frames: 1,
                     black,
                 });
+            } else if self.region > 0 && dark.len() >= self.region {
+                let group = largest_group(&dark);
+                if group.len() >= self.region {
+                    self.region_pending =
+                        Some((frame, group.clone(), before.clone(), mean(&tiles, &group)));
+                }
             }
         }
         self.last = Some((frame, tiles));

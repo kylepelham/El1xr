@@ -69,6 +69,8 @@ pub(crate) fn guard_split_log(frames: f64) {
 pub(crate) mod empty_notice;
 pub(crate) mod alias_skip;
 mod claim_narrow;
+/// (feedcard, #88) `VICTORY_FAULT_UNLOCKED=1`: a write fault opens its 4 KiB page beside a walk closing its block.
+mod fault_unlocked;
 mod hole_marks;
 mod holes;
 pub(crate) mod ask_split;
@@ -3931,8 +3933,13 @@ fn guard_shared(
                     let mut claims = Claims::none();
                     if claims.try_one(blk) && g.protected.contains(blk) && !g.clean.contains(blk) {
                         let mut kept = false;
+                        // (#88) `VICTORY_FAULT_UNLOCKED`: a page opened beside the close.
+                        let mut beside = false;
                         if guard4k::on() {
-                            match guard4k::close(blk, &mut now) {
+                            let closing = fault_unlocked::Closing::begin(blk);
+                            let closed = guard4k::close(blk, &mut now);
+                            beside = closing.end();
+                            match closed {
                                 guard4k::Closed::Failed => continue,
                                 guard4k::Closed::Pages { only: true } => pages_only.push(blk),
                                 guard4k::Closed::Kept => {
@@ -3941,6 +3948,14 @@ fn guard_shared(
                                 }
                                 guard4k::Closed::Pages { only: false } | guard4k::Closed::None => {}
                             }
+                        }
+                        if beside {
+                            // Not clean, its other views not guarded with it: the next check takes
+                            // the page. Opened alone if the block has no other view to cover.
+                            if crate::inplace::pages_of(blk * BLOCK).len() < 2 {
+                                guard4k::mark_only(blk);
+                            }
+                            continue;
                         }
                         let uncovered = if view_guard() {
                             cover_aliases_claimed(
@@ -4956,6 +4971,14 @@ fn open_faulted_untimed(at: usize) -> (usize, bool) {
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
     guard_split::add(guard_split::S::FaultLockUs, waited.as_micros() as u64);
+    // (#88) `VICTORY_FAULT_UNLOCKED`: beside a walk closing the block, without its claim.
+    if guard4k::on()
+        && fault_unlocked::on()
+        && BUSY.any(block, block + 1)
+        && let Some(answer) = fault_unlocked::fault(&g, block, at)
+    {
+        return answer;
+    }
     // (#88) `VICTORY_GUARD_CLAIM_NARROW`: a 4 KiB page alone under the block's shared claim.
     if guard4k::on()
         && claim_narrow::on()
@@ -5399,6 +5422,34 @@ pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
     }
 }
 
+/// [`title_memory_remapping_range`] if every lock can be had at once (`None` otherwise, holding
+/// none): for the runtime's unmapping thread (`VICTORY_UNMAP_LATER`), which must never wait on a
+/// lock a title thread holds while that thread waits for it.
+#[track_caller]
+pub fn title_memory_remapping_try(at: usize, len: usize) -> Option<Remapping> {
+    #[cfg(feature = "diagnostics")]
+    let asked = std::time::Instant::now();
+    let mut guards = Vec::new();
+    for s in shards(at, len) {
+        match MAPPING[s].try_write() {
+            Ok(guard) => guards.push(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => guards.push(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+    let lazy = crate::shadow::lazy_begin_remapping_barrier();
+    Some(Remapping {
+        _guards: guards,
+        _lazy: lazy,
+        #[cfg(feature = "diagnostics")]
+        taken: (
+            std::time::Instant::now(),
+            asked.elapsed().as_micros() as u64,
+            std::panic::Location::caller(),
+        ),
+    })
+}
+
 /// Diagnostics: the changes of the mapping by where the runtime made them since the
 /// last asking: file, line, and [changes, µs waited for in-place reads to end, µs held,
 /// longest µs held]. The texture refreshes wait on these ("waiting for title memory to
@@ -5630,6 +5681,7 @@ fn install() {
         guard4k::on(),
         crate::refresh_prof::on(),
         page_ask::on(),
+        fault_unlocked::on(),
         crate::title_waits::on(),
     );
     // SAFETY: the handler only touches our guard state and protections.
