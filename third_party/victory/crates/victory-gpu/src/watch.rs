@@ -2693,6 +2693,7 @@ pub fn written_through_view(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::bake_reuse::keep::invalidate(at as u64, len as u64);
     // Release any lazy GPU-resident pages without clobbering bytes already
     // written into the backing physical section through an alias view.
     crate::shadow::lazy_release_written_range(at, len);
@@ -5162,6 +5163,7 @@ pub fn writing_hold(at: usize, len: usize) -> crate::shadow::LazyAccessHold {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::bake_reuse::keep::invalidate(at as u64, len as u64);
     // Flush any lazy GPU-resident deferred pages before a kernel write lands.
     crate::shadow::lazy_flush_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
@@ -5254,6 +5256,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    crate::bake_reuse::keep::invalidate(at as u64, len as u64);
     // `VICTORY_STREAM_AHEAD=1`: the placed textures under it handed to the
     // prepare threads once all below is done.
     let _ahead = crate::texture::stream_ahead::Arrived(at, len);
@@ -5534,6 +5537,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if empty_notice::skip(at, len) {
         return;
     }
+    crate::bake_reuse::keep::invalidate(at as u64, len as u64);
     holes::forget(at, len);
     crate::texback::remapped(at, len);
     if reservation::enabled() {

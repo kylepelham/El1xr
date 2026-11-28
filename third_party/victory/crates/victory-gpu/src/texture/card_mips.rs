@@ -126,6 +126,18 @@ pub(crate) fn same(resource: usize, seen: &Arc<[u64]>) -> bool {
         .is_some_and(|bits| Arc::ptr_eq(bits, seen))
 }
 
+/// Snapshot of partial card-written subresource bits for `resource` (`None` if whole/unknown).
+pub(crate) fn snapshot(resource: usize) -> Option<Arc<[u64]>> {
+    let map = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&resource)?.as_ref().map(Arc::clone)
+}
+
+/// Restores card-written subresource ownership onto an adopted `resource`.
+pub(crate) fn restore(resource: usize, bits: Option<Arc<[u64]>>) {
+    let mut map = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new).insert(resource, bits);
+}
+
 /// The title released `resource`.
 pub(crate) fn forget(resource: usize) {
     let mut map = OWNED.lock().unwrap_or_else(|e| e.into_inner());
