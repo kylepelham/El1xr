@@ -78,6 +78,8 @@ mod end_fast;
 pub(crate) mod look_skip;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
+/// (critpath #88) `VICTORY_PAGE_ASK=1`: a write fault asks about its one page.
+mod page_ask;
 
 struct Journal {
     /// Room for the kernel's answer.
@@ -5553,6 +5555,15 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        let began = crate::title_waits::fault_start();
+        // SAFETY: as for `on_write_untimed`.
+        let answer = unsafe { on_write_untimed(info) };
+        if answer == EXCEPTION_CONTINUE_EXECUTION {
+            crate::title_waits::fault_end(began);
+        }
+        answer
+    }
+    unsafe extern "system" fn on_write_untimed(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
@@ -5618,6 +5629,8 @@ fn install() {
         guard_open_ahead(),
         guard4k::on(),
         crate::refresh_prof::on(),
+        page_ask::on(),
+        crate::title_waits::on(),
     );
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| {
@@ -5818,6 +5831,11 @@ fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
+    if page_ask::on()
+        && let Some(protection) = page_ask::protection(at)
+    {
+        return protection == PAGE_READWRITE;
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.

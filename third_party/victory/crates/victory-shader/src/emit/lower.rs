@@ -168,6 +168,8 @@ mod quad_lod;
 /// The lanes past a `DispatchX` thread count store nothing (`VICTORY_DISPATCHX_MASK=1`).
 #[path = "thread_limit.rs"]
 pub(super) mod thread_limit;
+#[path = "loop_keep.rs"]
+pub(super) mod loop_keep;
 
 type Why = &'static str;
 
@@ -506,6 +508,8 @@ struct Lower<'a> {
     traces: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loops closed by a plain jump, by header, with their blocks ([`loop_keep`]).
+    jump_loops: Option<Vec<(usize, Vec<bool>)>>,
     /// Per-wave half-meet state ([`half_meet`]).
     meet: half_meet::HalfMeet,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
@@ -1496,6 +1500,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            jump_loops: None,
             meet,
             twin: paired.then(Box::default),
             upper: false,
@@ -3946,16 +3951,19 @@ impl<'a> Lower<'a> {
         let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
         let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
         let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+        // (`VICTORY_DIV_INF_ZERO`) Zero and infinity operands before a NaN quotient.
+        let zero_first = super::div_zero::on();
         let make_inf = {
             let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-            self.s.m.bin(c, Bin::Or, t, q_nan)
+            if zero_first { t } else { self.s.m.bin(c, Bin::Or, t, q_nan) }
         };
         let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
         let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
         let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
         let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
         let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-        let r = self.s.m.select(c, make_zero, sign, signed_q);
+        let r = if zero_first { self.s.m.select(c, q_nan, signed_inf, signed_q) } else { signed_q };
+        let r = self.s.m.select(c, make_zero, sign, r);
         let r = self.s.m.select(c, make_inf, signed_inf, r);
         let r = self.s.m.select(c, invalid, kneg_qnan, r);
         let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -8310,6 +8318,8 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // (`VICTORY_LOOP_KEEP`) A loop closed by a plain jump leaves here at its limit.
+                let cond = self.keep_exit(b, taken, not_taken, cond);
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -8373,13 +8383,8 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
+        // (`VICTORY_LOOP_ROOM` raises them, `loop_keep`.)
+        let limit = self.loop_cap();
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)

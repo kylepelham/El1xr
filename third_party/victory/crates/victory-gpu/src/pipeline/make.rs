@@ -34,6 +34,7 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 mod compute_wait;
+mod exposure_early;
 #[cfg(windows)]
 mod rescue;
 mod head_map;
@@ -153,7 +154,11 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     }
     static MORE: OnceLock<bool> = OnceLock::new();
     let more = *MORE.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT_MORE").is_some_and(|v| v == "1"));
-    shaders.iter().any(|s| scene_input_named(s.stage, &s.hash, &s.container, more) || crate::bake_name::extra(s))
+    shaders.iter().any(|s| {
+        scene_input_named(s.stage, &s.hash, &s.container, more)
+            || crate::bake_name::extra(s)
+            || exposure_early::scene_input(&s.hash)
+    })
 }
 
 /// Whether one shader makes its pipeline a [`scene_input`]: by hash, and

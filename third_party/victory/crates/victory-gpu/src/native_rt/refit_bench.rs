@@ -8,7 +8,7 @@ use super::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 
-fn hardware() -> Option<ID3D12Device5> {
+pub(super) fn hardware() -> Option<ID3D12Device5> {
     // SAFETY: plain DXGI/D3D12 setup.
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -26,7 +26,7 @@ fn hardware() -> Option<ID3D12Device5> {
     }
 }
 
-fn upload(device: &ID3D12Device5, bytes: &[u8]) -> ID3D12Resource {
+pub(super) fn upload(device: &ID3D12Device5, bytes: &[u8]) -> ID3D12Resource {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_UPLOAD,
         ..Default::default()

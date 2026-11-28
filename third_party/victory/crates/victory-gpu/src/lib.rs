@@ -245,11 +245,16 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shader_pack;
 #[cfg(windows)]
+mod shader_prefetch;
+#[cfg(windows)]
 mod wave_more;
 mod zero_out;
 mod zero_fill;
+mod shadow_idle;
 #[cfg(windows)]
 mod face_watch;
+#[cfg(windows)]
+mod exposure_watch;
 #[cfg(windows)]
 mod target_reuse;
 #[cfg(windows)]
@@ -298,6 +303,10 @@ mod scratch_landing;
 mod submit_chunk;
 #[cfg(windows)]
 mod timeline;
+/// (critpath #88) The title's thread placement calls; `VICTORY_OWN_CPUS`, `VICTORY_TITLE_BOOST`.
+pub mod title_threads;
+/// (critpath #88) `VICTORY_TITLE_WAITS=1`: the title's threads' time in our faults, and their die.
+mod title_waits;
 #[cfg(windows)]
 mod merge_runs;
 #[cfg(windows)]

@@ -96,6 +96,9 @@ fn switches_in_the_shader_cache_key_are_retranslate() {
         "VICTORY_NATIVE_SHADOW",
         "VICTORY_HEAP_VIEW_ADDRESS",
         "VICTORY_MASK_ELSEWHERE",
+        "VICTORY_DIV_INF_ZERO",
+        "VICTORY_LOOP_KEEP",
+        "VICTORY_LOOP_ROOM",
         "VICTORY_RT_MISS_SKY",
         "VICTORY_RT_GLASS_SKY",
     ] {

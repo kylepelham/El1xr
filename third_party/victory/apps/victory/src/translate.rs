@@ -141,7 +141,7 @@ impl Tally {
 }
 
 /// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader, Vec<u8>)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
@@ -363,16 +363,51 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+        let find = |name: &str| kept.iter().find(|(l, ..)| l.contains(name));
+        // `VICTORY_MESH_LINK=1`: a mesh program past 32 KiB of outputs is linked to its pixel
+        // program first, as a run's pipeline is (`emit::link_mesh`), and with `--validate` both
+        // linked programs are validated.
+        let link = std::env::var("VICTORY_MESH_LINK").is_ok_and(|v| v.trim() == "1");
+        let mut validator = if validate { Validator::load(dll.as_deref()).ok() } else { None };
         for (v, p) in &pairs {
             let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
+                (Some((_, vs, vc)), Some((_, ps, pc))) => {
+                    let mut note = String::new();
+                    let linked = if link && vs.stage == HwStage::Ms && !emit::mesh_fits(&vs.dxil).unwrap_or(true) {
+                        match emit::link_mesh(vc, vs, pc, ps) {
+                            Ok(Some((lm, lp))) => {
+                                note = format!("linked (mesh fits {})", emit::mesh_fits(&lm.dxil).unwrap_or(false));
+                                if let Some(val) = validator.as_mut() {
+                                    let mut dxil = lm.dxil.clone();
+                                    let a = val.validate(&mut dxil).map(|()| "validated".to_owned()).unwrap_or_else(|e| e.lines().find(|l| l.contains("error")).unwrap_or("").to_owned());
+                                    let mut dxil = lp.dxil.clone();
+                                    let b = val.validate(&mut dxil).map(|()| "validated".to_owned()).unwrap_or_else(|e| e.lines().find(|l| l.contains("error")).unwrap_or("").to_owned());
+                                    note.push_str(&format!(", mesh {a}, pixel {b}"));
+                                }
+                                Some((lm, lp))
+                            }
+                            Ok(None) => {
+                                note = "does not link".to_owned();
+                                None
+                            }
+                            Err(e) => {
+                                note = format!("link failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let (vs, ps) = linked.as_ref().map_or((vs, ps), |(m, p)| (m, p));
+                    let made = if vs.stage == HwStage::Ms {
+                        host.mesh_pipeline(vs, ps)
+                    } else {
+                        host.pipeline(vs, ps)
+                    }
+                    .map(|_| "pipeline created".to_owned())
+                    .unwrap_or_else(|e| e);
+                    if note.is_empty() { made } else { format!("{note}; {made}") }
                 }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
             println!("pair {v} + {p}: {made}");
@@ -555,7 +590,7 @@ fn translate(
     // stricter first-lane proof)
     let strict = victory_gpu::shader_cache::uniform_strict_listed(&bytes);
     emit::with_uniform_strict(strict, || {
-        emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks))
+        emit::with_wave_pairs_vt(vt, || translate_programs(&container, &bytes, programs, &example, t, checks))
     });
     if vt {
         eprintln!("WAVE64-PAIRS-VT {}: {:?}", example(), emit::take_wave_pairs_vt());
@@ -572,7 +607,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, bytes: &[u8], programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -659,7 +694,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                                 );
                             }
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, bytes, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -728,12 +763,13 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
+    bytes: &[u8],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
+        lock(keep).push((label(), shader.clone(), bytes.to_vec()));
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list

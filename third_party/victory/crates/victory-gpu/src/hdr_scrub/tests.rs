@@ -16,6 +16,13 @@ fn the_switch_and_the_names_read_as_meant() {
     assert_eq!(pass_of(b"..CS_TAA2_Resolve_12345678.."), Some(2));
     assert_eq!(pass_of(b"..CS_TransmissionVolumetrics.."), Some(5));
     assert_eq!(pass_of(b"CS_TemporalResolve"), None);
+    // The post passes only when asked for; the transmission volume is not the glass.
+    assert_eq!(pass_among(b"..CS_AlphaTransmissionDenoise_2871f2e9..", BASE), None);
+    assert_eq!(pass_among(b"..CS_AlphaTransmissionDenoise_2871f2e9..", NAMES.len()), Some(8));
+    assert_eq!(pass_among(b"CS_AlphaTransmissionDepthTileMipDilate_7f", NAMES.len()), Some(6));
+    assert_eq!(pass_among(b"CS_TransmissionVolumetrics", NAMES.len()), Some(5));
+    assert_eq!(pass_among(b"CS_MainBlur_446b3af2_Wrapped", NAMES.len()), Some(12));
+    assert_eq!(POST.len(), NAMES.len() - BASE);
     assert_eq!(kind_of(26), Some(Kind::Float3));
     assert_eq!(kind_of(10), Some(Kind::Float4));
     assert_eq!(kind_of(41), Some(Kind::Float1));

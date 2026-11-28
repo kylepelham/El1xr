@@ -1288,7 +1288,10 @@ fn present_now(named: Named, asked: Option<std::time::Instant>) {
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `shared`: misses that took another thread's translation
+            // (`VICTORY_SHARED_CONVERSIONS=1`).
+            let shared = victory_pipeline::shared_conversions();
+            tracing::info!(hits, misses, shared, "shaders from the cache and translated so far");
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

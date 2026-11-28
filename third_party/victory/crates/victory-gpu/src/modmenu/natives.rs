@@ -240,13 +240,14 @@ pub const MAX_ARGS: usize = 32;
 #[repr(C, align(16))]
 struct Slots([u64; MAX_ARGS]);
 
-/// Calls the handler at `entry` with `args` and returns its first four result slots.
+/// Calls the handler at `entry` with `args` and returns its first four result slots; a fault in
+/// the handler comes back as `Err` ([`super::guard`]).
 ///
 /// # Safety
 /// `entry` must be a native handler from [`scan`] in the mapped title image, called on a title
 /// thread, with the arguments that native takes.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn invoke(entry: usize, args: &[u64]) -> [u64; 4] {
+pub unsafe fn invoke(entry: usize, args: &[u64]) -> Result<[u64; 4], super::guard::Fault> {
     let mut slots = Slots([0u64; MAX_ARGS]);
     let n = args.len().min(MAX_ARGS);
     slots.0[..n].copy_from_slice(&args[..n]);
@@ -259,11 +260,8 @@ pub unsafe fn invoke(entry: usize, args: &[u64]) -> [u64; 4] {
         rest: [0; 12],
     };
     // SAFETY: the caller's contract; the handler reads `ctx` and the slots and writes `ret`.
-    unsafe {
-        let handler: unsafe extern "C" fn(*mut CallContext) = std::mem::transmute(entry);
-        handler(&mut ctx);
-    }
-    [ret.0[0], ret.0[1], ret.0[2], ret.0[3]]
+    unsafe { super::guard::call(entry, (&raw mut ctx).cast())? };
+    Ok([ret.0[0], ret.0[1], ret.0[2], ret.0[3]])
 }
 
 #[cfg(test)]
@@ -426,6 +424,6 @@ pub(crate) mod tests {
     fn invoke_passes_slots_and_reads_the_result() {
         // SAFETY: `add` follows the handler contract.
         let r = unsafe { invoke(add as *const () as usize, &[40, 2]) };
-        assert_eq!(r, [42, 0, 0, 0]);
+        assert_eq!(r, Ok([42, 0, 0, 0]));
     }
 }

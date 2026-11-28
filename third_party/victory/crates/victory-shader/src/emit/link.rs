@@ -202,3 +202,7 @@ fn elements(dxil: &[u8], fourcc: FourCC) -> Result<Vec<Element>, ShaderError> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "link_tests.rs"]
+mod tests;

@@ -14,6 +14,14 @@
 //! [`LAG`] presents after it, when its GPU work is done.
 //!
 //! The original also scrubbed through a live config key and a peak cap; neither is ported.
+//!
+//! `VICTORY_HDR_SCRUB_POST=1` (with the above): the title's tiled post passes over the scene
+//! colour are counted too ([`POST`]: the window-glass transmission blur pyramid and its depth
+//! tiles, the depth of field's prefilter and blur, the motion blur downsample), each by name,
+//! so a frame's line says which of them first wrote a NaN or an infinity (#96: soft dark
+//! squares over the bright window). Meant with `VICTORY_NAN_SCRUB=0 VICTORY_NAN_GUARD=0`:
+//! with either on, the title's shaders make a NaN or infinity 0 (or 65504) before they store
+//! it and there is nothing left to count.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -22,15 +30,43 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-/// The title's programs whose images are counted, by the name in their container.
-pub(crate) const NAMES: [&str; 6] = [
+/// The title's programs whose images are counted, by the name in their container: the first
+/// [`BASE`] always, the rest ([`POST`]) with `VICTORY_HDR_SCRUB_POST=1`.
+pub(crate) const NAMES: [&str; 15] = [
     "CS_ApplyCombinedDeferred",
     "CS_SceneColorTemporalResolve",
     "CS_TAA2_Resolve",
     "CS_BloomDownsampleKaris",
     "CS_ComputeLuminanceBilateralGrid",
     "CS_TransmissionVolumetrics",
+    "CS_AlphaTransmissionDepthTile",
+    "CS_AlphaTransmissionBlurGaussian",
+    "CS_AlphaTransmissionDenoise",
+    "CS_AlphaTransmissionHistoryResolve",
+    "CS_GatherAlphaVBuffer",
+    "CS_PrefilterBoundaryColor",
+    "CS_MainBlur",
+    "CS_MotionBlurDownSample",
+    "CS_BilateralBlur",
 ];
+/// The names counted without `VICTORY_HDR_SCRUB_POST`.
+const BASE: usize = 6;
+/// The tiled post passes of [`NAMES`].
+pub(crate) const POST: &[&str] = NAMES.split_at(BASE).1;
+
+/// `VICTORY_HDR_SCRUB_POST=1`: [`POST`] counted too. Read once.
+fn post() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_HDR_SCRUB_POST").is_ok_and(|v| v.trim() == "1");
+        if on && mode() != 0 {
+            tracing::info!(
+                "HDR scrub counts the tiled post passes too: {POST:?} (VICTORY_HDR_SCRUB_POST)"
+            );
+        }
+        on
+    })
+}
 /// Frames in the counts' ring.
 const RING: u64 = 8;
 /// Presents after a frame that its counts are read.
@@ -67,7 +103,12 @@ fn parse(value: Option<&str>) -> u8 {
 
 /// The program `container` is, of [`NAMES`].
 pub(crate) fn pass_of(container: &[u8]) -> Option<u8> {
-    NAMES
+    pass_among(container, if post() { NAMES.len() } else { BASE })
+}
+
+/// The program `container` is, of the first `names` of [`NAMES`].
+fn pass_among(container: &[u8], names: usize) -> Option<u8> {
+    NAMES[..names]
         .iter()
         .position(|name| {
             let name = name.as_bytes();
@@ -364,6 +405,7 @@ fn summary(frame: u64) {
         .iter()
         .zip(&total)
         .zip(&RUN)
+        .take(if post() { NAMES.len() } else { BASE })
         .map(|((name, t), run)| {
             format!(
                 "{name} images={} nan={} inf={}",
