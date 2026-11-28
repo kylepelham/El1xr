@@ -180,7 +180,8 @@ pub(crate) fn wait(
     }
     let key = (resource as usize, first);
     let was_handed = HANDED.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
-    let waits = match again(was_handed, crate::texture::prepare::held(resource, first)) {
+    let held = crate::texture::prepare::held(resource, first);
+    let waits = match again(was_handed, held) {
         Some(waits) => {
             if !waits {
                 HANDED.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
@@ -210,7 +211,28 @@ pub(crate) fn wait(
             }
         }
     };
+    // (texflicker) `VICTORY_TABLE_NULL_ONCE`: only the first time.
+    if waits && crate::table_null::keeps(resource as usize) {
+        HANDED.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        return false;
+    }
     if waits {
+        crate::table_null::nulled(
+            resource as usize,
+            crate::table_null::Look {
+                slot,
+                first,
+                host_copy: made,
+                uploaded_from: uploaded,
+                staged_first: crate::resource::staged_first(resource),
+                held: match held {
+                    crate::texture::prepare::Held::Pending => "pending",
+                    crate::texture::prepare::Held::Ready => "ready",
+                    crate::texture::prepare::Held::Nothing => "nothing",
+                },
+                handed_before: was_handed,
+            },
+        );
         STATS[0].fetch_add(1, Relaxed);
         crate::flicker_catch::count(crate::flicker_catch::Kind::TableNulled);
         if t.filled {
