@@ -12,6 +12,13 @@
 //! and a close). With the switch each step is timed from its start to the
 //! next one's, so the line's "noting" parts carry the timing's own cost (a
 //! clock read a step).
+//!
+//! (worldstream, #26) The uploads' claims before each prelude
+//! (`PreludeUpload::finish_refresh`, where levels on demand get their tiles:
+//! `crate::tiles::ahead`'s line splits that) are a part of their own; they
+//! were in no part before, and were most of the bundle's pre-bake
+//! submission. The prelude lists made on first use are told apart inside
+//! the preludes' part.
 
 use super::Step;
 use std::sync::OnceLock;
@@ -33,9 +40,13 @@ const RUN: usize = 5;
 const HOST: usize = 6;
 /// The preludes recorded, their uploads claimed.
 const PRELUDE: usize = 7;
+/// The uploads claimed before the preludes (levels on demand given).
+const CLAIM: usize = 8;
 /// Lists.
-const LISTS: usize = 8;
-const PARTS: usize = 9;
+const LISTS: usize = 9;
+/// Of the preludes, the lists made on first use (inside [`PRELUDE`]).
+const MADE: usize = 10;
+const PARTS: usize = 11;
 
 const NAMES: [&str; PARTS] = [
     "fills noted",
@@ -46,7 +57,9 @@ const NAMES: [&str; PARTS] = [
     "steps of ours on title memory (with their flushes)",
     "host steps (with the texture checks before them)",
     "preludes recorded (with their uploads claimed)",
+    "uploads claimed before the preludes (levels on demand given tiles)",
     "lists",
+    "prelude lists made",
 ];
 
 /// Since the last line: nanoseconds and counts by part.
@@ -119,6 +132,29 @@ impl Drop for Prelude {
     }
 }
 
+/// Times the claims of a list's uploads, from now until it is dropped.
+pub(super) fn claims() -> Timed {
+    Timed(on().then(Instant::now), CLAIM)
+}
+
+/// `make` (a prelude's allocator and list, on first use), timed.
+pub(super) fn made<T>(make: impl FnOnce() -> T) -> T {
+    let _timed = Timed(on().then(Instant::now), MADE);
+    make()
+}
+
+/// Charges the time from its start until it is dropped to its part.
+pub(super) struct Timed(Option<Instant>, usize);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        if let Some(at) = self.0 {
+            NS[self.1].fetch_add(at.elapsed().as_nanos() as u64, Relaxed);
+            COUNT[self.1].fetch_add(1, Relaxed);
+        }
+    }
+}
+
 /// The parts per frame over `frames`: (name, ms, count).
 fn parts(frames: f64) -> Vec<(&'static str, f64, f64)> {
     (0..LISTS)
@@ -137,14 +173,17 @@ pub(super) fn line(frames: f64) {
     }
     let parts = parts(frames);
     let lists = COUNT[LISTS].swap(0, Relaxed) as f64 / frames;
+    let made_ms = NS[MADE].swap(0, Relaxed) as f64 / 1e6 / frames;
+    let made = COUNT[MADE].swap(0, Relaxed) as f64 / frames;
     let total: f64 = parts.iter().map(|p| p.1).sum();
     let text: Vec<String> = parts
         .iter()
         .map(|(name, ms, n)| format!("{name} {ms:.2} ms ({n:.0})"))
         .collect();
     tracing::info!(
-        "run_other split per frame (VICTORY_RUN_SPLIT=1): {total:.2} ms over {lists:.1} lists: {}",
-        text.join(", ")
+        "run_other split per frame (VICTORY_RUN_SPLIT=1): {total:.2} ms over {lists:.1} lists: {}; of the preludes, {} {made_ms:.2} ms ({made:.1})",
+        text.join(", "),
+        NAMES[MADE]
     );
     // Outside run_other (card_before's `card_dirty`, and merges under writes).
     let [joins, ranges, kept, ms] = crate::joined_apart::taken(frames);
@@ -175,5 +214,28 @@ mod tests {
         let mut off = Laps(None);
         off.to(HOST);
         off.end();
+    }
+
+    /// (worldstream) The claims and the prelude lists made are charged to
+    /// parts of their own; the lists made are outside the line's sum.
+    #[test]
+    fn claims_and_lists_made_have_parts_of_their_own() {
+        assert!(CLAIM < LISTS && MADE > LISTS, "claims summed, lists made not");
+        let before = (NS[CLAIM].load(Relaxed), COUNT[MADE].load(Relaxed));
+        drop(Timed(Some(Instant::now() - std::time::Duration::from_millis(1)), CLAIM));
+        assert!(NS[CLAIM].load(Relaxed) - before.0 >= 1_000_000);
+        let n = {
+            let _t = Timed(Some(Instant::now()), MADE);
+            7
+        };
+        assert_eq!(n, 7);
+        assert!(COUNT[MADE].load(Relaxed) > before.1);
+        // Off: nothing is charged.
+        let off = COUNT[CLAIM].load(Relaxed);
+        drop(Timed(None, CLAIM));
+        assert_eq!(COUNT[CLAIM].load(Relaxed), off);
+        if !on() {
+            assert_eq!(made(|| 3), 3);
+        }
     }
 }

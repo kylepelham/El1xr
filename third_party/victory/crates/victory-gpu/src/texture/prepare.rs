@@ -584,7 +584,24 @@ fn work(job: &Job) -> Outcome {
     // Not `refresh`: that counts as the submitting thread's "textures".
     staging.refresh_now();
     STATS[6].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    tiles_ahead(resource, &staging);
     Outcome::Done(Some(staging))
+}
+
+/// (worldstream, `VICTORY_TILES_AHEAD=1`) A host copy made level by level
+/// gets the tiles of the levels just detiled here, on the thread that made
+/// it ready, not in its upload's claim at the submission
+/// (`crate::tiles::ahead`).
+fn tiles_ahead(resource: This, staging: &Staging) {
+    if !crate::tiles::ahead::on() || !staging.on_demand {
+        return;
+    }
+    let held = staging.detiled.load(Relaxed);
+    if held != 0
+        && let Some(on_demand) = crate::resource::host_tiled(resource)
+    {
+        on_demand.ahead(held);
+    }
 }
 
 fn finish(job: Job, outcome: Outcome) {

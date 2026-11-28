@@ -3390,6 +3390,14 @@ impl OnDemand {
         waiting
     }
 
+    /// (`VICTORY_TILES_AHEAD=1`) [`crate::tiles::Tiled::ahead`] for the
+    /// held levels `held`, while the card has room ([`room`]).
+    pub(crate) fn ahead(&self, held: u32) {
+        if let Some(tiled) = &self.0.tiled {
+            tiled.ahead(&self.0.texture, held, room());
+        }
+    }
+
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
     pub(crate) fn card_wrote(&self, levels: u32, memory: u64) {
         if let Some(tiled) = &self.0.tiled
