@@ -279,7 +279,7 @@ def _lancer(tmp_path, faux_outil, code_cargo=0, options=(), code_victory=CODE_SO
         (jeu / nom).write_bytes(b"")
     (jeu / "outils" / "autre.rpf").write_bytes(b"")              # un sous-dossier : jamais parcouru par -Warm
     cible, outils = tmp_path / "cible", tmp_path / "outils"
-    for profil in ("diag", "release"):
+    for profil in ("diag", "release", "release-lto"):
         (cible / profil).mkdir(parents=True)
         _poser_outil(faux_outil, cible / profil / "victory.exe")   # compilation déjà présente (peut-être périmée)
     outils.mkdir()
@@ -386,6 +386,17 @@ def test_override_rejects_names_that_are_not_victory_variables(tmp_path, faux_ou
     fini, appels, _, _ = _lancer(tmp_path, faux_outil, commande="-Override @{ PATH = 'x' }")
     assert fini.returncode != 0 and "-Override takes VICTORY_* names only" in fini.stderr
     assert not any(a.startswith("victory") for a in appels), appels   # rien n'est lancé
+
+
+def test_launcher_builds_and_runs_the_release_lto_profile_when_asked(tmp_path, faux_outil):
+    fini, appels, manifeste, jeu = _lancer(tmp_path, faux_outil, options=("-CargoProfile", "release-lto"))
+    assert appels[0] == f"cargo build --profile release-lto -p victory --manifest-path {manifeste}", (appels, fini.stderr)
+    assert appels[1] == f"victory run {jeu / 'game_scarlett_master.exe'} --execute"
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    fini, appels, manifeste, _ = _lancer(tmp_path / "diag", faux_outil, options=("-CargoProfile", "release-lto", "-Diag"))
+    assert appels[0] == f"cargo build --profile diag -p victory --features diagnostics --manifest-path {manifeste}"
+    fini, appels, _, _ = _lancer(tmp_path / "faux", faux_outil, options=("-CargoProfile", "lto"))
+    assert fini.returncode != 0 and appels == [], "ValidateSet refuses a profile it does not know"
 
 
 def test_launcher_builds_the_diag_profile_for_dred(tmp_path, faux_outil):

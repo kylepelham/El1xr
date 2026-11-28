@@ -59,7 +59,7 @@ def no_game(dev, monkeypatch, warm=None):
     """Keeps `train --run` off the game folder: its prewarm and the prewarm ahead are recorded, never run."""
     warm = [] if warm is None else warm
 
-    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path):
+    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path, profile="release"):
         warm.append(("prewarm", dict(overrides), pipelines))
         return True, {"translated": 5, "hits": 0, "shaders": 5, "recipes": 1}
 
@@ -106,6 +106,8 @@ def test_a_json_plan_with_its_own_order_and_default_bench_options(tmp_path):
         ({"sets": {"on": {}, "off": {}}, "baseline": "x"}, "baseline"),
         ({"sets": {"on": {"VICTORY_X": [1]}, "off": {}}}, "string, number or boolean"),
         ({"sets": {"../on": {}, "off": {}}, "order": ["off"]}, "usable name"),
+        ({"sets": {"on": {}, "off": {}}, "profile": "lto"}, "profile: one of release, release-lto, not 'lto'"),
+        ({"sets": {"on": {"profile": "diag"}, "off": {}}}, "sets.on.profile: one of"),
     ],
 )
 def test_plan_mistakes_are_refused_by_name(data, message):
@@ -449,3 +451,117 @@ def test_a_train_run_holds_the_gpu_lock_and_quiets_builds_as_train(tmp_path, mon
     dev.main(["train", "--plan", str(plan_file(tmp_path))])
     assert events == [("gpu", "train"), ("quiet", "train", True), ("run", 60), ("quiet done", "train")]
     assert "DEV train FAIL run=01_on" in capsys.readouterr().out, "an empty log has no world"
+
+
+LTO_PLAN = """
+seconds = 60
+quiet = true
+order = ["base_warm", "lto_warm", "base", "lto", "lto", "base"]
+baseline = "base"
+
+[sets.base]
+[sets.base_warm]
+early_stop = true
+
+[sets.lto]
+profile = "release-lto"
+
+[sets.lto_warm]
+from = "lto"
+profile = "release-lto"
+early_stop = true
+"""
+
+
+def test_a_plan_runs_two_exes_by_a_set_or_plan_profile(tmp_path):
+    plan = dev_train.load_plan(plan_file(tmp_path, LTO_PLAN, "lto.toml"))
+    assert plan.profile == "release"
+    assert [dev_train.step_profile(plan, n) for n in ("base", "base_warm", "lto", "lto_warm")] == [
+        "release", "release", "release-lto", "release-lto",
+    ]
+    assert plan.sets["lto"] == {} and plan.sets["lto_warm"] == {}, "profile is a set flag, not an override"
+    listing = dev_train.listing(plan, {})
+    assert "03_base pending" in listing and "04_lto pending [60 s, quiet, gpu lock ttl>=20 min]: [release-lto]" in listing
+    whole = dev_train.parse_plan("p", {"profile": "release-lto", "sets": {"on": {}, "off": {"profile": "release"}}})
+    assert dev_train.step_profile(whole, "on") == "release-lto" and dev_train.step_profile(whole, "off") == "release"
+
+
+def test_train_runs_each_step_with_its_profiles_exe_and_prewarms_it(tmp_path, monkeypatch, capsys):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
+    profiles, warmed = [], []
+
+    def fake_bench(args, overrides, log_path, snap_dir, what):
+        profiles.append(args.profile)
+        s = dev.parse_victory_log("")
+        s.update(world_samples=10, fps=24.0)
+        return s, 0, 0, 0
+
+    def fake_prewarm(game_dir, overrides, mute, pipelines, jobs, log_path, profile="release"):
+        warmed.append(profile)
+        return True, {"translated": 5, "hits": 0, "shaders": 5, "recipes": 1}
+
+    monkeypatch.setattr(dev, "run_bench", fake_bench)
+    no_game(dev, monkeypatch)
+    monkeypatch.setattr(dev, "run_prewarm", fake_prewarm)
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "target"))
+    for profile, size in (("release", 1), ("release-lto", 2)):
+        (tmp_path / "target" / profile).mkdir(parents=True)
+        (tmp_path / "target" / profile / "victory.exe").write_bytes(b"x" * size)
+    plan = plan_file(tmp_path, LTO_PLAN, "lto.toml")
+    for _ in range(4):
+        assert dev.main(["train", "--plan", str(plan), "--run", "next"]) == 0
+    assert profiles == ["release", "release-lto", "release", "release-lto"]
+    assert warmed == ["release", "release-lto"], "each exe has its own prewarm stamp; the second run of each is warm"
+    saved = json.loads((tmp_path / "dev" / "train_lto" / "02_lto_warm.json").read_text(encoding="utf-8"))
+    assert saved["profile"] == "release-lto"
+
+
+def test_launcher_command_and_exe_path_follow_the_profile(monkeypatch):
+    dev = load_dev()
+    import dev_warm
+
+    def cmd(**kw):
+        return dev.build_launcher_command(game_dir=Path("G:/jeu"), overrides={}, **kw)[-1]
+
+    assert "-CargoProfile" not in cmd(diag=False)
+    assert "-CargoProfile" not in cmd(diag=False, profile="release")
+    assert "-CargoProfile release-lto" in cmd(diag=False, profile="release-lto")
+    assert "-Diag" in cmd(diag=True, profile="release-lto") and "-CargoProfile" not in cmd(diag=True, profile="release-lto")
+    monkeypatch.setenv("CARGO_TARGET_DIR", "T:/t")
+    assert dev_warm.victory_exe(Path("R:/"), False, "release-lto") == Path("T:/t/release-lto/victory.exe")
+    assert dev_warm.victory_exe(Path("R:/"), True, "release-lto") == Path("T:/t/diag/victory.exe")
+    assert dev_warm.victory_exe(Path("R:/")) == Path("T:/t/release/victory.exe")
+
+
+def test_build_and_bench_take_a_release_family_profile(tmp_path, monkeypatch, capsys):
+    import contextlib
+
+    dev = load_dev()
+    monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
+    monkeypatch.setattr(dev, "LOCKS_DIR", tmp_path / "locks")
+    monkeypatch.setattr(dev.dev_throttle, "disk_free_gb", lambda root: 1000.0)
+    monkeypatch.setattr(dev.dev_throttle, "below_normal_priority", lambda: None)
+    monkeypatch.setattr(dev, "build_slot", lambda name: contextlib.nullcontext)
+    steps = []
+    monkeypatch.setattr(dev, "run_logged_steps", lambda s, log: (steps.append(s) or True, {}))
+    assert dev.main(["build", "--profile", "release-lto"]) == 0
+    assert steps[-1][0][1][:4] == ["cargo", "build", "--profile", "release-lto"]
+    assert "--features" not in steps[-1][0][1]
+    assert "DEV build PASS profile=release-lto" in capsys.readouterr().out
+    assert dev.main(["build"]) == 0 and steps[-1][0][1][:3] == ["cargo", "build", "--release"]
+    assert dev.main(["build", "--profile", "release"]) == 0 and steps[-1][0][1][:3] == ["cargo", "build", "--release"]
+    with pytest.raises(SystemExit):
+        dev.main(["build", "--profile", "release-lto", "--diag"])
+    assert dev.build_parser().parse_args(["bench", "--profile", "release-lto"]).profile == "release-lto"
+    assert dev.build_parser().parse_args(["bench"]).profile == "release"
+
+
+def test_every_release_profile_is_a_cargo_profile():
+    import dev_warm
+
+    cargo = (TOOLS.parent / "third_party" / "victory" / "Cargo.toml").read_text(encoding="utf-8")
+    for name in dev_warm.RELEASE_PROFILES:
+        assert name == "release" or f"[profile.{name}]\ninherits = \"release\"" in cargo, name
+    lto = cargo.split("[profile.release-lto]", 1)[1].split("\n[", 1)[0]
+    assert 'lto = "fat"' in lto and "codegen-units = 1" in lto and "panic" not in lto

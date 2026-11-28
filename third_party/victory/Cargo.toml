@@ -74,6 +74,14 @@ opt-level = 2
 [profile.release]
 debug = "line-tables-only"
 
+# Release with whole-program optimisation (`cargo build --profile release-lto -p victory`):
+# one codegen unit and fat LTO so the submit/translate hot paths inline across crates.
+# Its own folder (target/release-lto), A/B'd against release by `dev.py bench --profile`.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.

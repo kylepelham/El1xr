@@ -41,8 +41,11 @@ Plan (TOML or JSON; every key optional but `sets`):
                                         # default: on for loud arms, off for quiet ones
     min_seconds = 90                    # early stop never before this (from launch), never after `seconds`
     steady_seconds = 60                 # steady windows needed after the world settled
+    profile = "release"                 # the cargo profile whose victory.exe runs (dev_warm.RELEASE_PROFILES;
+                                        # release-lto: build it first with `dev.py build --profile release-lto`)
 
-A set may say `quiet = true|false` and `early_stop = true|false` (its runs only; not inherited through `from`). `[live.<name>]` tables are
+A set may say `quiet = true|false`, `early_stop = true|false` and `profile = "..."` (its runs only; not inherited
+through `from`): two exes A/B'd in one plan. `[live.<name>]` tables are
 live arms (one launch, Live settings switched A/B/A/B; see tools/dev_live.py) and `[multilive.<name>]` tables
 multi-switch live launches (one launch, several Live switches A/B'd one after another; see tools/dev_multilive.py);
 `order` names both like sets.
@@ -65,6 +68,7 @@ from pathlib import Path
 import dev_greps
 import dev_live
 import dev_multilive
+import dev_warm
 
 OVERRIDE_KEY_RE = re.compile(r"^VICTORY_[A-Z0-9_]+$")
 SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -76,8 +80,9 @@ DEFAULT_SNAP_EVERY = 15.0
 PLAN_KEYS = {
     "seconds", "quiet", "snap_every", "save", "fast_boot", "unmute", "order", "baseline", "common", "sets", "greps",
     "live", "multilive", "prewarm", "prewarm_ahead", "ahead_jobs", "early_stop", "min_seconds", "steady_seconds",
+    "profile",
 }
-SET_FLAGS = ("from", "quiet", "early_stop")
+SET_FLAGS = ("from", "quiet", "early_stop", "profile")
 DEFAULT_MIN_SECONDS = 90
 DEFAULT_STEADY_SECONDS = 60
 # `--all`: per arm beyond its seconds (boot, prewarm made ahead, report), plus once for the first prewarm and a retry.
@@ -133,6 +138,14 @@ class Plan:
     set_early: dict[str, bool] = field(default_factory=dict)
     min_seconds: int = DEFAULT_MIN_SECONDS
     steady_seconds: int = DEFAULT_STEADY_SECONDS
+    profile: str = "release"
+    set_profile: dict[str, str] = field(default_factory=dict)
+
+
+def _profile(where: str, value: object) -> str:
+    if value not in dev_warm.RELEASE_PROFILES:
+        raise PlanError(f"{where}: one of {', '.join(dev_warm.RELEASE_PROFILES)}, not '{value}'")
+    return str(value)
 
 
 def _value(key: str, value: object) -> str:
@@ -217,6 +230,11 @@ def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None 
         greps = dev_greps.parse_greps(data.get("greps", {}))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    profile = _profile("profile", data.get("profile", "release"))
+    set_profile = {
+        n: _profile(f"sets.{n}.profile", t["profile"])
+        for n, t in raw_sets.items() if isinstance(t, dict) and "profile" in t
+    }
     return Plan(
         name=name,
         sets=sets,
@@ -239,6 +257,8 @@ def parse_plan(name: str, data: dict[str, object], kinds: dict[str, str] | None 
         set_early={n: bool(t["early_stop"]) for n, t in raw_sets.items() if isinstance(t, dict) and "early_stop" in t},
         min_seconds=int(data.get("min_seconds", DEFAULT_MIN_SECONDS)),
         steady_seconds=int(data.get("steady_seconds", DEFAULT_STEADY_SECONDS)),
+        profile=profile,
+        set_profile=set_profile,
     )
 
 
@@ -273,6 +293,12 @@ def step_quiet(plan: Plan, name: str) -> bool:
     if entry is not None and entry.quiet is not None:
         return bool(entry.quiet)
     return plan.set_quiet.get(name, plan.quiet)
+
+
+def step_profile(plan: Plan, name: str) -> str:
+    """The cargo profile whose victory.exe a step runs: the set's `profile`, else the plan's (live and multilive
+    launches take the plan's)."""
+    return plan.set_profile.get(name, plan.profile)
 
 
 def step_early_stop(plan: Plan, name: str, quiet: bool) -> bool:
@@ -424,6 +450,8 @@ def listing(plan: Plan, done: dict[int, dict[str, object]]) -> str:
             values = " ".join(f"{k}={v}" for k, v in plan.sets[name].items())
         else:
             values = "(set no longer in the plan)"
+        if step_profile(plan, name) != "release":
+            values = f"[{step_profile(plan, name)}] {values}".rstrip()
         extra = ""
         if state == "pending" and (name in plan.sets or name in plan.live or name in plan.multilive):
             extra = f" [{step_seconds(plan, name, done, step)} s{', quiet' if step_quiet(plan, name) else ''}, gpu lock ttl>={ttl_minutes(plan, name)} min]"
