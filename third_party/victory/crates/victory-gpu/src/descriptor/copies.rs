@@ -18,6 +18,13 @@
 //! views freed with their resource is kept ([`note_former`], only while
 //! `VICTORY_HEAP_FIND` is on), so a stale record can be told to have shown
 //! the memory looked for.
+//!
+//! (round 9) Part N counted 8-23 stale records in shader-visible heaps
+//! with no `copy slot` line: the count took every stale record, the line
+//! only those whose memory met the target. [`Walked`] now also counts the
+//! stale records whose memory is known and those that met the target, and
+//! the walk hands back the first [`MOST_STALE_SAMPLES`] other stale records
+//! of shader-visible heaps, so what they showed can be logged.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
@@ -70,6 +77,10 @@ fn former_of(i: u32, generation: u32) -> Option<(u64, u64)> {
         .copied()
 }
 
+/// Stale records of shader-visible heaps that showed other memory handed
+/// back by one walk at most.
+pub(crate) const MOST_STALE_SAMPLES: usize = 8;
+
 /// What a slot of a walk holds that names the view looked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -110,13 +121,29 @@ pub(crate) struct Copy {
 }
 
 /// The counts of a walk: heaps (shader-visible ones), slots read, records
-/// of freed views (in shader-visible heaps).
+/// of freed views in shader-visible heaps: all, those whose memory is
+/// known, those whose memory met what is looked for.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Walked {
     pub(crate) heaps: u32,
     pub(crate) visible_heaps: u32,
     pub(crate) slots: u64,
     pub(crate) stale_visible: u64,
+    pub(crate) stale_former_known: u64,
+    pub(crate) stale_target: u64,
+}
+
+impl Walked {
+    /// A stale record of a shader-visible heap was read: `former` the
+    /// memory its view showed, `kind` what [`classify`] made of it.
+    /// Whether it is a sample of other memory.
+    pub(crate) fn stale(&mut self, former: Option<(u64, u64)>, kind: Option<Kind>) -> bool {
+        self.stale_visible += 1;
+        self.stale_former_known += u64::from(former.is_some());
+        let target = kind == Some(Kind::Stale);
+        self.stale_target += u64::from(target);
+        !target
+    }
 }
 
 /// Whether one of `records` lies in `words` past its first word.
@@ -159,17 +186,20 @@ pub(crate) fn classify(
 /// the found slots (heap start, index, record), not named again; `keep`:
 /// whether a live view holds the memory; `meets`: whether memory (start,
 /// bytes) meets it; `raw`: whether a descriptor the title wrote itself
-/// names it. At most `most` slots.
+/// names it. At most `most` slots; also the first [`MOST_STALE_SAMPLES`]
+/// stale records of shader-visible heaps that do not name it (kind
+/// [`Kind::Stale`], `former` the memory they showed if known).
 pub(crate) fn copies_where(
     found: &[(u64, u32, [u32; 3])],
     mut keep: impl FnMut(&View) -> bool,
     meets: impl Fn(u64, u64) -> bool,
     raw: impl Fn(&[u32; 8]) -> bool,
     most: usize,
-) -> (Vec<Copy>, Walked) {
+) -> (Vec<Copy>, Vec<Copy>, Walked) {
     const CHUNK: u32 = 4096;
     let records: Vec<[u32; 3]> = found.iter().map(|f| f.2).collect();
     let mut out = Vec::new();
+    let mut samples = Vec::new();
     let mut walked = Walked::default();
     let heaps = VIEW_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &at in heaps.iter() {
@@ -211,10 +241,17 @@ pub(crate) fn copies_where(
                     }
                 };
                 let former = stale.then(|| former_of(i, generation)).flatten();
-                if stale && visible {
-                    walked.stale_visible += 1;
-                }
                 let kind = classify(&words, visible, &records, live, former, &meets, &raw);
+                if stale && visible && walked.stale(former, kind) && samples.len() < MOST_STALE_SAMPLES {
+                    samples.push(Copy {
+                        heap: heap.start,
+                        visible,
+                        index,
+                        kind: Kind::Stale,
+                        words,
+                        former,
+                    });
+                }
                 if let Some(kind) = kind
                     && out.len() < most
                 {
@@ -232,7 +269,7 @@ pub(crate) fn copies_where(
             first = last;
         }
     }
-    (out, walked)
+    (out, samples, walked)
 }
 
 #[cfg(test)]
@@ -305,6 +342,40 @@ mod tests {
         assert_eq!(
             classify(&[1; 8], true, &found, None, None, &never, &yes),
             None
+        );
+    }
+
+    /// A stale record that showed the target counts as such and is no
+    /// sample; one of other or unknown memory is a sample; both count as
+    /// stale (part N: 8-23 stale, no line, no way to tell why).
+    #[test]
+    fn stale_records_are_counted_by_what_they_showed() {
+        let found = [RECORD];
+        let meets = |start: u64, len: u64| start < 0xb_8680_0000 && 0xb_8640_0000 < start + len;
+        let stale = slot([VIEW_TAG, 5, 1]);
+        let mut walked = Walked::default();
+        for former in [Some((0xb_8640_0000, 0x3c_0000)), Some((0x1000, 0x100)), None] {
+            let kind = classify(&stale, true, &found, None, former, &meets, &no_raw);
+            let sample = walked.stale(former, kind);
+            assert_eq!(sample, former != Some((0xb_8640_0000, 0x3c_0000)));
+        }
+        assert_eq!(
+            (walked.stale_visible, walked.stale_former_known, walked.stale_target),
+            (3, 2, 1)
+        );
+    }
+
+    /// A view freed while the switch is on keeps its memory, so its stale
+    /// record is named a copy of the target the walk after.
+    #[test]
+    fn a_freed_view_of_the_target_emits_a_stale_copy() {
+        let (i, g) = (0xdead_0002, 9);
+        note_former(i, g, (0xb_8640_0000, 736 * 1280 * 4));
+        let meets = |start: u64, len: u64| start < 0xb_8640_0001 && 0xb_8640_0000 < start + len;
+        let stale = slot([VIEW_TAG, i, g]);
+        assert_eq!(
+            classify(&stale, true, &[RECORD], None, former_of(i, g), &meets, &no_raw),
+            Some(Kind::Stale)
         );
     }
 

@@ -93,10 +93,30 @@
 //!   descriptor in a heap the card does not see (`raw`): `heap find: copy
 //!   slot` lines, and `copies`, `stale_visible`, `view_heaps` on the scan
 //!   line.
+//!
+//! (round 9) Part N: `refs_binds` 424-2354 on the walked frames 859-901 of
+//! the Bink window and 0 past it, as meant, but the line showed the frame
+//! before (now `refs_of_frame`, and `refs_window` says whether this frame
+//! is in the window); the large budget ran out on every frame (fixed in
+//! [`refs`]: a buffer is read once a frame, not once per table set). Now:
+//! - `VICTORY_HEAP_FIND_REFS=1` searches every draw in the window whose
+//!   rt0 is not the followed target and not tiny ([`searched_target`]:
+//!   both sides from [`TINY`]; the scene at 2560x1440 under the upscaler,
+//!   a UI at 1024x512, a phone's 736x1280 all pass) and every dispatch;
+//!   the binds left out are counted (`refs_passed_over`), and the draws
+//!   and dispatches not run searched (`refs_dropped`; part N's window
+//!   dropped only ray-tracing builder and ray-only indirect dispatches,
+//!   which are left out before a bind, so 0 `dropped` lines was right);
+//! - `stale_visible` counts every record of a freed view in a
+//!   shader-visible heap; a `copy slot ... kind=stale` line needs the
+//!   freed view's memory to meet the target. The scan line adds
+//!   `stale_former_known` and `stale_target`, and the first
+//!   [`MOST_STALE_LINES`] such records a run that show other memory log
+//!   `heap find: stale slot` with that memory.
 
 mod refs;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -148,13 +168,13 @@ const SLOT_BYTES: u64 = 32;
 pub(crate) const MOST_SCAN: u64 = 16 << 10;
 /// Frames after a Bink write whose scene and UI draws are searched.
 const REFS_AFTER: u64 = 30;
-/// Narrowest render target 0 of a scene or UI draw (a portrait one is
-/// taken at any width).
-const SCENE_WIDTH: u64 = 1280;
-/// Shortest portrait or square UI target.
-const UI_HEIGHT: u64 = 512;
+/// A render target 0 narrower or shorter than this is tiny (a reduction,
+/// a lookup table): its draws are not searched.
+const TINY: u64 = 128;
 /// Values below this are too common in constants to be told apart.
-const SMALLEST: u32 = 256;
+pub(crate) const SMALLEST: u32 = 256;
+/// `heap find: stale slot` lines of a run at most.
+const MOST_STALE_LINES: u32 = 64;
 /// Found slots named on the scan line.
 const MOST_HOST_SLOTS: usize = 8;
 /// A view starting further than this before the address is not looked at
@@ -190,16 +210,16 @@ pub(crate) fn refs() -> bool {
 }
 
 /// Whether every bind is searched (`VICTORY_HEAP_FIND_REFS=2`), not only
-/// scene and UI draws after a Bink write.
+/// the draws and dispatches after a Bink write.
 pub(crate) fn refs_all() -> bool {
     REFS.get() == 2
 }
 
-/// Whether a draw whose render target 0 is `width` x `height` renders the
-/// scene colour or a UI (a phone's portrait or square one included, from
-/// [`UI_HEIGHT`] tall).
-pub(crate) fn scene_or_ui(width: u64, height: u64) -> bool {
-    width >= SCENE_WIDTH || (height >= UI_HEIGHT && height >= width)
+/// Whether a draw whose render target 0 is `width` x `height` is searched
+/// (round 9): any not [`TINY`] (the scene at any internal size, a UI of any
+/// shape); the followed target itself is left out by its memory.
+pub(crate) fn searched_target(width: u64, height: u64) -> bool {
+    width >= TINY && height >= TINY
 }
 
 /// Whether this frame is one of the [`REFS_AFTER`] after a Bink write
@@ -236,6 +256,9 @@ static FOLLOWED: Mutex<Vec<Followed>> = Mutex::new(Vec::new());
 /// Frames still to walk whatever the rate (set at a Bink write).
 static FORCED: AtomicU32 = AtomicU32::new(0);
 static COPY_LINES: AtomicU32 = AtomicU32::new(0);
+static STALE_LINES: AtomicU32 = AtomicU32::new(0);
+/// The stale records logged (heap, index, record), each once a run.
+static STALE_SEEN: Mutex<Option<HashSet<(u64, u32, [u32; 3])>>> = Mutex::new(None);
 static WRITE_LINES: AtomicU32 = AtomicU32::new(0);
 
 /// The memory looked for: half-open ranges (one byte for an address).
@@ -519,8 +542,9 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
             )
         })
         .collect();
-    let spent = RefsState::with(refs::Refs::start);
-    let (copies, walked) = if follows() {
+    let spent = RefsState::with(|r| r.start(frame));
+    let window = after_write();
+    let (copies, stale, walked) = if follows() {
         let records: Vec<(u64, u32, [u32; 3])> = found.iter().map(|f| (f.0, f.1, f.2)).collect();
         crate::descriptor::copies::copies_where(
             &records,
@@ -542,14 +566,20 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
         target = %crate::resource::find_facts::target_text(find),
         binds_by_index_of_the_last_walked_frame = by_index,
         host_slots = format_args!("[{}]", host_slots.join(", ")),
+        refs_of_frame = format_args!("{}", spent.frame.map_or_else(|| "none".into(), |f| f.to_string())),
+        refs_window = window,
         refs_searched_small = spent.searched[0],
         refs_searched_large = spent.searched[1],
         refs_unchanged = spent.unchanged,
         refs_buffers = spent.buffers,
         refs_binds = spent.binds,
+        refs_passed_over = spent.passed_over,
+        refs_dropped = spent.dropped,
         refs_full = spent.full,
         copies = copies.len(),
         stale_visible = walked.stale_visible,
+        stale_former_known = walked.stale_former_known,
+        stale_target = walked.stale_target,
         view_heaps = format_args!("{}/{}_visible", walked.heaps, walked.visible_heaps),
         walk_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
         "heap find: scan"
@@ -610,6 +640,28 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
             first_seen_frame = s.first,
             changed_frame = s.changed,
             "heap find: raw slot (a descriptor the title wrote itself)"
+        );
+    }
+    let mut stale_seen = STALE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let stale_seen = stale_seen.get_or_insert_with(HashSet::new);
+    for c in &stale {
+        if !stale_seen.insert((c.heap, c.index, [c.words[0], c.words[1], c.words[2]])) {
+            continue;
+        }
+        if STALE_LINES.fetch_add(1, Ordering::Relaxed) >= MOST_STALE_LINES {
+            break;
+        }
+        let former = c.former.map_or_else(
+            || "unknown (freed before the switch, or no memory)".to_string(),
+            |(start, len)| format!("{start:#x}..{:#x}", start + len),
+        );
+        tracing::warn!(
+            frame,
+            heap = format_args!("{:#x}", c.heap),
+            index = c.index,
+            words = format_args!("{:08x?}", c.words),
+            former = %former,
+            "heap find: stale slot (a record of a freed view; its memory is not the target)"
         );
     }
     for c in copies {
@@ -778,27 +830,60 @@ pub(crate) fn refs_bind() {
     RefsState::with(refs::Refs::bind);
 }
 
+/// A bind of the Bink window was left out (rt0 the target, tiny or none).
+pub(crate) fn refs_passed_over() {
+    RefsState::with(refs::Refs::passed_over);
+}
+
+/// A draw or dispatch not run had its roots searched.
+pub(crate) fn refs_dropped() {
+    RefsState::with(refs::Refs::dropped);
+}
+
+pub(crate) use refs::Filter;
+
+/// The words that may name one of `slots` of the heap starting at `heap`
+/// in any encoding [`wanted`] makes, whatever the bind's tables.
+pub(crate) fn filter(heap: u64, slots: &[u32]) -> Filter {
+    let bound = slots.iter().map(|&s| u64::from(s) * SLOT_BYTES).max().unwrap_or(0);
+    let extra = slots
+        .iter()
+        .map(|&s| (heap.wrapping_add(u64::from(s) * SLOT_BYTES) & 0xffff_ffff) as u32)
+        .collect();
+    Filter {
+        bound: u32::try_from(bound).unwrap_or(u32::MAX),
+        extra,
+    }
+}
+
 /// [`search`] of title memory at `start` (`len` bytes; small buffers whole,
-/// large ones their first [`MOST_SCAN`]) for a bind whose table set is
-/// `key`: once a walked frame each, not again while its bytes hash the
-/// same ([`refs`]); `None` if nothing is found or it cannot be read.
-pub(crate) fn search_memory(start: u64, len: u64, key: u64, wanted: &[Wanted]) -> Option<(usize, u32, String)> {
+/// large ones their first [`refs::MOST_LARGE`]): read once a walked frame
+/// whatever binds it, not searched again while its bytes hash the same
+/// ([`refs`]); `None` if nothing is found or it cannot be read.
+pub(crate) fn search_memory(
+    start: u64,
+    len: u64,
+    filter: &Filter,
+    wanted: &[Wanted],
+) -> Option<(usize, u32, String)> {
     let len = refs::taken(len);
     if start == 0 || len == 0 || start % 4 != 0 {
         return None;
     }
-    let k = (start, len, key);
+    let k = (start, len, filter.id());
     let known = RefsState::with(|r| r.known(k).ok_or_else(|| r.may_read(len)));
-    match known {
-        Ok(found) => return found,
+    let candidates = match known {
+        Ok(c) => c,
         Err(false) => return None,
-        Err(true) => {}
-    }
-    let mut bytes = vec![0u8; len as usize];
-    if !crate::host::read_into(start as *const u8, &mut bytes) {
-        return None;
-    }
-    RefsState::with(|r| r.take(k, &bytes, |b| refs::search_bytes(b, wanted)))
+        Err(true) => {
+            let mut bytes = vec![0u8; len as usize];
+            if !crate::host::read_into(start as *const u8, &mut bytes) {
+                return None;
+            }
+            RefsState::with(|r| r.take(k, &bytes, filter))
+        }
+    };
+    refs::lookup(&candidates?, wanted)
 }
 
 /// A bind of a walked frame that holds the address: its line.
@@ -906,32 +991,82 @@ mod tests {
         let data: Vec<u32> = vec![1, 2, 114_106, 4];
         let start = data.as_ptr() as u64;
         let w = wanted(0x1000_0000, &[114_106], &[]);
-        let _ = RefsState::with(refs::Refs::start);
+        let f = filter(0x1000_0000, &[114_106]);
+        let _ = RefsState::with(|r| r.start(1));
         assert_eq!(
-            search_memory(start, 16, 9, &w),
+            search_memory(start, 16, &f, &w),
             Some((2, 114_106, "slot 114106 as an index".to_string()))
         );
         assert_eq!(
-            search_memory(start, 16, 9, &w).map(|f| f.0),
+            search_memory(start, 16, &f, &w).map(|f| f.0),
             Some(2),
             "kept for the frame"
         );
-        let spent = RefsState::with(refs::Refs::start);
+        let spent = RefsState::with(|r| r.start(2));
         assert_eq!((spent.searched, spent.buffers, spent.full), ([16, 0], 1, false));
-        assert_eq!(search_memory(0, 16, 9, &w), None);
-        assert_eq!(search_memory(start + 2, 16, 9, &w), None, "unaligned");
+        assert_eq!(search_memory(0, 16, &f, &w), None);
+        assert_eq!(search_memory(start + 2, 16, &f, &w), None, "unaligned");
+        // A material table of 4 MiB naming part N's slot 109463 as a byte
+        // offset from a table at 109000, 3 MiB in (past round 8's 1 MiB).
+        let heap = 0x0b69_0000;
+        let mut table = vec![0x3f80_0000u32; (4 << 20) / 4];
+        table[(3 << 20) / 4] = 463 * 32;
+        let at = table.as_ptr() as u64;
+        let f = filter(heap, &[109_463]);
+        let w = wanted(heap, &[109_463], &[(2, 109_000)]);
+        assert_eq!(
+            search_memory(at, 4 << 20, &f, &w),
+            Some((
+                (3 << 20) / 4,
+                463 * 32,
+                "slot 109463 as a byte offset from table2 at 109000".to_string()
+            ))
+        );
+        let w_other = wanted(heap, &[109_463], &[(1, 100_000)]);
+        assert_eq!(search_memory(at, 4 << 20, &f, &w_other), None, "another table's numbers");
+        let spent = RefsState::with(|r| r.start(3));
+        assert_eq!((spent.searched, spent.buffers), ([0, 4 << 20], 1), "read once for both binds");
     }
 
-    /// Scene and UI targets are wide or portrait; small landscape ones
-    /// (shadow, bake and effect targets) are not.
+    /// Every target but tiny ones is searched: the scene at the title's
+    /// internal sizes under the upscaler, landscape UI and effect targets
+    /// (round 8 left 1024x512 and 256x256 out), a phone's portrait one.
     #[test]
-    fn scene_and_ui_targets_are_wide_or_portrait() {
-        assert!(scene_or_ui(3840, 2160));
-        assert!(scene_or_ui(1280, 720));
-        assert!(scene_or_ui(736, 1280), "a phone's UI");
-        assert!(scene_or_ui(1024, 1024), "a square UI");
-        assert!(!scene_or_ui(256, 256));
-        assert!(!scene_or_ui(1024, 512));
+    fn every_target_but_tiny_ones_is_searched() {
+        for (w, h) in [
+            (3840, 2160),
+            (2560, 1440),
+            (1920, 1080),
+            (1280, 720),
+            (960, 540),
+            (736, 1280),
+            (1024, 512),
+            (512, 256),
+            (256, 256),
+            (128, 128),
+        ] {
+            assert!(searched_target(w, h), "{w}x{h}");
+        }
+        for (w, h) in [(64, 64), (1, 1), (4096, 1), (16, 1024)] {
+            assert!(!searched_target(w, h), "{w}x{h}");
+        }
+    }
+
+    /// The filter keeps every number [`wanted`] makes for any table, so a
+    /// buffer read once answers every bind.
+    #[test]
+    fn the_filter_takes_every_wanted_number() {
+        let heap = 0x0b69_0000;
+        let slots = [109_463, 91_711];
+        let f = filter(heap, &slots);
+        assert_eq!(f.bound, 109_463 * 32);
+        for tables in [&[][..], &[(2, 109_000)][..], &[(0, 0), (5, 91_000)][..]] {
+            for (v, what) in wanted(heap, &slots, tables) {
+                let bytes = v.to_le_bytes();
+                assert_eq!(refs::candidates(&bytes, &f), vec![(v, 0)], "{what}");
+            }
+        }
+        assert!(refs::candidates(&1.0f32.to_bits().to_le_bytes(), &f).is_empty());
     }
 
     #[test]
