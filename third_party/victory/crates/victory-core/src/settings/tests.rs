@@ -278,21 +278,62 @@ fn a_read_only_file_is_refused_and_left_as_it_was() {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
+fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// A cleared change (the menu's Undo) goes back to the file's value at start; one the file never
+/// had leaves it.
 #[test]
-fn changes_merge_over_the_file_and_a_cleared_one_leaves_it() {
-    let file: BTreeMap<String, String> = [("VICTORY_A1", "1"), ("VICTORY_B1", "2")]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let changed: BTreeMap<String, String> = [("VICTORY_A1", ""), ("VICTORY_C1", "3")]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let out = merged(&file, &changed);
+fn changes_merge_over_the_file_and_a_cleared_one_goes_back_to_the_start() {
+    let start = map(&[("VICTORY_A1", "1"), ("VICTORY_B1", "2")]);
+    // Saved once with A1 changed (the menu saves restart changes at once), then undone.
+    let file = map(&[("VICTORY_A1", "7"), ("VICTORY_B1", "2"), ("VICTORY_D1", "4")]);
+    let changed = map(&[("VICTORY_A1", ""), ("VICTORY_C1", "3"), ("VICTORY_D1", "")]);
+    let out = merged(&file, &start, &changed);
+    assert_eq!(out, map(&[("VICTORY_A1", "1"), ("VICTORY_B1", "2"), ("VICTORY_C1", "3")]));
+}
+
+/// The launcher copies the file into the environment: those values still count as the file's
+/// (the resolution plan lets them give way), a launcher override does not.
+#[test]
+fn file_values_the_launcher_copied_still_count_as_the_files() {
+    let file = map(&[
+        ("VICTORY_RESOLUTION", "2560x1440"),
+        ("VICTORY_DLSS_QUALITY", "5"),
+        ("VICTORY_PRESENT_CAP", "60"),
+    ]);
+    let env = map(&[("VICTORY_RESOLUTION", "2560x1440"), ("VICTORY_DLSS_QUALITY", "2")]);
+    let got = file_values_in_env(&file, |n| env.get(n).cloned());
     assert_eq!(
-        out.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["VICTORY_B1", "VICTORY_C1"]
+        got.into_iter().collect::<Vec<_>>(),
+        ["VICTORY_PRESENT_CAP", "VICTORY_RESOLUTION"]
     );
+}
+
+/// Kyle's choice survives a restart: saved, read back at the next start, it plans the same
+/// output, and wins over the monitor default.
+#[test]
+fn a_saved_resolution_is_remembered_over_the_monitor_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    let saved = merged(&BTreeMap::new(), &BTreeMap::new(), &map(&[("VICTORY_RESOLUTION", "1920x1080")]));
+    write_file(&path, &saved).unwrap();
+    let (back, problems) = parse_file(&std::fs::read_to_string(&path).unwrap());
+    assert!(problems.is_empty());
+    let get = |n: &str| match n {
+        "VICTORY_NATIVE_DEFAULT" => Some("1".to_string()),
+        _ => back.get(n).cloned(),
+    };
+    let plan = crate::render_plan::plan(get, || Some((2560, 1440))).unwrap();
+    assert_eq!((plan.output, plan.defaulted), (Some((1920, 1080)), false));
+    // Never chosen: the monitor's.
+    let plan = crate::render_plan::plan(
+        |n| (n == "VICTORY_NATIVE_DEFAULT").then(|| "1".to_string()),
+        || Some((2560, 1440)),
+    )
+    .unwrap();
+    assert_eq!((plan.output, plan.defaulted), (Some((2560, 1440)), true));
 }
 
 #[test]

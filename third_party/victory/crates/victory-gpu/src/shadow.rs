@@ -29,6 +29,8 @@ pub(crate) mod lazy;
 #[path = "shadow_build.rs"]
 mod build;
 mod placement;
+#[path = "shadow_pending.rs"]
+mod pending;
 #[path = "shadow_plan_split.rs"]
 pub(crate) mod plan_split;
 #[path = "shadow_refresh_stamp.rs"]
@@ -744,7 +746,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<pending::Pending>,
     /// Lock-free mirror of `!pending.is_empty()` so read-only buffers and
     /// windows skip acquiring `pending` on every refresh and flight check.
     has_pending: AtomicBool,
@@ -5266,9 +5268,7 @@ impl Shadow {
                 self.pending
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .copied()
-                    .filter(|&(a, e)| a < to && e > from)
+                    .overlapping(from, to)
                     .collect()
             } else {
                 Vec::new()
@@ -5312,32 +5312,15 @@ impl Shadow {
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            pending.insert(range);
             self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
-        pending.push(range);
+        let parts = pending.uncovered(address, len, |a, l| self.inside(a, l));
+        pending.insert(range);
         self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts
             .iter()
@@ -5824,9 +5807,8 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .overlapping(from, to)
+            .map(|(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -5879,9 +5861,8 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .overlapping(from, to)
+            .map(|(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -5935,9 +5916,8 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .overlapping(from, to)
+            .map(|(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -6128,7 +6108,7 @@ impl Shadow {
             let end = address + len;
             let busy = if self.has_pending.load(Ordering::Acquire) {
                 let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-                pending.iter().filter(|&&(a, e)| a < end && e > address).count() as u64
+                pending.overlapping(address, end).count() as u64
             } else {
                 0
             };
@@ -6208,9 +6188,7 @@ impl Shadow {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
+            .overlapping(from, to)
             .collect();
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below

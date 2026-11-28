@@ -3,7 +3,7 @@
 //!
 //! Port of Linox-IDK/LNX-victory `0f9a071979` (GPL-3.0), adapted to our `crate::ambient`.
 //! With the ray-tracing structure builder off and `VICTORY_BVH_NO_HIT=1` the stand-in raises
-//! only the resolved diffuse light (`crate::ambient::LIGHT`). The skin lighting shaders
+//! only the resolved diffuse light (`crate::ambient_places` `LIGHT`). The skin lighting shaders
 //! (`MATERIAL_SHEEN_ANISOTROPY_SSS` materials) also read the screen probes' radiance atlas
 //! ([`ATLAS`], R32_UINT holding R9G9B9E5) and the probes' 13-layer array ([`LAYERS`]), which
 //! only the traced passes write: skin is black while eyes, lip gloss and hair (which read the

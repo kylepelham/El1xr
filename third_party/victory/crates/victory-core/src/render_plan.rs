@@ -6,7 +6,9 @@
 //! - `VICTORY_RESOLUTION=<w>x<h>|native` is the output (target) size: the
 //!   title's screen size and back buffers (`VICTORY_OUTPUT`), which the swap
 //!   chain follows. `native` is the primary monitor's mode, else the largest
-//!   of the title's modes inside it.
+//!   of the title's modes inside it. With none chosen,
+//!   `VICTORY_NATIVE_DEFAULT=1` takes `native` (the title's 3840x2160
+//!   without it).
 //! - `VICTORY_UPSCALE` with `VICTORY_UPSCALE_QUALITY` gives the render size:
 //!   with `stretch` or `dlss` the title's FidelityFX upscaler
 //!   (`VICTORY_UPSCALER=7`) renders at the target times the mode's scale
@@ -73,6 +75,18 @@ pub fn quality(name: &str) -> Option<Quality> {
         _ => return None,
     };
     Some(Quality { label, scale, ngx })
+}
+
+/// With it at `1`, no `VICTORY_RESOLUTION` means `native`.
+pub const NATIVE_DEFAULT: &str = "VICTORY_NATIVE_DEFAULT";
+
+/// `VICTORY_RESOLUTION` as chosen, else `native` when [`NATIVE_DEFAULT`] is
+/// on; the flag says it was defaulted.
+pub fn chosen_resolution(get: impl Fn(&str) -> Option<String>) -> Option<(String, bool)> {
+    if let Some(r) = get("VICTORY_RESOLUTION").filter(|v| !v.trim().is_empty()) {
+        return Some((r, false));
+    }
+    (get(NATIVE_DEFAULT).as_deref().map(str::trim) == Some("1")).then(|| ("native".to_string(), true))
 }
 
 /// The mode used when an upscaler is on and none is chosen.
@@ -163,6 +177,8 @@ pub struct Plan {
     pub switches: Vec<(&'static str, String)>,
     pub output: Option<(u32, u32)>,
     pub render: Option<(u32, u32)>,
+    /// No resolution was chosen: the output is the monitor's by [`NATIVE_DEFAULT`].
+    pub defaulted: bool,
 }
 
 /// The menu's and the log's words for what an upscaler and quality give at
@@ -181,20 +197,29 @@ pub fn describe(target: (u32, u32), upscale: &str, quality_name: Option<&str>) -
 }
 
 /// The plan for these values (`get` gives a switch's value); `None` when
-/// neither `VICTORY_RESOLUTION` nor `VICTORY_UPSCALE_QUALITY` is set.
+/// neither `VICTORY_RESOLUTION` nor `VICTORY_UPSCALE_QUALITY` is set (nor
+/// [`NATIVE_DEFAULT`] with a monitor size known).
 pub fn plan(
     get: impl Fn(&str) -> Option<String>,
     native: impl FnOnce() -> Option<(u32, u32)>,
 ) -> Option<Plan> {
-    let resolution = get("VICTORY_RESOLUTION").filter(|v| !v.trim().is_empty());
+    let resolution = chosen_resolution(&get);
     let quality_name = get("VICTORY_UPSCALE_QUALITY").filter(|v| !v.trim().is_empty());
     if resolution.is_none() && quality_name.is_none() {
         return None;
     }
-    let mut plan = Plan::default();
+    let defaulted = resolution.as_ref().is_some_and(|r| r.1);
+    let mut plan = Plan {
+        defaulted,
+        ..Plan::default()
+    };
     let output = resolution
-        .as_deref()
-        .and_then(|r| parse_resolution(r, native));
+        .as_ref()
+        .and_then(|(r, _)| parse_resolution(r, native));
+    // A defaulted resolution with no monitor size and no quality changes nothing.
+    if defaulted && output.is_none() && quality_name.is_none() {
+        return None;
+    }
     if let Some((w, h)) = output {
         plan.switches.push(("VICTORY_OUTPUT", format!("{w}x{h}")));
     }
@@ -247,8 +272,13 @@ impl Derived {
             s.map_or("the title's".to_string(), |(w, h)| format!("{w}x{h}"))
         };
         vec![format!(
-            "resolution plan: output {}, render {} (VICTORY_RESOLUTION / VICTORY_UPSCALE_QUALITY); set {}; kept from the environment {}",
+            "resolution plan: output {}{}, render {} (VICTORY_RESOLUTION / VICTORY_UPSCALE_QUALITY); set {}; kept from the environment {}",
             size(plan.output),
+            if plan.defaulted {
+                " (this monitor's: no resolution chosen, VICTORY_NATIVE_DEFAULT=1)"
+            } else {
+                ""
+            },
             size(plan.render),
             if self.set.is_empty() {
                 "nothing".into()
@@ -268,7 +298,7 @@ impl Derived {
 /// after `settings::init`, before any thread starts). A switch the
 /// environment sets stays, unless it came from the settings file
 /// (`from_file`). Nothing without `VICTORY_RESOLUTION` or
-/// `VICTORY_UPSCALE_QUALITY`.
+/// `VICTORY_UPSCALE_QUALITY` (or [`NATIVE_DEFAULT`]).
 pub fn derive_env(
     from_file: &BTreeSet<String>,
     native: impl FnOnce() -> Option<(u32, u32)>,
@@ -466,10 +496,64 @@ mod tests {
         assert_eq!(switches(&p), [("VICTORY_RENDER_SCALE", "1")]);
     }
 
+    /// Kyle: with nothing chosen the target is the primary monitor's (behind
+    /// `VICTORY_NATIVE_DEFAULT=1`), and DLSS's mode sizes the render from it.
+    #[test]
+    fn no_resolution_chosen_takes_the_monitor_with_native_default() {
+        let p = plan(env(&[("VICTORY_NATIVE_DEFAULT", "1")]), || Some((2560, 1440))).unwrap();
+        assert!(p.defaulted);
+        assert_eq!(
+            switches(&p),
+            [("VICTORY_OUTPUT", "2560x1440"), ("VICTORY_RENDER_SCALE", "1")]
+        );
+        let p = plan(
+            env(&[("VICTORY_NATIVE_DEFAULT", "1"), ("VICTORY_UPSCALE", "dlss")]),
+            || Some((2560, 1440)),
+        )
+        .unwrap();
+        assert_eq!(
+            switches(&p),
+            [
+                ("VICTORY_OUTPUT", "2560x1440"),
+                ("VICTORY_UPSCALER", "7"),
+                ("VICTORY_FFX_SCALE", "0.6666667"),
+                ("VICTORY_DLSS_QUALITY", "2"),
+            ]
+        );
+        assert_eq!((p.output, p.render), (Some((2560, 1440)), Some((1706, 960))));
+        let p = plan(
+            env(&[
+                ("VICTORY_NATIVE_DEFAULT", "1"),
+                ("VICTORY_UPSCALE", "dlss"),
+                ("VICTORY_UPSCALE_QUALITY", "performance"),
+            ]),
+            || Some((3440, 1440)),
+        )
+        .unwrap();
+        assert_eq!((p.output, p.render), (Some((2560, 1440)), Some((1280, 720))));
+        // A chosen resolution wins and is not "defaulted".
+        let p = plan(
+            env(&[("VICTORY_NATIVE_DEFAULT", "1"), ("VICTORY_RESOLUTION", "1920x1080")]),
+            || panic!("not asked"),
+        )
+        .unwrap();
+        assert_eq!((p.output, p.defaulted), (Some((1920, 1080)), false));
+        // Off, or no monitor size: today's (the title's 3840x2160, nothing set).
+        assert_eq!(plan(env(&[("VICTORY_NATIVE_DEFAULT", "0")]), || Some((2560, 1440))), None);
+        assert_eq!(plan(env(&[]), || Some((2560, 1440))), None);
+        assert_eq!(plan(env(&[("VICTORY_NATIVE_DEFAULT", "1")]), || None), None);
+        let d = Derived {
+            plan: plan(env(&[("VICTORY_NATIVE_DEFAULT", "1")]), || Some((2560, 1440))),
+            ..Derived::default()
+        };
+        assert!(d.lines()[0].starts_with("resolution plan: output 2560x1440 (this monitor's"), "{:?}", d.lines());
+    }
+
     /// `derive_env` touches the process environment: names of its own.
     #[test]
     fn the_environment_wins_but_the_file_gives_way() {
         let names = [
+            "VICTORY_NATIVE_DEFAULT",
             "VICTORY_RESOLUTION",
             "VICTORY_UPSCALE",
             "VICTORY_UPSCALE_QUALITY",

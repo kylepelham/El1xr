@@ -200,6 +200,7 @@ fn log_capped(host: &Host) {
             else {
                 return;
             };
+            crate::alloc_count::track(&allocator);
             let Ok(list) = host.device.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -319,6 +320,7 @@ fn read_defrag_counters(host: &Host) -> Option<(u64, u64, u64, u64)> {
             .device
             .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
             .ok()?;
+        crate::alloc_count::track(&allocator);
         let list: ID3D12GraphicsCommandList = host
             .device
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)

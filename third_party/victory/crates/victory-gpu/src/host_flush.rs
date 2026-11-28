@@ -413,8 +413,10 @@ pub(super) fn log(frames: f64) {
             small[2] as f64 / (frames * 1000.0),
         );
     }
+    super::beside::line(frames);
     crate::refresh_prof::log(frames);
     crate::shadow::refresh_stamp::line(frames);
+    super::scoped_flush::line(frames);
     crate::compare_apart::line(frames);
     crate::shadow::wide_wake::line(frames);
     crate::scratch_landing::line(frames);
