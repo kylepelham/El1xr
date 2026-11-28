@@ -2100,6 +2100,7 @@ impl State {
             self.replay(list);
         }
         self.bind_heaps(list);
+        crate::heap_warm::offer(&self.heaps);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
