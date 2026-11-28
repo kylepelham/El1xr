@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light (`crate::ambient`).
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Its place in `crate::hdr_scrub::NAMES` while `VICTORY_HDR_SCRUB` is on.
+    #[cfg(windows)]
+    pub(crate) hdr: Option<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
@@ -182,6 +185,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     .then(|| crate::ambient::role(bytes))
                     .flatten(),
                 #[cfg(windows)]
+                hdr: (stage == "compute" && crate::hdr_scrub::mode() != 0)
+                    .then(|| crate::hdr_scrub::pass_of(bytes))
+                    .flatten(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 skin: OnceLock::new(),
@@ -205,6 +212,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         ambient: (stage == "compute")
             .then(|| crate::ambient::role(container))
             .flatten(),
+        hdr: None,
         translated: OnceLock::new(),
         skin: OnceLock::new(),
     });

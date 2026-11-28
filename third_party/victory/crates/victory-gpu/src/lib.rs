@@ -133,6 +133,8 @@ mod present_audit;
 mod hold_frame;
 mod flicker_catch;
 #[cfg(windows)]
+mod hdr_scrub;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;

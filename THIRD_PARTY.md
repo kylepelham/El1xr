@@ -78,6 +78,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | [JozefDeTremmerie/CCS03](https://github.com/JozefDeTremmerie/CCS03) (9hvn9yt2vk-netizen) | GPL-3.0 | | Genou doux des reflets après la passe d'historique `CS_UpdateHistory`, plafond pris sur la lumière alentour de chaque texel au lieu d'un niveau unique (`647cf15c97`, `37e5ef3ecf`, `e7f4bb6776` ; `VICTORY_REFLECT_KNEE=<multiple>`, désactivé par défaut, `victory-gpu/src/ambient_reflect.rs`) |
 | [ProjectLeonida/mandy](https://github.com/ProjectLeonida/mandy) (NotRexed ; d'après felicienradio/cold-project-vi `ec62312` et aki-gta6/aki-runtime `01f6f31`) | GPL-3.0 | | Le nettoyage des NaN garde une infinité à ±65504 au lieu de 0 (`9c31718bc2`, `VICTORY_NAN_SCRUB_INF=1`) ; couleurs écrites par les programmes de pixels bornées à ±65024 avec le remplaçant 16 bits de R9G9B9E5 (`1411b6ca38`, partie 1, `VICTORY_HDR_CLAMP`) |
 | [bolado-dev/mandy-port](https://github.com/bolado-dev/mandy-port) (bolado-dev ; d'après avatarmanz `84eae35`) | GPL-3.0 | | Dispatches indirects de calcul jusqu'à 2^20 groupes en x exécutés en entier au lieu d'être coupés à 65 535 (`e5e11b3e`, `VICTORY_INDIRECT_WIDE=1`) |
+| [elaboratecl/VIctory-AMD-4K](https://github.com/elaboratecl/VIctory-AMD-4K) (elaboratecl) | GPL-3.0 | | Après les programmes de couleur HDR de la scène, compte des texels NaN et infinis de leurs images, nettoyage en option (`221ece13e1`, `VICTORY_HDR_SCRUB=1/2`) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 

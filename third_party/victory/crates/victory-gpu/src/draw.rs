@@ -2149,7 +2149,7 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return prepare_failed!(self, DynamicDescriptorTable);
             }
-            if stage.shader.ambient.is_some() {
+            if stage.shader.ambient.is_some() || stage.shader.hdr.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -3962,6 +3962,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.hdr_scrub(list, p);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on(role)
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
@@ -5200,6 +5201,12 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if ran
+            && kind == 2
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.hdr_scrub(list, p);
+        }
         // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
         // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
@@ -5925,6 +5932,7 @@ mod bake_check;
 mod bake_publish;
 mod material_pass;
 mod skin_views;
+mod hdr_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
