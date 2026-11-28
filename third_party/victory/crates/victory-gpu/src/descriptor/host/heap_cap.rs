@@ -92,11 +92,19 @@ fn env_u32(name: &str) -> Option<u32> {
 }
 
 /// (`=4`) Dynamic slots kept for per-draw tables on a capped heap whose
-/// last slot is `null`: `asked` (`VICTORY_HEAP_CAP_DYNAMIC`), default 2^18
-/// (2^17 ran out in the opening cutscene), between 2^16 and half the heap.
+/// last slot is `null`: `asked` (`VICTORY_HEAP_CAP_DYNAMIC`), default
+/// [`DYNAMIC_KEEP`], between 2^16 and half the heap.
 pub(crate) fn dynamic_keep_of(null: u32, asked: Option<u32>) -> u32 {
-    asked.unwrap_or(1 << 18).clamp(1 << 16, (null / 2).max(1 << 16))
+    asked
+        .unwrap_or(DYNAMIC_KEEP)
+        .clamp(1 << 16, (null / 2).max(1 << 16))
 }
+
+/// The default of [`dynamic_keep_of`]: 180,224. Part S measured a peak of
+/// 148,138 dynamic slots taken at once (2^17 ran out in the opening
+/// cutscene, R2 and S never neared 2^18); 22% over it, and the 81,920
+/// slots 2^18 kept beyond it go to packed views.
+pub(crate) const DYNAMIC_KEEP: u32 = 180_224;
 
 /// (`=4`) Title slots the host keeps as its own (identity) on a capped
 /// heap: `asked` (`VICTORY_HEAP_CAP_IDENTITY`), default 500,000, leaving at
@@ -440,6 +448,21 @@ pub(crate) fn fits(live: u64, dynamic_peak: u64, null: u32) -> bool {
     live + dynamic_peak + 2 <= u64::from(null) + 1
 }
 
+/// The process's commit (private bytes), for the census line.
+fn process_commit() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    c.PagefileUsage as u64
+}
+
 /// A census in progress: its first frame, the next slot, what it found.
 static CENSUS: Mutex<Option<(u64, u32, Scan)>> = Mutex::new(None);
 /// Title slots a call of [`watch`] reads at most.
@@ -474,7 +497,12 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
     };
     let started = std::time::Instant::now();
     const CHUNK: u32 = 1 << 14;
-    let mut bytes = vec![0u8; (CHUNK * 32) as usize];
+    // one buffer for the run, not one a frame
+    static BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let mut bytes = BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    if bytes.len() < (CHUNK * 32) as usize {
+        bytes.resize((CHUNK * 32) as usize, 0);
+    }
     let mut unread = 0u32;
     let end = title.min(at.saturating_add(CENSUS_CHUNK));
     while *at < end {
@@ -546,6 +574,8 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
         dynamic_peak = super::heap_remap::PEAK_TAKEN[0].swap(0, Relaxed),
         dynamic_peak_ever = peak_ever,
         ms = started.elapsed().as_millis() as u64,
+        process_commit_mb = process_commit() >> 20,
+        free_commit_mb = crate::commitline::free_commit() >> 20,
         "heap cap: title slots past the host heap"
     );
 }
@@ -691,14 +721,15 @@ mod tests {
     fn heap_cap_4_lays_out_identity_packed_and_dynamic_slots() {
         // defaults: 500,000 own, 2^18 dynamic, the rest packed
         let keep = dynamic_keep_of(NULL, None);
-        assert_eq!(keep, 1 << 18);
+        assert_eq!(keep, 180_224);
+        assert!(keep as f64 > 148_138.0 * 1.2, "the measured peak and a margin");
         let identity = identity_of(NULL, keep, None);
         assert_eq!(identity, 500_000);
         let extra = NULL - identity;
         assert_eq!(title_null_of(NULL, extra, UNCAPPED_NULL), Some(500_000));
         // reserve(): the null slot and the packed ones, the dynamic ones left
         let reserved = extra - keep;
-        assert_eq!(reserved, 1 + 237_854);
+        assert_eq!(reserved, 1 + 319_774);
         assert_eq!(extra - reserved, keep);
         // asked values stay sane
         assert_eq!(dynamic_keep_of(NULL, Some(1)), 1 << 16);
