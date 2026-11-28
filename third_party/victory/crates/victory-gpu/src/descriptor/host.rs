@@ -29,6 +29,7 @@ pub(crate) mod mirror_known;
 pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
+pub(crate) mod remade_safe;
 mod slot_wait;
 mod srgb_cast;
 pub(crate) mod view_ages;
@@ -432,6 +433,7 @@ pub(crate) fn requeue_show(heap: usize, index: u32) {
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
+    remade_safe::level_changed();
     RESHOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2517,6 +2519,9 @@ impl HostHeap {
         slot_wait::drain();
         self.stale_due();
         self.levels_due();
+        if remade_safe::on() {
+            return self.views_remade_safe();
+        }
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while

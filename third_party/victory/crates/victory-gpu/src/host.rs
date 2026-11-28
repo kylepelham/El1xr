@@ -4573,6 +4573,7 @@ impl Host {
             }
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::descriptor::host::remade_safe::point(flying);
         crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {
