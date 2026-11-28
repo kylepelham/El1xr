@@ -20,6 +20,11 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
+    /// The key's 32 bytes (the pack's index, `crate::pack`).
+    pub fn bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
     pub fn to_hex(&self) -> String {
         self.0.to_hex().to_string()
     }
@@ -32,6 +37,11 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// The cache's folder.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
@@ -47,7 +57,13 @@ impl Cache {
 
     /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
-        let key = CacheKey::new(converter, input);
+        self.get_or_convert_keyed(&CacheKey::new(converter, input), converter, input)
+    }
+
+    /// [`Cache::get_or_convert`] with the key worked out already
+    /// (`CacheKey::new(converter, input)`).
+    pub fn get_or_convert_keyed(&self, key: &CacheKey, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
+        let key = *key;
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");

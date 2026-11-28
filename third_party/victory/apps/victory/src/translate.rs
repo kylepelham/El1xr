@@ -225,6 +225,7 @@ pub fn warm_translations(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) 
             });
         }
     }
+    victory_gpu::host_facts::shader_pack_sync();
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
     let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
     let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
@@ -463,6 +464,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    victory_gpu::host_facts::shader_pack_sync();
     let (hits, misses) = victory_gpu::host_facts::shader_cache_counts();
     println!("warm cache   {hits} from the cache, {misses} translated now");
     Ok(())
