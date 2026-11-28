@@ -273,14 +273,17 @@ def summary(b: Build, steps: list[Step], wall: float) -> dict[str, str]:
 def gate(
     victory_dir: Path, repo_root: Path, coord_dir: Path, log_path: Path, crate: str | None,
     build_slot: Callable[[], ContextManager[object]] = contextlib.nullcontext,
+    wait_room: Callable[[], object] = lambda: None,
 ) -> tuple[bool, Build, dict[str, str]]:
     """Builds inside `build_slot()`, then outside it runs every check at once and logs them;
-    whether all passed, the build, and the DEV line's fields."""
+    whether all passed, the build, and the DEV line's fields. `wait_room()` runs before the checks
+    (they hold tens of GB of commit: `dev.py` waits there while a game run is short of it)."""
     t0 = time.monotonic()
     with build_slot():
         b = build(victory_dir / "Cargo.toml", crate)
     steps: list[Step] = []
     if b.ok:
+        wait_room()
         steps = run_all(plan(b, victory_dir, repo_root, python_for_tests(repo_root, coord_dir)))
     write_log(log_path, b, steps)
     ok = b.ok and all(s.ok for s in steps)

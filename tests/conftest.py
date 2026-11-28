@@ -28,6 +28,9 @@ def _dossier_de_test(variable, prefixe):
 # Tests déterministes : El1xr gère seul le runtime GDK, même si Gaming Services est
 # installé. Les tests de délégation lancent un sous-processus avec la valeur "1".
 os.environ.setdefault("ANYXBOXX_SYSTEM_RUNTIME", "0")
+# Un test qui passe par dev.py run_bench ne tue jamais les builds de la machine pour faire de la place
+# en mémoire engagée (dev_throttle.make_room) : il n'en demande aucune.
+os.environ["ANYXBOXX_GAME_COMMIT_GB"] = "0"
 # Cache de shaders propre à la session de tests : jamais celui de l'utilisateur.
 _dossier_de_test("ANYXBOXX_SHADER_CACHE", "anyxboxx-shader-cache-")
 # Sans DLL de TomBox dans les tests du runtime : ils vérifient nos DLL. Le dossier par défaut

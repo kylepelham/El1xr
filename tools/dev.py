@@ -20,7 +20,7 @@ import sys
 import time
 from datetime import UTC, datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 import dev_autovis
 import dev_driver
@@ -82,6 +82,7 @@ WORLD_DRAWS_MIN = 100.0
 LOADING_P50_MS = 100.0
 BUILD_GRACE_SECS = 600.0
 MONITOR_POLL_SECS = 2.0
+PREEMPT_RETRIES = 5
 
 
 def ensure_coord_dirs() -> None:
@@ -127,7 +128,7 @@ def parse_overrides(items: list[str]) -> dict[str, str]:
 @contextlib.contextmanager
 def acquire_gpu_lock(tag: str, timeout_s: float = 4 * 3600.0) -> Iterator[None]:
     ensure_coord_dirs()
-    with dev_throttle.hold_first_free([GPU_LOCK], tag, timeout_s):
+    with dev_throttle.hold_first_free([LOCKS_DIR / GPU_LOCK.name], tag, timeout_s):
         yield
 
 
@@ -148,19 +149,52 @@ def throttled(name: str, whole: bool = True):
                 return 1
             ensure_coord_dirs()
             dev_throttle.below_normal_priority()
-            if not whole:
-                return func(args)
-            with build_slot(name)():
-                return func(args)
+            dev_throttle.take_preempted(LOCKS_DIR)  # an earlier process's with this pid
+            for attempt in range(PREEMPT_RETRIES + 1):
+                wait_for_game_room(name)
+                if not whole:
+                    rc = func(args)
+                else:
+                    with build_slot(name)():
+                        rc = func(args)
+                why = dev_throttle.take_preempted(LOCKS_DIR)
+                if why is None:
+                    return rc
+                if attempt == PREEMPT_RETRIES:
+                    print(f"DEV {name} FAIL reason=preempted {PREEMPT_RETRIES + 1} times by game runs")
+                    return 1
+                print(f"DEV {name}: a game run preempted this {name} for commit (the result above is void); "
+                      f"retrying once it ends ({why})", flush=True)
+            return 1
 
         return run
 
     return wrap
 
 
+def wait_for_game_room(name: str) -> float:
+    """Builds, tests and gates wait while a game run holds the gpu lock and commit is short."""
+    return dev_throttle.wait_for_game_room(LOCKS_DIR / GPU_LOCK.name, name, out=lambda line: print(line, flush=True))
+
+
+@contextlib.contextmanager
+def _slot_with_room(name: str) -> Iterator[None]:
+    """One build slot, taken only while no game run is short of commit (rechecked once it is held:
+    a writer queued for a slot may get it while a game run starts)."""
+    tag = f"{JOB or 'main'}:{name}"
+    while True:
+        wait_for_game_room(name)
+        with dev_throttle.build_slot(LOCKS_DIR, tag):
+            free = dev_throttle.commit_free_gb()
+            if free is None or free >= dev_throttle.WRITER_COMMIT_GB or not dev_throttle.held_by_other(LOCKS_DIR / GPU_LOCK.name):
+                yield
+                return
+        time.sleep(dev_throttle.COMMIT_POLL_S)
+
+
 def build_slot(name: str):
     """A factory for this job's hold on one machine-wide build slot."""
-    return lambda: dev_throttle.build_slot(LOCKS_DIR, f"{JOB or 'main'}:{name}")
+    return lambda: _slot_with_room(name)
 
 
 def run_logged_steps(
@@ -331,14 +365,26 @@ def kill_process_tree(pid: int) -> None:
             pass
 
 
+class RunEnd(NamedTuple):
+    """How `run_timed_victory` ended: `timed_out` when our timer or the monitor ended it (else the
+    launcher, so the game, exited by itself), the launcher's exit code, the seconds since the game
+    mapped (since the start without it), and the least free commit seen (GiB; None off Windows)."""
+
+    timed_out: bool
+    returncode: int
+    ran_s: float = 0.0
+    commit_min_gb: float | None = None
+
+
 def run_timed_victory(
     cmd: list[str], log_path: Path, seconds: int, monitor: dev_early.Monitor | None = None
-) -> tuple[bool, int]:
+) -> RunEnd:
     """Runs the launcher until `seconds` after the game mapped (or BUILD_GRACE_SECS without it); a `monitor` reads
     the log's new lines every MONITOR_POLL_SECS and may end the run sooner (early stop, fatal lines)."""
     ensure_coord_dirs()
     tail = dev_early.LogTail(log_path) if monitor is not None else None
     polled = 0.0
+    commit_min: float | None = None
     with log_path.open("wb") as logf:
         proc = subprocess.Popen(
             cmd,
@@ -351,6 +397,9 @@ def run_timed_victory(
         timed_out = False
         try:
             while proc.poll() is None:
+                free = dev_throttle.commit_free_gb()
+                if free is not None and (commit_min is None or free < commit_min):
+                    commit_min = free
                 now = time.monotonic()
                 if launched_at is None:
                     text = read_log_text(log_path)
@@ -375,7 +424,75 @@ def run_timed_victory(
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-        return timed_out, proc.returncode if proc.returncode is not None else -1
+        ran_s = time.monotonic() - (launched_at if launched_at is not None else started_at)
+        return RunEnd(timed_out, proc.returncode if proc.returncode is not None else -1, round(ran_s, 1), commit_min)
+
+
+# What a game that ended a run by itself died of, from its log: the runtime's fatal reports (host GPU
+# failure, unhandled exception) and ERROR lines. A WARN with 0x8007000E is a texture the game went on without.
+DEATH_LINES = (
+    ("0x8007000E_out_of_memory", re.compile(r"(?:host GPU failure|\bERROR\b).*(?i:0x8007000E|out of memory|not enough memory)")),
+    ("device_removed", re.compile(r"(?:host GPU failure|\bERROR\b).*(?i:device removed|DEVICE_HUNG|0x887A000[56])")),
+    ("unhandled_exception", re.compile(r"VIctory: unhandled exception (0x[0-9a-f]+)", re.I)),
+    ("host_gpu_failure", re.compile(r"host GPU failure")),
+)
+# Only these say the game died even when it was still running when the timer ended the run.
+DEATH_ALWAYS = ("0x8007000E_out_of_memory", "unhandled_exception", "host_gpu_failure")
+
+
+def death_reason(text: str) -> str | None:
+    """The first fatal report of a run's log (DEATH_LINES), as one token, or None."""
+    clean = dev_early.ANSI_RE.sub("", text)
+    for name, pattern in DEATH_LINES:
+        m = pattern.search(clean)
+        if m:
+            return f"{name}_{m.group(1).lower()}" if m.groups() else name
+    return None
+
+
+def game_death(end: RunEnd, text: str) -> tuple[float, str] | None:
+    """(seconds, reason) when the game died before the planned end: the launcher exited by itself,
+    or the log holds a fatal report (DEATH_ALWAYS) though the timer ended the run. None otherwise."""
+    why = death_reason(text)
+    if not end.timed_out:
+        code = end.returncode & 0xFFFFFFFF
+        return end.ran_s, why or (f"exit_0x{code:08x}" if code > 0xFFFF else f"exit_{code}")
+    if why is not None and why.startswith(DEATH_ALWAYS):
+        return end.ran_s, why
+    return None
+
+
+def apply_death(stats: dict[str, object], end: RunEnd, text: str) -> dict[str, object]:
+    """`stats` with `died_s`/`died_why` (which fail `bench_ok`) and `commit_min_gb` from the run's end."""
+    death = game_death(end, text)
+    if death is not None:
+        stats["died_s"], stats["died_why"] = death
+    if end.commit_min_gb is not None:
+        stats["commit_min_gb"] = round(end.commit_min_gb, 1)
+    return stats
+
+
+def died_field(stats: dict[str, object]) -> str:
+    """` ended=died:<s>s reason=<why>` for a run whose game died, else nothing."""
+    if stats.get("died_why") is None:
+        return ""
+    return f" ended=died:{float(stats['died_s']):.0f}s reason={stats['died_why']}"
+
+
+@contextlib.contextmanager
+def _room(what: str) -> Iterator[None]:
+    """Commit headroom for a game launch (`dev_throttle.make_room`), inside the gpu lock."""
+    room = dev_throttle.make_room(LOCKS_DIR, what, out=lambda line: print(line, flush=True))
+    if room.free_gb is not None:
+        short = f" SHORT of {room.need_gb:g} GB" if room.free_gb < room.need_gb else ""
+        print(f"DEV {what}: commit free {room.free_gb:.1f} GB before launch (waited {room.waited_s:.0f}s, "
+              f"preempted {room.preempted} builds){short}", flush=True)
+    yield
+
+
+def _print_commit_min(what: str, stats: dict[str, object]) -> None:
+    if "commit_min_gb" in stats:
+        print(f"DEV {what}: commit free min {float(stats['commit_min_gb']):.1f} GB during the run", flush=True)
 
 
 def parse_pacing_line(line: str) -> dict[str, float] | None:
@@ -568,7 +685,8 @@ def _dev_line(cmd: str, ok: bool, fields: dict[str, str]) -> str:
 def cmd_test(args: argparse.Namespace) -> int:
     ensure_coord_dirs()
     ok, _build, fields = dev_gate.gate(
-        VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate, build_slot("test")
+        VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "test.log", args.crate, build_slot("test"),
+        lambda: wait_for_game_room("test"),
     )
     print(_dev_line("test", ok, fields))
     return 0 if ok else 1
@@ -584,7 +702,8 @@ def cmd_gate(args: argparse.Namespace) -> int:
     ok = True
     for _ in range(runs):
         ok, build, fields = dev_gate.gate(
-            VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None, build_slot("gate")
+            VICTORY_DIR, REPO_ROOT, COORD_DIR, DEV_DIR / "gate.log", None, build_slot("gate"),
+            lambda: wait_for_game_room("gate"),
         )
         ok = ok and not build.warnings
         walls.append(fields["wall_s"])
@@ -679,17 +798,20 @@ def run_bench(
             profile=getattr(args, "profile", None) or "release",
         )
         monitor = getattr(args, "monitor", None)
-        with acquire_gpu_lock(what), _quiet(args, what):
+        with acquire_gpu_lock(what), _room(what), _quiet(args, what):
             resets_before = dev_driver.resets_since_boot()
-            run_timed_victory(cmd, log_path, args.seconds, *([monitor] if monitor is not None else []))
+            end = run_timed_victory(cmd, log_path, args.seconds, *([monitor] if monitor is not None else []))
             resets_after = dev_driver.resets_since_boot()
-    stats = parse_victory_log(read_log_text(log_path))
+    text = read_log_text(log_path)
+    stats = apply_death(parse_victory_log(text), end, text)
+    _print_commit_min(what, stats)
     snaps = len(list(snap_dir.glob("snap-*.png"))) if args.snap_every > 0 else 0
     return stats, resets_before, resets_after, snaps
 
 
 def bench_ok(stats: dict[str, object]) -> bool:
-    return int(stats["world_samples"]) > 0 and not bool(stats["device_removed"])
+    """A world was measured, the device stayed, and the game did not die before the planned end."""
+    return int(stats["world_samples"]) > 0 and not bool(stats["device_removed"]) and stats.get("died_why") is None
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -707,7 +829,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     ok = bench_ok(stats)
     menu = menu_pngs_field(user_overrides, snap_dir)
     snapped = f" snaps={snaps}{menu} snap_dir={snap_dir}" if args.snap_every > 0 or menu else ""
-    print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}")
+    print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}{died_field(stats)}")
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
     return 0 if ok else 1
@@ -841,19 +963,21 @@ def cmd_capture(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             title_args=title_args,
         )
-        with acquire_gpu_lock(f"capture:{safe_tag}"), _quiet(args, "capture"):
+        with acquire_gpu_lock(f"capture:{safe_tag}"), _room("capture"), _quiet(args, "capture"):
             resets_before = dev_driver.resets_since_boot()
-            run_timed_victory(cmd, log_path, args.seconds)
+            end = run_timed_victory(cmd, log_path, args.seconds)
             resets_after = dev_driver.resets_since_boot()
 
-    stats = parse_victory_log(read_log_text(log_path))
+    text = read_log_text(log_path)
+    stats = apply_death(parse_victory_log(text), end, text)
+    _print_commit_min("capture", stats)
     frames = len(list(cap_dir.glob("*.png")))
-    ok = frames > 0 and not bool(stats["device_removed"])
+    ok = frames > 0 and not bool(stats["device_removed"]) and stats.get("died_why") is None
     status = "PASS" if ok else "FAIL"
     print(
         f"DEV capture {status} boot_s={float(stats['boot_s']):.1f} "
         f"settled_s={float(stats['settled_s']):.1f} frames={frames} refused={int(stats['refused'])} refused_ahead={int(stats['refused_ahead'])} "
-        f"driver_resets={_count(resets_after)}{menu_pngs_field(user_overrides, menu_dir)} dir={cap_dir}"
+        f"driver_resets={_count(resets_after)}{menu_pngs_field(user_overrides, menu_dir)} dir={cap_dir}{died_field(stats)}"
     )
     _print_driver_warning(resets_before, resets_after)
     _print_hang_lines(log_path)
@@ -1159,7 +1283,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     print(
         f"{_dev_line('train', ok, {'run': rid})} {bench_fields(stats)} driver_resets={_count(after)} "
         f"snaps={record['snaps']} next={nxt_id}{ttl} prewarm={record['prewarm']} ahead={ahead_field} "
-        f"ended={record['ended']['how']}:{record['ended'].get('at_s', record['seconds'])}s log={record['log']}"
+        f"ended={record['ended']['how']}:{record['ended'].get('at_s', record['seconds'])}s"
+        f"{' reason=' + str(record['ended']['why']) if record['ended']['how'] == 'died' else ''} log={record['log']}"
     )
     if "live" in record:
         print(_live_line(rid, record["live"]))
@@ -1250,6 +1375,8 @@ def train_arm(
         raise
     ahead_info = finish_ahead(ahead) if ahead is not None else None
     ended = monitor.ended or {"how": "time"}
+    if stats.get("died_why") is not None:
+        ended = {"how": "died", "at_s": stats["died_s"], "why": stats["died_why"]}
     if monitor.ended:
         line = monitor.summary()
         append_log_line(log_path, f"dev.py train: {line}")
