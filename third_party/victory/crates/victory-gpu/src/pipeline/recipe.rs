@@ -373,12 +373,12 @@ mod tests {
 
     /// (portscout, c #20) Offline count of a run's recipes file: how many
     /// graphics pipelines `VICTORY_PSO_CANON` would key as one with another.
-    /// `VICTORY_RECIPES_FILE=<pipeline-recipes.bin> cargo test -p victory-gpu
+    /// `EL1XR_RECIPES_FILE=<pipeline-recipes.bin> cargo test -p victory-gpu
     /// --lib recipes_file_duplicates -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn recipes_file_duplicates() {
-        let path = std::env::var("VICTORY_RECIPES_FILE").expect("VICTORY_RECIPES_FILE");
+        let path = std::env::var("EL1XR_RECIPES_FILE").expect("EL1XR_RECIPES_FILE");
         let book = Book::decode(&std::fs::read(path).expect("read")).expect("a recipes file");
         let [graphics, leftovers, same, unreadable] = duplicates_in(&book);
         let mut by_stages: HashMap<Vec<(u8, [u8; 32])>, HashSet<String>> = HashMap::new();
