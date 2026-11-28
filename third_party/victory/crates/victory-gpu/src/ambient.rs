@@ -979,7 +979,13 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let bound = optional(specular().is_some() && crate::ambient_reflect::bound(), "BOUND", s!("bound_light"));
     let hold = optional(crate::ambient_reflect::reflect().is_some(), "HOLD", s!("hold"));
     let knee = optional(crate::ambient_reflect::knee().is_some(), "HOLD", s!("knee"));
-    let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+    // The slow mean, the flags and the points are read before they are
+    // written: zeros written, not taken for granted (`crate::zero_fill`).
+    let made = |bytes| {
+        let made = buffer(bytes).ok_or_else(windows::core::Error::empty)?;
+        crate::zero_fill::zero_buffer(device, &made, bytes)?;
+        Ok::<_, windows::core::Error>(made)
+    };
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
         keep,

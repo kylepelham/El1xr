@@ -243,6 +243,7 @@ mod shader_pack;
 #[cfg(windows)]
 mod wave_more;
 mod zero_out;
+mod zero_fill;
 #[cfg(windows)]
 mod face_watch;
 #[cfg(windows)]
