@@ -6722,7 +6722,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -6752,7 +6753,12 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(if root == Some(RootType::ResourceHeap) && !sampler {
+            self.s.title_view_index(c, index)
+        } else {
+            index
+        })
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -6762,7 +6768,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -6792,7 +6799,12 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(if root == Some(RootType::ResourceHeap) && !sampler {
+            self.s.title_view_index(c, index)
+        } else {
+            index
+        })
     }
 
     fn integer(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {

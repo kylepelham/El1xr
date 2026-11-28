@@ -15,6 +15,8 @@ static ASSUMED: AtomicBool = AtomicBool::new(false);
 pub fn assume_host_facts(max_wave: u32, view_null_slot: u32) {
     victory_shader::emit::set_host_max_wave(max_wave);
     victory_shader::emit::set_view_heap_limit(view_null_slot);
+    #[cfg(windows)]
+    crate::descriptor::host::heap_cap::tell_translator(view_null_slot);
     ASSUMED.store(true, Relaxed);
 }
 

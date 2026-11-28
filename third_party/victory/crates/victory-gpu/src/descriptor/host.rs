@@ -17,6 +17,7 @@ use crate::host::host;
 mod buffer_format;
 mod copy_first;
 mod flicker;
+pub(crate) mod heap_cap;
 mod heap_notices;
 pub(crate) mod host_textures;
 mod keep_shown;
@@ -1490,6 +1491,7 @@ pub(crate) fn probe_view_limit() {
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
+        heap_cap::tell_translator(views - 1);
     });
 }
 
@@ -1624,7 +1626,8 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // The null slot every index past the heap reads is the heap's last,
         // past the dynamic slots (`probe_view_limit`): all of them are free.
-        let taken = DynamicBits::new(extra as usize);
+        let mut taken = DynamicBits::new(extra as usize);
+        let reserved = heap_cap::reserve(&mut taken, sampler, count, extra);
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -1670,7 +1673,7 @@ impl HostHeap {
             released: Condvar::new(),
             timed_out_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             timed_out_min: std::sync::atomic::AtomicU32::new(u32::MAX),
-            free: std::sync::atomic::AtomicU32::new(extra),
+            free: std::sync::atomic::AtomicU32::new(extra - reserved),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -3602,6 +3605,7 @@ impl HostHeap {
         if index < self.count {
             return true;
         }
+        heap_cap::made_past(index, self.count, for_draw);
         // Diagnostic (NVIDIA heap cap): the highest title slot past the
         // host heap seen so far.
         static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

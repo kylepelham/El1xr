@@ -148,7 +148,8 @@ pub use hit_only::with_rays_missed;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
+    USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_title_view_limit, set_view_heap_limit,
+    title_view_limit, view_heap_limit,
 };
 pub use lower::thread_limit::on as dispatchx_mask;
 
@@ -269,6 +270,11 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    // (heapcap) only when set: translations made without it keep their key
+    if shader::title_view_limit() != 0 {
+        out.extend_from_slice(b"title_view_limit");
+        out.extend_from_slice(&shader::title_view_limit().to_le_bytes());
+    }
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());

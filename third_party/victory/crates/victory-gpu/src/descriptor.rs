@@ -235,6 +235,10 @@ pub(crate) fn sync_heaps() {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
         let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) {
+            let null = victory_shader::emit::view_heap_limit();
+            host::heap_cap::watch(start, u64::from(step), host.count(), heap.desc.count, null);
+        }
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -257,6 +261,7 @@ pub(crate) fn sync_heaps() {
         if let Some(retries) = &mut retries {
             retries.include_due(crate::frame::current(), start as usize, end as usize, &mut ranges);
         }
+        host::heap_cap::note_writes(&ranges, start, step, host.count(), heap.desc.count);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {

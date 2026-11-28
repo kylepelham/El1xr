@@ -277,3 +277,112 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
         }
     }
 }
+
+/// (heapcap) A program that picks its texture from the view heap by a root constant (root type
+/// `ResourceHeap`: the index is the title's own, `s0 << 5` bytes in) and stores its size to the
+/// raw UAV at heap index 1, as the first test does.
+fn heap_indexed() -> NativeProgram {
+    let mut program = native(&[]);
+    let mut words = vec![
+        0x8F14_8500, // s_lshl_b32 s20, s0, 5
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0202,
+        0x2800_0000, // s_load_dwordx8 s[8:15], s[4:5], s20
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0x9014_9E09, // s_lshr_b32 s20, s9, 30
+        0x8F15_820A, // s_lshl_b32 s21, s10, 2
+        0x8814_1514, // s_or_b32 s20, s20, s21
+        0x8714_FF14,
+        0x0000_3FFF, // s_and_b32 s20, s20, 0x3fff
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0x9396_FF0A,
+        0x000E_000E, // s_bfe_u32 s22, s10, 0x000e000e (bits 14-27)
+        0x8116_8116, // s_add_i32 s22, s22, 1
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0x7E04_0216, // v_mov_b32 v2, s22
+        0xE070_0000,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+        0xE070_0004,
+        0x8004_0200, // buffer_store_dword v2, off, s[16:19], 0 offset:4
+    ];
+    words.push(S_ENDPGM);
+    program.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    program.layout[1].root = RootType::ResourceHeap;
+    program.used.clear();
+    program
+}
+
+/// `native` translated with the title view limit at `limit` (None: not set) on this thread.
+fn translate_limited(native: &NativeProgram, limit: Option<u32>) -> HostShader {
+    let was = super::shader::TITLE_VIEW_LIMIT_HERE.replace(limit);
+    let shader = translate(native);
+    super::shader::TITLE_VIEW_LIMIT_HERE.set(was);
+    shader
+}
+
+#[test]
+fn a_view_index_the_title_computes_is_clamped_to_the_title_null_slot_under_heap_cap() {
+    let program = heap_indexed();
+    let before = translate_limited(&program, None);
+    assert_eq!(translate_limited(&program, Some(0)).dxil, before.dxil, "0 is off: as before");
+    let capped = translate_limited(&program, Some(2));
+    assert_ne!(capped.dxil, before.dxil, "the clamp is in the program");
+    // Heap: the texture at 0, the UAV at 1, a null texture at 2 (the title null slot).
+    let texels = [[0.0f32; 4]; 13 * 7];
+    let views = [View::Texture(13, 7, &texels), View::RawUav(4), View::NullTexture];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&capped)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut sizes = Vec::new();
+        for s0 in [0u32, 2, 3, 898_339, (1 << 27) - 1] {
+            let mut ud = vec![0u32; capped.user_data_dwords().max(1) as usize];
+            for u in &capped.user_data {
+                if (u.root, u.dword) == (RootType::Constants, 0) {
+                    ud[u.index as usize] = s0;
+                }
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            sizes.push(words[0][..2].to_vec());
+        }
+        assert_eq!(sizes[0], [13, 7], "{label}: index 0 reads its texture");
+        // past the title's slots: every index reads the null slot 2, none the UAV or past the heap
+        for (k, size) in sizes.iter().enumerate().skip(1) {
+            assert_eq!(size, &sizes[1], "{label}: index {k} reads the null slot");
+        }
+        assert_ne!(sizes[1], [13, 7], "{label}");
+    }
+}
+
+#[test]
+fn a_view_index_a_table_gives_is_left_alone_under_heap_cap() {
+    // The first test's program: both views from a table the host made (root type `Table`).
+    let program = native(&[
+        0x7E02_020A, // v_mov_b32 v1, s10
+        0xE070_0000,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+    ]);
+    assert_eq!(
+        translate_limited(&program, Some(2)).dxil,
+        translate_limited(&program, None).dxil
+    );
+}
