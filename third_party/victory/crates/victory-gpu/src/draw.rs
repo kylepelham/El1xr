@@ -3836,6 +3836,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.zero_out(list, p) {
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -5274,6 +5277,9 @@ impl State {
             ));
             return false;
         }
+        if kind == DISPATCH && self.zero_out(list, p) {
+            return true;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some((args, max)) = crate::shadow::find_any(arguments, len)
             .map(|args| (args, max))
@@ -5840,6 +5846,7 @@ mod bake_fresh;
 mod bake_publish;
 mod material_pass;
 mod skin_views;
+mod zero_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
