@@ -530,9 +530,19 @@ fn emit_any(
 ) -> Result<HostShader, ShaderError> {
     let first = emit_any_once(c, native, p, st, io, res);
     crate::lane_split::again(first, st.wide.len(), lower::host_max_wave(), || {
-        let st = structure::structure(p)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-        emit_any_once(c, native, p, &st, io, &res)
+        let per_lane = || {
+            let st = structure::structure(p)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            emit_any_once(c, native, p, &st, io, &res)
+        };
+        // (killed lanes leaving at the kill, as the callers try next: `translate --list` builds
+        // that structure outside this call)
+        match per_lane() {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+                structure::without_live_quads(per_lane)
+            }
+            other => other,
+        }
     })
     .map(|(shader, _)| shader)
 }
