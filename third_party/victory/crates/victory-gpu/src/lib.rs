@@ -90,6 +90,8 @@ mod pieces_diag;
 mod pieces_log;
 #[cfg(windows)]
 mod read_there;
+#[cfg(windows)]
+mod pieces_dump;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
