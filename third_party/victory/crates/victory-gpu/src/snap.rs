@@ -101,6 +101,12 @@ pub(crate) fn seconds() -> Option<f64> {
     lock(&STATE).start.map(|start| start.elapsed().as_secs_f64())
 }
 
+/// A snap is being written (its submission awaited, its PNG encoded): for the flicker catcher.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn writing() -> bool {
+    lock(&STATE).busy
+}
+
 /// A snap recorded into a present's list, to be written once that list has run.
 pub(crate) struct Pending {
     buffer: Buffer,
@@ -176,6 +182,7 @@ fn record_in(
     s.busy = true;
     s.due = Some(next_due(now, due, every));
     drop(s);
+    crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::Snap);
     let to = D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: the location borrows the buffer for the call; no reference is taken.
         pResource: unsafe { std::mem::transmute_copy(&buffer) },

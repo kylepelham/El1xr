@@ -782,6 +782,7 @@ pub(crate) fn let_go_idle() {
         keep
     });
     if went > 0 {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::StagingGone);
         crate::host::trail(|| {
             format!(
                 "sweep: {went} staging buffers of textures let go ({} KiB), held by no list",
@@ -995,6 +996,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
+                crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::LevelsAsked);
             } else {
                 staging.waiting.store(crate::host::moment().max(1), Relaxed);
             }

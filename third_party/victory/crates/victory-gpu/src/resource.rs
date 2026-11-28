@@ -2585,6 +2585,7 @@ pub(crate) fn let_go_idle() {
         crate::commitline::floor_report(&floor_went);
     }
     if went > 0 {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::TexturesGone);
         crate::host::trail(|| {
             format!(
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",

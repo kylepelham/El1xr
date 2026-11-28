@@ -322,6 +322,7 @@ if (-not $NoTunedSettings) {
         VICTORY_TEXTURE_HASH_BEHIND      = '1'         # batch 5K: guarded-texture looks for missed writes on threads of their own (run_other 7.83 -> 6.30, prep -1.78)
         VICTORY_RESULT_RING              = '1'         # batch 5K: compare result slices handed back as read (prep -0.47, +0.85 fps)
         VICTORY_FLUSH_BESIDE             = '1'         # batch 5J/K: final flush refreshes beside the preludes (batch_flush 7.88 -> 6.23, prep -0.85)
+        VICTORY_RESET_ASIDE              = '1'         # batch 5M: landed lists and their preludes reset on victory-land-aside (prep -1.0, run_other -0.57)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
