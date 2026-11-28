@@ -5125,6 +5125,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // `VICTORY_STREAM_AHEAD=1`: the placed textures under it handed to the
+    // prepare threads once all below is done.
+    let _ahead = crate::texture::stream_ahead::Arrived(at, len);
     reservation::completed_write(at, len);
     // Preserve DirectStorage/runtime physical-page writes over any deferred
     // GPU pages, writing back only the unwritten complement.

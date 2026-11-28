@@ -102,6 +102,10 @@ struct Ready {
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
+    /// (worldstream, `VICTORY_STREAM_AHEAD=1`) Textures handed out as their
+    /// bytes arrived ([`hand_ahead`]): run only when `jobs` is empty, moved
+    /// into it when a slot asks for one ([`Queue::promote`]).
+    ahead: VecDeque<Job>,
     /// What is handed out and not done, by resource and first mip, with
     /// the slots that wait for it.
     pending: HashMap<(usize, u32), Vec<u32>>,
@@ -123,6 +127,28 @@ struct Queue {
 }
 
 impl Queue {
+    /// The next texture for a thread: the ones slots wait for first.
+    fn next_job(&mut self) -> Option<Job> {
+        self.jobs.pop_front().or_else(|| self.ahead.pop_front())
+    }
+
+    /// A slot waits for `key`: handed out ahead ([`hand_ahead`]) and not
+    /// started, it goes with the jobs slots wait for (`urgent`: first).
+    fn promote(&mut self, key: (usize, u32), urgent: bool) {
+        let Some(i) = self.ahead.iter().position(|j| (j.resource, j.first) == key) else {
+            return;
+        };
+        let Some(job) = self.ahead.remove(i) else {
+            return;
+        };
+        super::stream_ahead::STATS[super::stream_ahead::PROMOTED].fetch_add(1, Relaxed);
+        if urgent {
+            self.jobs.push_front(job);
+        } else {
+            self.jobs.push_back(job);
+        }
+    }
+
     fn wait(&mut self, slot: u32) {
         *self.waiting.entry(slot).or_insert(0) += 1;
     }
@@ -185,6 +211,9 @@ impl Queue {
             .max_by_key(|(_, r)| r.first)
             .map(|(i, _)| i)?;
         let staging = all[best].staging.clone();
+        if all[best].slots.is_empty() {
+            super::stream_ahead::STATS[super::stream_ahead::TAKEN].fetch_add(1, Relaxed);
+        }
         if let Some(now) = now {
             all[best].at = now;
         }
@@ -414,6 +443,7 @@ fn look_in(
         if added {
             q.wait(slot);
         }
+        q.promote(key, urgent);
         return Look::Wait;
     }
     if q.frame != frame {
@@ -472,7 +502,7 @@ fn start_thread() {
         // waits for a thread that is not there.
         queue().started -= 1;
         loop {
-            let Some(job) = queue().jobs.pop_front() else {
+            let Some(job) = queue().next_job() else {
                 break;
             };
             let outcome = work(&job);
@@ -504,7 +534,7 @@ fn run() {
         let job = {
             let mut q = queue();
             loop {
-                if let Some(job) = q.jobs.pop_front() {
+                if let Some(job) = q.next_job() {
                     break job;
                 }
                 q = WORK.wait(q).unwrap_or_else(|e| e.into_inner());
@@ -792,6 +822,9 @@ impl Queue {
             while i < all.len() {
                 if old(all[i].at) {
                     let ready = all.swap_remove(i);
+                    if ready.slots.is_empty() {
+                        super::stream_ahead::STATS[super::stream_ahead::UNTAKEN].fetch_add(1, Relaxed);
+                    }
                     crate::table_null::pruned(resource);
                     risks += usize::from(risky(resource, ready.first));
                     stale.push(ready);
@@ -906,6 +939,83 @@ pub(crate) fn make_ready_ahead(resource: This, first: u32) -> Option<u64> {
     Some(bytes)
 }
 
+/// What [`hand_ahead`] did with a texture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Ahead {
+    /// Handed to the threads: the title bytes its staging buffer will read.
+    Handed(u64),
+    /// Handed out or made ready already, from that mip or a larger one.
+    Held,
+    /// Its staging buffer serves from that mip already: the submission
+    /// reads it again, as before.
+    Staged,
+    /// [`AHEAD_MOST`] wait already.
+    Full,
+    /// No prepare threads, a texture the title does not fill, or one the
+    /// host refused.
+    Not,
+}
+
+/// Textures handed out ahead and not started, at most.
+pub(crate) const AHEAD_MOST: usize = 256;
+
+/// (worldstream, `VICTORY_STREAM_AHEAD=1`, `super::stream_ahead`) The title's
+/// bytes of title texture `resource` from mip `first` on have just arrived
+/// (a DirectStorage request finished writing them): it is handed to the
+/// threads now, with no slot waiting, behind every texture a slot waits for.
+/// What they make is filed as [`make_ready_ahead`] files it: the pass that
+/// later finds a slot of it due takes it ([`take_ready`]) instead of handing
+/// it out then and passing the slot over for a frame or more; a slot that
+/// asks while it is not started moves it up ([`Queue::promote`]). Counted
+/// against no budget (it holds no slot's bytes); [`prune`] lets go of what
+/// nothing took in two seconds.
+pub(crate) fn hand_ahead(resource: This, first: u32) -> Ahead {
+    if threads() == 0
+        || resource.is_null()
+        || !crate::resource::title_fills(resource)
+        || crate::resource::host_refused(resource)
+    {
+        return Ahead::Not;
+    }
+    if crate::resource::host_copy_made(resource) && crate::resource::staged_first(resource) <= first {
+        return Ahead::Staged;
+    }
+    let bytes = super::staged_bytes(resource, first);
+    let mut q = queue();
+    let start = match q.push_ahead(resource as usize, first) {
+        Ahead::Handed(_) => threads().saturating_sub(q.started),
+        other => return other,
+    };
+    crate::resource::keep_alive(resource);
+    q.started += start;
+    drop(q);
+    for _ in 0..start {
+        start_thread();
+    }
+    WORK.notify_one();
+    Ahead::Handed(bytes)
+}
+
+impl Queue {
+    /// [`hand_ahead`]'s look in the queue: files the job unless something
+    /// serves it or the line is full (the caller keeps the resource alive).
+    fn push_ahead(&mut self, resource: usize, first: u32) -> Ahead {
+        if !self.free_ahead(resource, first) {
+            return Ahead::Held;
+        }
+        if self.ahead.len() >= AHEAD_MOST {
+            return Ahead::Full;
+        }
+        self.pending.insert((resource, first), Vec::new());
+        self.ahead.push_back(Job {
+            resource,
+            first,
+            bytes: 0,
+        });
+        Ahead::Handed(0)
+    }
+}
+
 /// Until nothing is handed out and not done, at most `most`: whether that
 /// came (tests).
 #[cfg(test)]
@@ -915,7 +1025,7 @@ pub(crate) fn wait_idle(most: std::time::Duration) -> bool {
     loop {
         {
             let q = queue();
-            if q.jobs.is_empty() && q.pending.is_empty() {
+            if q.jobs.is_empty() && q.ahead.is_empty() && q.pending.is_empty() {
                 return true;
             }
         }
@@ -948,6 +1058,45 @@ mod tests {
         assert_eq!(ready_count, 2);
         assert_eq!(skipped, 2);
         assert_eq!(due, [(3, 12), (5, 14), (1, 10)]);
+    }
+
+    /// (worldstream) A texture handed out ahead runs after every one a slot
+    /// waits for, holds its key against a second hand-out, and moves up
+    /// when a slot asks for it.
+    #[test]
+    fn ahead_jobs_wait_behind_slots_and_move_up_when_asked() {
+        let mut q = Queue::default();
+        assert_eq!(q.push_ahead(5, 0), Ahead::Handed(0));
+        assert_eq!(q.push_ahead(5, 0), Ahead::Held, "pending already");
+        assert_eq!(q.push_ahead(5, 2), Ahead::Held, "a larger mip serves a smaller view");
+        assert_eq!(q.push_ahead(6, 1), Ahead::Handed(0));
+        q.jobs.push_back(Job { resource: 7, first: 0, bytes: 10 });
+        assert_eq!(q.next_job().map(|j| j.resource), Some(7), "a slot's job first");
+        q.promote((6, 1), false);
+        assert_eq!(q.next_job().map(|j| (j.resource, j.first)), Some((6, 1)), "moved up");
+        assert_eq!(q.next_job().map(|j| j.resource), Some(5));
+        assert!(q.next_job().is_none());
+        assert!(q.pending.get(&(5, 0)).is_some_and(Vec::is_empty), "no slot waits");
+        for i in 0..AHEAD_MOST {
+            let _ = q.push_ahead(100 + i, 0);
+        }
+        assert_eq!(q.push_ahead(99_999, 0), Ahead::Full);
+    }
+
+    /// (worldstream) What a thread made ahead is filed with no slot: the
+    /// first take of its texture gets it and it leaves the queue.
+    #[test]
+    fn a_texture_made_ahead_is_taken_by_the_first_take() {
+        let mut q = Queue::default();
+        assert_eq!(q.push_ahead(9, 1), Ahead::Handed(0));
+        let job = q.next_job().unwrap();
+        q.pending.remove(&(job.resource, job.first));
+        q.put_ahead(9, Ready { staging: None, first: 1, bytes: 0, at: 0, slots: Vec::new() });
+        assert!(q.take(9, 0, Some(3), false, None).is_none(), "mip 1 does not serve mip 0");
+        let (_, gone) = q.take(9, 2, Some(3), false, None).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert!(q.ready.is_empty());
+        assert_eq!(q.outstanding, 0);
     }
 
     fn ready(q: &mut Queue, key: usize, first: u32, bytes: u64, slots: &[u32]) {
