@@ -60,6 +60,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_CAPTURE_WORLD", Apply::Restart),
     ("VICTORY_CAPTURE_WORLD_ALSO", Apply::Restart),
     ("VICTORY_CARD_ACCOUNTING", Apply::Restart),
+    ("VICTORY_CARD_BLOCK_REUSE", Apply::Restart),
     ("VICTORY_CARD_BUFFERS", Apply::Restart),
     ("VICTORY_CARD_BUFFERS_MIN_MB", Apply::Restart),
     ("VICTORY_CARD_CHANGED_LIST", Apply::Restart),
