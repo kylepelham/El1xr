@@ -137,6 +137,18 @@ pub const USER_GLASS_NATIVE: u32 = 0x106;
 /// no top level the host built.
 pub const USER_SHADOW_BASE_FIRST: u32 = 0x107;
 pub const USER_SHADOW_BASE_SECOND: u32 = 0x108;
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) `RootType::Other` code of a user-data dword the host sets:
+/// the title view slot of the first descriptor of the table of root parameter `slot` (whatever
+/// slots the host binds the table at), for constant buffers read through the table by title
+/// address ([`SLOT_BUFFER_RANGES`]); [`NO_TABLE_SLOT`] for none. Asked at dword 0. Asked at
+/// [`TABLE_SLOT_KEPT`] too (the value unused) when the shader also reads a constant buffer of
+/// that table through its descriptor: then the host keeps making the table's constant buffers.
+pub const USER_TABLE_SLOT: u32 = 0x109;
+/// See [`USER_TABLE_SLOT`].
+pub const TABLE_SLOT_KEPT: u32 = 1;
+/// See [`USER_TABLE_SLOT`]: past every entry of the ranges table (which reads 0 there), and
+/// far from wrapping when a descriptor's distance is added.
+pub const NO_TABLE_SLOT: u32 = 1 << 30;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

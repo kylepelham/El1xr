@@ -436,7 +436,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
+    let by_address = crate::draw::table_plan::cbvs_by_address(&host.user_data);
+    let tables =
+        crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views, &by_address);
     Ok(Translated {
         host,
         used,

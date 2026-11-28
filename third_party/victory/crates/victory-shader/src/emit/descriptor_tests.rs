@@ -725,6 +725,27 @@ fn run_by_address(
     [s0, s1]: [u32; 2],
     n: usize,
 ) -> Vec<u32> {
+    let words = |root: RootType, dword: u32| match (root, dword) {
+        (RootType::Constants, 0) => Some(s0),
+        (RootType::Constants, 1) => Some(s1),
+        _ => None,
+    };
+    run_by_address_with(host, label, shader, views, ranges, directory, &words, n)
+}
+
+/// [`run_by_address`] with the user-data dwords `words` gives (0 for the rest, 1 for
+/// `USER_MEMORY_BASE`).
+#[allow(clippy::too_many_arguments)]
+fn run_by_address_with(
+    host: &Host,
+    label: &str,
+    shader: &HostShader,
+    views: &[View],
+    ranges: &[u32],
+    directory: &[u32],
+    words: &dyn Fn(RootType, u32) -> Option<u32>,
+    n: usize,
+) -> Vec<u32> {
     use super::shader::{
         MEMORY_FAULTS, SLOT_BUFFER_RANGES, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
         USER_MEMORY_BASE,
@@ -734,12 +755,11 @@ fn run_by_address(
         .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        match (u.root, u.dword) {
-            (RootType::Constants, 0) => ud[u.index as usize] = s0,
-            (RootType::Constants, 1) => ud[u.index as usize] = s1,
-            (RootType::Other(USER_MEMORY_BASE), _) => ud[u.index as usize] = 1,
-            _ => {}
-        }
+        ud[u.index as usize] = match (words(u.root, u.dword), u.root) {
+            (Some(w), _) => w,
+            (None, RootType::Other(USER_MEMORY_BASE)) => 1,
+            (None, _) => 0,
+        };
     }
     // root views after the constants, by slot, as the harness orders them
     let mut roots = vec![(0, Root::Constants(ud))];
@@ -909,4 +929,95 @@ fn a_constant_buffer_picked_from_the_heap_reads_the_same_constants_by_address() 
         // a buffer view the host has no descriptor for, by its own range
         assert_eq!(run(&by_address, 3, 0), constants[56..], "{label}: title slot 3");
     }
+}
+
+/// A program that reads eight dwords at byte `s1` of the constant buffer at dword 0 of its table
+/// (root parameter 1, `s4`) with a scalar load and stores them to the raw UAV at dword 8 of the
+/// table.
+fn table_constants_program() -> NativeProgram {
+    let mut program = native_of(&[], 4, 0);
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xF408_0402,
+        0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+        0xF42C_0604,
+        0x0200_0000, // s_buffer_load_dwordx8 s[24:31], s[8:11], s1
+    ];
+    for out in 0..8u32 {
+        // v_mov_b32 v1, s<24 + out>; buffer_store_dword v1, off, s[16:19], 0 offset:4*out
+        words.push(0x7E00_0000 | 1 << 17 | 1 << 9 | (24 + out));
+        words.push(0x38 << 26 | 0x1C << 18 | (4 * out));
+        words.push(0x80 << 24 | (16 >> 2) << 16 | 1 << 8);
+    }
+    words.push(S_ENDPGM);
+    program.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    program.used[0].kind = ResourceType::Cbv;
+    program
+}
+
+#[test]
+fn a_tables_constant_buffer_reads_the_same_constants_by_title_address() {
+    use super::shader::{
+        BUFFER_RANGES_COUNT, NO_TABLE_SLOT, SLOT_BUFFER_RANGES, SLOT_MEMORY, TABLE_SLOT_KEPT,
+        USER_TABLE_SLOT,
+    };
+    let program = table_constants_program();
+    let plain = translate_buffer_address(&program, false);
+    let by_address = translate_buffer_address(&program, true);
+    let asks = |s: &HostShader, dword: u32| {
+        s.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(USER_TABLE_SLOT) && u.slot == 1 && u.dword == dword)
+    };
+    assert!(!plain.root_srvs.contains(&SLOT_BUFFER_RANGES) && !asks(&plain, 0));
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    // the host is told the table's title slot, and that no constant buffer of it is read
+    // through its descriptor (so it need not make the table afresh for one)
+    assert!(asks(&by_address, 0) && !asks(&by_address, TABLE_SLOT_KEPT));
+    // 256 bytes of constants, at byte 0x100 of title memory page 3; the host's descriptor at
+    // heap slot 0 holds the same.
+    let constants: Vec<u32> = (0..64).map(|k| 0x200 + k).collect();
+    let mut page = vec![0xDEAD_BEEFu32; 16384];
+    page[64..128].copy_from_slice(&constants);
+    let views = [View::Cbv(&constants), View::RawUav(8), View::RawUavData(&page)];
+    // The table's title slots start at 4: entry 4 is the constant buffer's range.
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[16..20].copy_from_slice(&[0x3_0100, 0, 256, 0]);
+    let mut directory = vec![0u32; 2 * 8];
+    directory[6] = 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // the table bound at host slot 0 (a fresh copy, or in place), its title slot `title`
+        let run = |shader: &HostShader, s1: u32, title: u32| {
+            let words = move |root: RootType, dword: u32| match (root, dword) {
+                (RootType::Constants, 1) => Some(s1),
+                (RootType::Other(USER_TABLE_SLOT), 0) => Some(title),
+                _ => None,
+            };
+            run_by_address_with(&host, label, shader, &views, &ranges, &directory, &words, 8)
+        };
+        for s1 in [0u32, 32, 128] {
+            let want = constants[(s1 / 4) as usize..][..8].to_vec();
+            assert_eq!(run(&plain, s1, 4), want, "{label}: descriptor, byte {s1}");
+            assert_eq!(run(&by_address, s1, 4), want, "{label}: by address, byte {s1}");
+        }
+        // the last 16 bytes in, the rest out, as for a constant buffer picked from the heap
+        let mut want = constants[60..].to_vec();
+        want.extend([0; 4]);
+        assert_eq!(run(&by_address, 240, 4), want, "{label}: by address, byte 240");
+        // the title slot, not the bound one, names the range: none there reads zeros
+        assert_eq!(run(&by_address, 0, 5), [0; 8], "{label}: title slot 5");
+    }
+    // No table: past every entry of the host's ranges table (its last entry, never written,
+    // reads 0); not run here, where the table is 8 entries long and a root view has no bounds.
+    const { assert!(NO_TABLE_SLOT >= BUFFER_RANGES_COUNT && NO_TABLE_SLOT < u32::MAX / 2) };
 }

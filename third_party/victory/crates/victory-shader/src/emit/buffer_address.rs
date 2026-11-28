@@ -14,7 +14,7 @@
 //! title memory only once a write path there is proven, byte and short loads keep
 //! their descriptor. Out of bounds as a raw view: each dword past the size reads 0.
 
-use super::{Attr, Bin, Cast, Fields, Lower, NULL, Operand, Reg, RootType, Tag, V, Why, pred};
+use super::{Attr, Bin, Cast, Fields, Lower, NULL, Operand, Reg, RootType, Tag, V, Val, Why, pred};
 use crate::resource::Source;
 
 #[cfg(test)]
@@ -83,13 +83,85 @@ impl Lower<'_> {
         count: u32,
         guard: Option<V>,
     ) -> Result<Option<Vec<V>>, Why> {
-        use super::super::shader::{BUFFER_RANGES_COUNT, SLOT_BUFFER_RANGES};
         if !on() {
             return Ok(None);
         }
         let Some(slot) = self.heap_buffer_slot(src)? else {
             return Ok(None);
         };
+        Ok(Some(self.load_by_slot(slot, index, off, count, guard)))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A scalar load of `count` dwords at byte `off` of the
+    /// constant buffer `src` names in a descriptor table, by title address; `None` when `src` is
+    /// not a table's constant buffer loaded from the table or the switch is off. The table's
+    /// title slot is a host word ([`super::super::shader::USER_TABLE_SLOT`]): the root
+    /// argument may name the host's fresh copy of the table, whose slots the ranges table
+    /// does not know; the descriptor is the same distance past the start in both.
+    pub(super) fn table_cbv_load(
+        &mut self,
+        src: &Source,
+        off: V,
+        count: u32,
+    ) -> Result<Option<Vec<V>>, Why> {
+        use super::super::shader::USER_TABLE_SLOT;
+        if !on() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = *src else {
+            return Ok(None);
+        };
+        let Some(a) = self.scalar.get(&load).copied() else {
+            return Ok(None);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param).copied() else {
+            return Ok(None);
+        };
+        if rp.root != RootType::Table {
+            return Ok(None);
+        }
+        let c = self.cur;
+        // the slot the root argument names, and the table's start there
+        let bound = self.heap_index(load, first, false)?;
+        let Val::I32(start) = self.user(a.param, 0) else {
+            return Ok(None);
+        };
+        let five = self.s.m.i32(5);
+        let start = self.s.m.bin(c, Bin::LShr, start, five);
+        let past = self.s.m.bin(c, Bin::Sub, bound, start);
+        let title = self.host_word(RootType::Other(USER_TABLE_SLOT), rp.slot, 0);
+        let slot = self.s.m.bin(c, Bin::Add, title, past);
+        Ok(Some(self.load_by_slot(slot, None, off, count, None)))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A descriptor of a table's constant buffer read through
+    /// the table after all: the host keeps the table's constant buffers made
+    /// ([`super::super::shader::TABLE_SLOT_KEPT`]).
+    pub(super) fn table_cbv_kept(&mut self, src: &Source) {
+        use super::super::shader::{TABLE_SLOT_KEPT, USER_TABLE_SLOT};
+        if !on() {
+            return;
+        }
+        let Some(u) = self.used_kind(src) else {
+            return;
+        };
+        if u.root != RootType::Table || u.kind != super::ResourceType::Cbv {
+            return;
+        }
+        let _ = self.host_word(RootType::Other(USER_TABLE_SLOT), u.slot, TABLE_SLOT_KEPT);
+    }
+
+    /// A read-only load of `count` dwords at byte `off` (of element `index`, if indexed) of the
+    /// buffer at title slot `slot`, by address.
+    fn load_by_slot(
+        &mut self,
+        slot: V,
+        index: Option<V>,
+        off: V,
+        count: u32,
+        guard: Option<V>,
+    ) -> Vec<V> {
+        use super::super::shader::{BUFFER_RANGES_COUNT, SLOT_BUFFER_RANGES};
         let c = self.cur;
         let i32t = self.s.t.i32;
         // Inside the table whatever the slot (a root view has no bounds).
@@ -172,6 +244,6 @@ impl Lower<'_> {
                 out.push(self.s.m.select(c, ok, x, zero));
             }
         }
-        Ok(Some(out))
+        out
     }
 }

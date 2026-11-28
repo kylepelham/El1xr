@@ -19,7 +19,7 @@ mod heap_find;
 mod exposure_watch;
 mod root_gather;
 mod root_slots;
-mod table_plan;
+pub(crate) mod table_plan;
 #[cfg(windows)]
 pub(crate) use table_plan::TablePlan;
 #[cfg(all(test, windows))]
@@ -1917,6 +1917,17 @@ impl State {
                     ((s.gpu(address) - base) & 15) as u32
                 }),
                 _ => 0,
+            };
+        }
+        if kind == victory_shader::emit::USER_TABLE_SLOT {
+            // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The table's title slot, for its constant
+            // buffers read by title address (`TablePlan` leaves them out).
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => self.heap_of(table).map_or(
+                    victory_shader::emit::NO_TABLE_SLOT,
+                    |heap| ((table - heap.start) / 32) as u32,
+                ),
+                _ => victory_shader::emit::NO_TABLE_SLOT,
             };
         }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
@@ -4748,6 +4759,8 @@ impl State {
                     hash = (hash.rotate_left(5) ^ u64::from(group.has_half(k * 8)))
                         .wrapping_mul(K);
                 }
+                // (Another table than the same slots made with their constant buffers.)
+                hash = (hash.rotate_left(5) ^ u64::from(group.cbv_by_address)).wrapping_mul(K);
                 // (Neptune) By contents alone (`tables_by_content`): the title writes every
                 // draw's table at a place of its own, and two thirds of a frame's tables
                 // (9,600 of 15,200, 73,000 slots) were made afresh although others with the
@@ -4941,6 +4954,8 @@ impl State {
                 let view = views.get(table + u64::from(k) * 32);
                 crate::table_prof::part(crate::table_prof::P::Lookup, looked);
                 match view {
+                    // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Read by title address: nothing to copy.
+                    Some(View::Constant(..)) if group.cbv_by_address => host.make_null(index),
                     Some(View::Constant(address, size)) => {
                         let written = crate::port_cbv::written_level();
                         if written > 0

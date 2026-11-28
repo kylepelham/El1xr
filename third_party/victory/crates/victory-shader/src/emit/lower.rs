@@ -6096,6 +6096,17 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) A table's constant buffer by title address: the host
+        // need not make the table afresh for it. (Also one no used-resource entry names: the
+        // host's copy of the table would not reach it.)
+        if kind.is_none_or(|u| u.kind == ResourceType::Cbv)
+            && let Some(xs) = self.table_cbv_load(&src, addr, count)?
+        {
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
@@ -6480,6 +6491,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if !sampler {
+            self.table_cbv_kept(src);
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
