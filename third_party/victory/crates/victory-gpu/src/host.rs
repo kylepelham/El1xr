@@ -3692,6 +3692,7 @@ impl Host {
                 let allocator: ID3D12CommandAllocator = self
                     .device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                     0,
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -3719,6 +3720,7 @@ impl Host {
             let allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,

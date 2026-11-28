@@ -737,6 +737,7 @@ impl LazyReadback {
                 Err(_) => (host.queue().clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
             };
             let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(list_type).ok()?;
+            crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList =
                 host.device.CreateCommandList(0, list_type, &allocator, None).ok()?;
             list.Close().ok()?;
