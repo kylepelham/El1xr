@@ -320,16 +320,22 @@ impl Drop for Text {
     }
 }
 
-/// The line under a setting's label: what it gives (`detail`) or its help, then the switch's
-/// name for experts only (players read the label and the line).
+/// The line under a setting's label: what it gives (`detail`), its short line ([`short`]) or its
+/// help, then the switch's name for experts only (players read the label and the line).
 pub(super) fn setting_line(info: &Info, model: &dyn MenuModel, expert: bool) -> String {
     let detail = model.detail(info.name);
-    match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
+    let line = detail.as_deref().or_else(|| short(info.name)).unwrap_or(info.help);
+    match (line, info.label == info.name) {
         (help, true) => help.to_string(),
-        ("", false) => info.name.to_string(),
-        (help, false) if expert => format!("{help}   {}", info.name),
+        ("", false) if expert => info.name.to_string(),
+        (help, false) if expert && !help.is_empty() => format!("{help}   {}", info.name),
         (help, false) => help.to_string(),
     }
+}
+
+/// A developer-tab setting's short line ([`super::short::SHORT`]).
+fn short(name: &str) -> Option<&'static str> {
+    super::short::SHORT.iter().find(|(n, _)| *n == name).map(|&(_, line)| line)
 }
 
 /// The selected row's whole description for the band under the list: a setting's full help
@@ -507,14 +513,20 @@ impl Painter {
         // Footer: hints, then the last change's outcome at the right.
         let f = l.footer;
         rule(&mut bm, l, f.x + pad, f.y, f.w - 2 * pad, RULE);
-        let hints = format!(
-            "{} / Esc close   \u{2191}\u{2193} select   \u{2190}\u{2192} change   Q E tabs   X expert      Pad: A change  B close  LB RB tabs  Y expert",
-            super::hotkey_name()
-        );
+        // Hints for the device last used: the control in the brighter text, what it does dimmer.
         let status = t.fit(SMALL, menu.status.as_deref().unwrap_or_default(), (f.w - 2 * pad) * 3 / 5);
         let sw = t.measure(SMALL, &status).0;
-        let hints = t.fit(SMALL, &hints, f.w - 2 * pad - sw - px(24.0));
-        t.mid(&mut bm, SMALL, &hints, f.x + pad, f, DIM);
+        let end = f.right() - pad - sw - px(24.0);
+        let mut x = f.x + pad;
+        for (control, what) in menu.hints.pairs() {
+            let (cw, ww) = (t.measure(SMALL, &control).0, t.measure(SMALL, what).0);
+            if x + cw + px(5.0) + ww > end {
+                break;
+            }
+            t.mid(&mut bm, SMALL, &control, x, f, SOFT);
+            t.mid(&mut bm, SMALL, what, x + cw + px(5.0), f, DIM);
+            x += cw + px(5.0) + ww + px(16.0);
+        }
         t.mid(&mut bm, SMALL, &status, f.right() - pad - sw, f, SOFT);
         Some(bm)
     }
@@ -678,12 +690,12 @@ fn short_path(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::model::{Registry, registry_lock};
-    use super::super::state::{Tab, rows, tabs};
+    use super::super::state::{rows, tabs};
     use super::*;
 
     /// What would be cut at `w` x `h` on every tab, the expert one too: a label wider than its
-    /// room, a Display row's line wider than its room (players read those in the row), and a
-    /// description longer than the band under the list.
+    /// room, a listed setting's line wider than its room, and a description longer than the band
+    /// under the list.
     fn cut(w: i32, h: i32) -> Vec<String> {
         let model = Registry::default();
         let mut menu = Menu::default();
@@ -710,7 +722,7 @@ mod tests {
                 if let Row::Setting(i) = row {
                     let info = &model.infos()[i];
                     wide(LABEL, "label", info.label, room);
-                    if tab == Tab::DISPLAY && !info.expert {
+                    if !info.expert {
                         wide(HELP, "line", &setting_line(info, &model, false), room);
                     }
                 }
@@ -729,7 +741,13 @@ mod tests {
     fn nothing_is_cut_at_1080_or_1440() {
         let _lock = registry_lock();
         let cut: Vec<String> = [(1920, 1080), (2560, 1440)].iter().flat_map(|&(w, h)| cut(w, h)).collect();
-        assert!(cut.is_empty(), "{} cut:\n{}", cut.len(), cut.join("\n"));
+        assert!(
+            cut.is_empty(),
+            "{} cut (a listed setting's row line: give it a line in menu/short.rs; a description: \
+             shorten the registry help to {ABOUT_LINES} lines):\n{}",
+            cut.len(),
+            cut.join("\n")
+        );
     }
 
     #[test]
