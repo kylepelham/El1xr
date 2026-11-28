@@ -36,6 +36,8 @@ pub mod device;
 #[cfg(windows)]
 mod alloc_backoff;
 #[cfg(windows)]
+mod stack_commit;
+#[cfg(windows)]
 mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
