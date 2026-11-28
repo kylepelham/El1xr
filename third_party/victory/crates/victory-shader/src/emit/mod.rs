@@ -90,6 +90,8 @@ pub(crate) mod glass_splice;
 pub(crate) mod shadow_splice;
 mod glass_patch;
 mod shadow_patch;
+#[cfg(test)]
+mod walk_find;
 mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
