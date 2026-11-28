@@ -34,9 +34,13 @@ fn parse_ttl(value: Option<&str>) -> u64 {
 /// `block` from fewer than `VICTORY_HOLES_ONCE` frames ago.
 pub(super) fn uncommitted_end_cached(block: usize) -> usize {
     let frames = ttl_frames();
+    let marks = super::hole_marks::mode();
+    if marks != 0 {
+        return super::hole_marks::end(block, super::hole_marks::frame(), marks, super::uncommitted_span);
+    }
     if frames == 0 {
         if kept_on() {
-            return kept_end(&KEPT, block, crate::frame::current(), super::uncommitted_span);
+            return kept_end(&KEPT, block, super::hole_marks::frame(), super::uncommitted_span);
         }
         return super::uncommitted_end(block);
     }
@@ -173,6 +177,7 @@ pub(super) fn forget(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    super::hole_marks::forget(at, len);
     forget_in_table(&KEPT, at, len);
     if ttl_frames() == 0 {
         return;

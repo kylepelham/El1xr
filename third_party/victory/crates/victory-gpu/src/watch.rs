@@ -67,6 +67,7 @@ pub(crate) fn guard_split_log(frames: f64) {
     guard_split::log(frames);
 }
 pub(crate) mod empty_notice;
+mod hole_marks;
 mod holes;
 pub(crate) mod ask_split;
 /// (worldstream) `VICTORY_ASK_END_FAST=1`: an end with nothing standing leaves the journal's lock alone.
