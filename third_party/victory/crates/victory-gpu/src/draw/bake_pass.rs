@@ -16,8 +16,25 @@ thread_local! {
     pub(super) static ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether a pass over the due slots stops before its `i`th: never for the first `pinned` (a
+/// bake draw's own textures, `VICTORY_BAKE_INPUTS`: outside the budgets, whatever
+/// `VICTORY_BAKE_ONE_BUDGET` left of the pass's time), else once the frame's bytes are spent
+/// (`bytes_spent`) or, after an upload (or at every 8th slot looked at), past `budget`.
+pub(super) fn stops_at(
+    i: usize,
+    pinned: usize,
+    bytes_spent: bool,
+    uploaded: u64,
+    checked: u64,
+    budget: std::time::Duration,
+    elapsed: impl FnOnce() -> std::time::Duration,
+) -> bool {
+    let looked_enough = uploaded > 0 || (checked > 0 && checked.is_multiple_of(8));
+    i >= pinned && (bytes_spent || (looked_enough && elapsed() >= budget))
+}
+
 /// Reads `n` dwords at title address `at`, if its memory is there.
-fn words(at: u64, n: usize) -> Option<Vec<u32>> {
+pub(super) fn words(at: u64, n: usize) -> Option<Vec<u32>> {
     if at == 0 || n == 0 || !crate::texture::committed(at as *const u8, n * 4) {
         return None;
     }
@@ -56,8 +73,13 @@ impl State {
             ONLY.set(false);
             add(C::OwnUs, began.elapsed().as_micros() as u64);
         }
+        let waited_ms = self.bake_wait(list, heap, host);
         let mine = PINNED.take();
-        let pending = host.texture_slots_pick(&mine).len() as u64;
+        let left = host.texture_slots_pick(&mine);
+        if crate::bake_why::why() {
+            self.bake_why(p, heap, host, &left, waited_ms);
+        }
+        let pending = left.len() as u64;
         add(C::Bakes, 1);
         add(C::Inputs, mine.len() as u64);
         add(C::Uploaded, before.saturating_sub(pending));
@@ -67,8 +89,98 @@ impl State {
         }
     }
 
+    /// (`VICTORY_BAKE_WAIT_MS=N`) The bake draw's own textures whose memory the title has not
+    /// (all) mapped: waits up to N ms for all of it, then uploads them alone. The ms waited.
+    fn bake_wait(
+        &mut self,
+        list: &HostList,
+        heap: &'static crate::descriptor::Heap,
+        host: &'static crate::descriptor::host::HostHeap,
+    ) -> u64 {
+        let ms = crate::bake_why::wait_ms();
+        if ms == 0 {
+            return 0;
+        }
+        let waiting: Vec<(u64, u64)> = PINNED.with_borrow(|mine| {
+            host.texture_slots_pick(mine)
+                .iter()
+                .filter_map(|&(index, _)| {
+                    let (address, len, _) = placed(heap, index)?;
+                    let mapped = mapped(address, len);
+                    crate::bake_why::lack(mapped, len)
+                        .waits_for_title()
+                        .then_some((address, len))
+                })
+                .collect()
+        });
+        if waiting.is_empty() {
+            return 0;
+        }
+        let ms = crate::bake_why::wait_left(crate::frame::current(), ms);
+        if ms == 0 {
+            return 0;
+        }
+        let _hitch = crate::hitch::span(crate::hitch::Phase::EarlyTextures);
+        let (_, took) = crate::bake_why::wait_for(ms, || {
+            waiting.iter().all(|&(address, len)| mapped(address, len) >= len)
+        });
+        crate::bake_why::waited(took.max(1));
+        ONLY.set(true);
+        PASS_BUDGET.set(Some((0, 0, true)));
+        self.heap_textures(list, heap, host);
+        PASS_BUDGET.set(None);
+        ONLY.set(false);
+        took
+    }
+
+    /// (`VICTORY_BAKE_WHY=1`) A line for each of the bake draw's textures still pending, and
+    /// for each found pending before that has been uploaded since.
+    fn bake_why(
+        &self,
+        p: &HostPipeline,
+        heap: &'static crate::descriptor::Heap,
+        host: &'static crate::descriptor::host::HostHeap,
+        left: &[(u32, u64)],
+        waited_ms: u64,
+    ) {
+        let frame = crate::frame::current();
+        crate::bake_why::landed(frame, |slots| {
+            host.texture_slots_pick(slots).into_iter().map(|(i, _)| i).collect()
+        });
+        if left.is_empty() {
+            return;
+        }
+        let seen: Vec<crate::bake_why::Seen> = left
+            .iter()
+            .map(|&(slot, _)| {
+                let (address, len, shape) = placed(heap, slot).unwrap_or((0, 0, [0; 4]));
+                let mapped = if len == 0 { 0 } else { mapped(address, len) };
+                crate::bake_why::Seen {
+                    slot,
+                    lack: if len == 0 {
+                        crate::bake_why::Lack::Other
+                    } else {
+                        crate::bake_why::lack(mapped, len)
+                    },
+                    mapped,
+                    len,
+                    address,
+                    shape,
+                    state: host.texture_slot_state(slot, frame),
+                }
+            })
+            .collect();
+        crate::bake_why::pending(
+            frame,
+            bake_hash(p),
+            self.targets.first().copied().unwrap_or(0),
+            waited_ms,
+            &seen,
+        );
+    }
+
     /// The first view heap bound that is not a sampler heap, with its host heap.
-    fn view_heap(
+    pub(super) fn view_heap(
         &self,
     ) -> Option<(
         &'static crate::descriptor::Heap,
@@ -85,7 +197,7 @@ impl State {
 
     /// The title slots bake draw `p` reads textures from (`crate::bake_inputs`): from its
     /// parameter constants and records, found through user data word 9.
-    fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
+    pub(super) fn bake_input_slots(&self, p: &HostPipeline) -> Option<Vec<u32>> {
         let stage = p
             .stages
             .iter()
@@ -121,5 +233,61 @@ impl State {
                 .flatten()
                 .map(|w| w[0])
         }))
+    }
+}
+
+/// The title address, the bytes from the first mip shown and the shape of the texture placed in
+/// memory that slot `index` views (None: another kind of view).
+fn placed(heap: &crate::descriptor::Heap, index: u32) -> Option<(u64, u64, [u32; 4])> {
+    let Some(View::Placed(false, resource, desc)) =
+        heap.handle(index).and_then(crate::descriptor::view)
+    else {
+        return None;
+    };
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let len =
+        crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+    Some((address, len, crate::bake_why::shape(&resource)))
+}
+
+fn mapped(address: u64, len: u64) -> u64 {
+    crate::texture::mapped_bytes(address as *const u8, len as usize)
+}
+
+/// The bake pixel shader of `p`, as [`BAKE_PIXEL_SHADERS`] names it.
+fn bake_hash(p: &HostPipeline) -> &'static str {
+    p.stages
+        .iter()
+        .find_map(|s| BAKE_PIXEL_SHADERS.iter().find(|&&h| h == s.shader.hash.as_str()))
+        .copied()
+        .unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stops_at;
+    use std::time::Duration;
+
+    /// Batch 4 part C: `bake inputs frame ... short=1` in the world with
+    /// `VICTORY_BAKE_ONE_BUDGET=1`. The switch only shortens the pass's
+    /// `budget`; a bake draw's own slots (the first `pinned`) are uploaded
+    /// whatever the budget or bytes say, so a short bake is a slot the pass
+    /// could not upload (no memory yet, part of it, or no room), not one it
+    /// ran out of time for.
+    #[test]
+    fn a_bake_draws_own_slots_are_outside_every_budget() {
+        let none = Duration::ZERO;
+        let late = || Duration::from_secs(10);
+        for i in 0..3 {
+            assert!(!stops_at(i, 3, true, 5, 8, none, late), "pinned slot {i}");
+        }
+        assert!(stops_at(3, 3, true, 0, 1, none, late), "past the bytes");
+        assert!(stops_at(3, 3, false, 1, 4, none, late), "past the time after an upload");
+        assert!(!stops_at(3, 3, false, 0, 3, none, late), "nothing uploaded, not the 8th look");
+        assert!(stops_at(3, 3, false, 0, 8, none, late), "the 8th look");
+        assert!(
+            !stops_at(3, 3, false, 1, 4, Duration::from_secs(11), late),
+            "within the budget"
+        );
     }
 }

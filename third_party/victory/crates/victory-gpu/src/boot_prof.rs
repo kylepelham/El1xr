@@ -8,7 +8,8 @@
 //! for work" is the title pacing itself, and nothing in the log said so.
 //! Each line has the frames begun in the second, the milliseconds the
 //! title slept in frame waits (origin and other), and every phase's
-//! milliseconds on all threads in that second; milestones (first frame,
+//! milliseconds on all threads in that second, and the milliseconds presents
+//! were held by `VICTORY_PRESENT_SMOOTH` (`crate::pacing`); milestones (first frame,
 //! first bake pass, first world frame) are logged once each.
 //!
 //! Off: nothing is counted and nothing is logged.
@@ -127,6 +128,10 @@ pub(crate) fn tick() {
     let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed));
     let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1000.0;
     let paced = [ms(&PACED_US[0]), ms(&PACED_US[1])];
+    #[cfg(windows)]
+    let held = crate::pacing::take_held_us() as f64 / 1000.0;
+    #[cfg(not(windows))]
+    let held = 0.0;
     let mut phases = String::new();
     for (name, c) in NAMES.iter().zip(&PHASE_US) {
         let v = ms(c);
@@ -135,7 +140,7 @@ pub(crate) fn tick() {
         }
     }
     tracing::info!(
-        "boot prof: second {now} (frame {frame}, {frames} frames, world {}): the title slept in frame waits {:.0} ms origin, {:.0} ms other; phases on all threads (ms){phases}",
+        "boot prof: second {now} (frame {frame}, {frames} frames, world {}): the title slept in frame waits {:.0} ms origin, {:.0} ms other; presents held by smoothing {held:.0} ms; phases on all threads (ms){phases}",
         WORLD_AT.load(Relaxed) != 0,
         paced[0],
         paced[1],

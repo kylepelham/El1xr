@@ -47,7 +47,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
+fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -106,8 +106,20 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool) -> [u8; 32] {
     if wave_pairs_vt {
         h.update(b"VICTORY_WAVE_PAIRS_VT=1");
     }
+    if strict {
+        h.update(b"VICTORY_UNIFORM_STRICT=1");
+    }
     if victory_shader::emit::native_glass() {
         h.update(b"VICTORY_NATIVE_GLASS=1");
+    }
+    if let Some(key) = victory_shader::emit::miss_sky_key() {
+        h.update(key.as_bytes());
+    }
+    if let Some(key) = crate::rt_hit_only::key() {
+        h.update(key.as_bytes());
+    }
+    if victory_shader::emit::dispatchx_mask() {
+        h.update(b"VICTORY_DISPATCHX_MASK=1");
     }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
@@ -168,6 +180,25 @@ const WAVE_PAIRS_VT: [&str; 29] = [
     "3c196d81eca7ff15", "acf14a70f37fb012", "f79824724d8e2daf", "f0aa2b1e79275592",
 ];
 
+/// `VICTORY_UNIFORM_STRICT=<hash,hash,..>` (none by default): the containers, by the 16-digit
+/// hash the log names shaders with, whose first-lane reads take the stricter proof of
+/// `VICTORY_UNIFORM_STRICT_ALL=1` (`victory_shader::emit::with_uniform_strict`), so that switch's
+/// shaders can be tried apart. Only these containers' cache keys change.
+static UNIFORM_STRICT: OnceLock<Vec<String>> = OnceLock::new();
+
+fn allow_uniform_strict(container: &[u8]) -> bool {
+    hash_in_list(
+        container,
+        UNIFORM_STRICT.get_or_init(|| parse_hash_list(std::env::var("VICTORY_UNIFORM_STRICT").ok().as_deref(), &[])),
+    )
+}
+
+/// Whether `VICTORY_UNIFORM_STRICT` names this container: for the offline translation
+/// (`victory translate`), which calls the translator without this cache.
+pub fn uniform_strict_listed(container: &[u8]) -> bool {
+    allow_uniform_strict(container)
+}
+
 fn wave_pairs_vt_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_WAVE_PAIRS_VT").is_ok_and(|v| v.trim() == "1"))
@@ -186,6 +217,13 @@ pub fn wave_pairs_vt_listed(container: &[u8]) -> bool {
 /// [`translate_container`], for a container [`allow_wave_pairs_vt`] names inside
 /// `with_wave_pairs_vt`, with one log line saying what the paired form made of it.
 fn translate_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
+    victory_shader::emit::with_rays_missed(crate::rt_hit_only::misses(container), || {
+        translate_paired_vt(container, wide, pairs, vt)
+    })
+}
+
+/// [`translate_vt`] inside `VICTORY_RT_HIT_ONLY`'s choice.
+fn translate_paired_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
     if !vt {
         return translate_container(container, wide, pairs);
     }
@@ -224,8 +262,22 @@ fn parse_hash_list(value: Option<&str>, default: &[&str]) -> Vec<String> {
     }
 }
 
-fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
-    parse_hash_list(value, &WAVE_WIDE_DEFAULT)
+/// `VICTORY_WATER_WIDE=1` (issue #38): the water transmission programs the list above leaves
+/// out, which no other form takes on a 32-lane host: `CS_TransmissionVolumetrics` and
+/// `_Submerged` are refused (their dispatches dropped), `_VolumePortalsOnly` comes out with
+/// 64-lane waves. The wave-wide form gives each 32-lane waves, as it does their tiled siblings.
+const WATER_WIDE: [&str; 3] = ["6871d6e4b3ac9a10", "926c46bab3b86bd6", "a10179ab7eda0dc3"];
+
+fn parse_wave_wide_only(value: Option<&str>, water: bool) -> Vec<String> {
+    let mut list = parse_hash_list(value, &WAVE_WIDE_DEFAULT);
+    if water {
+        for h in WATER_WIDE {
+            if !list.iter().any(|s| s == h) {
+                list.push(h.to_owned());
+            }
+        }
+    }
+    list
 }
 
 fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
@@ -234,13 +286,20 @@ fn parse_wave_pairs_only(value: Option<&str>) -> Vec<String> {
 
 fn wave_wide_list() -> &'static [String] {
     WAVE_WIDE.get_or_init(|| {
-        parse_wave_wide_only(std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref())
+        let list = parse_wave_wide_only(
+            std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref(),
+            std::env::var("VICTORY_WATER_WIDE").is_ok_and(|v| v.trim() == "1"),
+        );
+        let more = crate::wave_more::wide(std::env::var("VICTORY_WAVE_WIDE_MORE").ok().as_deref());
+        crate::wave_more::extend(list, &more)
     })
 }
 
 fn wave_pairs_list() -> &'static [String] {
     WAVE_PAIRS.get_or_init(|| {
-        parse_wave_pairs_only(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref())
+        let list = parse_wave_pairs_only(std::env::var("VICTORY_WAVE_PAIRS_ONLY").ok().as_deref());
+        let more = crate::wave_more::pairs(std::env::var("VICTORY_WAVE_PAIRS_MORE").ok().as_deref());
+        crate::wave_more::extend(list, &more)
     })
 }
 
@@ -317,12 +376,13 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
     let vt = allow_wave_pairs_vt(container);
+    let strict = allow_uniform_strict(container);
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        translate_vt(c, wide, pairs, vt)
+        victory_shader::emit::with_uniform_strict(strict, || translate_vt(c, wide, pairs, vt))
     };
-    cached(cache, &build(wide, pairs, vt), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(wide, pairs, vt, strict), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
@@ -331,9 +391,10 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wide = allow_wave_wide(container);
     let pairs = allow_wave_pairs(container);
     let vt = allow_wave_pairs_vt(container);
-    let translate = |c: &[u8]| translate_vt(c, wide, pairs, vt);
+    let strict = allow_uniform_strict(container);
+    let translate = |c: &[u8]| victory_shader::emit::with_uniform_strict(strict, || translate_vt(c, wide, pairs, vt));
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(wide, pairs, vt), container, translate),
+        Some(cache) => cached(cache, &build(wide, pairs, vt, strict), container, translate),
         None => translate(container),
     }
 }
@@ -666,19 +727,33 @@ mod tests {
 
     #[test]
     fn wave_wide_only_parses_defaults_disable_and_lists() {
-        let default = parse_wave_wide_only(None);
+        let default = parse_wave_wide_only(None, false);
         assert!(default.contains(&"02384a60fda6f2d0".to_owned()));
         assert!(default.contains(&"6b82bc7d22016cb5".to_owned()));
         assert!(default.contains(&"2da4beb386509b77".to_owned()));
         assert_eq!(default.len(), WAVE_WIDE_DEFAULT.len());
 
         for off in ["0", "none", "NONE", "", "   "] {
-            assert!(parse_wave_wide_only(Some(off)).is_empty(), "{off:?}");
+            assert!(parse_wave_wide_only(Some(off), false).is_empty(), "{off:?}");
         }
         assert_eq!(
-            parse_wave_wide_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
+            parse_wave_wide_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,"), false),
             vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
         );
+    }
+
+    #[test]
+    fn water_wide_adds_the_three_water_programs_once() {
+        let off = parse_wave_wide_only(None, false);
+        for h in WATER_WIDE {
+            assert!(!off.contains(&h.to_owned()), "{h} is in the default list");
+        }
+        let on = parse_wave_wide_only(None, true);
+        assert_eq!(on[..WAVE_WIDE_DEFAULT.len()], off[..]);
+        assert_eq!(on[WAVE_WIDE_DEFAULT.len()..], WATER_WIDE.map(str::to_owned));
+        let named = parse_wave_wide_only(Some("926c46bab3b86bd6"), true);
+        assert_eq!(named, vec!["926c46bab3b86bd6", "6871d6e4b3ac9a10", "a10179ab7eda0dc3"]);
+        assert_eq!(parse_wave_wide_only(Some("none"), true), WATER_WIDE.map(str::to_owned));
     }
 
     #[test]
@@ -695,5 +770,16 @@ mod tests {
             parse_wave_pairs_only(Some("02384a60fda6f2d0, 6B82BC7D22016CB5,")),
             vec!["02384a60fda6f2d0", "6b82bc7d22016cb5"]
         );
+    }
+
+    /// `VICTORY_UNIFORM_STRICT` names no container unless set, and a named one is filed
+    /// under a key of its own.
+    #[test]
+    fn uniform_strict_names_none_by_default_and_keys_its_own() {
+        assert!(parse_hash_list(None, &[]).is_empty());
+        assert!(!hash_in_list(b"container", &parse_hash_list(None, &[])));
+        let h = blake3::hash(b"container").to_hex()[..16].to_owned();
+        assert!(hash_in_list(b"container", &parse_hash_list(Some(&h.to_uppercase()), &[])));
+        assert_ne!(build(false, false, false, true), build(false, false, false, false));
     }
 }

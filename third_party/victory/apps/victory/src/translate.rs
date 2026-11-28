@@ -534,10 +534,14 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    let mut programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // (the form a run translates: `victory_shader::emit::translate` does the same)
+    for program in &mut programs {
+        emit::host_form(&container, program);
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
@@ -545,7 +549,12 @@ fn translate(
     // (`VICTORY_WAVE_PAIRS_VT=1`: the programs the run's shader cache gives Vice-Tay #208's
     // paired form)
     let vt = victory_gpu::shader_cache::wave_pairs_vt_listed(&bytes);
-    emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks));
+    // (`VICTORY_UNIFORM_STRICT=<hashes>`: the containers the run's shader cache gives the
+    // stricter first-lane proof)
+    let strict = victory_gpu::shader_cache::uniform_strict_listed(&bytes);
+    emit::with_uniform_strict(strict, || {
+        emit::with_wave_pairs_vt(vt, || translate_programs(&container, programs, &example, t, checks))
+    });
     if vt {
         eprintln!("WAVE64-PAIRS-VT {}: {:?}", example(), emit::take_wave_pairs_vt());
     }

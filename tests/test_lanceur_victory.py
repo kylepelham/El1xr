@@ -586,4 +586,4 @@ def test_dev_runs_ignore_the_users_settings_file():
     sys.path.insert(0, str(RACINE / "tools"))
     import dev
     cmd = dev.build_launcher_command(game_dir=Path("G:/jeu"), diag=False, overrides={})
-    assert cmd[-1].startswith("$env:VICTORY_SETTINGS_FILE = 'none'; & ")
+    assert cmd[-1].startswith("$env:VICTORY_SETTINGS_FILE = 'none'; $env:VICTORY_AUTO_A_PADS = '1'; & ")

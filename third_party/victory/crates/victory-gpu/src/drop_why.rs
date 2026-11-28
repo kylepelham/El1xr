@@ -15,15 +15,17 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// Reasons per frame line shown at most.
 const SHOWN: usize = 32;
 
 /// Whether drops are counted by reason (`VICTORY_DROP_REASONS=1`).
+/// Live (a diagnostic): the first line after it is turned on counts part of
+/// a stretch.
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_REASONS").is_some_and(|v| v == "1"))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_DROP_REASONS");
+    ON.get_bool()
 }
 
 /// Pipelines per frame line named at most.
@@ -252,6 +254,11 @@ fn summary(counts: HashMap<Key, u64>, frames: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_live() {
+        victory_core::settings::check_live("VICTORY_DROP_REASONS", "1", on, false, true);
+    }
 
     #[test]
     fn summary_is_per_frame_and_most_first() {

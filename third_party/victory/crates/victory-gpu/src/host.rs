@@ -1035,6 +1035,8 @@ pub(crate) struct HostList {
     /// records into ([`HostList::clamp_ahead`]), and whether a prelude has
     /// left each in the indirect-argument state. Kept across resets.
     ahead_chunks: Mutex<Vec<(ID3D12Resource, bool)>>,
+    /// Left open for the title's next reset (`crate::fresh_open`).
+    pub(crate) left_open: std::sync::atomic::AtomicU8,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Its title commands, for device-removed data and the hang watch.
@@ -1869,6 +1871,21 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// [`give_chunks`] for a held list whose submission landed, before its reset
+/// (`crate::scratch_landing`): what the pool has no room for comes back, to
+/// stay with the list and be freed at that reset as before.
+fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    crate::scratch_landing::spare_what_fits(chunks, |chunk, size| {
+        let back = spare.give(chunk, size, crate::scratch_spare::spare_most());
+        if back.is_none() {
+            ALIVE[3].fetch_add(1, Ordering::Relaxed);
+            ALIVE[4].fetch_add(size, Ordering::Relaxed);
+        }
+        back
+    })
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3733,6 +3750,7 @@ impl Host {
                 twins_writing: std::sync::atomic::AtomicBool::new(false),
                 card_constants: Default::default(),
                 ahead_chunks: Mutex::default(),
+                left_open: crate::fresh_open::mark(),
                 _alive: Counted::new(),
                 ops,
                 #[cfg(feature = "diagnostics")]
@@ -3901,6 +3919,7 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
+                    flight.lists.iter().for_each(|l| l.host().release_scratch());
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -4419,6 +4438,7 @@ impl Host {
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
+                        flight.lists.iter().for_each(|l| l.host().release_scratch());
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -4522,7 +4542,7 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + crate::sweep_every::every_ms() {
             if sweep_aside::on() {
                 sweep_aside::ask();
             } else {
@@ -4556,6 +4576,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        crate::shadow::refresh_stamp::expire();
         let parts_before = crate::submit_chunk::parts();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4707,9 +4728,11 @@ impl Host {
                 *f += 1;
             }
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        let apart = crate::compare_apart::split(
+            card.as_ref().and_then(|c| c.check.clone()),
+            &mut lists,
+            crate::compare_apart::on(),
+        );
         PREP_PARTS[8].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::texture::alias_skip::submitted(runs);
         let t_heaps = std::time::Instant::now();
@@ -4731,6 +4754,7 @@ impl Host {
                 // SAFETY: closed lists; the fence is ours.
                 let signalled = unsafe {
                     self.queue.ExecuteCommandLists(&lists);
+                    crate::compare_apart::send(&self.queue, &apart);
                     self.queue.Signal(&self.fence, *submitted)
                 };
                 self.card_sent();
@@ -4802,6 +4826,9 @@ impl Host {
                 let waited = {
                     let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
                     self.queue.ExecuteCommandLists(group);
+                    if i + 1 == groups.len() {
+                        crate::compare_apart::send(&self.queue, &apart);
+                    }
                     self.card_sent();
                     self.queue.Signal(&self.fence, *submitted).and_then(|()| {
                         self.submitted_fence.store(*submitted, Ordering::Release);
@@ -5113,6 +5140,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.left_open.store(crate::fresh_open::NO, Ordering::Release);
         crate::gpucost::at(&self.list, crate::gpucost::LIST_END);
         self.twins_to_depth();
         self.textures_back();
@@ -5135,6 +5163,18 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+    }
+
+    /// Its held submission landed: the card read its scratch for the last
+    /// time (`crate::scratch_landing`, `VICTORY_SCRATCH_AT_LANDING=1`).
+    pub(crate) fn release_scratch(&self) {
+        if !scratch_pool() || !crate::scratch_landing::on() {
+            return;
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        (scratch.current, scratch.used) = (0, 0);
+        let chunks = std::mem::take(&mut scratch.chunks);
+        scratch.chunks = spare_what_fits(chunks);
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -5178,16 +5218,19 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        // Open and empty since it was made or last reset (`crate::fresh_open`).
+        if !crate::fresh_open::skip_reset(self) {
+            // SAFETY: the list is not executing.
+            let reset = unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
+            crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         }
-        crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
@@ -6142,7 +6185,9 @@ impl HostList {
                 // And the records its budget emptied (`VICTORY_INDIRECT_BUDGET_LOG2`).
                 crate::indirect::budget::EMPTIED
                     .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
-                for k in 0..7 {
+                // And its records over the budget (`VICTORY_INDIRECT_REST`).
+                crate::indirect::rest::take(words, crate::indirect::budget::log2().unwrap_or(27));
+                for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6779,6 +6824,7 @@ impl Batch {
         self.flush_fills();
         self.flush_textures();
         self.flush();
+        crate::shadow::refresh_stamp::expire();
         self.textures.clear();
     }
 
@@ -7812,6 +7858,8 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         crate::indirect::budget::line(frames);
+        crate::indirect::rest::line(frames);
+        crate::indirect::raw_check::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
@@ -8129,7 +8177,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {} slots taken out by a table read after the first of their frame \
+                     (VICTORY_TABLED_REREAD=1)",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -8137,7 +8186,8 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed)
                 );
                 let [
                     views,

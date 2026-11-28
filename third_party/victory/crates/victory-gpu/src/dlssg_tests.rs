@@ -106,6 +106,83 @@ fn constants_from_the_camera() {
     assert!((c.camera_fov - d.fov_y).abs() < 1e-6);
 }
 
+/// Without `VICTORY_UPSCALER=7` (no upscale dispatch), the camera's velocity
+/// pass gives the constants: its mv scale (UV per pixel) and jitter, and its
+/// reversed depth read as inverted.
+#[test]
+fn constants_without_an_upscale_come_from_the_camera() {
+    let mut cam = still_camera();
+    cam.mv_scale = [1.0 / RENDER[0] as f32, 1.0 / RENDER[1] as f32];
+    cam.jitter_px = [0.125, -0.25];
+    assert!(constants(Some(&cam), None).is_err(), "nothing tagged: paused");
+    let up = from_camera(&cam, RENDER).expect("upscale values from the camera");
+    assert_eq!(up.render, RENDER);
+    assert!(up.near > up.far, "reversed depth");
+    let c = constants(Some(&cam), Some(&up)).expect("constants");
+    assert_eq!(c.mvec_scale, cam.mv_scale);
+    assert_eq!(c.jitter_offset, [0.125, -0.25]);
+    assert_eq!(c.depth_inverted, sl::TRUE);
+    assert!(c.camera_near > 0.0 && c.camera_near < c.camera_far);
+    // A camera without matrices gives nothing.
+    assert!(from_camera(&FrameCamera::default(), RENDER).is_none());
+}
+
+/// Camera r3 on Series X (no upscale hook): `PS_VelocityFill` noted motion
+/// (RT0, R16G16_FLOAT) and depth (DSV, R32G8X24_TYPELESS) at 2560x1440, the
+/// frame record's scales come from that motion size (`camera::finish`), and
+/// the first Scaleform draw after `PS_TAA2_SpatialUpscale` tagged them at the
+/// motion texture's size. The present's constants are this camera's, with
+/// motion vectors in UV per pixel of that size.
+#[test]
+fn a_series_x_velocity_fill_frame_gives_constants_end_to_end() {
+    const SERIES_X: [u32; 2] = [2560, 1440];
+    let mut cam = still_camera();
+    let d = cam.camera.unwrap();
+    cam.motion = Some(crate::camera::Surface {
+        title: 0x2c0c_6f94_ec0,
+        format: DXGI_FORMAT_R16G16_FLOAT.0,
+        size: SERIES_X,
+    });
+    cam.depth = Some(crate::camera::Surface {
+        title: 0x2c0c_6f94_740,
+        format: DXGI_FORMAT_R32G8X24_TYPELESS.0,
+        size: SERIES_X,
+    });
+    (cam.mv_scale, cam.jitter_px) = crate::camera::frame_scales(Some(&d), cam.motion.unwrap().size);
+    let up = frame_upscale(false, Some(SERIES_X), None, Some(&cam)).expect("the camera's values");
+    let c = constants(Some(&cam), Some(&up)).expect("constants");
+    assert_eq!(c.mvec_scale, [1.0 / 2560.0, 1.0 / 1440.0]);
+    assert_eq!(c.jitter_offset, cam.jitter_px);
+    assert_eq!(c.depth_inverted, sl::TRUE);
+    assert!(c.camera_near > 0.0 && c.camera_near < c.camera_far);
+    assert!((c.camera_fov - d.fov_y).abs() < 1e-6);
+    // The record's jitter, in pixels of the tagged size (y down).
+    let want = [d.jitter_ndc[0] * 1280.0, -d.jitter_ndc[1] * 720.0];
+    assert!((cam.jitter_px[0] - want[0]).abs() < 1e-4 && (cam.jitter_px[1] - want[1]).abs() < 1e-4);
+}
+
+/// Which values the present takes: the upscale's when it tagged this frame,
+/// the camera's when only the camera did, none when nothing did (not an
+/// earlier frame's upscale: Streamline would have no tags for this frame).
+#[test]
+fn the_constants_follow_what_tagged_this_frame() {
+    let mut cam = still_camera();
+    cam.mv_scale = [1.0 / RENDER[0] as f32, 1.0 / RENDER[1] as f32];
+    let earlier = upscaled();
+    assert_eq!(frame_upscale(true, None, Some(&earlier), Some(&cam)), Some(earlier));
+    assert_eq!(
+        frame_upscale(true, Some(RENDER), Some(&earlier), Some(&cam)),
+        Some(earlier),
+        "the upscale wins"
+    );
+    let from_cam = frame_upscale(false, Some(RENDER), Some(&earlier), Some(&cam)).unwrap();
+    assert_eq!(from_cam, from_camera(&cam, RENDER).unwrap());
+    assert_eq!(frame_upscale(false, None, Some(&earlier), Some(&cam)), None);
+    assert_eq!(frame_upscale(false, Some(RENDER), None, None), None);
+    let why = constants(Some(&cam), None).unwrap_err();
+    assert!(why.contains("tagged this frame"), "{why}");
+}
+
 #[test]
 fn no_hudless_without_a_copy_of_this_frame() {
     assert!(hudless_for(None).is_none());

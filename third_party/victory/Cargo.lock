@@ -717,6 +717,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

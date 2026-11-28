@@ -186,12 +186,16 @@ fn parse_mb_bytes(val: &str) -> Option<u64> {
         .map(|mb| mb.min(u64::MAX >> 20) << 20)
 }
 
+/// `VICTORY_TEXTURE_CATCHUP=0`: a long queue keeps the plain budget. Live.
+static TEXTURE_CATCHUP: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_TEXTURE_CATCHUP", |v| u64::from(v.is_none_or(|v| v != "0")));
+
+/// Live: each pass takes the budgets as they are when it begins.
 fn early_pass_config() -> EarlyPassConfig {
-    static CFG: std::sync::OnceLock<EarlyPassConfig> = std::sync::OnceLock::new();
-    *CFG.get_or_init(|| {
-        let ms = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
+    use victory_core::settings::live_var;
+    static CFG: victory_core::settings::Derived<EarlyPassConfig> = victory_core::settings::Derived::new(|| {
+        let ms = |value: Option<String>, default: u64| {
+            value
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(default)
         };
@@ -204,20 +208,19 @@ fn early_pass_config() -> EarlyPassConfig {
         // so gameplay frames do not stall on `early_textures`. After initial
         // loading passes (`HEAP_BUFFER_PASSES > 60`), default bake uploads are
         // capped to 250 ms unless `VICTORY_BAKE_TEXTURES_MS` is set explicitly.
-        let bake_ms = std::env::var("VICTORY_BAKE_TEXTURES_MS")
-            .ok()
+        let bake_ms = live_var("VICTORY_BAKE_TEXTURES_MS")
             .and_then(|v| v.trim().parse::<u64>().ok());
         EarlyPassConfig {
-            early_ms: ms("VICTORY_EARLY_TEXTURES_MS", 40),
+            early_ms: ms(live_var("VICTORY_EARLY_TEXTURES_MS"), 40),
             bake_ms,
-            gameplay_ms: ms("VICTORY_GAMEPLAY_TEXTURES_MS", 3),
-            pass_bytes_override: std::env::var("VICTORY_TEXTURE_PASS_MB")
-                .ok()
+            gameplay_ms: ms(live_var("VICTORY_GAMEPLAY_TEXTURES_MS"), 3),
+            pass_bytes_override: live_var("VICTORY_TEXTURE_PASS_MB")
                 .as_deref()
                 .and_then(parse_mb_bytes),
-            loading_drain: std::env::var_os("VICTORY_LOADING_DRAIN").is_none_or(|v| v != "0"),
+            loading_drain: live_var("VICTORY_LOADING_DRAIN").is_none_or(|v| v != "0"),
         }
-    })
+    });
+    CFG.get()
 }
 
 /// Computes the `(ms, bytes, now)` `PASS_BUDGET` for `State::early_textures`.
@@ -711,6 +714,7 @@ impl RootBindings {
 impl State {
     fn commit_pending_shows(&mut self) {
         for (heap, index, handle, key) in self.pending_shows.drain(..) {
+            crate::bake_publish::released(heap, index);
             crate::descriptor::host::commit_show(heap, index, handle, key);
         }
     }
@@ -882,6 +886,20 @@ pub(crate) fn forget_heap_ranges(id: u64) {
         .as_mut()
         .and_then(|heaps| heaps.remove(&id));
     drop(ranges);
+}
+
+#[cfg(test)]
+#[test]
+fn the_texture_budgets_are_live() {
+    use victory_core::settings::check_live;
+    let early = || early_pass_config().early_ms;
+    check_live("VICTORY_EARLY_TEXTURES_MS", "12", early, 40, 12);
+    check_live("VICTORY_GAMEPLAY_TEXTURES_MS", "6", || early_pass_config().gameplay_ms, 3, 6);
+    check_live("VICTORY_BAKE_TEXTURES_MS", "500", || early_pass_config().bake_ms, None, Some(500));
+    check_live("VICTORY_TEXTURE_PASS_MB", "64", || early_pass_config().pass_bytes_override, None, Some(64 << 20));
+    check_live("VICTORY_LOADING_DRAIN", "0", || early_pass_config().loading_drain, true, false);
+    check_live("VICTORY_TEXTURE_LOOK_MS", "500", look_ms, None, Some(500));
+    check_live("VICTORY_TEXTURE_CATCHUP", "0", || TEXTURE_CATCHUP.get_bool(), true, false);
 }
 
 #[cfg(test)]
@@ -1174,6 +1192,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 impl State {
     pub(crate) fn reset(&mut self, new_pipeline: This) {
         for (heap, index, _, _) in self.pending_shows.drain(..) {
+            crate::bake_publish::released(heap, index);
             crate::descriptor::host::requeue_show(heap, index);
         }
         crate::descriptor::release_dynamic_many(&self.dynamic);
@@ -1815,6 +1834,9 @@ impl State {
         if kind == USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_THREAD_LIMIT {
+            return crate::rt_diag::thread_limit();
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1907,6 +1929,10 @@ impl State {
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
+        }
+        // `VICTORY_SKIN_FILL=1`: skin's probe inputs before its first draw of a frame.
+        if crate::skin_fill::on() {
+            self.skin_fill(list, p);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: sync its depth/stencil plane
@@ -2812,11 +2838,23 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
+        if !compute && crate::material_demand::on() {
+            self.material_textures(p);
+        }
         // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
         if p.is_bake && !compute && crate::bake_inputs::on() {
-            return self.bake_draw_textures(list, p);
+            self.bake_draw_textures(list, p);
+        } else {
+            self.early_textures_plain(list, p, compute);
         }
-        self.early_textures_plain(list, p, compute);
+        // `VICTORY_BAKE_PUBLISH=1|2`: its textures held back by `VICTORY_SHOW_AFTER` shown now.
+        if p.is_bake && !compute {
+            let mode = crate::bake_publish::mode();
+            if mode > 0 {
+                self.bake_publish(p, mode);
+            }
+        }
     }
 
     fn early_textures_plain(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
@@ -3136,6 +3174,15 @@ impl State {
             }
             None => 0,
         };
+        // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
+        if !only && crate::material_demand::on() {
+            let wanted = host.texture_slots_pick(&crate::material_demand::take());
+            if !wanted.is_empty() {
+                due.retain(|d| !wanted.iter().any(|w| w.0 == d.0));
+                crate::material_demand::add(crate::material_demand::C::Promoted, wanted.len() as u64);
+                due.splice(pinned..pinned, wanted);
+            }
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -3177,13 +3224,10 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(250)
-        }));
+        static SPAN_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_STAGE_MS", |v| {
+            v.and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+        });
+        let span = std::time::Duration::from_millis(SPAN_MS.get());
         // A long queue (the world's first minutes: over 20,000 slots, which
         // at the usual pace took three and a half minutes with the materials
         // black) gets 512 MB and 1.5 s a pass while the run's allowance for
@@ -3194,9 +3238,7 @@ impl State {
         const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
         const LONG: u64 = 2_000;
-        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP
-            .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let catchup = TEXTURE_CATCHUP.get_bool();
         let plain = span;
         let (per_frame, span) =
             if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
@@ -3215,12 +3257,11 @@ impl State {
         // (`VICTORY_HEAP_TEXTURES_MS` overrides; otherwise 4 ms / 10 ms in
         // steady gameplay and 200 ms during initial world-entry loading passes
         // to eliminate main-thread upload spikes while draining streaming fast).
-        static HEAP_TEXTURES_MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let heap_textures_ms = *HEAP_TEXTURES_MS.get_or_init(|| {
-            std::env::var("VICTORY_HEAP_TEXTURES_MS")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
+        // (Plus one: 0 unset.)
+        static HEAP_TEXTURES_MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_HEAP_TEXTURES_MS", |v| {
+            v.and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |ms| ms.saturating_add(1))
         });
+        let heap_textures_ms = HEAP_TEXTURES_MS.get().checked_sub(1);
         let smooth_budget = std::time::Duration::from_millis(match heap_textures_ms {
             Some(ms) => ms,
             None => {
@@ -3307,11 +3348,15 @@ impl State {
                 break;
             }
             let slot_budget = if is_ready { ready_budget } else { budget };
-            if i >= pinned
-                && (SPENT.load(Ordering::Relaxed) >= bytes_at_most
-                    || ((uploaded_this_pass > 0 || (checked > 0 && checked % 8 == 0))
-                        && began.elapsed() >= slot_budget))
-            {
+            if bake_pass::stops_at(
+                i,
+                pinned,
+                SPENT.load(Ordering::Relaxed) >= bytes_at_most,
+                uploaded_this_pass,
+                checked,
+                slot_budget,
+                || began.elapsed(),
+            ) {
                 break;
             }
             checked += 1;
@@ -3342,8 +3387,11 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: what the slot showed is let go. (`VICTORY_BAKE_KEEP_GONE=1`:
+                    // not a bake draw's own input, which would read the null view.)
+                    if !crate::bake_publish::keeps_gone(i < pinned) {
+                        host.texture_slot_gone(index);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -3538,8 +3586,7 @@ impl State {
                 return;
             }
             if let Some(key) = deferred_key {
-                self.pending_shows
-                    .push((std::ptr::from_ref(heap) as usize, index, handle, key));
+                self.hold_show(std::ptr::from_ref(heap) as usize, index, handle, key);
             }
             if let Some(recheck) = previous {
                 let live = host.texture_slot_done(index, write, None);
@@ -3599,6 +3646,9 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             uploads += 1;
             let live = host.texture_slot_done(index, write, again);
+            if live {
+                crate::descriptor::host::live_watch::uploaded(index, resource);
+            }
             // Whole and uploaded: looked at again (`texture_slots_rechecked`).
             let recheck = memory.map(|(at, len)| {
                 (
@@ -3684,6 +3734,10 @@ impl State {
         if role == Role::Miss {
             return self.ambient_miss(list, p);
         }
+        // `crate::ambient_reflect`'s holds (`reflect_views`).
+        if role.holds_image() {
+            return self.ambient_hold(list, p, role);
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3724,6 +3778,8 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Miss => crate::ambient::MISS_LIGHT,
+            Role::Reflect => crate::ambient_reflect::REFLECTIONS[0],
+            Role::Knee => crate::ambient_reflect::KNEE_IMAGE,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             once!(
@@ -3750,7 +3806,7 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air | Role::Miss => None,
+            Role::Radiance | Role::Air | Role::Miss | Role::Reflect | Role::Knee => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
@@ -3777,6 +3833,12 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// `DispatchX`: its dimensions may be thread counts (`crate::rt_diag`).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let ([x, y, z], limit) = crate::rt_diag::dispatch_x(self.pipeline as This, [x, y, z], flags);
+        crate::rt_diag::with_thread_limit(limit, || self.dispatch(list, x, y, z));
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
@@ -3808,6 +3870,7 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -3819,6 +3882,9 @@ impl State {
                 self.list_dropped_roots([x, y, z]);
             }
             return;
+        }
+        if crate::rt_diag::on() && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::rt_diag::builder(true);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -3879,6 +3945,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
+            && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -5107,12 +5174,16 @@ impl State {
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
-        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too.
+        // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
+        // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
             && kind == 2
-            && crate::ambient::specular().is_some()
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && match role {
+                crate::ambient::Role::Miss => crate::ambient::specular().is_some() || crate::ambient_sky::sky_bound().is_some(),
+                role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
+            }
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
@@ -5216,6 +5287,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::rt_diag::builder(false);
             crate::drop_why::set("ray-tracing structure builder off");
             return false;
         }
@@ -5404,9 +5476,23 @@ impl State {
         }
         // (El1xr) `VICTORY_SPLIT_RAW=1`: and a dispatch split into parts, in one piece.
         let split_raw = split && crate::indirect::split_raw();
+        let raw = raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split;
+        // (El1xr) `VICTORY_RAW_CHECK`: a raw record is read first (`crate::indirect::raw_check`).
+        let checked = if raw && !after_writer && !split_raw {
+            crate::indirect::raw_check::check(list, (kind, stride, max), arguments, count, || {
+                crate::pipeline::shaders_of(self.pipeline as This)
+            })
+        } else {
+            crate::indirect::raw_check::Check::Run
+        };
+        if checked == crate::indirect::raw_check::Check::Drop {
+            crate::drop_why::set("raw record over the limits (VICTORY_RAW_CHECK)");
+            why("raw record over the limits (VICTORY_RAW_CHECK)");
+            return false;
+        }
         if after_writer
             || split_raw
-            || (raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split)
+            || (raw && checked == crate::indirect::raw_check::Check::Run)
         {
             self.window = None;
             args.refresh(list, arguments, len);
@@ -5441,6 +5527,19 @@ impl State {
             });
             if kind == MESH {
                 self.mesh_scissor(list, true);
+            }
+            // (El1xr) `VICTORY_RAW_ARGS_WATCH`: what the card reads, for the hang watch
+            // (not a record our pass made safe: its buffer is in the argument state).
+            if !after_writer {
+                crate::raw_watch::note(
+                    list,
+                    (kind, stride, max),
+                    (&args.buffer, args.offset(arguments)),
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+                    arguments,
+                    if split_raw { "split" } else { "raw" },
+                    || crate::pipeline::shaders_of(self.pipeline as This),
+                );
             }
             // SAFETY: an open list with everything set; the list keeps the host copies
             // alive, and the signature is cached.
@@ -5793,7 +5892,12 @@ mod indirect_signature_tests;
 
 mod miss_views;
 
+mod reflect_views;
+
 mod bake_pass;
+mod bake_publish;
+mod material_pass;
+mod skin_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
@@ -5928,6 +6032,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         crate::bake_watch::view(address as u64, len as u64, kind == ResourceType::Uav);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
+            crate::descriptor::host::live_watch::uav_wrote(address as u64, len as u64);
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
@@ -6294,21 +6399,20 @@ mod root_binding_tests {
 /// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
 /// four seconds counted in passes, as before). The looks back off 1, 2, 4,
 /// ... frames up to it.
+/// Live; logged when it changes.
 fn look_ms() -> Option<u64> {
-    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|&ms| ms > 0)?;
+    static MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_LOOK_MS", |v| {
+        v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    });
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let ms = MS.get();
+    if ms != 0 && LOGGED.swap(ms, Ordering::Relaxed) != ms {
         tracing::info!(
             ms,
             "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)"
         );
-        Some(ms)
-    })
+    }
+    (ms > 0).then_some(ms)
 }
 
 /// The milliseconds of a frame lately (a mean over the last frames), from

@@ -66,12 +66,24 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
+    #[cfg(windows)]
+    skin: OnceLock<bool>,
 }
 
 impl Shader {
-    /// The program name in its container (`PS_VelocityFill_...`), if any.
-    pub(crate) fn program(&self) -> Option<&str> {
-        program_name(&self.container)
+    /// The program as the camera tap names it: the container's `_Wrapped`
+    /// identifier (a graphics container names `SV_Position` first), else
+    /// known by hash (`crate::camera_diag`).
+    #[cfg(windows)]
+    pub(crate) fn camera_name(&self) -> String {
+        crate::camera_diag::program_name(&self.container, &self.hash)
+    }
+
+    /// Whether it is a skin lighting pixel stage (`crate::skin_fill`).
+    #[cfg(windows)]
+    pub(crate) fn skin(&self) -> bool {
+        *self.skin.get_or_init(|| self.stage == "pixel" && crate::skin_fill::skin_program(&self.container))
     }
 }
 
@@ -171,6 +183,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     .flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                skin: OnceLock::new(),
             })
         })
         .clone()
@@ -192,6 +206,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
             .then(|| crate::ambient::role(container))
             .flatten(),
         translated: OnceLock::new(),
+        skin: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)
@@ -692,6 +707,27 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
         && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// A compute pipeline's shader hash (cheap) and, when `group`, its
+/// thread-group size (parses the container).
+#[cfg(windows)]
+pub(crate) fn compute_group(this: This, group: bool) -> Option<(String, Option<[u32; 3]>)> {
+    use victory_shader::{Container, FourCC, native::StageIo};
+    if this.is_null() {
+        return None;
+    }
+    let shader = pipeline(this).shaders.iter().find(|s| s.stage == "compute")?;
+    if !group {
+        return Some((shader.hash.clone(), None));
+    }
+    let c = Container::parse(&shader.container).ok()?;
+    let part = c.part(FourCC::DXIL).or_else(|| c.part(FourCC::ACCC))?;
+    let programs = victory_shader::native_programs(part.data).ok()?;
+    programs.iter().find_map(|p| match &p.io {
+        StageIo::Cs(cs) => Some((shader.hash.clone(), Some(cs.threads))),
+        _ => None,
+    })
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -715,8 +751,7 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -725,6 +760,13 @@ pub(crate) fn builder_runs() -> bool {
     }
     if b.whole {
         return true;
+    }
+    // All of them to the workers first, so the ones not made yet are made
+    // side by side; this thread then makes or waits for each in turn.
+    if builder_early() {
+        for p in &b.pipelines {
+            make::soon(p, true);
+        }
     }
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
@@ -742,6 +784,42 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
+}
+
+/// `VICTORY_BVH_BUILDER=1`: the structure builder may run.
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_BVH_BUILDER_EARLY=1` (off by default; only with
+/// `VICTORY_BVH_BUILDER=1`): the builder's pipelines are queued for the
+/// workers when the title creates them, and all at once when its first
+/// dispatch wants them, not made one after another on that dispatch's
+/// thread. Made in a row there, the 53 took 8 s with a warm driver cache and
+/// over 30 s with a cold one in DexNom/VIctory #121's runs, while the title's
+/// main thread waited for the frame: its watchdog ended the run (a store to
+/// address 0), with 40 of the 53 made by then.
+#[cfg(windows)]
+fn builder_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_builder_early(std::env::var("VICTORY_BVH_BUILDER_EARLY").ok().as_deref()))
+}
+
+#[cfg(windows)]
+fn parse_builder_early(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn builder_early_is_off_unless_asked() {
+    assert!(!parse_builder_early(None));
+    assert!(!parse_builder_early(Some("0")));
+    assert!(!parse_builder_early(Some("")));
+    assert!(parse_builder_early(Some("1")));
+    assert!(parse_builder_early(Some(" 1 ")));
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -1082,6 +1160,10 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        if builder_allowed() && builder_early() {
+            make::soon(&host, false);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

@@ -87,6 +87,7 @@ mod bitcode;
 mod container;
 pub mod glass_record;
 mod glass_splice;
+mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
@@ -101,8 +102,10 @@ mod loops_wave;
 mod lower;
 pub mod meet;
 mod mesh_launch;
+mod miss_sky;
 pub mod nvidia;
 mod own_bits;
+mod quad_helpers;
 mod ray_query;
 #[cfg(all(test, windows))]
 mod ray_query_warp_tests;
@@ -121,6 +124,7 @@ mod wave32_nvidia_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -131,13 +135,17 @@ pub use link::{link_mesh, mesh_fits};
 pub use mesh_launch::{LAUNCH_SPACE, mesh_payload_bytes};
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, native_glass};
+pub use miss_sky::miss_sky_key;
+pub use hit_only::with_rays_missed;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
+    USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_view_heap_limit, view_heap_limit,
 };
+pub use lower::thread_limit::on as dispatchx_mask;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -358,12 +366,12 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_retried(container) {
+    miss_sky::with_container(container, || match translate_retried(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
             structure::without_live_quads(|| translate_retried(container))
         }
         other => other,
-    }
+    })
 }
 
 fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -375,6 +383,18 @@ fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs from the
+/// program as the title has it: on a host of 32-lane waves, with `VICTORY_WATER_TILE_SLOTS=1`,
+/// the water light's tile lists take a slot a lane ([`water_tile_slots`]). [`translate`] does
+/// this itself; a caller that parses the container and calls [`emit`] calls this first.
+/// Returns whether the program changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     // (`ACCC`, native code another compiler made, only with `VICTORY_WAVE32_NVIDIA=1`)
@@ -382,7 +402,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .part(FourCC::DXIL)
         .or_else(|| c.part(FourCC::ACCC).filter(|_| nvidia::enabled()))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -394,6 +414,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -639,6 +660,21 @@ fn is_scene_kernel(io: &crate::native::StageIo, digest: [u8; 16]) -> bool {
         )
 }
 
+/// `VICTORY_WAVE_LOOP_SKIPS=1` ([`crate::loop_skips`]): the form the wave-wide branches try
+/// first, every skip left out but those around loops that go round on a scalar test (the
+/// program itself where those are the only skips the deep form leaves out); `None` when off.
+fn loop_skips_kept<F>(
+    p: &ir::Program,
+    deep: bool,
+    form: &impl Fn(Option<ir::Program>) -> Option<F>,
+) -> Option<F> {
+    if !crate::loop_skips::on() || std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let kept = crate::loop_skips::with_kept(|| ir::without_skips(p, true));
+    form(kept.or_else(|| deep.then(|| p.clone())))
+}
+
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
 /// host; where an approximate form translates the program, the paired form instead if it
 /// does.
@@ -819,7 +855,9 @@ fn emit_forms(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    let kept = if wide_on && !defrag { loop_skips_kept(p, deep.is_some(), &form) } else { None };
+                    let before = bases.into_iter().flatten().next();
+                    for base in [kept.as_ref().map(|f| &f.0), before].into_iter().flatten() {
                         let again = if defrag {
                             lower::with_half_meets(|| widen(c, native, base, why, false))
                         } else {
@@ -914,7 +952,9 @@ fn emit_forms(
                 forms[0].1.as_ref().map(|f| &f.0),
                 Some(p),
             ];
-            if let Some(base) = bases.into_iter().flatten().next() {
+            let kept = loop_skips_kept(p, deep.is_some(), &form);
+            let before = bases.into_iter().flatten().next();
+            for base in [kept.as_ref().map(|f| &f.0), before].into_iter().flatten() {
                 let again = widen(c, native, base, why, false);
                 report("wave-wide branches (last)", &again);
                 if done(&again) {
@@ -2990,6 +3030,35 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A derivative taken by hand (`quad_perm:[1,0,3,2]`, the neighbour across x) reads its
+    /// neighbour through quad reads with `VICTORY_QUAD_HELPERS=1` (a helper lane at a
+    /// triangle's edge is in the quad, not in the wave's reads); off, the translation is
+    /// byte-identical to before, and a program without quad reads is the same either way.
+    #[test]
+    fn a_pixel_quad_permutation_reads_helpers_only_with_the_switch() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_02FA, // v_mov_b32 v3, v2 quad_perm:[1,0,3,2] bound_ctrl:1
+            0xFF08_B102,
+            v_add_f32(2, 2, 3),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let off = quad_helpers::with(false, || pixel(&words, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&words, PERSP_CENTER)).unwrap();
+        assert_ne!(on.dxil, off.dxil);
+        assert_eq!(off.dxil, pixel(&words, PERSP_CENTER).unwrap().dxil);
+        validate(&off);
+        validate(&on);
+        let plain = [0xC808_0000, 0xC809_0001, e0, e1, S_ENDPGM];
+        let off = quad_helpers::with(false, || pixel(&plain, PERSP_CENTER)).unwrap();
+        let on = quad_helpers::with(true, || pixel(&plain, PERSP_CENTER)).unwrap();
+        assert_eq!(on.dxil, off.dxil);
     }
 
     /// A pixel program with TEXCOORD0..2 in rows 0..2 that reads only attribute 2's z

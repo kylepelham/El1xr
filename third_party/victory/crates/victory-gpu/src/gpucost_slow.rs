@@ -10,7 +10,6 @@
 //! label (at `VICTORY_GPU_COST=2` the title command's kind and shader
 //! hashes). Every line starts with `gpu cost slow run:`.
 
-use std::sync::OnceLock;
 
 /// Stretches named per slow run.
 const TOP: usize = 8;
@@ -18,10 +17,16 @@ const TOP: usize = 8;
 /// `VICTORY_GPU_COST_SLOW_MS`: the run length past which a run is said, in
 /// ticks of a card whose timestamps tick `frequency` times a second.
 pub(crate) fn threshold(frequency: u64) -> Option<u64> {
-    static MS: OnceLock<Option<f64>> = OnceLock::new();
-    let ms =
-        (*MS.get_or_init(|| parse(std::env::var("VICTORY_GPU_COST_SLOW_MS").ok().as_deref())))?;
+    let ms = slow_ms()?;
     Some((ms * frequency as f64 / 1e3) as u64)
+}
+
+/// Live (0 bits: unset; a set one is above 0).
+fn slow_ms() -> Option<f64> {
+    static MS: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_GPU_COST_SLOW_MS", |v| parse(v).map_or(0, f64::to_bits));
+    let bits = MS.get();
+    (bits != 0).then(|| f64::from_bits(bits))
 }
 
 fn parse(value: Option<&str>) -> Option<f64> {
@@ -94,6 +99,11 @@ pub(crate) fn note<L: AsRef<str>>(id: u64, labels: &[L], stamps: &[u64], frequen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_threshold_is_live() {
+        victory_core::settings::check_live("VICTORY_GPU_COST_SLOW_MS", "2.5", slow_ms, None, Some(2.5));
+    }
 
     #[test]
     fn reads_the_milliseconds() {

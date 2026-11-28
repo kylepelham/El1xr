@@ -1,5 +1,6 @@
 //! GPU-side telemetry buffer for `CS_DefragHeap_ComputeRelocations` half-meets
-//! (`SLOT_MEET`): three dwords tracking meetings, wait iterations, and wait atomics.
+//! (`SLOT_MEET`): three dwords tracking meetings, wait iterations, and wait atomics,
+//! and with `VICTORY_MEET_POLLS` a fourth: the waits that gave up at the poll cap.
 
 use std::sync::Mutex;
 
@@ -18,7 +19,24 @@ struct DefragCounter {
     va: u64,
     /// The zeroing copy has been recorded on some list.
     armed: bool,
+    /// The periodic read ([`log_capped`]) saw `armed` already: the list that zeroes the
+    /// buffer has been submitted, so a read list may take it out of UAV state.
+    armed_seen: bool,
 }
+
+/// The periodic read of the give-up dword with `VICTORY_MEET_POLLS`: its own list and fence,
+/// never waited on; the next [`log_capped`] takes the value once the card has done it.
+struct CapRead {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    /// The fence value of the read in flight; 0 before the first.
+    sent: u64,
+    /// The give-ups said so far.
+    said: u32,
+}
+
+static CAP_READ: Mutex<Option<CapRead>> = Mutex::new(None);
 
 static DEFRAG_COUNTER: Mutex<Option<DefragCounter>> = Mutex::new(None);
 
@@ -100,6 +118,7 @@ pub(crate) fn bind_defrag_counter(list: &ID3D12GraphicsCommandList) -> Option<u6
             readback,
             va,
             armed: false,
+            armed_seen: false,
         });
     }
     let counter = slot.as_mut()?;
@@ -133,6 +152,112 @@ pub(crate) fn log_progress() {
             "CS_DefragHeap_ComputeRelocations since start"
         );
     }
+    if meet_cap_on() {
+        if let Some(host) = host() {
+            log_capped(host);
+        }
+    }
+}
+
+/// `VICTORY_MEET_POLLS` is set (the translator caps the half-meet wait and counts give-ups).
+fn meet_cap_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_MEET_POLLS").is_ok_and(|v| v.trim().parse::<u32>().is_ok_and(|n| n > 0))
+    })
+}
+
+/// The line for give-ups seen since the last one, or None when there are none new.
+fn capped_line(meetings: u32, capped: u32, said: u32) -> Option<String> {
+    (capped > said).then(|| {
+        format!(
+            "half meet: {} waits gave up at the VICTORY_MEET_POLLS cap ({capped} since start, \
+             {meetings} meetings): a partner half never came, its values may be wrong",
+            capped - said
+        )
+    })
+}
+
+/// Takes the value of the last read if the card has done it and says new give-ups, then
+/// sends the next read. Never waits on the card.
+fn log_capped(host: &Host) {
+    let mut counter_slot = DEFRAG_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(counter) = counter_slot.as_mut() else {
+        return;
+    };
+    if !counter.armed_seen {
+        counter.armed_seen = counter.armed;
+        return;
+    }
+    let mut slot = CAP_READ.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: objects this process owns; the allocator and readback are touched only once
+    // the fence says the card finished the read that used them.
+    unsafe {
+        if slot.is_none() {
+            let Ok(allocator) = host
+                .device
+                .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            else {
+                return;
+            };
+            let Ok(list) = host.device.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            ) else {
+                return;
+            };
+            let _ = list.Close();
+            let Ok(fence) = host.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else {
+                return;
+            };
+            *slot = Some(CapRead { allocator, list, fence, sent: 0, said: 0 });
+        }
+        let Some(read) = slot.as_mut() else {
+            return;
+        };
+        if read.sent > 0 {
+            if read.fence.GetCompletedValue() < read.sent {
+                return;
+            }
+            let mut data = std::ptr::null_mut();
+            if counter.readback.Map(0, None, Some(&mut data)).is_ok() {
+                let words = std::slice::from_raw_parts(data as *const u32, 4);
+                let (meetings, capped) = (words[0], words[3]);
+                counter.readback.Unmap(0, None);
+                if let Some(line) = capped_line(meetings, capped, read.said) {
+                    tracing::warn!("{line}");
+                    read.said = capped;
+                }
+            }
+        }
+        if read.allocator.Reset().is_err() || read.list.Reset(&read.allocator, None).is_err() {
+            return;
+        }
+        read.list.ResourceBarrier(&[transition(
+            &counter.gpu,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        read.list.CopyBufferRegion(&counter.readback, 0, &counter.gpu, 0, 16);
+        read.list.ResourceBarrier(&[transition(
+            &counter.gpu,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+        if read.list.Close().is_err() {
+            return;
+        }
+        let Ok(list) = read.list.cast::<ID3D12CommandList>() else {
+            return;
+        };
+        host.queue.ExecuteCommandLists(&[Some(list)]);
+        let next = read.sent + 1;
+        if host.queue.Signal(&read.fence, next).is_ok() {
+            read.sent = next;
+        }
+    }
 }
 
 /// Reads the face-relocation counters after the queue has finished what it
@@ -154,7 +279,7 @@ pub fn log_defrag_counters() {
         return;
     };
     let read = read_defrag_counters(host);
-    let (meetings, polls, atomics) = read.unwrap_or((0, 0, 0));
+    let (meetings, polls, atomics, capped) = read.unwrap_or((0, 0, 0, 0));
     let per_group = if groups == 0 {
         0.0
     } else {
@@ -175,17 +300,18 @@ pub fn log_defrag_counters() {
         meetings,
         wait_iterations = polls,
         wait_atomics = atomics,
+        waits_capped = capped,
         meetings_per_group = format!("{per_group:.2}"),
         iterations_per_meeting = format!("{per_meet:.2}"),
         "CS_DefragHeap_ComputeRelocations counters"
     );
 }
 
-fn read_defrag_counters(host: &Host) -> Option<(u64, u64, u64)> {
+fn read_defrag_counters(host: &Host) -> Option<(u64, u64, u64, u64)> {
     let slot = DEFRAG_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
     let counter = slot.as_ref()?;
     if !counter.armed {
-        return Some((0, 0, 0));
+        return Some((0, 0, 0, 0));
     }
     // SAFETY: objects this process owns. The fence waits for the copy.
     unsafe {
@@ -216,8 +342,26 @@ fn read_defrag_counters(host: &Host) -> Option<(u64, u64, u64)> {
         let mut data = std::ptr::null_mut();
         counter.readback.Map(0, None, Some(&mut data)).ok()?;
         let words = std::slice::from_raw_parts(data as *const u32, 4);
-        let out = (u64::from(words[0]), u64::from(words[1]), u64::from(words[2]));
+        let out = (
+            u64::from(words[0]),
+            u64::from(words[1]),
+            u64::from(words[2]),
+            u64::from(words[3]),
+        );
         counter.readback.Unmap(0, None);
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capped_line;
+
+    #[test]
+    fn capped_line_says_only_new_give_ups() {
+        assert_eq!(capped_line(10, 0, 0), None);
+        assert_eq!(capped_line(10, 3, 3), None);
+        let line = capped_line(40, 5, 3).unwrap();
+        assert!(line.starts_with("half meet: 2 waits gave up at the VICTORY_MEET_POLLS cap (5 since start, 40 meetings)"), "{line}");
     }
 }

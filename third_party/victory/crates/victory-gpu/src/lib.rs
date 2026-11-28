@@ -41,19 +41,29 @@ mod buffer_ahead;
 mod ambient;
 #[cfg(windows)]
 mod ambient_miss;
+#[cfg(windows)]
+mod ambient_reflect;
+#[cfg(windows)]
+mod ambient_sky;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bake_ahead;
 mod boot_prof;
 #[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]
+mod bake_publish;
+#[cfg(windows)]
 mod bake_watch;
+#[cfg(windows)]
+mod bake_why;
 #[cfg(windows)]
 mod draw;
 #[cfg(windows)]
 mod dred;
 #[cfg(windows)]
 mod hang_watch;
+#[cfg(windows)]
+mod raw_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
 pub mod dxgi;
@@ -127,6 +137,10 @@ pub mod list;
 pub mod native_rt;
 #[cfg(windows)]
 mod rt_bind;
+#[cfg(windows)]
+mod rt_diag;
+#[cfg(windows)]
+mod rt_hit_only;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -155,6 +169,7 @@ mod ngx;
 pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
+pub mod camera_diag;
 #[cfg(windows)]
 pub mod camera_copy;
 #[cfg(windows)]
@@ -164,7 +179,15 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod wave_more;
+#[cfg(windows)]
+mod material_demand;
+#[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+pub mod bvh_premap;
+#[cfg(windows)]
+mod skin_fill;
 #[cfg(windows)]
 mod ramline;
 #[cfg(windows)]
@@ -178,7 +201,15 @@ mod refresh_prof;
 #[cfg(windows)]
 mod stale_batch;
 #[cfg(windows)]
+mod sweep_every;
+#[cfg(windows)]
 mod card_prof;
+#[cfg(windows)]
+mod compare_apart;
+#[cfg(windows)]
+mod fresh_open;
+#[cfg(windows)]
+mod scratch_landing;
 #[cfg(windows)]
 mod submit_chunk;
 #[cfg(windows)]

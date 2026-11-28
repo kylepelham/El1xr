@@ -174,8 +174,8 @@ fn cpu_now() -> Cpu {
 
 /// Whether every frame's phases are written (`VICTORY_FRAME_PHASES=1`).
 fn every_frame() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_PHASES").is_some_and(|v| v == "1"))
+    static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_FRAME_PHASES");
+    ON.get_bool()
 }
 
 fn credit(phase: Phase, micros: u64, call: bool) {
@@ -189,13 +189,10 @@ fn credit(phase: Phase, micros: u64, call: bool) {
 
 /// The threshold in milliseconds (`VICTORY_HITCH_MS`, default 100; 0: off).
 pub(crate) fn threshold_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        std::env::var("VICTORY_HITCH_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(100)
-    })
+    static MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_HITCH_MS", |v| {
+        v.and_then(|v| v.trim().parse().ok()).unwrap_or(100)
+    });
+    MS.get()
 }
 
 /// An open phase; its time is counted when it is dropped.
@@ -386,7 +383,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_switches_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_HITCH_MS", "50", threshold_ms, 100, 50);
+        check_live("VICTORY_FRAME_PHASES", "1", every_frame, false, true);
+    }
+
+    #[test]
     fn nested_spans_leave_out_their_inner_time() {
+        let started = std::time::Instant::now();
         let outer = span(Phase::Submit);
         std::thread::sleep(std::time::Duration::from_millis(20));
         {
@@ -394,11 +399,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
         drop(outer);
+        let elapsed = started.elapsed().as_micros() as u64;
         let bank = bank();
         let submit = MICROS[bank][Phase::Submit as usize].swap(0, Ordering::Relaxed);
         let heap = MICROS[bank][Phase::HeapBuffers as usize].swap(0, Ordering::Relaxed);
         assert!(heap >= 40_000, "{heap}");
-        assert!((20_000..40_000).contains(&submit), "{submit}");
+        // The outer span leaves out the inner one: what is left is the outer sleep, however long a
+        // loaded machine made either sleep.
+        assert!(submit >= 20_000 && submit + heap <= elapsed + 1_000, "{submit} + {heap} vs {elapsed}");
         assert_eq!(
             CALLS[bank][Phase::Submit as usize].swap(0, Ordering::Relaxed),
             1

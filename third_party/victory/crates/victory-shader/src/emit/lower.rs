@@ -58,6 +58,7 @@ mod uniform_lane;
 /// The stricter first-lane value proof (`VICTORY_UNIFORM_STRICT_ALL=1`).
 #[path = "uniform_all.rs"]
 mod uniform_all;
+pub use uniform_all::with_strict as with_uniform_strict;
 
 /// RDNA2 LDS bounds-check, narrow-wave barrier policy, and quadmask helpers.
 #[path = "lds_bounds.rs"]
@@ -129,6 +130,9 @@ mod code_table;
 /// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
 #[path = "isa_fixes.rs"]
 pub(super) mod isa_fixes;
+/// The lanes past a `DispatchX` thread count store nothing (`VICTORY_DISPATCHX_MASK=1`).
+#[path = "thread_limit.rs"]
+pub(super) mod thread_limit;
 
 type Why = &'static str;
 
@@ -465,6 +469,9 @@ struct Lower<'a> {
     /// console lane the host lane plus 32).
     twin: Option<Box<LaneState>>,
     upper: bool,
+    /// Per console lane of the thread (lower, upper): whether it is below the
+    /// dispatch's thread count ([`thread_limit`]).
+    thread_live: Option<[V; 2]>,
     /// The paired form: whether the last LDS access of the IR block being lowered wrote (none
     /// at its start), for the fences between accesses ([`Self::paired_inst`]).
     lds_last: Option<bool>,
@@ -1442,6 +1449,7 @@ impl<'a> Lower<'a> {
             meet,
             twin: paired.then(Box::default),
             upper: false,
+            thread_live: None,
             lds_last: None,
             lane_scalars: if paired {
                 lane_scalars(p, x.res)
@@ -2273,6 +2281,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.thread_limit_init();
         // Title memory written by address has no rasterizer-ordered form.
         let by_address = |&&(site, a): &&(Site, Address)| {
             let name = self.x.p.blocks[site.0].insts[site.1].name();
@@ -3130,6 +3139,7 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
         let name = inst.name();
+        let guard = self.thread_limit_guard(name, guard);
         let count = |rest: &str| match rest {
             "dword" => Ok(1u8),
             "dwordx2" => Ok(2),
@@ -4895,6 +4905,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad reads in a pixel
+    /// program (`VICTORY_QUAD_HELPERS=1`; Belobug, via VItoriaBr 2b3c339ef1). At a
+    /// triangle's edge the quad's other pixels are helpers (and so are discarded ones), which
+    /// only quad reads see: wave reads leave them out, so a derivative taken by hand
+    /// (`quad_perm`) was the whole value there, the texture read that used it took its
+    /// smallest level, and the triangles' edges showed as lines on car paint, glass and skin.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel && super::quad_helpers::on()
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -5049,7 +5069,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)

@@ -26,11 +26,16 @@ use crate::object::This;
 pub(crate) mod alias_skip;
 pub(crate) mod blind_hash;
 mod gpu_detile;
+mod inside_copy;
+#[cfg(all(test, windows))]
+mod inside_copy_tests;
 pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+mod short_remap;
 mod stage_unlocked;
+pub(crate) mod staged_ask;
 mod stale_audit;
 pub(crate) mod take_by_table;
 
@@ -132,6 +137,16 @@ struct Through {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// For a view placed inside the written texture (`inside_copy`): the
+    /// written texture's subresource for each part; `None`: the part's own.
+    from_parts: Option<Arc<[u32]>>,
+}
+
+impl Through {
+    /// The written texture's subresource that part `index` is copied from.
+    fn from(&self, index: usize) -> usize {
+        self.from_parts.as_ref().map_or(index, |p| p[index] as usize)
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -199,7 +214,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
-    let through = {
+    let inside = crate::resource::placed_inside::inside_parts(placed, source);
+    let through = if let Some(parts) = &inside {
+        let Some(through) = inside_copy::through(host, placed, source, from, to, parts) else {
+            return false;
+        };
+        through
+    } else {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
         match map.get(&(placed as usize)) {
@@ -286,6 +307,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let through = Arc::new(Through {
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    from_parts: None,
                 });
                 map.insert(placed as usize, through.clone());
                 through
@@ -335,8 +357,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     let Some(buffer) = &through.buffer else {
-        alias_skip::under(&list.list, predicate.as_ref(), || {
-            reinterpret::record(&list.list, from, to, through.parts.len());
+        alias_skip::under(&list.list, predicate.as_ref(), || match &through.from_parts {
+            Some(parts) => inside_copy::record_direct(&list.list, from, to, parts),
+            None => reinterpret::record(&list.list, from, to, through.parts.len()),
         });
         return restore(list, source, before);
     };
@@ -360,7 +383,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, through.from(index)), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
@@ -778,7 +801,7 @@ pub(crate) fn host_written(resource: This) {
 /// (`VICTORY_BAKE_WATCH`) The texture the host wrote, other than `except`,
 /// whose memory holds part of `[address, address + len)`: its address
 /// and resource.
-fn in_host_written(address: u64, len: u64, except: usize) -> Option<(u64, usize)> {
+pub(crate) fn in_host_written(address: u64, len: u64, except: usize) -> Option<(u64, usize)> {
     let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
     let end = address.saturating_add(len);
     let before = map.range(..=address).next_back();
@@ -1673,7 +1696,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1703,8 +1726,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1724,7 +1746,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1743,7 +1765,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let sample = sampling.then(|| blind_hash::sample(tiled));
         let kept = blind_hash::kept_sample(last.sample, last.hash);
@@ -2077,7 +2099,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         // the slot is due again (`texture_slots_remapped`, `note_buffer`).
         return Some((s.held_bytes() as u64, true));
     }
-    Some((s.size as u64, committed(s.memory, s.size)))
+    Some((s.size as u64, staged_ask::whole(resource, s.memory, s.size, committed)))
 }
 
 /// The first mip a title texture's staging buffer holds; `u32::MAX` without

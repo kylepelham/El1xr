@@ -347,6 +347,13 @@ fn live_value(name: &str) -> Option<String> {
     }
 }
 
+/// What `std::env::var(name).ok()` gives a reader, with a change of a live
+/// setting made while running on top: for the builders of [`Derived`]
+/// values.
+pub fn live_var(name: &str) -> Option<String> {
+    live_value(name)
+}
+
 /// When a change of `name` takes effect: live when its table entry says
 /// so or a hook ([`on_change`]) applies it.
 pub fn apply_of(name: &str) -> Option<Apply> {
@@ -483,7 +490,9 @@ fn write_file(path: &Path, values: &BTreeMap<String, String>) -> std::io::Result
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, render(values))?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// A live setting's parsed value, kept in an atomic: [`Live::get`] costs two
@@ -509,6 +518,12 @@ impl Live {
         }
     }
 
+    /// A switch on only when its value is exactly `1`: what
+    /// `std::env::var_os(name).is_some_and(|v| v == "1")` read.
+    pub const fn flag(name: &'static str) -> Self {
+        Live::new(name, flag_bits)
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -531,6 +546,71 @@ impl Live {
 
     pub fn get_f64(&self) -> f64 {
         f64::from_bits(self.get())
+    }
+}
+
+/// For the tests of a reader made live: `name` is live and a schedule takes
+/// it; `read` (the reader on its hot path) gives `launch` as launched, then
+/// `changed` after `set(name, value)`, then `launch` again once cleared.
+/// Skipped (false) when the environment sets `name`.
+#[doc(hidden)]
+pub fn check_live<T: PartialEq + std::fmt::Debug>(
+    name: &str,
+    value: &str,
+    read: impl Fn() -> T,
+    launch: T,
+    changed: T,
+) -> bool {
+    if std::env::var_os(name).is_some() {
+        return false;
+    }
+    assert_eq!(apply_of(name), Some(Apply::Live), "{name}");
+    let line = format!("at 1s set {name}={value}\n");
+    assert!(schedule::parse(&line).is_ok(), "a schedule refuses {line}");
+    assert_eq!(read(), launch, "{name} as launched");
+    assert_eq!(set(name, value), Ok(Applied::Now), "{name}={value}");
+    assert_eq!(read(), changed, "{name}={value}");
+    assert_eq!(set(name, ""), Ok(Applied::Now));
+    assert_eq!(read(), launch, "{name} cleared");
+    true
+}
+
+fn flag_bits(value: Option<&str>) -> u64 {
+    u64::from(value == Some("1"))
+}
+
+/// A value built from live settings (read through [`live_var`]) that does
+/// not fit a [`Live`] cell's 64 bits: built at its first use and again after
+/// a [`set`] of a live setting. [`Derived::get`] takes a lock, so keep it off
+/// paths run per draw; a [`Live`] cell is lock-free.
+pub struct Derived<T: Copy> {
+    make: fn() -> T,
+    /// The generation the value was built at, plus one (0: never).
+    seen: AtomicU64,
+    value: Mutex<Option<T>>,
+}
+
+impl<T: Copy> Derived<T> {
+    pub const fn new(make: fn() -> T) -> Self {
+        Derived {
+            make,
+            seen: AtomicU64::new(0),
+            value: Mutex::new(None),
+        }
+    }
+
+    pub fn get(&self) -> T {
+        let generation = GENERATION.load(Ordering::Acquire) + 1;
+        let mut value = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        if self.seen.load(Ordering::Relaxed) == generation
+            && let Some(v) = *value
+        {
+            return v;
+        }
+        let made = (self.make)();
+        *value = Some(made);
+        self.seen.store(generation, Ordering::Relaxed);
+        made
     }
 }
 

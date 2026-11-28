@@ -28,6 +28,8 @@ pub struct Upscale {
     pub motion: u64,
     pub exposure: u64,
     pub output: u64,
+    /// The title's reactive mask (0: none).
+    pub reactive: u64,
     pub render: [u32; 2],
     pub jitter: [f32; 2],
     pub motion_scale: [f32; 2],
@@ -45,7 +47,7 @@ pub struct Upscale {
 }
 
 impl Upscale {
-    pub const WORDS: usize = 12;
+    pub const WORDS: usize = 13;
 
     pub fn to_words(self) -> [u64; Self::WORDS] {
         let pair = |a: f32, b: f32| u64::from(a.to_bits()) | (u64::from(b.to_bits()) << 32);
@@ -62,6 +64,7 @@ impl Upscale {
             pair(self.near, self.far),
             u64::from(self.reset) | (u64::from(self.dlss) << 1),
             pair(self.fov_y, self.metres_per_unit),
+            self.reactive,
         ]
     }
 
@@ -90,6 +93,7 @@ impl Upscale {
             dlss: w[10] & 2 != 0,
             fov_y,
             metres_per_unit,
+            reactive: w[12],
         })
     }
 }
@@ -206,6 +210,7 @@ pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
                 depth: input(up.depth),
                 motion: input(up.motion),
                 exposure: input(up.exposure),
+                reactive: if crate::dlss::reactive() { input(up.reactive) } else { None },
                 output: to,
                 jitter: up.jitter,
                 motion_scale: up.motion_scale,
@@ -286,6 +291,7 @@ mod tests {
             motion: 0x3344_5566_7788_99aa,
             exposure: 0x4455_6677_8899_aabb,
             output: 0x5566_7788_99aa_bbcc,
+            reactive: 0x6677_8899_aabb_ccdd,
             render: [2560, 1440],
             jitter: [-0.25, 0.375],
             motion_scale: [-2560.0, 1440.0],

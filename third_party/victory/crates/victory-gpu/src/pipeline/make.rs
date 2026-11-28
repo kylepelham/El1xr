@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+mod compute_wait;
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -69,6 +71,8 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
+    } else if water_light_out(shaders) {
+        Some("the water's tiled light (VICTORY_WATER_LIGHT=0), left out")
     } else {
         None
     }
@@ -91,6 +95,30 @@ fn named_out(shaders: &[Arc<Shader>]) -> bool {
             .collect()
     });
     !hashes.is_empty() && shaders.iter().any(|s| hashes.contains(&s.hash))
+}
+
+/// The light in the water's volume, in tiles (`CS_TransmissionVolumetrics_Tiled` and
+/// `_Tiled_LocalLights`): one 64-lane wave a group, run on a host of 32-lane waves in the
+/// wave-wide form (`WAVE_WIDE_DEFAULT` in `shader_cache.rs`), which left whole tiles of
+/// open water dark around boats, shores and bridges and took about 15 ms of the card a frame
+/// (RTX 5070, 25 fps with them, 30 without). After trustno1-coder/VIctory-NVIDIA 35c156087e,
+/// which leaves them out by default there; here only with `VICTORY_WATER_LIGHT=0` (unset or 1:
+/// made as before). Left out, the water has no light of its own depth (darker, bluer).
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_out(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| std::env::var("VICTORY_WATER_LIGHT").is_ok_and(|v| v.trim() == "0"));
+    let named = out && water_light_named(shaders.iter().map(|s| s.hash.as_str()));
+    if named {
+        tracing::info!(shaders = ?shaders, "the water's tiled light left out (VICTORY_WATER_LIGHT=0)");
+    }
+    named
+}
+
+/// Whether one of these shader hashes is one of [`WATER_LIGHT`].
+fn water_light_named<'a>(mut hashes: impl Iterator<Item = &'a str>) -> bool {
+    hashes.any(|h| WATER_LIGHT.contains(&h))
 }
 
 /// Passes whose output lasts the whole run or feeds every face: the
@@ -123,22 +151,26 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
 /// The longest one scene-input wait may be, whatever is asked.
 const SCENE_WAIT_MOST: u64 = 10_000;
 
-fn ms_from_env(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+fn ms_of(value: Option<&str>, default: u64) -> u64 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 /// What one scene-input wait may last: `VICTORY_SCENE_INPUT_WAIT_MS`
 /// (3000), at most [`SCENE_WAIT_MOST`].
 fn scene_input_wait() -> u64 {
-    static MS: OnceLock<u64> = OnceLock::new();
-    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_WAIT_MS", 3000).min(SCENE_WAIT_MOST))
+    static MS: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_SCENE_INPUT_WAIT_MS", |v| {
+        ms_of(v, 3000).min(SCENE_WAIT_MOST)
+    });
+    MS.get()
 }
 
 /// What all scene-input waits of a run may last together:
-/// `VICTORY_SCENE_INPUT_TOTAL_MS` (15000).
+/// `VICTORY_SCENE_INPUT_TOTAL_MS` (15000). Live: what was taken stays
+/// taken; a larger total gives the rest.
 fn scene_input_total() -> u64 {
-    static MS: OnceLock<u64> = OnceLock::new();
-    *MS.get_or_init(|| ms_from_env("VICTORY_SCENE_INPUT_TOTAL_MS", 15_000))
+    static MS: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_SCENE_INPUT_TOTAL_MS", |v| ms_of(v, 15_000));
+    MS.get()
 }
 
 /// Takes what a scene-input wait may last, in milliseconds, from the run's
@@ -301,24 +333,24 @@ fn wait_budget(compute: bool) -> Duration {
     if let Some(budget) = TEST_BUDGET.get() {
         return budget;
     }
-    static BUDGET: OnceLock<(Duration, Duration)> = OnceLock::new();
-    let (graphics, compute_budget) = *BUDGET.get_or_init(|| {
-        let override_ms = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok());
-        let graphics = override_ms.unwrap_or(DEFAULT_WAIT_MS);
-        let compute_ms = override_ms.unwrap_or(DEFAULT_WAIT_COMPUTE_MS);
+    // Live: logged at its first use and when it changes.
+    static OVERRIDE: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_PIPELINE_WAIT_MS", |v| {
+        // Plus one: 0 unset.
+        v.and_then(|value| value.trim().parse::<u64>().ok()).map_or(0, |ms| ms.saturating_add(1))
+    });
+    static LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let bits = OVERRIDE.get();
+    let override_ms = bits.checked_sub(1);
+    let graphics = override_ms.unwrap_or(DEFAULT_WAIT_MS);
+    let compute_ms = override_ms.unwrap_or(DEFAULT_WAIT_COMPUTE_MS);
+    if LOGGED.swap(bits, Ordering::Relaxed) != bits {
         tracing::info!(
             graphics,
             compute = compute_ms,
             "host pipeline wait budget per frame, per kind (ms)"
         );
-        (
-            Duration::from_millis(graphics),
-            Duration::from_millis(compute_ms),
-        )
-    });
-    if compute { compute_budget } else { graphics }
+    }
+    Duration::from_millis(if compute { compute_ms } else { graphics })
 }
 
 /// The default gameplay base budgets of [`wait_budget`]: short enough that
@@ -421,6 +453,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         } else {
             wait(p, crate::frame::current());
         }
+        compute_wait::after(p, crate::frame::current());
         super::eager::waited(p.made.get().is_some());
     }
     p.made.get()?.as_ref()
@@ -838,6 +871,16 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// Moves a requested pipeline not taken yet to the front
+    /// ([`compute_wait`]).
+    fn to_front(&mut self, p: &Arc<Pending>) {
+        if let Some(at) = self.requested.iter().position(|q| Arc::ptr_eq(q, p))
+            && let Some(q) = self.requested.remove(at)
+        {
+            self.requested.push_front(q);
+        }
+    }
+
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
@@ -850,6 +893,15 @@ impl Queue {
             self.eager -= 1;
         }
         Some(p)
+    }
+}
+
+/// Queues `p` for the workers if it is not made or queued yet: `asked`, as
+/// a draw's is (before the pipelines nothing has asked for), or else among
+/// those made early. Does not wait (`VICTORY_BVH_BUILDER_EARLY`).
+pub(crate) fn soon(p: &Arc<Pending>, asked: bool) {
+    if p.left_out.is_none() && p.made.get().is_none() && !p.shaders.is_empty() {
+        start(p, if asked { REQUESTED } else { EARLY }, 0);
     }
 }
 
@@ -1188,6 +1240,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_wait_budgets_are_live() {
+        use victory_core::settings::check_live;
+        check_live("VICTORY_SCENE_INPUT_WAIT_MS", "50000", scene_input_wait, 3000, SCENE_WAIT_MOST);
+        check_live("VICTORY_SCENE_INPUT_TOTAL_MS", "100", scene_input_total, 15_000, 100);
+    }
+
+    #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
         let bad = Arc::new(Pending::new(Vec::new(), None));
         let good = Arc::new(Pending::new(Vec::new(), None));
@@ -1230,6 +1289,20 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.scene_waited.load(Ordering::Relaxed));
         assert!(matches!(p.made.get(), Some(None)), "the first use waits until the worker has answered");
+    }
+
+    /// The water light's two tiled programs are named, and no other shader; with
+    /// `VICTORY_WATER_LIGHT` unset nothing is left out.
+    #[test]
+    fn the_water_light_is_named_and_left_out_only_with_its_switch() {
+        assert!(water_light_named(["5dc3b25986622949"].into_iter()));
+        assert!(water_light_named(["1aa247ed3653b616", "6f225b641c5b0708"].into_iter()));
+        assert!(!water_light_named(["1aa247ed3653b616", "926c46bab3b86bd6"].into_iter()));
+        assert!(!water_light_named(std::iter::empty()));
+        if std::env::var_os("VICTORY_WATER_LIGHT").is_none() {
+            assert!(!water_light_out(&[]));
+            assert!(left_out(&[]).is_none());
+        }
     }
 
     /// `VICTORY_LEAVE_OUT` is read once; with it unset nothing is named.

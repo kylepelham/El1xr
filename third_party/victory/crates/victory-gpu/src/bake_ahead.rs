@@ -105,15 +105,35 @@ fn stage_ahead() -> bool {
 /// `VICTORY_BAKE_TEXTURES_MS=500` while the title loaded, with its
 /// recording thread waiting (batch 3 q04: 3.3 s of 11.4 s of bake passes
 /// over their budget; frames 299-411 of the loading screen 0.5-2.2 s each).
-fn one_budget() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ONE_BUDGET").is_some_and(|v| v == "1"))
+/// `=2`: only before the world's first frame (`crate::load_rate::in_world`);
+/// in the world the pass takes its whole budget again, as without the switch.
+/// A bake draw's own textures (`VICTORY_BAKE_INPUTS`) are outside the budget
+/// either way (`draw::bake_pass::stops_at`).
+fn one_budget() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| parse_one_budget(std::env::var("VICTORY_BAKE_ONE_BUDGET").ok().as_deref()))
+}
+
+fn parse_one_budget(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 }
 
 /// What the pass may take after the threads took `spent` of `budget`
 /// ([`one_budget`]; without it all of `budget` again).
 pub(crate) fn left_after(budget: Duration, spent: Duration) -> Duration {
-    if one_budget() { left_of(budget, spent) } else { budget }
+    left_in(one_budget(), crate::load_rate::in_world(), budget, spent)
+}
+
+/// [`left_after`] for switch value `mode`, in the world or not.
+fn left_in(mode: u8, world: bool, budget: Duration, spent: Duration) -> Duration {
+    match (mode, world) {
+        (1, _) | (2, false) => left_of(budget, spent),
+        _ => budget,
+    }
 }
 
 /// `budget` less `spent`, and at least a fifth of `budget`: the pass still
@@ -273,6 +293,24 @@ mod tests {
         if std::env::var_os("VICTORY_BAKE_ONE_BUDGET").is_none() {
             assert_eq!(left_after(ms(500), ms(500)), ms(500));
         }
+    }
+
+    /// `=2` takes the threads' time out of the pass's budget while loading
+    /// only; in the world the pass has its whole budget, as with the switch off.
+    #[test]
+    fn one_budget_two_is_for_loading_only() {
+        let ms = Duration::from_millis;
+        assert_eq!(parse_one_budget(None), 0);
+        assert_eq!(parse_one_budget(Some("1")), 1);
+        assert_eq!(parse_one_budget(Some(" 2")), 2);
+        assert_eq!(parse_one_budget(Some("3")), 0);
+        let (budget, spent) = (ms(250), ms(200));
+        assert_eq!(left_in(0, false, budget, spent), budget);
+        assert_eq!(left_in(0, true, budget, spent), budget);
+        assert_eq!(left_in(1, false, budget, spent), ms(50));
+        assert_eq!(left_in(1, true, budget, spent), ms(50));
+        assert_eq!(left_in(2, false, budget, spent), ms(50));
+        assert_eq!(left_in(2, true, budget, spent), budget);
     }
 
     /// Nothing is started past the deadline.

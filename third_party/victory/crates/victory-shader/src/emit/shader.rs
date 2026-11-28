@@ -84,6 +84,11 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host sets: the thread
+/// count in x of a `DispatchX` that counts threads, `u32::MAX` otherwise.
+/// Asked for by the structure builder's programs with
+/// `VICTORY_DISPATCHX_MASK=1` (`lower::thread_limit`).
+pub const USER_THREAD_LIMIT: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

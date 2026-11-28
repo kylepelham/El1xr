@@ -48,9 +48,10 @@ const MOST_FRAMES: u64 = 240;
 
 /// For how many frames after a draw bound its table a slot is left to its
 /// draws (`VICTORY_TABLED_ALL_FRAMES`, 1 to 240; 60 unless set).
+/// Live: each look at a table's stamps takes it as it is.
 pub(crate) fn frames() -> u64 {
-    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *FRAMES.get_or_init(|| parse_frames(std::env::var("VICTORY_TABLED_ALL_FRAMES").ok().as_deref()))
+    static FRAMES: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TABLED_ALL_FRAMES", parse_frames);
+    FRAMES.get()
 }
 
 fn parse_frames(value: Option<&str>) -> u64 {
@@ -139,6 +140,11 @@ impl Retries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frames_are_live() {
+        victory_core::settings::check_live("VICTORY_TABLED_ALL_FRAMES", "8", frames, DEFAULT_FRAMES, 8);
+    }
 
     #[test]
     fn the_switch_is_off_unless_one() {

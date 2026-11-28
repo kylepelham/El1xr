@@ -229,7 +229,12 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    let host = unsafe { (*this.cast::<List>()).host.as_ref() };
+    #[cfg(windows)]
+    if let Some(host) = host {
+        crate::fresh_open::touched(host);
+    }
+    host
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
@@ -523,14 +528,16 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which wants it closed (`crate::fresh_open`: or finds it so).
+        crate::fresh_open::leave_open(&fresh);
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        // Submitted again without a reset: it runs closed, empty.
+        crate::fresh_open::touched(&host);
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -595,8 +602,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which wants it closed (`crate::fresh_open`: or finds it so).
+        crate::fresh_open::leave_open(&fresh);
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -604,6 +611,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            // Submitted again without a reset: it runs closed, empty.
+            crate::fresh_open::touched(&host);
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -777,6 +786,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // Before `host_list` below: a list left open is not closed for it.
+        if let Some(host) = list.host.as_ref() {
+            crate::fresh_open::title_reset(host);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -1701,12 +1714,12 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1989,6 +2002,10 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

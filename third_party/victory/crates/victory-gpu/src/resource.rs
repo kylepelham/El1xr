@@ -1337,6 +1337,9 @@ pub(crate) fn is_texture(this: This) -> bool {
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
+pub(crate) mod placed_inside;
+
+#[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -1481,7 +1484,7 @@ pub(crate) fn alias_of(this: This) -> Option<Held> {
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let count = changes.load(Relaxed);
-    let found = target_at(&targets, r, one);
+    let found = target_at(&targets, r, one).or_else(|| placed_inside::linked(&targets, this, r));
     if found.is_none() {
         r.host
             .no_target
@@ -1886,15 +1889,16 @@ pub(crate) fn host_made<'a>(
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
+///
+/// Live: each look takes the cap as it is (copies over a lowered cap go as
+/// the budget's usual eviction lets them go).
 fn texture_budget_limit() -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|mb| mb.min(u64::MAX >> 20) << 20)
-    })
+    // Plus one: 0 unset.
+    static LIMIT: victory_core::settings::Live = victory_core::settings::Live::new("VICTORY_TEXTURE_BUDGET_MB", |v| {
+        v.and_then(|mb| mb.trim().parse::<u64>().ok())
+            .map_or(0, |mb| (mb.min(u64::MAX >> 20) << 20).saturating_add(1))
+    });
+    LIMIT.get().checked_sub(1)
 }
 
 /// Remaining bytes under `VICTORY_TEXTURE_BUDGET_MB`, if that cap is set.
@@ -3321,6 +3325,14 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// Whether resource `this` lies in memory the title mapped itself (made at
+/// an address): the only resource memory that can be unmapped while the
+/// resource lives. A committed resource's memory and a heap's are ours,
+/// allocated whole when they were made (`crate::texture::staged_ask`).
+pub(crate) fn at_title_address(this: This) -> bool {
+    !this.is_null() && matches!(resource(this).backing, Backing::Address(_))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -3404,6 +3416,7 @@ fn hand_out_resource(
             targets.insert(resource.data() as u64, at);
             target_changes(resource.data() as u64)
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+            placed_inside::cover(resource.data() as u64, &desc);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -4167,6 +4180,12 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn the_texture_budget_is_live() {
+        victory_core::settings::check_live("VICTORY_TEXTURE_BUDGET_MB", "1024", super::texture_budget_limit, None, Some(1024 << 20));
+    }
+
     #[test]
     fn a8_unorm_stands_outside_the_r8_family() {
         const R8_TYPELESS: u32 = 60;
@@ -4364,6 +4383,34 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// Only a resource made at an address the title mapped can lose its
+    /// memory while it lives (`crate::texture::staged_ask`).
+    #[test]
+    fn only_resources_at_a_title_address_may_lose_their_memory() {
+        let null = std::ptr::null();
+        let committed = crate::resource::test_lazy_texture();
+        assert!(!at_title_address(committed));
+        let heap = heap(KIB_64);
+        let mut placed = null;
+        assert_eq!(
+            create_placed(null, heap, 0, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut placed),
+            S_OK
+        );
+        assert!(!at_title_address(placed));
+        let title = vec![0u8; KIB_64 as usize];
+        let mut at = null;
+        assert_eq!(
+            create_at_address(null, title.as_ptr() as u64, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut at),
+            S_OK
+        );
+        assert!(at_title_address(at));
+        assert!(!at_title_address(null));
+        for r in [placed, at, heap] {
+            slot::<Release>(r, 0x10)(r);
+        }
+        crate::resource::test_release_texture(committed);
     }
 
     #[test]

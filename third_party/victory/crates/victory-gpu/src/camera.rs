@@ -651,6 +651,9 @@ pub fn frame_end(read: impl Fn(u64, &mut [u8]) -> bool) {
     let cam = finish(read);
     #[cfg(windows)]
     crate::camera_mv::frame_end(&cam);
+    if crate::camera_diag::on() {
+        crate::camera_diag::frame_end(cam.frame, &found(&cam));
+    }
     let due = {
         let mut last = LAST_LOG.lock().unwrap_or_else(|e| e.into_inner());
         let due = last.is_none_or(|t| t.elapsed().as_secs_f32() >= 3.0);
@@ -663,6 +666,19 @@ pub fn frame_end(read: impl Fn(u64, &mut [u8]) -> bool) {
         log(&cam);
     }
     *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(cam));
+}
+
+/// What the frame's record holds, for the diag's frame line.
+fn found(cam: &FrameCamera) -> String {
+    format!(
+        "velocity={} why=\"{}\" ui={:?} hudless={:?} depth={:?} motion={:?}",
+        cam.sources[0] != 0,
+        cam.why,
+        cam.ui.map(|u| (u.texture, u.target)),
+        cam.hudless.map(|s| (s.format, s.size)),
+        cam.depth.map(|s| (s.title, s.format, s.size)),
+        cam.motion.map(|s| (s.title, s.format, s.size)),
+    )
 }
 
 fn log(cam: &FrameCamera) {

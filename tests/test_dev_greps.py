@@ -234,3 +234,31 @@ def test_hang_lines_keep_the_dred_report_and_the_hang_watch_once_each():
         "hang watch: the card's fence has stood at 1702 for 3.0 s with work queued up to 1703",
     ]
     assert dev_greps.scan_log(text, {}).hang[1] == "dred: removal reason 0x887a0006: hung"
+
+
+def test_the_title_watchdog_crash_is_named_before_the_hang_lines():
+    text = "\n".join([
+        info("hang watch: the card's fence has stood at 1702 for 3.0 s with work queued up to 1703", target="victory_gpu::hang_watch"),
+        "VIctory: first-chance exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x0: nothing mapped there)",
+        "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x0: nothing mapped there)",
+    ])
+    lines = dev_greps.hang_lines(text)
+    assert lines[0].startswith("title watchdog: the write to 0x0 at victory-image+0x23cf683 is the title's own hang watchdog")
+    assert "not a GPU hang" in lines[0]
+    assert lines[1].startswith("hang watch: the card's fence has stood")
+    assert len(lines) == 2
+    assert dev_greps.scan_log(text, {}).hang[0] == lines[0]
+
+
+def test_other_title_crashes_are_not_taken_for_the_watchdog():
+    for line in [
+        # a write to 0 elsewhere in the image, a read of 0 at the watchdog's address, a write elsewhere
+        "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x35a43b0 (write 0x0: nothing mapped there)",
+        "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (read 0x0: nothing mapped there)",
+        "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0xf950b00: read-only)",
+        "VIctory: unhandled exception 0xc0000005 at victory.exe+0x23cf683 (write 0x0: nothing mapped there)",
+    ]:
+        assert dev_greps.title_watchdog(line) is None, line
+        assert dev_greps.hang_lines(line) == []
+    sibling = "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x2215035 (write 0x0: nothing mapped there)"
+    assert dev_greps.title_watchdog(sibling).startswith("title watchdog: the write to 0x0 at victory-image+0x2215035")
