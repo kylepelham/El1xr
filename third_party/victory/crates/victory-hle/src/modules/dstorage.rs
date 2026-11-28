@@ -227,11 +227,36 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let limit = staging_limit(u64::from(size));
+    tracing::info!(size, limit, "dstorage: staging buffer size (and the limit here, VICTORY_DSTORAGE_STAGING_MB)");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = limit;
     }
     S_OK
+}
+
+/// The compressed source in flight here for a staging buffer of `title`
+/// bytes: at least `VICTORY_DSTORAGE_STAGING_MB` MiB (unset or 0: the
+/// title's, as the console; at most 2048). The console's decompression
+/// unit is done with its staging quickly; here a worker of ours inflates
+/// and unpacks each request and holds its staging much longer, so with the
+/// title's 32 MiB few requests run at once while textures wait (CCS03: one
+/// of 24 workers busy on average in a cutscene's first seconds). The
+/// staging is only compressed source in this process's memory.
+fn staging_limit(title: u64) -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    let mb = *MB.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    staging_at_least(title, mb)
+}
+
+/// [`staging_limit`] for `mb` MiB, kept to 2048.
+fn staging_at_least(title: u64, mb: u64) -> u64 {
+    title.max(mb.min(2048) << 20)
 }
 
 fn text(name: *const c_char) -> String {
@@ -454,7 +479,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(STAGING),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -1589,6 +1614,16 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_staging_limit_is_at_least_the_switchs() {
+        let mib = 1u64 << 20;
+        assert_eq!(super::staging_at_least(32 * mib, 0), 32 * mib, "unset: the title's");
+        assert_eq!(super::staging_at_least(32 * mib, 256), 256 * mib);
+        assert_eq!(super::staging_at_least(32 * mib, 16), 32 * mib, "never below the title's");
+        assert_eq!(super::staging_at_least(32 * mib, 1 << 40), 2048 * mib, "at most 2048 MiB");
+        assert_eq!(super::staging_at_least(u64::MAX, 256), u64::MAX);
+    }
+
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
