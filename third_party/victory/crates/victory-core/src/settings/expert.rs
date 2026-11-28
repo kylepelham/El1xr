@@ -173,6 +173,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HALVES_LANE", Apply::Retranslate),
     ("VICTORY_HDR_CLAMP", Apply::Retranslate),
     ("VICTORY_HDR_SCRUB", Apply::Restart),
+    ("VICTORY_HDR_SCRUB_POST", Apply::Restart),
     ("VICTORY_HEAD_MAP_WAIT", Apply::Restart),
     ("VICTORY_HEAP_CAP_COMPACT", Apply::Restart),
     ("VICTORY_HEAP_CAP_DYNAMIC", Apply::Restart),
