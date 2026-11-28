@@ -28,6 +28,8 @@ pub mod console;
 mod commitline;
 #[cfg(windows)]
 mod poolslack;
+#[cfg(windows)]
+mod staging_hold;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]

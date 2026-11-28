@@ -765,14 +765,19 @@ pub(crate) fn let_go_idle() {
     let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // (El1xr) VICTORY_UPLOAD_CAP_MB / VICTORY_COMMIT_FLOOR_MB: past either, 2 s.
     let idle_ms = crate::commitline::staging_idle_ms(idle_ms);
+    // (El1xr) VICTORY_STAGING_HOLD_MS while VICTORY_POOL_SLACK_MB is pressed.
+    let (hold_ms, hold_frames) = crate::staging_hold::idle(idle_ms, IDLE_FRAMES);
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|&resource, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+        let used = s.used.load(Relaxed);
+        let keep = Arc::strong_count(s) > 1 || !crate::host::long_ago(used, hold_ms, hold_frames);
         if !keep {
+            if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+                crate::staging_hold::let_go(resource, s.bytes);
+            }
             // (A live texture: one the title releases leaves the
             // table first, under this lock.)
             crate::resource::set_staged_first(resource as This, u32::MAX);
@@ -920,6 +925,7 @@ pub(crate) fn forget(resource: usize) {
     // (Neptune) And what a prepare thread made ready for it: its memory goes.
     prepare::forget(resource);
     crate::table_null::forget(resource);
+    crate::staging_hold::forget(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
