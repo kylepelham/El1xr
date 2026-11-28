@@ -3964,6 +3964,9 @@ impl State {
         if watch {
             self.skin_watch_plain(true, ran);
         }
+        if ran && crate::tile_args_watch::on() {
+            self.tile_args_producer(list);
+        }
         crate::consumer_gate::after(role, ran);
     }
 
@@ -5416,6 +5419,9 @@ impl State {
         if let Some(w) = watch {
             self.skin_watch_after(list, w, ran);
         }
+        if ran && kind == 2 && crate::tile_args_watch::on() {
+            self.tile_args_producer(list);
+        }
         if ran
             && kind == 2
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
@@ -5813,6 +5819,13 @@ impl State {
                     || crate::pipeline::shaders_of(self.pipeline as This),
                 );
             }
+            // (El1xr) `VICTORY_TILE_ARGS_WATCH`: a skin lighting draw's record as the card reads it.
+            if crate::tile_args_watch::on() {
+                let path = if after_writer { "sanitized" } else { "raw" };
+                let read = tile_args_watch::Read { path, buffer: (&args.buffer, args.offset(arguments)), ours: false };
+                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
+            }
             if !idle {
                 // SAFETY: an open list with everything set; the list keeps the host copies
                 // alive, and the signature is cached.
@@ -5929,6 +5942,10 @@ impl State {
                     CLAMPS[0].fetch_add(1, Ordering::Relaxed);
                     DISPATCHED.fetch_add(1, Ordering::Relaxed);
                     return true;
+                }
+                if crate::tile_args_watch::on() {
+                    let read = tile_args_watch::Read { path: "ahead", buffer: (&slots, at), ours: true };
+                    self.tile_args_watch(list, p, read, &args, None, (kind, stride, max), arguments);
                 }
                 // SAFETY: an open list with everything set; the list keeps its
                 // ahead buffers, and the signature is cached.
@@ -6099,6 +6116,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        if crate::tile_args_watch::on() && parts.is_none() {
+            let read = tile_args_watch::Read { path: "clamped", buffer: (&bounded, at), ours: true };
+            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
+        }
         if !idle {
             // SAFETY: an open list with everything set; the scratch buffer and
             // host copies are kept alive by the list, and the signature is cached.
@@ -6184,6 +6206,7 @@ mod face_watch;
 mod material_pass;
 mod skin_views;
 mod skin_watch;
+mod tile_args_watch;
 mod zero_views;
 mod hdr_views;
 
