@@ -3834,8 +3834,16 @@ impl State {
             return;
         }
         let issued = crate::consumer_gate::issued_count();
+        let watch = crate::skin_watch::on();
+        if watch {
+            crate::drop_why::clear_last();
+        }
         self.dispatch_run(list, x, y, z);
-        crate::consumer_gate::after(role, crate::consumer_gate::issued_count() != issued);
+        let ran = crate::consumer_gate::issued_count() != issued;
+        if watch {
+            self.skin_watch_plain(true, ran);
+        }
+        crate::consumer_gate::after(role, ran);
     }
 
     fn dispatch_run(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
@@ -5072,6 +5080,9 @@ impl State {
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
         }
+        if crate::skin_watch::on() {
+            self.skin_watch_plain(false, ran);
+        }
         if crate::bake_replay::mode() > 0 {
             let again = bake_replay::Again::Draw(vertices, instances, first, first_instance);
             self.bake_replay_drawn(ran && !rects, again);
@@ -5198,6 +5209,9 @@ impl State {
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
         }
+        if crate::skin_watch::on() {
+            self.skin_watch_plain(false, ran);
+        }
         if crate::bake_replay::mode() > 0 {
             let again = bake_replay::Again::Indexed(indices, instances, first, base, first_instance);
             self.bake_replay_drawn(ran, again);
@@ -5232,7 +5246,14 @@ impl State {
             crate::drop_why::set("consumer of a dropped producer held (VICTORY_CONSUMER_GATE)");
             return false;
         }
+        // `VICTORY_SKIN_WATCH`: the passes that light skin, counted and read back.
+        let watch = crate::skin_watch::on()
+            .then(|| self.skin_watch_before(list, kind))
+            .flatten();
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if let Some(w) = watch {
+            self.skin_watch_after(list, w, ran);
+        }
         if ran
             && kind == 2
             && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
@@ -5989,6 +6010,7 @@ mod bake_zero;
 mod face_watch;
 mod material_pass;
 mod skin_views;
+mod skin_watch;
 mod zero_views;
 mod hdr_views;
 
