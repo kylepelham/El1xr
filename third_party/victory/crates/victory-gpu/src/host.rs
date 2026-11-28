@@ -6423,6 +6423,16 @@ impl HostList {
         !self.deferred().bound.insert(pipeline)
     }
 
+    /// The texture uploads the list deferred to its submission (tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_textures(&self) -> Vec<crate::texture::PreludeUpload> {
+        let deferred = self.deferred();
+        deferred.copies.iter().filter_map(|step| match step {
+            Step::Texture(upload) => Some(upload.clone()),
+            _ => None,
+        }).collect()
+    }
+
     /// The shader-visible descriptor heaps the list keeps (tests).
     #[cfg(test)]
     pub(crate) fn kept_shader_heaps(&self) -> Vec<ID3D12DescriptorHeap> {

@@ -1364,6 +1364,8 @@ pub(crate) mod alias_compatible;
 pub(crate) mod find_facts;
 #[cfg(windows)]
 pub(crate) mod idle_sweep;
+#[cfg(windows)]
+pub(crate) mod card_kept;
 #[cfg(all(test, windows))]
 mod class_depth_tests;
 
@@ -2572,6 +2574,7 @@ fn duplicate_bytes(mut copies: Vec<(usize, u64)>) -> u64 {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    card_kept::tick();
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
