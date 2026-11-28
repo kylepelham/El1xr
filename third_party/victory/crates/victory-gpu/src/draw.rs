@@ -13,6 +13,8 @@ mod mesh_launch;
 #[cfg(windows)]
 mod camera_tap;
 mod draw_dump;
+#[cfg(windows)]
+mod heap_find;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2071,6 +2073,10 @@ impl State {
         }
         if crate::draw_dump::recording() {
             self.draw_dump(list, p, compute);
+        }
+        #[cfg(windows)]
+        if crate::heap_find::recording() {
+            self.heap_find(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {

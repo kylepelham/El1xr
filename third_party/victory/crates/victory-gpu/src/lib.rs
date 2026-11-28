@@ -173,6 +173,8 @@ pub mod camera_diag;
 pub mod camera_tag;
 mod draw_dump;
 #[cfg(windows)]
+mod heap_find;
+#[cfg(windows)]
 pub mod camera_copy;
 #[cfg(windows)]
 pub mod camera_mv;

@@ -1564,6 +1564,65 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// (#115, `crate::heap_find`) The views in the shader-visible view heaps
+/// that `keep` takes: (heap start, slot index, the slot's record words,
+/// view). Reads the records as they are; the view table's lock is taken a
+/// chunk of slots at a time, the heaps' list for the whole walk. `keep`
+/// takes no lock of this module.
+#[cfg(windows)]
+pub(crate) fn shader_views_where(
+    mut keep: impl FnMut(&View) -> bool,
+    most: usize,
+) -> Vec<(u64, u32, [u32; 3], View)> {
+    const CHUNK: u32 = 4096;
+    let mut found = Vec::new();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, which
+        // waits for this list's lock).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(step) = increment(heap.desc.kind).filter(|_| heap.desc.kind == VIEWS_KIND) else {
+            continue;
+        };
+        let mut first = 0;
+        while first < heap.desc.count && found.len() < most {
+            let last = first.saturating_add(CHUNK).min(heap.desc.count);
+            let views = views_read();
+            for index in first..last {
+                let record = record_at(start + u64::from(index) * u64::from(step));
+                let [tag, i, generation] = record;
+                if tag != VIEW_TAG {
+                    continue;
+                }
+                let view = match generation >> KIND_SHIFT {
+                    0 => views
+                        .list
+                        .get(i as usize)
+                        .filter(|(_, g)| *g == generation)
+                        .map(|(v, _)| v.clone()),
+                    CONSTANT => Some(constant_of(i, generation)),
+                    PLACED => views.placed_of(i, generation),
+                    _ => None,
+                };
+                if let Some(view) = view.filter(|v| keep(v))
+                    && found.len() < most
+                {
+                    found.push((start, index, record, view));
+                }
+            }
+            drop(views);
+            first = last;
+        }
+    }
+    found
+}
+
+/// (#115) The shader-visible heap slot of `handle`: heap start and index.
+#[cfg(windows)]
+pub(crate) fn shader_heap_slot(handle: u64) -> Option<(u64, u32)> {
+    shader_slot(handle).map(|(heap, index)| (heap.start, index))
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.

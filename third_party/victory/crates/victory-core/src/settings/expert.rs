@@ -7,6 +7,7 @@ use super::Apply;
 pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_ACTIVATE_RAYS", Apply::Restart),
     ("VICTORY_AGILITY_SDK", Apply::Restart),
+    ("VICTORY_ALIAS_COMPATIBLE", Apply::Restart),
     ("VICTORY_ALIAS_COPY", Apply::Restart),
     ("VICTORY_AMBIENT_CHROMA_SCRUB", Apply::Restart),
     ("VICTORY_AMBIENT_REFLECT", Apply::Restart),
@@ -148,6 +149,9 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_GUARD_OPEN_AHEAD", Apply::Restart),
     ("VICTORY_HALVES_LANE", Apply::Retranslate),
     ("VICTORY_HEAP_EARLY_ROUNDS", Apply::Restart),
+    ("VICTORY_HEAP_FIND", Apply::Live),
+    ("VICTORY_HEAP_FIND_EVERY_MS", Apply::Live),
+    ("VICTORY_HEAP_FIND_WINDOW", Apply::Live),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
     // Not live: list stamps and the round floor are kept only while on; turned on mid-run it

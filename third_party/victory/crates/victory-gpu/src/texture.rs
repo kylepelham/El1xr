@@ -147,6 +147,14 @@ impl Through {
     fn from(&self, index: usize) -> usize {
         self.from_parts.as_ref().map_or(index, |p| p[index] as usize)
     }
+
+    /// Whether part `index` has nothing to copy from
+    /// (`crate::resource::alias_compatible::NONE`).
+    fn skips(&self, index: usize) -> bool {
+        self.from_parts
+            .as_ref()
+            .is_some_and(|p| p[index] == crate::resource::alias_compatible::NONE)
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -214,7 +222,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
-    let inside = crate::resource::placed_inside::inside_parts(placed, source);
+    let inside = crate::resource::placed_inside::inside_parts(placed, source)
+        .or_else(|| crate::resource::alias_compatible::copy_parts(placed, source));
     let through = if let Some(parts) = &inside {
         let Some(through) = inside_copy::through(host, placed, source, from, to, parts) else {
             return false;
@@ -382,12 +391,18 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            if through.skips(index) {
+                continue;
+            }
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, through.from(index)), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            if through.skips(index) {
+                continue;
+            }
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }

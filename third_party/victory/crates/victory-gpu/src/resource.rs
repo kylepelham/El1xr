@@ -1338,6 +1338,10 @@ pub(crate) fn is_texture(this: This) -> bool {
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
 pub(crate) mod placed_inside;
+#[cfg(windows)]
+pub(crate) mod alias_compatible;
+#[cfg(windows)]
+pub(crate) mod find_facts;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
@@ -1484,7 +1488,9 @@ pub(crate) fn alias_of(this: This) -> Option<Held> {
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
     let count = changes.load(Relaxed);
-    let found = target_at(&targets, r, one).or_else(|| placed_inside::linked(&targets, this, r));
+    let found = target_at(&targets, r, one)
+        .or_else(|| placed_inside::linked(&targets, this, r))
+        .or_else(|| alias_compatible::linked(&targets, r));
     if found.is_none() {
         r.host
             .no_target

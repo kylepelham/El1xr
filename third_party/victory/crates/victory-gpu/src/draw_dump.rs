@@ -32,7 +32,7 @@ fn window_bits(value: Option<&str>) -> u64 {
 }
 
 /// `"<from>-<to>"` seconds, `from < to`.
-fn window(value: Option<&str>) -> Option<(u32, u32)> {
+pub(crate) fn window(value: Option<&str>) -> Option<(u32, u32)> {
     let (from, to) = value?.trim().split_once('-')?;
     let (from, to) = (from.trim().parse().ok()?, to.trim().parse().ok()?);
     (from < to).then_some((from, to))
@@ -84,7 +84,7 @@ fn decide(frame: u64, bits: u64) {
 
 /// Whether a frame beginning `at` seconds is dumped: inside `[from, to)`
 /// and `every_ms` after the last dumped one.
-fn due(at: f64, from: f64, to: f64, last: Option<f64>, every_ms: u64) -> bool {
+pub(crate) fn due(at: f64, from: f64, to: f64, last: Option<f64>, every_ms: u64) -> bool {
     at >= from && at < to && last.is_none_or(|l| (at - l) * 1000.0 >= every_ms as f64)
 }
 

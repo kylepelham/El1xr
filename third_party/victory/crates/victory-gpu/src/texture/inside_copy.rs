@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::{Through, reinterpret};
+use crate::resource::alias_compatible::NONE;
 use crate::host::Host;
 use crate::object::This;
 
@@ -44,7 +45,8 @@ pub(super) fn through(
     if !two_d(&of_from)
         || !two_d(&of_to)
         || parts.len() != count(&of_to) as usize
-        || parts.iter().any(|&p| p >= count(&of_from))
+        || parts.iter().any(|&p| p != NONE && p >= count(&of_from))
+        || parts.iter().all(|&p| p == NONE)
     {
         return None;
     }
@@ -52,6 +54,12 @@ pub(super) fn through(
     let mut at = 0u64;
     for (n, &p) in parts.iter().enumerate() {
         let mut row = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        // A level or layer the target lacks (`VICTORY_ALIAS_COMPATIBLE`):
+        // nothing copied into it.
+        if p == NONE {
+            rows.push((row[0], row[1]));
+            continue;
+        }
         let mut bytes = [0u64; 2];
         // SAFETY: plain queries of one subresource each; the out pointers
         // are ours.
@@ -140,7 +148,7 @@ pub(super) fn record_direct(
             SubresourceIndex: index,
         },
     };
-    for (n, &p) in parts.iter().enumerate() {
+    for (n, &p) in parts.iter().enumerate().filter(|&(_, &p)| p != NONE) {
         // SAFETY: an open list; live textures of the same format, whose
         // subresources `n` and `p` are of one size, in the copy states.
         unsafe { list.CopyTextureRegion(&part(to, n as u32), 0, 0, 0, &part(from, p), None) };
