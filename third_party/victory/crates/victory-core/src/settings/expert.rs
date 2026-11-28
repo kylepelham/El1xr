@@ -236,6 +236,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_NATIVE_GLASS", Apply::Retranslate),
     ("VICTORY_NO_COPY_BACK", Apply::Restart),
     ("VICTORY_NULL_MAGENTA", Apply::Live),
+    ("VICTORY_NULL_VIEW_SIZE", Apply::Retranslate),
     ("VICTORY_OUTPUT", Apply::Restart),
     ("VICTORY_OWNERLESS_VIEWS", Apply::Restart),
     ("VICTORY_PACE", Apply::Live),
