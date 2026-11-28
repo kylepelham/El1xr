@@ -78,6 +78,15 @@ mod halves;
 /// (`VICTORY_EXCHANGE_PAIRS=1`).
 #[path = "exchange_pairs.rs"]
 pub(super) mod exchange_pairs;
+/// Each exchange of two host waves its own LDS dwords (`VICTORY_EXCHANGE_SITES=1`).
+#[path = "exchange_sites.rs"]
+pub(super) mod exchange_sites;
+/// A mask's lane bit by console lane in the halves form (`VICTORY_HALVES_LANE=1`).
+#[path = "halves_lane.rs"]
+pub(super) mod halves_lane;
+/// The wave-wide form before the deep form without skips (`VICTORY_WAVE_WIDE_AUTO=1`).
+#[path = "wide_auto.rs"]
+pub(super) mod wide_auto;
 pub(crate) use halves::nan_scrub;
 use halves::{all_lane_blocks, lane_constant_masks, lane_scalars, lds_meetings, whole_masks};
 pub(super) use halves::{branches_around, lane_uniform};
@@ -395,6 +404,8 @@ struct Lower<'a> {
     /// With `exchange`: the exchanges take turns between two sets of dwords
     /// ([`exchange_pairs`]).
     xpairs: exchange_pairs::ExchangePairs,
+    /// Dwords of the exchanges' own arrays so far ([`Self::exchange_site`]).
+    xsites: u32,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1397,6 +1408,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => Default::default(),
             },
+            xsites: 0,
             xpairs: exchange_pairs::ExchangePairs::new(
                 exchange_turns,
                 if exchange_quad { 4 } else { 2 },
@@ -4141,7 +4153,8 @@ impl<'a> Lower<'a> {
     /// wave holds a 32-aligned run of console lanes (in the paired form, the lane being
     /// lowered). Without `exchange` or the paired form: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() && self.twin.is_none() {
+        let by_console = self.halves.is_some() && halves_lane::enabled();
+        if self.exchange.is_none() && self.twin.is_none() && !by_console {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4163,6 +4176,7 @@ impl<'a> Lower<'a> {
         {
             self.meet.group_barriers += 1;
         }
+        self.note_barrier(block);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s
@@ -4194,11 +4208,13 @@ impl<'a> Lower<'a> {
         let (at, turn) = self.exchange_turn(at);
         let pair = self.exchange_pair(slot);
         let pair = self.exchange_set(at, pair, turn);
+        let site = self.exchange_site(at, slot, pair);
+        let pair = site.map_or(pair, |s| s.1);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
+        let lds = site.map_or_else(|| self.s.lds(), |s| s.0);
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
         let at = self.order_waves(at, self.reached_by_group());
@@ -4244,13 +4260,15 @@ impl<'a> Lower<'a> {
         let (at, turn) = self.exchange_turn(at);
         let base = self.exchange_pair(slot);
         let base = self.exchange_set(at, base, turn);
+        let site = self.exchange_site(at, slot, base);
+        let base = site.map_or(base, |s| s.1);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let idx_a = self.s.m.bin(at, Bin::Add, base, half);
         let two = self.s.m.i32(2);
         let idx_b = self.s.m.bin(at, Bin::Add, idx_a, two);
-        let lds = self.s.lds();
+        let lds = site.map_or_else(|| self.s.lds(), |s| s.0);
         let ptr_a = self.s.m.element(at, lds, idx_a);
         let ptr_b = self.s.m.element(at, lds, idx_b);
         self.s.m.store(at, ptr_a, a);
@@ -4472,7 +4490,8 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() || self.twin.is_some() {
+        let by_console = self.halves.is_some() && halves_lane::enabled();
+        let lane = if self.exchange.is_some() || self.twin.is_some() || by_console {
             self.console_lane()
         } else {
             self.s.op(
@@ -5539,6 +5558,9 @@ impl<'a> Lower<'a> {
                     }
                     self.cur = self.order_waves(self.cur, false);
                 } else {
+                    if waits {
+                        self.note_barrier(self.cur);
+                    }
                     let mode = self.s.m.i32(mode);
                     let void = self.s.t.void;
                     self.s
