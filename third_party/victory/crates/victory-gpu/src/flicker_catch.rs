@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub(crate) mod detect;
 pub(crate) mod periodic;
+pub(crate) mod region;
 pub(crate) mod shadow_tiles;
 #[cfg(windows)]
 pub(crate) mod pass;
@@ -295,6 +296,7 @@ pub(crate) fn title_presents() {
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .unwrap_or_default();
+    region::title_presents();
     let mut staged = STAGED.lock().unwrap_or_else(|e| e.into_inner());
     match staged.as_mut() {
         Some(s) => {
@@ -550,6 +552,7 @@ pub(crate) fn frame_done(frame: u64) {
         ),
     };
     let periodic = periodic::take();
+    region::frame_done(frame);
     let mut programs: Vec<_> = taken
         .programs
         .into_iter()
@@ -882,6 +885,7 @@ pub(crate) fn report(event: &detect::Event) -> String {
     let (frame, back) = match *event {
         detect::Event::Flicker { frame, frames, .. } => (frame, frame + u64::from(frames)),
         detect::Event::Black { frame, frames } => (frame, frame + u64::from(frames)),
+        detect::Event::Region { frame, .. } => (frame, frame + 1),
     };
     let (before, dark, after) = (summary_of(frame - 1), summary_of(frame), summary_of(back));
     let head = event.describe();
@@ -891,8 +895,15 @@ pub(crate) fn report(event: &detect::Event) -> String {
             frame - 1
         );
     };
+    let region = match event {
+        detect::Event::Region { tiles, .. } => format!(
+            "; {}",
+            region::line(frame, tiles, Some(&before), Some(&dark), after.as_ref(), &named)
+        ),
+        _ => String::new(),
+    };
     format!(
-        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}; {}",
+        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}; {}{region}",
         frame - 1,
         programs_diff(&before, &dark, after.as_ref(), &named),
         watched(&before, &dark, after.as_ref(), &named, watched_names()),
