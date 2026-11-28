@@ -43,9 +43,15 @@ pub(crate) enum P {
     Protect4kCalls,
     Protect4kUs,
     StalePlanWaitUs,
+    // (feedcard, #88) `VICTORY_PLAN_SNAPSHOT`: plans that changed nothing, published, redone;
+    // the exclusive lock's hold.
+    SnapUnchanged,
+    SnapPublished,
+    SnapRedone,
+    SnapHeldUs,
 }
 
-const COUNT: usize = P::StalePlanWaitUs as usize + 1;
+const COUNT: usize = P::SnapHeldUs as usize + 1;
 
 static STATS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 
@@ -122,5 +128,15 @@ pub(crate) fn log(frames: f64) {
         per(P::Protect4kCalls),
         ms(P::Protect4kUs),
         u8::from(crate::watch::guard_4k_join()),
+    );
+    tracing::info!(
+        "stale copy plans from a snapshot per frame (VICTORY_PLAN_SNAPSHOT={}): {:.0} changed \
+         nothing (no exclusive lock), {:.0} published, {:.0} redone under the lock (a page moved), \
+         exclusive lock held {:.2} ms (all threads)",
+        u8::from(crate::shadow::plan_snapshot::on()),
+        per(P::SnapUnchanged),
+        per(P::SnapPublished),
+        per(P::SnapRedone),
+        ms(P::SnapHeldUs),
     );
 }

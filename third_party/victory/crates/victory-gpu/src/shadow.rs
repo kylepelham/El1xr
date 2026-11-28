@@ -34,6 +34,8 @@ mod placement;
 mod pending;
 #[path = "shadow_plan_split.rs"]
 pub(crate) mod plan_split;
+#[path = "shadow_plan_snapshot.rs"]
+pub(crate) mod plan_snapshot;
 #[path = "shadow_copied_shared.rs"]
 pub(crate) mod copied_shared;
 #[path = "shadow_refresh_stamp.rs"]
@@ -6588,7 +6590,12 @@ impl Shadow {
             |idx: usize| has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire));
         // Sub-page path (`VICTORY_WATCH_4K=1` or `VICTORY_DIRTY_4K=1|alt`) preserved
         // with CopiedPages bitset consistency, partial-page stamps, and lazy-deferred skipping.
-        let bytes_runs = if plan_split::on() {
+        let bytes_runs = if plan_snapshot::on() {
+            plan_snapshot::plan(
+                &self.copied, base, start, end, from, to, now, written, subs, &mut page_mask,
+                skip_idx, planning,
+            )
+        } else if plan_split::on() {
             // (feedcard, #88) The masks of pages taken whole and the runs after the lock.
             let claimed = {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
