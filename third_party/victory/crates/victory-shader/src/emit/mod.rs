@@ -114,6 +114,7 @@ mod sampler;
 mod shader;
 mod sync_full;
 mod threading;
+mod underwater;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -816,7 +817,12 @@ fn emit_forms(
         // One logical wave per group, with a wave32 PSO on RTX. The particle
         // light-atlas shaders that reset the card are not in this list.
         // Explicit policy wins.
-        let scene_kernel = is_scene_kernel(&native.io, c.digest);
+        let threads = match &native.io {
+            crate::native::StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+            _ => None,
+        };
+        let scene_kernel =
+            is_scene_kernel(&native.io, c.digest) || underwater::listed(threads, c.digest);
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
