@@ -174,6 +174,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAD_MAP_WAIT", Apply::Restart),
     ("VICTORY_HEAP_EARLY_ROUNDS", Apply::Restart),
     ("VICTORY_HEAP_FIND", Apply::Live),
+    ("VICTORY_HEAP_FIND_ENTRY", Apply::Live),
     ("VICTORY_HEAP_FIND_EVERY_MS", Apply::Live),
     ("VICTORY_HEAP_FIND_REFS", Apply::Live),
     ("VICTORY_HEAP_FIND_WINDOW", Apply::Live),
