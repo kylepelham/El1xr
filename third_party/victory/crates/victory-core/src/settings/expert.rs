@@ -173,6 +173,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_FIND_WINDOW", Apply::Live),
     ("VICTORY_HEAP_NOTICES", Apply::Restart),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
+    ("VICTORY_HEAP_RECHECK_MIPS", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
     // Not live: list stamps and the round floor are kept only while on; turned on mid-run it
     // would trust a stale floor and skip a heap round a submission needs (stale descriptors).
@@ -331,6 +332,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_RT_MISS_SKY", Apply::Retranslate),
     ("VICTORY_RT_RESOLVE", Apply::Restart),
     ("VICTORY_RT_TRACE", Apply::Restart),
+    ("VICTORY_SAMPLER_CLAMP", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE_OUT", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE_SECONDS", Apply::Restart),
