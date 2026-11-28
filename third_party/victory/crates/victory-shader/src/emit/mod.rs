@@ -377,13 +377,11 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    sync_full::with_container(container, || {
-        miss_sky::with_container(container, || match translate_retried(container) {
-            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
-                structure::without_live_quads(|| translate_retried(container))
-            }
-            other => other,
-        })
+    miss_sky::with_container(container, || match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
     })
 }
 
@@ -440,6 +438,18 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    sync_full::with_container(c, || emit_listed(c, native, p, st, io, res))
+}
+
+/// [`emit`] inside the program's [`sync_full`] scope.
+fn emit_listed(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

@@ -85,9 +85,11 @@ thread_local! {
     static HERE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Runs the translation `f` of `container` with [`here`] set when the switch names it.
-pub(super) fn with_container<R>(container: &[u8], f: impl FnOnce() -> R) -> R {
-    if !listed(container, names()) {
+/// Runs the translation `f` of the program in `c` with [`here`] set when the switch names it
+/// (the name is in one of the container's parts).
+pub(super) fn with_container<R>(c: &crate::dxbc::Container, f: impl FnOnce() -> R) -> R {
+    let names = names();
+    if names.is_empty() || !c.parts.iter().any(|part| listed(part.data, names)) {
         return f();
     }
     with_here(f)
@@ -156,6 +158,15 @@ mod tests {
             assert!(!listed(no, &on), "{}", String::from_utf8_lossy(no));
         }
         assert!(!listed(b"x CS_SSSTileClassification_0_Wrapped", &[]));
+        let bytes = crate::dxbc::build(&[(
+            crate::dxbc::FourCC(*b"RDAT"),
+            b"\0lib:CS_EyeCapUpdate_0a1b2c3d_Wrapped\0",
+        )]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let was = HERE.get();
+        assert!(c.parts.iter().any(|part| listed(part.data, &on)));
+        assert!(!with_container(&c, here) || !names().is_empty());
+        assert_eq!(HERE.get(), was);
         let only = parse(Some("EyeCap"));
         assert!(listed(b"x CS_EyeCapUpdate_0_Wrapped", &only));
         assert!(!listed(b"x CS_SSSTileClassification_0_Wrapped", &only));
