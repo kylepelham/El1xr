@@ -8010,6 +8010,7 @@ impl Meter {
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
+        crate::alias_later::line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
             [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

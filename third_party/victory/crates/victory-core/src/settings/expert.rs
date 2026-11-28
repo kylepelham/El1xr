@@ -9,6 +9,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_AGILITY_SDK", Apply::Restart),
     ("VICTORY_ALIAS_COMPATIBLE", Apply::Restart),
     ("VICTORY_ALIAS_COPY", Apply::Restart),
+    ("VICTORY_ALIAS_LATER", Apply::Live),
     ("VICTORY_AMBIENT_CHROMA_SCRUB", Apply::Restart),
     ("VICTORY_AMBIENT_REFLECT", Apply::Restart),
     ("VICTORY_AMBIENT_REFLECT_IN", Apply::Restart),
