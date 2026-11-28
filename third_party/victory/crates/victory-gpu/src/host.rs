@@ -5194,6 +5194,7 @@ impl HostList {
         self.twins_writing.store(false, Ordering::Relaxed);
         self.changes.fetch_add(1, Ordering::Relaxed);
         self.card_constants.clear();
+        crate::read_back_pool::give(&mut self.deferred().backs, |b| b.0);
         *self.deferred() = Deferred::default();
         use crate::list_reap::{alone, let_go};
         let_go(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()), |(_, _, h)| alone(h));

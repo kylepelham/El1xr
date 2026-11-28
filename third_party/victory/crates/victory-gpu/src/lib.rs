@@ -242,6 +242,8 @@ mod prep_cut;
 #[cfg(windows)]
 mod result_ring;
 #[cfg(windows)]
+mod read_back_pool;
+#[cfg(windows)]
 mod wide_copy;
 #[cfg(windows)]
 mod compare_apart;
