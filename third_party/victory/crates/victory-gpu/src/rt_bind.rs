@@ -177,6 +177,11 @@ pub(crate) fn dispatch(
     let (kind, views) = crate::pipeline::ray_views(this)?;
     let glass = kind == Walks::Glass;
     let view = |slot: u8, dword: u32| crate::descriptor::view(table(slot)? + u64::from(dword) * 4);
+    if let Walks::Shadow(b) = kind
+        && b.any
+    {
+        return auto(b, &views, view);
+    }
     let mut matched = [0u64; 2];
     // (register, count row, the top levels it is matched for: 0 first, 1 second, 2 both).
     let walks: &[(Option<u32>, usize, u8)] = match kind {
@@ -226,6 +231,82 @@ pub(crate) fn dispatch(
         Walks::Glass | Walks::Shadow(_) => both(matched).map(bound),
         Walks::VBuffer | Walks::Trace => None,
     }
+}
+
+/// The first two distinct structure addresses among `views`.
+fn distinct_structures(
+    views: &[(u8, u32, u32)],
+    view: impl Fn(u8, u32) -> Option<View>,
+) -> Vec<u64> {
+    let mut found = Vec::new();
+    for &(slot, dword, _) in views {
+        if let Some(at) = view(slot, dword).as_ref().and_then(structure_address)
+            && !found.contains(&at)
+        {
+            found.push(at);
+            if found.len() == 2 {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// A program the automatic splice changed (`VICTORY_NATIVE_SHADOW_AUTO=1`): its candidates are
+/// its first two distinct structures. Walks that pick per wave compare their base with the
+/// candidates on the card, so any are safe; a walk that does not runs on the first host top
+/// level, so such a program is bound only with exactly one structure.
+fn auto(
+    b: victory_shader::emit::ShadowBinding,
+    views: &[(u8, u32, u32)],
+    view: impl Fn(u8, u32) -> Option<View>,
+) -> Option<Bound> {
+    let found = distinct_structures(views, view);
+    let mut titles = [None; 2];
+    let mut matched = [0u64; 2];
+    for (k, &at) in found.iter().enumerate() {
+        titles[k] = Some(at);
+        matched[k] = crate::native_rt::top_level(at).unwrap_or(0);
+    }
+    let row = match (found.len(), matched[0] != 0 || matched[1] != 0) {
+        (0, _) => Found::NoView,
+        (_, true) => Found::Host,
+        (_, false) => Found::NoHost,
+    };
+    COUNTS[4][row as usize].fetch_add(1, Ordering::Relaxed);
+    summary();
+    let bound = auto_bound(b.per_wave, titles, matched);
+    log_auto(b.per_wave, titles, matched, bound.is_some());
+    bound
+}
+
+/// The first few distinct candidate sets of automatically spliced programs, logged.
+fn log_auto(per_wave: bool, titles: [Option<u64>; 2], host: [u64; 2], bound: bool) {
+    static SEEN: Mutex<Vec<[Option<u64>; 2]>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 16 || seen.contains(&titles) {
+        return;
+    }
+    seen.push(titles);
+    let at = |k: usize| titles[k].map_or("none".to_owned(), |a| format!("{a:#x} host={}", host[k] != 0));
+    tracing::info!(
+        per_wave,
+        first = %at(0),
+        second = %at(1),
+        bound,
+        "native rt bind: auto-spliced shadow walks (not bound: the title's walk)"
+    );
+}
+
+/// What [`auto`] binds, from the candidates' title addresses and host top levels.
+fn auto_bound(per_wave: bool, titles: [Option<u64>; 2], matched: [u64; 2]) -> Option<Bound> {
+    if per_wave {
+        let built = matched.iter().filter(|&&m| m != 0).count();
+        VARIANTS[built].fetch_add(1, Ordering::Relaxed);
+        return (built > 0).then(|| Bound { host: matched, bases: bases(titles, matched) });
+    }
+    (titles[1].is_none() && matched[0] != 0)
+        .then(|| Bound { host: [matched[0]; 2], bases: [0; 2] })
 }
 
 fn both(m: [u64; 2]) -> Option<[u64; 2]> {
@@ -354,6 +435,34 @@ mod tests {
     #[test]
     fn off_by_default() {
         assert!(!on());
+    }
+
+    #[test]
+    fn an_automatic_splice_binds_its_first_two_structures() {
+        let views = [(1, 0, 400), (1, 8, 12), (1, 16, 13), (2, 8, 14), (4, 8, 15)];
+        let view = |slot, dword| match (slot, dword) {
+            (1, 8) | (2, 8) => Some(rt_view(0xa000)),
+            (1, 16) => Some(rt_view(0xb000)),
+            (4, 8) => Some(rt_view(0xc000)),
+            (1, 0) => Some(View::Constant(0x10, 16)),
+            _ => None,
+        };
+        assert_eq!(distinct_structures(&views, view), vec![0xa000, 0xb000]);
+        assert_eq!(distinct_structures(&views, |_, _| None), Vec::<u64>::new());
+        let two = [Some(0xa000), Some(0xb000)];
+        // Per wave: the built candidates and their bases; none built, not bound.
+        assert_eq!(
+            auto_bound(true, two, [0x10, 0]),
+            Some(Bound { host: [0x10, 0], bases: [0xa0, 0] })
+        );
+        assert_eq!(auto_bound(true, two, [0, 0]), None);
+        // A fixed walk: only with one structure, and it built.
+        assert_eq!(auto_bound(false, two, [0x10, 0x20]), None);
+        assert_eq!(
+            auto_bound(false, [Some(0xa000), None], [0x10, 0]),
+            Some(Bound { host: [0x10, 0x10], bases: [0; 2] })
+        );
+        assert_eq!(auto_bound(false, [Some(0xa000), None], [0, 0]), None);
     }
 
     #[test]

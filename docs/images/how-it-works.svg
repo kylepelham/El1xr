@@ -17,14 +17,12 @@
   </style>
   <defs>
     <linearGradient id="cardbg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#120a24"/><stop offset="1" stop-color="#1b0f33"/></linearGradient>
-    <radialGradient id="glow" cx=".85" cy="1.05" r=".75"><stop offset="0" stop-color="#ff3d8b" stop-opacity=".22"/><stop offset=".5" stop-color="#9b5cff" stop-opacity=".08"/><stop offset="1" stop-color="#9b5cff" stop-opacity="0"/></radialGradient>
     <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <linearGradient id="sunsetv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <clipPath id="cardclip"><rect width="900" height="470" rx="18"/></clipPath>
   </defs>
   <g clip-path="url(#cardclip)">
     <rect width="900" height="470" fill="url(#cardbg)"/>
-    <rect width="900" height="470" fill="url(#glow)"/>
     <path d="M0 470L0 452L27 452L27 451L47 451L47 464L61 464L61 454L63 454L63 464L77 464L77 449L101 449L101 458L127 458L127 455L163 455L163 443L179 443L179 446L196 446L196 459L233 459L233 446L269 446L269 435L284 435L284 460L322 460L322 434L338 434L338 424L340 424L340 434L356 434L356 462L379 462L379 432L401 432L401 435L434 435L434 431L461 431L461 455L484 455L484 444L503 444L503 460L530 460L530 453L566 453L566 445L602 445L602 440L616 440L616 456L641 456L641 455L656 455L656 445L658 445L658 455L673 455L673 438L690 438L690 428L692 428L692 438L710 438L710 446L738 446L738 439L769 439L769 461L793 461L793 463L810 463L810 453L845 453L845 449L862 449L862 439L864 439L864 449L881 449L881 465L900 465L900 470Z" fill="#9b5cff" fill-opacity=".07"/>
     <rect width="900" height="4" fill="url(#sunset)"/>
   </g>
