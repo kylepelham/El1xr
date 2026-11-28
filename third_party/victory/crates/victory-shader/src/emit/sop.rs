@@ -434,7 +434,18 @@ impl Lower<'_> {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                // SCC: the carry out of the sum in 64 bits, the bits shifted out included
+                // (`VICTORY_SCC_SHIFT_ADD=1`; off: `D != 0`)
+                let carry = super::isa_fixes::Fix::SccShiftAdd.on().then(|| {
+                    let (n, z) = (name.as_bytes()[6] - b'0', self.s.m.i32(0));
+                    let k = self.s.m.i32(32 - u32::from(n));
+                    let out = self.s.m.bin(c, Bin::LShr, a, k);
+                    let lost = self.s.m.cmp(c, pred::NE, out, z);
+                    let wrapped = self.s.m.cmp(c, pred::IULT, r, t);
+                    self.s.m.select(c, lost, lost, wrapped)
+                });
+                (r, carry)
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);

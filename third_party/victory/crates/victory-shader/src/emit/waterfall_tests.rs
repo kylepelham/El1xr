@@ -16,6 +16,21 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    let (shader, nonuniform_handles, wave_ops) = lower_cs32_with(words, buffers);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(nonuniform_handles, 1);
+    assert!(!wave_ops);
+    shader
+}
+
+/// [`build`]'s program of textures, lowered and validated as it is.
+pub(super) fn lower_cs32(words: &[u32]) -> HostShader {
+    lower_cs32_with(words, false).0
+}
+
+/// [`build`] without its checks: the shader, its non-uniform handles and whether it uses wave
+/// operations.
+fn lower_cs32_with(words: &[u32], buffers: bool) -> (HostShader, u32, bool) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,9 +86,6 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -92,13 +104,13 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, lowered.nonuniform_handles, lowered.wave_ops)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
