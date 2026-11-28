@@ -1369,6 +1369,25 @@ pub(crate) mod idle_sweep;
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// (`VICTORY_TABLE_VIEW_MEMO`) Monotonic epoch bumped after any change that
+/// can invalidate a memoized texture view (host copy evicted/dropped, texture
+/// released, placed texture removed, `TARGETS_AT` insert, `first_shown` or
+/// `prefilled` changed).
+#[cfg(windows)]
+static VIEW_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn view_epoch() -> u64 {
+    VIEW_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn bump_view_epoch() {
+    VIEW_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 /// Change counts of [`TARGETS_AT`], by bucket of the memory's 64 KiB
 /// block: bumped under its lock each time a texture enters it there. A
 /// texture's kept "no target" answer ([`Hosted::no_target`]) holds while
@@ -1653,7 +1672,9 @@ pub(crate) fn test_let_go_host_copy(this: This) {
     let gone = {
         let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         crate::texture::unstage(this);
-        made.take()
+        let gone = made.take();
+        bump_view_epoch();
+        gone
     };
     if gone.is_some() {
         r.host.gone.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2612,7 +2633,9 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::table_null::unstaged(at, crate::table_null::Why::HostIdle);
                 crate::texture::unstage(at as This);
-                made.take()
+                let gone = made.take();
+                bump_view_epoch();
+                gone
             } else {
                 None
             }
@@ -2782,7 +2805,9 @@ fn slot_evict_with(all: &std::collections::BTreeSet<usize>, need: u64, idle_ms: 
                 r.host
                     .slot_evicted
                     .store(crate::host::moment().max(1), Relaxed);
-                made.take()
+                let gone = made.take();
+                bump_view_epoch();
+                gone
             } else {
                 None
             }
@@ -3508,6 +3533,7 @@ fn hand_out_resource(
             targets.insert(resource.data() as u64, at);
             target_changes(resource.data() as u64)
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
+            bump_view_epoch();
             placed_inside::cover(resource.data() as u64, &desc);
         }
         if !lazy() {
@@ -3574,6 +3600,9 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        if self.desc.dimension != BUFFER {
+            bump_view_epoch();
+        }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -4082,6 +4111,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
         if let std::collections::btree_map::Entry::Vacant(slot) = targets.entry(address) {
             slot.insert(existing);
             target_changes(address).fetch_add(1, std::sync::atomic::Ordering::Release);
+            bump_view_epoch();
         }
         return Some(existing as This);
     }
@@ -4116,6 +4146,7 @@ pub(crate) fn release_test_placed_texture(address: u64, desc: [u32; 14]) {
         .unwrap()
         .remove(&(address, loose_key(desc)));
     PLACED_OUT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    bump_view_epoch();
     if let Some(resource) = resource {
         resource_release(resource as This);
     }
@@ -4743,6 +4774,7 @@ mod tests {
         // As `hosted` leaves a texture the card had no room for just now:
         // not asked again yet, but still waited for (not refused).
         *r.host.made.lock().unwrap() = None;
+        bump_view_epoch();
         r.host.no_room.store(crate::host::moment().max(1), Relaxed);
         assert!(
             hosted(image, true).is_none(),
@@ -4758,6 +4790,7 @@ mod tests {
         assert_eq!(r.host.no_room.load(Relaxed), 0);
         // Refused: never again.
         *r.host.made.lock().unwrap() = None;
+        bump_view_epoch();
         r.host.no_room.store(0, Relaxed);
         r.host.refused.store(true, Relaxed);
         assert!(hosted(image, true).is_none());

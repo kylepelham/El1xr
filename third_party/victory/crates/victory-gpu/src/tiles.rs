@@ -769,14 +769,18 @@ impl Tiled {
             given_tiles && given.fresh & (1 << level) == 0
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        self.shown.swap(shown, Ordering::Relaxed) != shown
+        let changed = self.shown.swap(shown, Ordering::Release) != shown;
+        if changed {
+            crate::resource::bump_view_epoch();
+        }
+        changed
     }
 
     /// The first level a view of the texture may show; `None` while no
     /// level is both held and given (the views are then as the title made
     /// them, and read zeros).
     pub(crate) fn first_shown(&self) -> Option<u32> {
-        let shown = self.shown.load(Ordering::Relaxed);
+        let shown = self.shown.load(Ordering::Acquire);
         (shown != u32::MAX).then_some(shown)
     }
 

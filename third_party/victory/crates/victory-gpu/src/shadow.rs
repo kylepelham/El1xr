@@ -4991,9 +4991,14 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter()
+        let removed: Vec<Arc<Shadow>> = idle
+            .into_iter()
             .filter_map(|key| map.remove(&key))
-            .collect()
+            .collect();
+        if !removed.is_empty() {
+            bump_view_epoch();
+        }
+        removed
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -7436,6 +7441,21 @@ pub(crate) fn shape() -> u64 {
     SHAPE.load(Ordering::Acquire)
 }
 
+/// (`VICTORY_TABLE_VIEW_MEMO`) Monotonic epoch bumped *after* any mutation to
+/// `BUFFERS`, `LOOSE` or `EXACT` (while holding its write lock) that could
+/// invalidate a memoized buffer view.
+static VIEW_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn view_epoch() -> u64 {
+    VIEW_EPOCH.load(Ordering::Acquire)
+}
+
+#[inline]
+pub(super) fn bump_view_epoch() {
+    VIEW_EPOCH.fetch_add(1, Ordering::Release);
+}
+
 /// The windows' table, to change it.
 fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
     SHAPE.fetch_add(1, Ordering::Release);
@@ -7492,7 +7512,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -7500,11 +7521,17 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             building: None,
         },
     );
+    bump_view_epoch();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let removed = buffers().remove(&(start, resource)).and_then(|e| e.shadow);
+    let removed = {
+        let mut map = buffers();
+        let removed = map.remove(&(start, resource)).and_then(|e| e.shadow);
+        bump_view_epoch();
+        removed
+    };
     if let Some(shadow) = removed
         && shadow.deferred_count.load(Ordering::Acquire) > 0
     {
@@ -7540,15 +7567,23 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        let before = gone.len();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if gone.len() > before {
+            bump_view_epoch();
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
+        let before = gone.len();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
+        }
+        if gone.len() > before {
+            bump_view_epoch();
         }
     }
     let n = gone.len() as u64;
@@ -8025,6 +8060,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        bump_view_epoch();
         return Some(shadow);
     }
     let ask = (!unsized_ask).then(|| end - address);
@@ -8042,6 +8078,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let shadow = loose_copy(start, len, ask)?;
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    bump_view_epoch();
     Some(shadow)
 }
 
@@ -8257,6 +8294,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 }
                 keep
             });
+            if !gone.is_empty() {
+                bump_view_epoch();
+            }
         }
         gone
     };

@@ -1389,7 +1389,8 @@ fn prefill_levels(
         // SAFETY: an open prelude list; both locations name live resources.
         unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    copy.prefilled.store(levels, Relaxed);
+    copy.prefilled.store(levels, std::sync::atomic::Ordering::Release);
+    crate::resource::bump_view_epoch();
     crate::texstore::PREFILLED.fetch_add(1, Relaxed);
     Prefilled::Done
 }

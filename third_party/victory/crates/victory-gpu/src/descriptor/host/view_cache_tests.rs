@@ -143,7 +143,7 @@ fn a_full_shard_gives_the_oldest_slot_to_the_next_record() {
 
 /// Title memory registered as a title buffer, as a buffer object's creation
 /// registers it (`crate::shadow::register`), under resource number `owner`.
-pub(super) struct TitleBuffer {
+pub(crate) struct TitleBuffer {
     base: *mut u8,
     owner: usize,
 }
@@ -152,7 +152,7 @@ pub(super) struct TitleBuffer {
 const TITLE_LEN: usize = 1 << 16;
 
 impl TitleBuffer {
-    pub(super) fn new(owner: usize) -> TitleBuffer {
+    pub(crate) fn new(owner: usize) -> TitleBuffer {
         let layout = std::alloc::Layout::from_size_align(TITLE_LEN, 1 << 16).unwrap();
         // SAFETY: a non-zero size.
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -162,7 +162,7 @@ impl TitleBuffer {
     }
 
     /// The title releases the buffer and makes another at the same address.
-    fn made_again(&mut self, owner: usize) {
+    pub(crate) fn made_again(&mut self, owner: usize) {
         crate::shadow::unregister(self.owner, self.base as u64);
         self.owner = owner;
         crate::shadow::register(owner, self.base as u64, TITLE_LEN as u64);
@@ -170,7 +170,7 @@ impl TitleBuffer {
 
     /// A raw shader view of all of it, placed in memory (no resource
     /// object), and a record naming it.
-    pub(super) fn view(&self) -> (View, [u32; 3]) {
+    pub(crate) fn view(&self) -> (View, [u32; 3]) {
         let len = TITLE_LEN as u64;
         let address = self.base as u64;
         let mut resource = [0u32; 14];
