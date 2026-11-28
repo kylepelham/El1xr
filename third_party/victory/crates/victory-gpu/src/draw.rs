@@ -2248,6 +2248,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_REMAP {
+                        // (heapcap) Ours: the host slots of title view slots past the host heap's.
+                        let host = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host());
+                        match host.and_then(|h| crate::descriptor::host::heap_cap::remap_root(list, h)) {
+                            Some(gpu) => {
+                                self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+                            }
+                            None => once!("a shader reads the view remap table without a view heap"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.

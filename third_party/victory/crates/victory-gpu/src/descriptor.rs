@@ -237,7 +237,7 @@ pub(crate) fn sync_heaps() {
         let heap = unsafe { &*(at as *const Heap) };
         if let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) {
             let null = victory_shader::emit::view_heap_limit();
-            host::heap_cap::watch(start, u64::from(step), host.count(), heap.desc.count, null);
+            host::heap_cap::watch(start, u64::from(step), host, heap.desc.count, null);
         }
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
