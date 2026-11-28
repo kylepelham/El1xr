@@ -539,6 +539,90 @@ fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Ve
     Some(out[0].clone())
 }
 
+/// Each active lane (threads below s0) stores to its own dword in the arm a branch on
+/// `s_and_b64 s, vcc, exec` (thread s1's bit) chose: SCC is "some active lane has it", so every
+/// active lane takes the same arm and keeps EXEC there (cool_fox #66, test of `bd8b4f524a`).
+/// The address is set before EXEC narrows, so a store by an inactive lane would show.
+fn stores_in_scc_arms(on_set: bool) -> NativeProgram {
+    let (branch, fallthrough, taken) = if on_set {
+        (0xBF85_0004, 1, 2) // s_cbranch_scc1
+    } else {
+        (0xBF84_0004, 2, 1) // s_cbranch_scc0
+    };
+    native(&[
+        0xBF8C_0000, // s_waitcnt 0 for the descriptor
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz to the restore
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        branch,
+        0x7E04_0280 | fallthrough, // v_mov_b32 v2, fallthrough
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBF82_0003, // s_branch to the restore
+        0x7E04_0280 | taken, // v_mov_b32 v2, taken
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ])
+}
+
+/// `VICTORY_LANE_MASK_WIDE=1` ([`crate::lane_split`]): the branch on the mask's SCC is the
+/// wave's, so both arms keep EXEC as a guard on their store, and on a host of 32-lane waves every
+/// active lane stores the arm the wave chose (2 when thread s1 is active, else 1). Off, the
+/// branch is split per lane and one arm's store loses its guard.
+#[test]
+fn a_branch_on_a_masks_scc_is_the_waves_and_its_arms_keep_their_guards() {
+    for on_set in [false, true] {
+        let native = stores_in_scc_arms(on_set);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let form = ir::without_skips(&p, false).expect("removable EXEC skip");
+        let scc = (0..form.blocks.len())
+            .find(|&b| form.blocks[b].insts.last().is_some_and(|i| i.name().starts_with("s_cbranch_scc")))
+            .expect("the branch on SCC");
+        let guarded = |on: bool| {
+            let was = crate::lane_split::TEST_LANE_MASK_WIDE.replace(Some(on));
+            let st = structure::structure(&form).expect("structure");
+            crate::lane_split::TEST_LANE_MASK_WIDE.set(was);
+            let mut stores = Vec::new();
+            for (block, guards) in form.blocks.iter().zip(&st.guards) {
+                for (inst, guard) in block.insts.iter().zip(guards) {
+                    if inst.name() == "buffer_store_dword" {
+                        stores.push(guard.is_some());
+                    }
+                }
+            }
+            (st.wide.contains(&scc), stores)
+        };
+        assert_eq!(guarded(true), (true, vec![true, true]), "on_set={on_set}");
+        let (wide, stores) = guarded(false);
+        assert!(!wide && stores.contains(&false), "on_set={on_set}: off, split per lane");
+
+        let was = crate::lane_split::TEST_LANE_MASK_WIDE.replace(Some(true));
+        lower::take_needs();
+        let shader = lowered(&native, &form, &HashSet::new());
+        crate::lane_split::TEST_LANE_MASK_WIDE.set(was);
+        let shader = shader.expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (below, lane) in [(40u32, 5u32), (40, 36), (64, 63), (10, 50)] {
+            let Some(out) = whole_uav(&shader, [below, lane], 64) else {
+                return;
+            };
+            let chosen = if lane < below { 2 } else { 1 };
+            let want: Vec<u32> = (0..64).map(|t| if t < below { chosen } else { 0 }).collect();
+            assert_eq!(out, want, "on_set={on_set}, {below} lanes active, lane {lane}");
+        }
+    }
+}
+
 /// A 64-bit mask the program does not track (s[0:1], root constants), read as a number by a
 /// select, in a console wave of 64 run as two host waves of 32 (the DPP move makes it take the
 /// console's lanes, so the halves form): each lane takes its own bit, lanes 32-63 the high
@@ -2379,6 +2463,65 @@ fn automatic_barrier_flags_reach_the_emitted_shader() {
         let shader = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
         assert_eq!(shader.barrier_modes, vec![expected]);
     }
+}
+
+/// `VICTORY_GROUP_SYNC_FULL` ([`super::sync_full`]): a program it names keeps the wait of a
+/// divergent barrier that `auto` drops on a host of 32-lane waves (mode 8, the fence only, to 9),
+/// and `VICTORY_GROUP_SYNC=0` still wins.
+#[test]
+fn a_named_program_keeps_the_wait_of_a_divergent_barrier() {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: [
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0001, // s_cbranch_execz past the barrier
+            0xBF8A_0000, // s_barrier
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect(),
+    };
+    let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &[], native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("IO");
+    let modes = |setting: u8, full: bool| {
+        let old_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+        let old_mode = super::TEST_GROUP_SYNC.replace(Some(setting));
+        let parts = lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let shader = if full {
+            super::sync_full::with_here_for_test(|| lower::lower(&parts))
+        } else {
+            lower::lower(&parts)
+        };
+        lower::TEST_HOST_WAVE.set(old_wave);
+        super::TEST_GROUP_SYNC.set(old_mode);
+        shader.expect("lower").barrier_modes
+    };
+    assert_eq!(modes(3, false), vec![8]);
+    assert_eq!(modes(3, true), vec![9]);
+    assert_eq!(modes(0, true), vec![8]);
 }
 
 /// A barrier entered by only part of a console wave must complete on a

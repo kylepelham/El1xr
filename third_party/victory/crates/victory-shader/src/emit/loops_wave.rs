@@ -54,6 +54,7 @@ pub(super) fn again(
     native: &NativeProgram,
     p: &Program,
     st: &Structured,
+    digest: [u8; 16],
     emit: impl FnOnce(&Structured, &Resources) -> Emitted,
 ) -> Emitted {
     let Ok((_, Some(wave))) = &first else {
@@ -79,7 +80,11 @@ pub(super) fn again(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= wave => {
+        // (`VICTORY_UNDERWATER_WIDE=1`: not a retry that still needs wider waves than the host's,
+        // whose blocks to meet the wave-wide form needs)
+        Ok((shader, Some(w)))
+            if w <= wave && super::underwater::retry_counts(digest, w, lower::host_max_wave()) =>
+        {
             if why {
                 eprintln!(
                     "WAVE-LOOPS {} loop branches taken by each host wave together",
@@ -234,5 +239,67 @@ mod tests {
         assert!(plain.1.is_some());
         assert!(on.1 <= plain.1);
         assert_ne!(on.0.dxil, plain.0.dxil);
+    }
+
+    /// A loop each lane leaves on its own, then an LDS exchange between the halves of the
+    /// console wave inside a lane branch (lane t reads lane t ^ 63's dword): no host-loop retry
+    /// takes that to 32-lane waves. With `VICTORY_UNDERWATER_WIDE=1` the retry that still needs
+    /// 64 lanes does not count, and the block where the halves must meet stays known for the
+    /// wave-wide form (foxhound PR #16); off, the retry took over and that block was lost.
+    #[test]
+    fn a_retry_still_at_64_lanes_keeps_the_blocks_to_widen() {
+        let mut native = native(&[
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
+            0x3A06_00BF, // v_xor_b32 v3, 63, v0
+            0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the partner lane's (other half)
+            0x7E04_0300, // v_mov_b32 v2, v0
+            0x7E0A_0300, // v_mov_b32 v5, v0
+            0x4A0A_0AC1, // loop: v_add_nc_u32 v5, -1, v5
+            0x7D02_0A80, // v_cmp_lt_i32 vcc, 0, v5
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+            0xBF88_0006, // s_cbranch_execz restore
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000,
+            0x0400_0003, // ds_read_b32 v4, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+            0xBEFE_040E, // restore: s_mov_b64 exec, s[14:15]
+            0xE070_1000,
+            0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        ]);
+        if let crate::native::StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        }
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut bytes = crate::dxbc::build(&[]);
+        bytes[4..20].copy_from_slice(&super::super::underwater::DIGESTS[0]);
+        let c = super::super::Container::parse(&bytes).unwrap();
+        assert_eq!(loop_branches(&p, &st).len(), 1);
+        let wave = lower::TEST_HOST_WAVE.replace(Some(32));
+        let loops = TEST_LOOPS_WAVE.replace(Some(true));
+        let needs = |fixed: bool| {
+            let was = super::super::underwater::TEST_UNDERWATER_WIDE.replace(Some(fixed));
+            lower::take_needs();
+            let r = emit_program(&c, &native, &p, &st, &io, &res);
+            let needs = lower::take_needs();
+            super::super::underwater::TEST_UNDERWATER_WIDE.set(was);
+            (r.map(|r| r.1).ok().flatten(), needs)
+        };
+        let (fixed, before) = (needs(true), needs(false));
+        TEST_LOOPS_WAVE.set(loops);
+        lower::TEST_HOST_WAVE.set(wave);
+        assert_eq!(fixed.0, Some(64), "the plain form needs 64 lanes");
+        let around = lower::branches_around(&st, &fixed.1).expect("branches to widen");
+        assert_eq!(around.len(), 1);
+        assert!(!loop_branches(&p, &st).contains(&around[0]), "the LDS branch after the loop");
+        assert!(before.1.is_empty(), "off, the retry took over: {:?}", before);
     }
 }
