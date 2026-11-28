@@ -66,6 +66,10 @@ pub const SLOT_REMAP: u8 = 249;
 pub const REMAP_BASE: u32 = 1 << 20;
 /// (heapcap) Title view slots the [`SLOT_REMAP`] table covers from [`title_view_limit`] on.
 pub const REMAP_LEN: u32 = SLOT_STRIDES_COUNT - REMAP_BASE - 1;
+/// (heapcap, `VICTORY_HEAP_CAP=4`) Dwords of the whole-heap [`SLOT_REMAP`] table
+/// ([`title_remap_full`]): dword `i` the host slot of title view slot `i`; indices at or past
+/// the last read the last, a null slot.
+pub const FULL_REMAP: u32 = 1 << 21;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -189,6 +193,31 @@ thread_local! {
     pub(crate) static TITLE_VIEW_LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// For a test's thread alone: [`title_remap_len`].
     pub(crate) static TITLE_REMAP_LEN_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// (heapcap, `VICTORY_HEAP_CAP=4`) Every view index the title computes reads the host slot the
+/// whole-heap [`SLOT_REMAP`] table ([`FULL_REMAP`] dwords) gives: the host lays out its heap
+/// as it likes (which title slots are its own, which are packed) without a new translation.
+static TITLE_REMAP_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`title_remap_full`].
+    pub(crate) static TITLE_REMAP_FULL_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`TITLE_REMAP_FULL`].
+pub fn set_title_remap_full(on: bool) {
+    TITLE_REMAP_FULL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`TITLE_REMAP_FULL`].
+pub fn title_remap_full() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TITLE_REMAP_FULL_HERE.get() {
+        return on;
+    }
+    TITLE_REMAP_FULL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`TITLE_REMAP_LEN`]: `len` title slots past the limit read the remap table (0: none).

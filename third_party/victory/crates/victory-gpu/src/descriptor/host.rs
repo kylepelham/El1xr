@@ -1579,7 +1579,11 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let extra = if sampler { 0 } else { dynamic_slots(null) };
+        let extra = if sampler {
+            0
+        } else {
+            heap_cap::extra_slots(null, dynamic_slots(null))
+        };
         let (heap, count, size) = if sampler {
             let fitted = count.min(SAMPLERS - 1);
             match make(SAMPLERS) {
