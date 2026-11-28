@@ -376,6 +376,20 @@ extern "system" fn unknown_pipeline(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    // `VICTORY_PIPELINE_PIECES=1`: 0x1c8 makes the graphics pipeline from the loose pieces the
+    // description names (`pipeline::pieces`, from trustno1-coder/VIctory-NVIDIA #18); one it
+    // does not understand well enough to draw right is refused with its reason (logged once
+    // a reason) and answered as before.
+    #[cfg(windows)]
+    if crate::pipeline::pieces::enabled() {
+        match crate::pipeline::pieces::graphics(desc, _iid, out) {
+            Ok(answer) => {
+                crate::pieces_log::pieces_outcome(calls, Ok(()));
+                return answer;
+            }
+            Err(why) => crate::pieces_log::pieces_outcome(calls, Err(why)),
+        }
+    }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
@@ -443,6 +457,7 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[55] = crate::pieces_log::derived as *const (); // 0x1b8
     f[57] = unknown_pipeline as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0

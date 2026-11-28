@@ -426,6 +426,17 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// Runs `f` as on a host whose widest wave has `lanes` lanes, on this
+/// thread only (tests outside this module that translate for both kinds of
+/// host).
+#[cfg(test)]
+pub(crate) fn with_test_host_wave<R>(lanes: u32, f: impl FnOnce() -> R) -> R {
+    let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
+    let r = f();
+    lower::TEST_HOST_WAVE.set(was);
+    r
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -2998,6 +3009,7 @@ mod barycentric_tests {
         ];
         let io = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![VsOutput {
                 usage: Usage::Generic,
                 row: 1,
@@ -3245,6 +3257,7 @@ mod barycentric_tests {
         };
         let io = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![output(1, 0), output(2, 1)],
         };
         let osg1 = [
@@ -3280,6 +3293,7 @@ mod barycentric_tests {
         });
         let vs = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![],
         };
         let digests = [
