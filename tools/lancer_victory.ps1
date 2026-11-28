@@ -325,6 +325,7 @@ if (-not $NoTunedSettings) {
         VICTORY_RESET_ASIDE              = '1'         # batch 5M: landed lists and their preludes reset on victory-land-aside (prep -1.0, run_other -0.57)
         VICTORY_CARD_BLOCK_REUSE         = '1'         # batch 5O: card pieces zeroed and reused (blocks 4480 -> 2944 MB, fps 23.6 -> 26.0)
         VICTORY_HEAP_WARM                = '1'         # batch 5N/O: view heaps' host copies made on the loading screen (world-entry frame 1048 -> 614 ms)
+        VICTORY_TABLE_NULL_ONCE          = '1'         # batch 5R2: the diner background dark one frame every ~2 s gone (0 vs 12-19 per run, no cost)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
