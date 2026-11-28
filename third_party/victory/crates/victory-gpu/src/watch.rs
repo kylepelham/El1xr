@@ -1661,6 +1661,15 @@ pub(crate) fn note_4k(mask: Option<u16>) {
     COPY_4K[i + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// [`note_4k`] of many pages at once: `counts` as [`COPY_4K`] keeps them.
+pub(crate) fn note_4k_add(counts: [u64; 4]) {
+    for (cell, n) in COPY_4K.iter().zip(counts) {
+        if n > 0 {
+            cell.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// [`COPY_4K`], taken.
 pub(crate) fn copy_4k_stats() -> [u64; 4] {
     [0, 1, 2, 3].map(|i| COPY_4K[i].swap(0, std::sync::atomic::Ordering::Relaxed))

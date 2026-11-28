@@ -396,7 +396,7 @@ if (mode == 0) {
     }
 }
 
-fn make_test_shadow(h: &crate::host::Host, addr: u64, len: u64, carded: bool) -> Option<Arc<Shadow>> {
+pub(super) fn make_test_shadow(h: &crate::host::Host, addr: u64, len: u64, carded: bool) -> Option<Arc<Shadow>> {
     let size = len.next_multiple_of(PAGE as u64);
     let (staging, data) = h.shared_buffer(size)?;
     let (buffer, card) = if carded {

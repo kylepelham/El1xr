@@ -132,6 +132,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_STAGING_HOLD_MS", "How long an unused staging buffer is kept when memory is low, in ms."),
     ("VICTORY_STALE_BATCH", "Notes a refresh's changes once, not with two locks per run."),
     ("VICTORY_STALE_DIFF_WIDE", "Compares stale card copy bytes 128 at a time with prefetch."),
+    ("VICTORY_STALE_RUN_LEAN", "Joins touching stale copy runs and prefetches the next one."),
     ("VICTORY_STREAM_AHEAD", "Prepares a streamed texture as soon as its data arrives from disk."),
     ("VICTORY_SWEEP_ASIDE", "Runs the periodic cleanup sweep on its own thread."),
     ("VICTORY_TABLE_NULL_ONCE", "Leaves a texture slot empty while loading only the first time it is met."),
