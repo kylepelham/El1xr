@@ -125,6 +125,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_SHADER_PACK", "Reads translated shaders from one pack file, not a million loose files."),
     ("VICTORY_SHADOW_RASTER_TILES", "Sends sun shadow tiles to the shadow maps when rays always miss."),
     ("VICTORY_SHADOW_TILE_WATCH", "Logs sun-shadow tile programs that changed path between frames."),
+    ("VICTORY_SHARED_CONVERSIONS", "A shader two threads miss at once is translated once and shared."),
     ("VICTORY_SKIN_FILL", "Fills skin's probe radiance atlas with ambient light before skin draws."),
     ("VICTORY_SKIN_WATCH", "Logs per frame how skin lighting passes ran and what they wrote."),
     ("VICTORY_SPARSE_ZERO_SAFE", "Writes zeros for unmapped pages only where memory is committed."),

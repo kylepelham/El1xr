@@ -12,7 +12,7 @@
 mod cache;
 mod pack;
 
-pub use cache::{Cache, CacheKey};
+pub use cache::{Cache, CacheKey, shared_conversions};
 pub use pack::{Pack, PackStats};
 
 /// A deterministic transformation of one input into one output.
