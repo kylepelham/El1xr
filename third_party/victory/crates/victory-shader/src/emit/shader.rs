@@ -67,6 +67,15 @@ pub const SLOT_REMAP: u8 = 249;
 /// keeps, pair `i` the title address (low, high) of the buffer or ray-tracing structure view at
 /// title slot `i` (0: none). Slots past the last read the last, never written.
 pub const SLOT_VIEW_ADDRESSES: u8 = 248;
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The root SRV `t<SLOT_BUFFER_RANGES>` in [`ROOT_CBV_SPACE`] of
+/// a shader that reads buffers it picks from the view heap by their title address
+/// (`lower::buffer_address`): [`BUFFER_RANGES_COUNT`] entries of four dwords the host keeps, entry
+/// `i` the buffer view at title slot `i`: its first byte's address (low, high), its size in
+/// bytes, its element stride; all 0 for a slot with no buffer view. Slots past the last read the
+/// last, never written.
+pub const SLOT_BUFFER_RANGES: u8 = 247;
+/// Entries of the [`SLOT_BUFFER_RANGES`] buffer: every title slot (1,245,184 in the retail title).
+pub const BUFFER_RANGES_COUNT: u32 = 1 << 21;
 /// Pairs of the [`SLOT_VIEW_ADDRESSES`] buffer.
 pub const VIEW_ADDRESSES_COUNT: u32 = 1 << 21;
 /// (heapcap) Where the [`SLOT_REMAP`] dwords start in the [`SLOT_STRIDES`] buffer: past every

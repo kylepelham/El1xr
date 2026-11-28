@@ -33,6 +33,7 @@ mod slot_wait;
 mod srgb_cast;
 pub(crate) mod view_ages;
 mod view_addresses;
+pub(crate) mod buffer_ranges;
 pub(crate) use list_views::on as list_views;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
@@ -231,6 +232,9 @@ pub(crate) struct HostHeap {
     /// (`VICTORY_HEAP_VIEW_ADDRESS=1`) View heaps: the title address of the view at each title
     /// slot ([`view_addresses`]).
     addresses: Option<(ID3D12Resource, u64, usize)>,
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) View heaps: the buffer range of the view at each title
+    /// slot ([`buffer_ranges`]).
+    ranges: Option<buffer_ranges::Table>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1693,6 +1697,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             addresses: (!sampler).then(view_addresses::make).flatten(),
+            ranges: (!sampler).then(buffer_ranges::make).flatten(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
@@ -1934,6 +1939,11 @@ impl HostHeap {
     /// and GPU address.
     pub(crate) fn addresses(&self) -> Option<(&ID3D12Resource, u64)> {
         self.addresses.as_ref().map(|a| (&a.0, a.1))
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The table of buffer ranges by title slot.
+    pub(crate) fn buffer_ranges(&self) -> Option<&buffer_ranges::Table> {
+        self.ranges.as_ref()
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -3162,6 +3172,7 @@ impl HostHeap {
             };
         }
         view_addresses::write(&self.addresses, index, view);
+        buffer_ranges::write(&self.ranges, index, view);
         // The set is only written here: a slot with its flag set is in it,
         // and the lock is taken only to put one in or to take one out.
         let flagged = self.slot_flags.get(index as usize);

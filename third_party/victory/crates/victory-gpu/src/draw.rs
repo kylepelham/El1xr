@@ -2340,6 +2340,28 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_BUFFER_RANGES {
+                        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Ours: the buffer range of each
+                        // view heap slot's view, for buffers read by title address.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.buffer_ranges())
+                            .map(|t| t.root());
+                        match table {
+                            Some((buffer, gpu)) => {
+                                // The list may outlive the title's heap object.
+                                list.keep(buffer);
+                                self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+                            }
+                            None => once!("a shader reads buffer ranges without their table"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.

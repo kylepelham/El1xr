@@ -47,6 +47,8 @@ mod dpp;
 mod descriptor_data;
 #[path = "heap_address.rs"]
 pub(super) mod heap_address;
+#[path = "buffer_address.rs"]
+pub(super) mod buffer_address;
 #[path = "mask_elsewhere.rs"]
 pub(super) mod mask_elsewhere;
 
@@ -6014,6 +6016,16 @@ impl<'a> Lower<'a> {
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
+        // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) By title address: a buffer view's range or a
+        // constant buffer's, from the host's table by title slot.
+        if kind.is_none()
+            && let Some(xs) = self.heap_buffer_load(&src, None, addr, count, None)?
+        {
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,

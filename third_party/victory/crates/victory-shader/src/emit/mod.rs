@@ -163,9 +163,11 @@ pub use shader::{
     title_view_limit, view_heap_limit, REMAP_BASE, REMAP_LEN, SLOT_REMAP, set_title_remap_len,
     title_remap_len, FULL_REMAP, set_title_remap_full, title_remap_full, FAULT_DWORDS, FAULT_FLAG,
     set_title_fault_slot, title_fault_slot, SLOT_VIEW_ADDRESSES, VIEW_ADDRESSES_COUNT,
+    SLOT_BUFFER_RANGES, BUFFER_RANGES_COUNT,
 };
 pub use lower::thread_limit::on as dispatchx_mask;
 pub use lower::heap_address::on as heap_view_address;
+pub use lower::buffer_address::on as heap_buffer_address;
 pub use lower::mask_elsewhere::on as mask_elsewhere;
 
 /// The loop limit without an override: 2^20.
