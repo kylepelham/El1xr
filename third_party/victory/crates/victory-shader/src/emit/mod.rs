@@ -88,6 +88,7 @@ mod container;
 pub mod glass_record;
 pub(crate) mod glass_splice;
 pub(crate) mod shadow_splice;
+mod div_zero;
 mod glass_patch;
 mod shadow_patch;
 mod hit_only;
@@ -131,6 +132,8 @@ mod quad_lod_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
+mod div_zero_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave32_nvidia_tests;
@@ -167,6 +170,7 @@ pub use shader::{
 pub use lower::thread_limit::on as dispatchx_mask;
 pub use lower::heap_address::on as heap_view_address;
 pub use lower::mask_elsewhere::on as mask_elsewhere;
+pub use div_zero::on as div_inf_zero;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

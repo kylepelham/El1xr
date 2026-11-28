@@ -250,6 +250,7 @@ mod shader_prefetch;
 mod wave_more;
 mod zero_out;
 mod zero_fill;
+mod shadow_idle;
 #[cfg(windows)]
 mod face_watch;
 #[cfg(windows)]
