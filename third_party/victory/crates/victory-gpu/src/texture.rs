@@ -26,6 +26,7 @@ use crate::object::This;
 pub(crate) mod alias_skip;
 pub(crate) mod blind_hash;
 mod gpu_detile;
+mod hash_behind;
 mod inside_copy;
 mod mapped_holes;
 #[cfg(all(test, windows))]
@@ -119,6 +120,9 @@ struct Last {
     /// `(hash, sample)` of the last whole read, with
     /// `VICTORY_TEXTURE_HASH_SAMPLED` ([`blind_hash::kept_sample`]).
     sample: Option<(blake3::Hash, blake3::Hash)>,
+    /// Its look for an unseen write taken behind the submitting thread
+    /// (`VICTORY_TEXTURE_HASH_BEHIND`, [`hash_behind`]).
+    behind: hash_behind::Behind,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1624,7 +1628,7 @@ impl Staging {
 
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    pub(crate) fn refresh(self: &Arc<Self>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
@@ -1634,19 +1638,55 @@ impl Staging {
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(self: &Arc<Self>) -> usize {
         let whole = std::time::Instant::now();
         let mut blind = blind_hash::Read::Seen;
-        let read = self.refresh_timed(&mut blind);
+        let mut behind = None;
+        let read = self.refresh_timed(&mut blind, &mut behind);
+        if let Some(expect) = behind {
+            let staging = Arc::clone(self);
+            hash_behind::queue(move || staging.look_behind(expect));
+        }
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         blind_hash::note_read(blind, read, us);
         read
     }
 
+    /// The look for an unseen write handed to its threads by a check
+    /// ([`hash_behind`]): the memory hashed in place, as the check would have
+    /// under the same lock, and the result left for the next check.
+    fn look_behind(&self, expect: blake3::Hash) {
+        let size = self.size;
+        let seen = {
+            let mapped = if no_wait() {
+                crate::watch::title_memory_reading_now(self.memory as usize, size)
+            } else {
+                Some(crate::watch::title_memory_reading_range(self.memory as usize, size))
+            };
+            match mapped {
+                Some(_mapped) if committed(self.memory, size) => {
+                    // SAFETY: committed memory of the texture's layout size,
+                    // and it stays committed while `_mapped` is held.
+                    let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+                    hash_behind::hash_against(tiled, expect)
+                }
+                _ => hash_behind::Seen::Unread,
+            }
+        };
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        hash_behind::landed(&mut last.behind, last.hash, expect, seen);
+    }
+
     /// `blind` says whether the texture was read although no write to it was
-    /// seen, and how ([`blind_hash`]).
-    fn refresh_timed(&self, blind: &mut blind_hash::Read) -> usize {
+    /// seen, and how ([`blind_hash`]); `behind`, the hash a look handed to
+    /// its threads checks against ([`hash_behind`]).
+    fn refresh_timed(
+        &self,
+        blind: &mut blind_hash::Read,
+        behind: &mut Option<blake3::Hash>,
+    ) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1707,8 +1747,25 @@ impl Staging {
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
             let film = desc.swizzle.0 == 0 && desc.mips == 1;
-            if unwritten && !turn && !film && frame >= last.unguarded {
-                return 0;
+            // Without `VICTORY_TEXTURE_HASH_BEHIND` (and no look of it under
+            // way) skips exactly when unwritten, not the turn, not a film
+            // and past its window.
+            let can_behind = blind_hash::full_every().is_none() && !through_copy();
+            match hash_behind::look(
+                &mut last.behind,
+                hash_behind::on(),
+                unwritten,
+                turn,
+                film || frame < last.unguarded,
+                can_behind,
+                last.hash,
+            ) {
+                hash_behind::Look::Skip => return 0,
+                hash_behind::Look::Behind(expect) => {
+                    *behind = Some(expect);
+                    return 0;
+                }
+                hash_behind::Look::Read => {}
             }
             unseen = unwritten;
             if unwritten {
