@@ -43,6 +43,7 @@ mod slice_len;
 mod stage_unlocked;
 pub(crate) mod staged_ask;
 mod stale_audit;
+pub(crate) mod stream_ahead;
 pub(crate) mod take_by_table;
 
 macro_rules! once {
