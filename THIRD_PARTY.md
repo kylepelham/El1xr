@@ -79,6 +79,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | [ProjectLeonida/mandy](https://github.com/ProjectLeonida/mandy) (NotRexed ; d'après felicienradio/cold-project-vi `ec62312` et aki-gta6/aki-runtime `01f6f31`) | GPL-3.0 | | Le nettoyage des NaN garde une infinité à ±65504 au lieu de 0 (`9c31718bc2`, `VICTORY_NAN_SCRUB_INF=1`) ; couleurs écrites par les programmes de pixels bornées à ±65024 avec le remplaçant 16 bits de R9G9B9E5 (`1411b6ca38`, partie 1, `VICTORY_HDR_CLAMP`) |
 | [bolado-dev/mandy-port](https://github.com/bolado-dev/mandy-port) (bolado-dev ; d'après avatarmanz `84eae35`) | GPL-3.0 | | Dispatches indirects de calcul jusqu'à 2^20 groupes en x exécutés en entier au lieu d'être coupés à 65 535 (`e5e11b3e`, `VICTORY_INDIRECT_WIDE=1`) |
 | [elaboratecl/VIctory-AMD-4K](https://github.com/elaboratecl/VIctory-AMD-4K) (elaboratecl) | GPL-3.0 | | Après les programmes de couleur HDR de la scène, compte des texels NaN et infinis de leurs images, nettoyage en option (`221ece13e1`, `VICTORY_HDR_SCRUB=1/2`) |
+| [zm0kiemedia/Neptune_VI](https://github.com/zm0kiemedia/Neptune_VI) (zm0kie) | GPL-3.0 | | Emplacement périmé gardé jusqu'à son remplacement, au plus 120 s (`61f2206058`, `VICTORY_FLICKER_KEEP_MS`) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
