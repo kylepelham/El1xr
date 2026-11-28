@@ -120,6 +120,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_SCC_SHIFT_ADD", "Fixes the carry flag of shift-and-add shader instructions."),
     ("VICTORY_SCOPED_FLUSH", "CPU copies into game memory flush only the host copies they overlap."),
     ("VICTORY_SCRATCH_AT_LANDING", "Returns a list's scratch memory when its submission finishes."),
+    ("VICTORY_SEND_OWN", "Card copy uploads use bytes taken when the frame was prepared."),
     ("VICTORY_SEND_THREAD", "Sends submissions to the card from a separate thread."),
     ("VICTORY_SETTLE_ROOM", "Allows more lists and changed runs in flight before settling."),
     ("VICTORY_SHADER_PACK", "Reads translated shaders from one pack file, not a million loose files."),
