@@ -18,6 +18,8 @@
 //! triangles) is not built, since an invalid build can remove the device;
 //! and the title's clones and compactions name the host structure of their
 //! source, so top levels that point at the compacted copy still find one.
+//! The title's meshlet indices and quantized positions (most of its
+//! geometry) are decoded first ([`packed`]).
 //!
 //! Source: Linox-IDK/LNX-victory 012fbf0526, acbd3e6d96 (GPL-3.0-or-later).
 
@@ -33,6 +35,7 @@ use crate::object::Object;
 
 mod batch;
 mod gpu_instances;
+mod packed;
 mod refit;
 #[cfg(test)]
 mod refit_bench;
@@ -139,6 +142,11 @@ static REFIT_REFUSED: AtomicU64 = AtomicU64::new(0);
 static BARRIERS: AtomicU64 = AtomicU64::new(0);
 /// Top levels whose instances were made on the card ([`gpu_instances`]).
 static GPU_INSTANCES: AtomicU64 = AtomicU64::new(0);
+/// Geometries whose meshlet indices or quantized positions were decoded,
+/// and bottom levels refused for one that would not decode ([`packed`]).
+static PACKED_INDICES: AtomicU64 = AtomicU64::new(0);
+static PACKED_POSITIONS: AtomicU64 = AtomicU64::new(0);
+static PACKED_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// What a bottom level is built from: its flags and each geometry's
 /// description (addresses, counts, formats). Equal: the same structure, unless
@@ -164,11 +172,12 @@ fn signature(flags: u32, geometries: &[Triangles]) -> u64 {
     h.finish() | 1
 }
 
-/// Bytes per index of a DXGI index format (0: no index buffer).
+/// Bytes per index DXR is given for a DXGI index format (0: no index
+/// buffer). The title's meshlet indices are decoded to `R16_UINT` first.
 fn index_size(format: u32) -> u64 {
     match format {
-        57 => 2, // R16_UINT
-        42 => 4, // R32_UINT
+        57 | packed::MESHLET_INDICES => 2, // R16_UINT
+        42 => 4,                           // R32_UINT
         _ => 0,
     }
 }
@@ -197,7 +206,7 @@ fn geometry_ok(g: &Triangles, tier_1_1: bool) -> bool {
     } else {
         index_size(g.index_format) != 0 && g.index_count % 3 == 0
     };
-    indices_ok && vertex_format_ok(g.vertex_format, tier_1_1) && g.stride != 0
+    indices_ok && vertex_format_ok(g.vertex_format, tier_1_1) && packed::stride(g.stride) != 0
 }
 
 /// The host device's ray-tracing tier: 10 (1.0), 11 (1.1) or more; 0 none.
@@ -436,7 +445,7 @@ fn build_one(
     }
     // The inputs, with host addresses.
     let mut geometry = Vec::new();
-    let mut instance_upload: Option<ID3D12Resource> = None;
+    let mut uploads: Vec<ID3D12Resource> = Vec::new();
     let (dest, inputs) = match b {
         Build::Bottom {
             dest,
@@ -449,13 +458,18 @@ fn build_one(
                 return;
             }
             for g in geometries {
-                let ib_len = u64::from(g.index_count) * index_size(g.index_format);
-                let vb_len = u64::from(g.vertex_count) * g.stride;
-                let (Some(ib), Some(vb), Some(tr)) = (
-                    host_address(host, g.index_buffer, ib_len),
-                    host_address(host, g.vertex_buffer, vb_len),
-                    host_address(host, g.transform, 48),
-                ) else {
+                let (ib, vb) = match unpacked(host, g, &mut uploads) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(why) => {
+                        refused_packed(g, why);
+                        return;
+                    }
+                };
+                let Some(tr) = host_address(host, g.transform, 48) else {
                     SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
@@ -469,18 +483,14 @@ fn build_one(
                     Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
                         Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                             Transform3x4: tr,
-                            IndexFormat: DXGI_FORMAT(if ib == 0 {
-                                0
-                            } else {
-                                g.index_format as i32
-                            }),
-                            VertexFormat: DXGI_FORMAT(g.vertex_format as i32),
-                            IndexCount: if ib == 0 { 0 } else { g.index_count },
+                            IndexFormat: DXGI_FORMAT(if ib.0 == 0 { 0 } else { ib.1 as i32 }),
+                            VertexFormat: DXGI_FORMAT(vb.1 as i32),
+                            IndexCount: if ib.0 == 0 { 0 } else { g.index_count },
                             VertexCount: g.vertex_count,
-                            IndexBuffer: ib,
+                            IndexBuffer: ib.0,
                             VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                                StartAddress: vb,
-                                StrideInBytes: g.stride,
+                                StartAddress: vb.0,
+                                StrideInBytes: vb.2,
                             },
                         },
                     },
@@ -545,7 +555,7 @@ fn build_one(
                 GPU_INSTANCES.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: a live buffer.
                 let va = unsafe { array.GetGPUVirtualAddress() };
-                instance_upload = Some(array);
+                uploads.push(array);
                 va
             } else {
                 let upload = crate::host::host().and_then(|h| h.upload_buffer(size));
@@ -557,7 +567,7 @@ fn build_one(
                 unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), data, raw.len()) };
                 // SAFETY: a live buffer.
                 let va = unsafe { upload.GetGPUVirtualAddress() };
-                instance_upload = Some(upload);
+                uploads.push(upload);
                 va
             };
             (
@@ -704,8 +714,8 @@ fn build_one(
     }
     host.keep(&result.buffer);
     host.keep(&scratch.buffer);
-    if let Some(upload) = instance_upload {
-        host.keep(&upload);
+    for upload in &uploads {
+        host.keep(upload);
     }
     if let Some(st) = store.by_title.get_mut(&dest) {
         st.built = true;
@@ -727,6 +737,109 @@ fn build_one(
             BUILT_TOP.fetch_add(1, Ordering::Relaxed)
         }
     };
+}
+
+/// A geometry's index buffer (host address, DXGI format) and vertex buffer
+/// (host address, DXGI format, stride) as DXR takes them: plain ones as
+/// their host copies, the title's meshlet indices and quantized positions
+/// decoded from title memory into upload buffers held in `uploads`
+/// ([`packed`]). `None`: no host copy.
+#[allow(clippy::type_complexity)]
+fn unpacked(
+    host: &crate::host::HostList,
+    g: &Triangles,
+    uploads: &mut Vec<ID3D12Resource>,
+) -> Result<Option<((u64, u32), (u64, u32, u64))>, packed::Refused> {
+    let mut read = |at: u64, out: &mut [u8]| crate::host::read_into(at as *const u8, out);
+    let stride = packed::stride(g.stride);
+    let ib = if g.index_format == packed::MESHLET_INDICES && g.index_buffer != 0 {
+        let tris = g.index_count / 3;
+        let flip = packed::flips(g.stride);
+        let ix = packed::indices(g.index_buffer, tris, g.vertex_count, flip, &mut read)?;
+        let bytes: Vec<u8> = ix.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let Some(va) = upload(&bytes, uploads) else {
+            return Ok(None);
+        };
+        PACKED_INDICES.fetch_add(1, Ordering::Relaxed);
+        packed_said(g, "meshlet indices", ix.iter().copied().max().map_or(0, u32::from), None);
+        (va, packed::R16_UINT)
+    } else {
+        let len = u64::from(g.index_count) * index_size(g.index_format);
+        let Some(va) = host_address(host, g.index_buffer, len) else {
+            return Ok(None);
+        };
+        (va, g.index_format)
+    };
+    let vb = if g.vertex_format == packed::QUANTIZED_POSITIONS {
+        let ps = packed::positions(g.vertex_buffer, g.vertex_count, stride, &mut read)?;
+        let bytes: Vec<u8> = ps.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+        let Some(va) = upload(&bytes, uploads) else {
+            return Ok(None);
+        };
+        PACKED_POSITIONS.fetch_add(1, Ordering::Relaxed);
+        let bounds = ps.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+            (
+                std::array::from_fn(|c| lo[c].min(p[c])),
+                std::array::from_fn(|c| hi[c].max(p[c])),
+            )
+        });
+        packed_said(g, "quantized positions", 0, Some(bounds));
+        (va, packed::R32G32B32_FLOAT, packed::POSITION_STRIDE)
+    } else {
+        let len = u64::from(g.vertex_count) * stride;
+        let Some(va) = host_address(host, g.vertex_buffer, len) else {
+            return Ok(None);
+        };
+        (va, g.vertex_format, stride)
+    };
+    Ok(Some((ib, vb)))
+}
+
+/// `bytes` in a fresh upload buffer held in `uploads`: its host address.
+fn upload(bytes: &[u8], uploads: &mut Vec<ID3D12Resource>) -> Option<u64> {
+    let (buffer, data) = crate::host::host()?.upload_buffer(bytes.len().max(4) as u64)?;
+    // SAFETY: the mapped upload buffer holds at least `bytes`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+    // SAFETY: a live buffer.
+    let va = unsafe { buffer.GetGPUVirtualAddress() };
+    uploads.push(buffer);
+    Some(va)
+}
+
+/// The first few decoded geometries, for a batch to check the decode by.
+fn packed_said(g: &Triangles, what: &str, max_index: u32, bounds: Option<([f32; 3], [f32; 3])>) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 12 {
+        tracing::info!(
+            what,
+            index_count = g.index_count,
+            vertex_count = g.vertex_count,
+            max_index,
+            bounds = ?bounds,
+            index_buffer = format!("{:#x}", g.index_buffer),
+            vertex_buffer = format!("{:#x}", g.vertex_buffer),
+            "native bvh packed: decoded (the first 12)"
+        );
+    }
+}
+
+/// A bottom level not built: one of its geometries would not decode.
+fn refused_packed(g: &Triangles, why: packed::Refused) {
+    PACKED_REFUSED.fetch_add(1, Ordering::Relaxed);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            reason = ?why,
+            index_format = g.index_format,
+            vertex_format = g.vertex_format,
+            index_count = g.index_count,
+            vertex_count = g.vertex_count,
+            stride = g.stride,
+            index_buffer = format!("{:#x}", g.index_buffer),
+            vertex_buffer = format!("{:#x}", g.vertex_buffer),
+            "native bvh packed: a bottom level refused (the first 8)"
+        );
+    }
 }
 
 /// Whether the update `b` the title asked (of this `shape`, from
@@ -843,6 +956,9 @@ fn summary() {
         refit_refused = REFIT_REFUSED.swap(0, Ordering::Relaxed),
         barriers = BARRIERS.swap(0, Ordering::Relaxed),
         gpu_instances = GPU_INSTANCES.swap(0, Ordering::Relaxed),
+        packed_indices = PACKED_INDICES.swap(0, Ordering::Relaxed),
+        packed_positions = PACKED_POSITIONS.swap(0, Ordering::Relaxed),
+        packed_refused = PACKED_REFUSED.swap(0, Ordering::Relaxed),
         structures_kept = kept,
         mb_live = BYTES.load(Ordering::Relaxed) >> 20,
         "native bvh: host structures built in the last 5 s"
@@ -970,6 +1086,23 @@ mod tests {
         assert_eq!(index_size(57), 2);
         assert_eq!(index_size(42), 4);
         assert_eq!(index_size(0), 0);
+        // The title's meshlet indices (R16_TYPELESS), decoded to R16_UINT.
+        assert_eq!(index_size(53), 2);
+    }
+
+    #[test]
+    fn the_titles_own_forms_are_built() {
+        // Batch 5 part F: 134 of 140 logged geometries, refused before.
+        let meshlets = Triangles {
+            index_format: 53,
+            vertex_format: 16,
+            stride: 8,
+            ..tri(0x200)
+        };
+        assert!(geometry_ok(&meshlets, false));
+        assert!(geometry_ok(&Triangles { vertex_format: 6, stride: 12, ..meshlets }, false));
+        // Bit 15 of the stride is a flag: a stride of 0 under it is none.
+        assert!(!geometry_ok(&Triangles { stride: 0x8000, ..meshlets }, false));
     }
 
     #[test]
