@@ -381,6 +381,13 @@ impl Lower<'_> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
+                // (`VICTORY_SHADOW_RASTER_TILES`) The sun shadow's tile flags: no traced place.
+                if let Some(level) = crate::emit::shadow_raster::level_at(inst.machine.offset) {
+                    // (The words as the registers hold them: 32-bit integers.)
+                    for x in &mut vals {
+                        *x = self.shadow_raster_rewrite(level, *x);
+                    }
+                }
                 // Four unsigned integers for halves, four floats otherwise.
                 let component = if halves { 0x405 } else { 0x409 };
                 args.push(self.handle(site, src, false, (10 | u, component))?);
@@ -568,5 +575,24 @@ impl Lower<'_> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// (`VICTORY_SHADOW_RASTER_TILES`) A sun shadow tile's flags `v` with no traced place: at
+    /// level 1 if it has a raster place, at level 2 moved to the raster path if it was traced.
+    fn shadow_raster_rewrite(&mut self, level: u8, v: V) -> V {
+        use crate::emit::shadow_raster::{RASTER, TRACED};
+        let c = self.cur;
+        let (raster, traced) = (self.s.m.i32(RASTER), self.s.m.i32(TRACED));
+        let zero = self.s.m.i32(0);
+        let keep = self.s.m.i32(!TRACED);
+        let cleared = self.s.m.bin(c, Bin::And, v, keep);
+        let (test, then) = if level == 1 {
+            (raster, cleared)
+        } else {
+            (traced, self.s.m.bin(c, Bin::Or, cleared, raster))
+        };
+        let bits = self.s.m.bin(c, Bin::And, v, test);
+        let hit = self.s.m.cmp(c, pred::NE, bits, zero);
+        self.s.m.select(c, hit, then, v)
     }
 }
