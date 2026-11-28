@@ -31,6 +31,7 @@ pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 pub(crate) mod remade_safe;
+mod shown_already;
 mod slot_wait;
 mod srgb_cast;
 pub(crate) mod swap_watch;

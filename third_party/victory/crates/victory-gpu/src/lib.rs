@@ -75,6 +75,8 @@ mod bake_publish;
 #[cfg(windows)]
 mod bake_replay;
 #[cfg(windows)]
+mod bake_reuse;
+#[cfg(windows)]
 mod bake_spread;
 #[cfg(windows)]
 mod bind_hash;
@@ -204,6 +206,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 mod heap_pass;
+/// (feedcard, #88) `VICTORY_HEAP_PASS_SPLIT`: the heap-buffers pass's slots looked at on helper threads.
+mod heap_pass_split;
 pub mod query;
 pub mod queue;
 /// (mandy 6e80eb8648) `VICTORY_ALIAS_LATER=1`: page-mapping copies mapped behind the title's call.
