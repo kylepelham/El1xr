@@ -100,6 +100,41 @@ fn only_carded_writes(pending: &[HostCopy]) -> bool {
     })
 }
 
+/// `VICTORY_FLUSH_SMALL_ALONE=1`: a pass of a wide flush this small runs on
+/// the submitting thread instead of waking the kept threads.
+static SMALL_ALONE: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_FLUSH_SMALL_ALONE");
+/// The most copies, and bytes of refreshes over them all, of a small pass.
+pub(super) const SMALL_COPIES: usize = 4;
+pub(super) const SMALL_BYTES: usize = 256 << 10;
+
+/// Whether `pending` is a pass small enough to run alone: at most
+/// [`SMALL_COPIES`] copies whose refreshes span at most [`SMALL_BYTES`].
+pub(super) fn small_pass<C>(pending: &[ShadowBatch<C>]) -> bool {
+    pending.len() <= SMALL_COPIES
+        && pending
+            .iter()
+            .flat_map(|c| &c.steps)
+            .map(|s| match *s {
+                ShadowStep::Refresh(f, t) => t.saturating_sub(f),
+                _ => 0,
+            })
+            .sum::<usize>()
+            <= SMALL_BYTES
+}
+
+/// Whether the next pass of a wide flush runs alone on this thread.
+pub(super) fn alone_now<C>(
+    pending: &[ShadowBatch<C>],
+    small: bool,
+    carded: impl Fn(&[ShadowBatch<C>]) -> bool,
+) -> bool {
+    pending.len() == 1 || carded(pending) || (small && small_pass(pending))
+}
+
+/// Small passes run alone since the last line: passes, refresh bytes, us.
+static SMALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// The refreshes of a flush: on several threads with `wide`, else one copy
 /// after the other on this thread.
 pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
@@ -134,14 +169,34 @@ pub(super) fn refresh(copies: Vec<HostCopy>, wide: bool) {
 fn refresh_wide(copies: Vec<HostCopy>) {
     let prof = crate::refresh_prof::on();
     let one_pass = super::one_pass::on();
+    let small = SMALL_ALONE.get_bool();
     let mut pending = copies;
     while !pending.is_empty() {
-        if pending.len() == 1 || only_carded_writes(&pending) {
+        if alone_now(&pending, small, only_carded_writes) {
+            let counted = small && pending.len() > 1 && !only_carded_writes(&pending);
+            let bytes: usize = if counted {
+                pending
+                    .iter()
+                    .flat_map(|c| &c.steps)
+                    .map(|s| match *s {
+                        ShadowStep::Refresh(f, t) => t - f,
+                        _ => 0,
+                    })
+                    .sum()
+            } else {
+                0
+            };
             let alone = Instant::now();
             for copy in pending {
                 copy.run();
             }
-            add(F::AloneUs, alone.elapsed().as_micros() as u64);
+            let us = alone.elapsed().as_micros() as u64;
+            add(F::AloneUs, us);
+            if counted {
+                SMALL[0].fetch_add(1, Ordering::Relaxed);
+                SMALL[1].fetch_add(bytes as u64, Ordering::Relaxed);
+                SMALL[2].fetch_add(us, Ordering::Relaxed);
+            }
             break;
         }
         if one_pass {
@@ -347,6 +402,17 @@ pub(super) fn last<R>(flush: impl FnOnce() -> R) -> R {
 /// The account's line, per frame, for both kinds of flush.
 pub(super) fn log(frames: f64) {
     super::one_pass::line(frames);
+    let small: Vec<u64> = SMALL.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    if SMALL_ALONE.get_bool() {
+        tracing::info!(
+            "small flush passes run on the submitting thread per frame (VICTORY_FLUSH_SMALL_ALONE=1, up to {} copies and {} KiB): {:.1} passes, {:.0} KiB of refreshes, {:.2} ms",
+            SMALL_COPIES,
+            SMALL_BYTES >> 10,
+            small[0] as f64 / frames,
+            small[1] as f64 / (frames * 1024.0),
+            small[2] as f64 / (frames * 1000.0),
+        );
+    }
     crate::refresh_prof::log(frames);
     crate::shadow::refresh_stamp::line(frames);
     crate::compare_apart::line(frames);
@@ -393,5 +459,138 @@ pub(super) fn log(frames: f64) {
             ms(F::TexturesUs),
             per(F::Textures),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(id: usize, steps: Vec<ShadowStep>) -> ShadowBatch<usize> {
+        ShadowBatch {
+            shadow: id,
+            refresh_span: None,
+            steps,
+        }
+    }
+
+    #[test]
+    fn small_passes_are_few_copies_of_few_bytes() {
+        let r = |n: usize| ShadowStep::Refresh(0x10000, 0x10000 + n);
+        assert!(small_pass(&[batch(0, vec![r(SMALL_BYTES)])]));
+        assert!(!small_pass(&[batch(0, vec![r(SMALL_BYTES + 1)])]));
+        let four: Vec<_> = (0..SMALL_COPIES).map(|i| batch(i, vec![r(4096), ShadowStep::Write(1, 2)])).collect();
+        assert!(small_pass(&four));
+        let five: Vec<_> = (0..=SMALL_COPIES).map(|i| batch(i, vec![r(4096)])).collect();
+        assert!(!small_pass(&five));
+        let split = vec![batch(0, vec![r(SMALL_BYTES / 2)]), batch(1, vec![r(SMALL_BYTES / 2 + 1)])];
+        assert!(!small_pass(&split), "the bytes count over all the copies");
+        assert!(!alone_now(&split, true, |_| false));
+        assert!(alone_now(&split[..1], false, |_| false), "one copy runs alone as before");
+        assert!(alone_now(&four, true, |_| false));
+        assert!(!alone_now(&four, false, |_| false), "off: as before");
+    }
+
+    /// Drives a wide flush the way `refresh_wide` does (same `split_pass`
+    /// and `alone_now`), recording each copy's steps in the order they ran
+    /// and how many passes woke the kept threads.
+    fn drive(copies: Vec<ShadowBatch<usize>>, small: bool) -> (Vec<Vec<ShadowStep>>, usize) {
+        let n = copies.len();
+        let mut did: Vec<Vec<ShadowStep>> = vec![Vec::new(); n];
+        let mut pending = copies;
+        let mut wide = 0;
+        while !pending.is_empty() {
+            if alone_now(&pending, small, |_| false) {
+                for c in pending {
+                    did[c.shadow].extend(c.steps);
+                }
+                break;
+            }
+            wide += 1;
+            let (tasks, next) = split_pass(pending, crate::watch::PAGE);
+            // The kept threads run tasks in any order: last first here.
+            for t in tasks.into_iter().rev() {
+                match t {
+                    Task::Copy(c) => did[c.shadow].extend(c.steps),
+                    Task::Chunk(id, a, b) => did[id].push(ShadowStep::Refresh(a, b)),
+                }
+            }
+            pending = next;
+        }
+        (did, wide)
+    }
+
+    /// Joins adjacent refreshes (pieces of a long refresh) for comparison.
+    fn joined(steps: &[ShadowStep]) -> Vec<(u8, usize, usize)> {
+        let mut out: Vec<(u8, usize, usize)> = Vec::new();
+        for &s in steps {
+            let k = match s {
+                ShadowStep::Refresh(a, b) => (0, a, b),
+                ShadowStep::Write(a, l) => (1, a, l),
+                ShadowStep::Barrier => (2, 0, 0),
+            };
+            match out.last_mut() {
+                Some(last) if last.0 == 0 && k.0 == 0 && last.2 == k.1 => last.2 = k.2,
+                _ => out.push(k),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn small_passes_alone_do_the_same_steps_in_the_same_order() {
+        let p = crate::watch::PAGE;
+        let long = SPLIT_MIN + 3 * p;
+        let shapes: Vec<Vec<ShadowBatch<usize>>> = vec![
+            // A long refresh, then a small tail: the tail's pass runs alone.
+            vec![
+                batch(0, vec![ShadowStep::Refresh(0, long), ShadowStep::Write(8, 4), ShadowStep::Refresh(p, 2 * p)]),
+                batch(1, vec![ShadowStep::Refresh(long, 2 * long), ShadowStep::Refresh(p, 2 * p)]),
+                batch(2, vec![ShadowStep::Refresh(p, 2 * p)]),
+            ],
+            // Few small copies: the whole flush runs alone.
+            vec![
+                batch(0, vec![ShadowStep::Refresh(0, 4096)]),
+                batch(1, vec![ShadowStep::Write(0, 16), ShadowStep::Barrier, ShadowStep::Refresh(0, 64)]),
+            ],
+            // Many copies and two long refreshes in one copy: wide as before.
+            (0..12)
+                .map(|i| {
+                    batch(i, vec![
+                        ShadowStep::Refresh(i * long, (i + 1) * long),
+                        ShadowStep::Write(i, 1),
+                        ShadowStep::Refresh(i * long, i * long + long),
+                    ])
+                })
+                .collect(),
+        ];
+        let mut fewer = 0;
+        for copies in shapes {
+            let copy = |c: &Vec<ShadowBatch<usize>>| {
+                c.iter().map(|b| batch(b.shadow, b.steps.clone())).collect::<Vec<_>>()
+            };
+            let (off, wide_off) = drive(copy(&copies), false);
+            let (on, wide_on) = drive(copy(&copies), true);
+            assert_eq!(off.len(), on.len());
+            for (a, b) in off.iter().zip(&on) {
+                assert_eq!(joined(a), joined(b), "each copy: the same steps in the same order");
+            }
+            assert!(wide_on <= wide_off);
+            fewer += wide_off - wide_on;
+        }
+        assert!(fewer >= 2, "the small passes did not wake the kept threads");
+    }
+
+    #[test]
+    fn the_switch_is_live() {
+        if std::env::var_os("VICTORY_FLUSH_SMALL_ALONE").is_some() {
+            return;
+        }
+        assert!(!SMALL_ALONE.get_bool(), "off by default");
+        victory_core::settings::set("VICTORY_FLUSH_SMALL_ALONE", "1").unwrap();
+        let now = SMALL_ALONE.get_bool();
+        victory_core::settings::set("VICTORY_FLUSH_SMALL_ALONE", "").unwrap();
+        assert!(now, "a change takes effect while running");
+        assert!(!SMALL_ALONE.get_bool());
     }
 }
