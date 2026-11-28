@@ -6384,7 +6384,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_copy(dst, src, len);
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -9212,6 +9212,8 @@ mod one_pass;
 mod step_reads;
 #[path = "host_run_split.rs"]
 mod run_split;
+#[path = "host_scoped_flush.rs"]
+mod scoped_flush;
 #[path = "host_run_wait.rs"]
 mod run_wait;
 #[path = "host_ask.rs"]

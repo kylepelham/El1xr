@@ -268,6 +268,8 @@ mod defrag;
 mod watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod wc_skip;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod default_back;
 
 #[cfg(windows)]
 pub use defrag::log_defrag_counters;
