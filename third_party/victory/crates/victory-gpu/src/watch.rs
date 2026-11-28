@@ -61,6 +61,7 @@ pub(crate) fn guard_4k_join() -> bool {
     guard4k::join()
 }
 mod holes;
+pub(crate) mod ask_split;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
 
@@ -1979,7 +1980,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let ending = std::time::Instant::now();
     ask_once_end();
+    ask_split::add_us(ask_split::END_US, ending);
     if reservation::enabled() {
         reservation::ask(ranges);
         return;
@@ -2653,6 +2656,7 @@ fn ask_kernel_found(j: &mut Journal, first: usize, last: usize) -> Option<usize>
     if !known {
         reservation::count_kernel(count);
     }
+    let split = ask_split::asking().then(std::time::Instant::now);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known
         || unsafe {
@@ -2682,9 +2686,19 @@ fn ask_kernel_found(j: &mut Journal, first: usize, last: usize) -> Option<usize>
     );
     COUNTS[7].fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
     let now = j.ahead_asked;
+    let noting = split.map(|asked| {
+        ask_split::add_us(ask_split::KERNEL_US, asked);
+        ask_split::add(ask_split::CALLS, 1);
+        ask_split::add(ask_split::WALKED, ((last - first) * PAGE / KERNEL_PAGE) as u64);
+        ask_split::add(ask_split::FOUND, count as u64);
+        std::time::Instant::now()
+    });
     // Noted with a later asking meanwhile (the copy-back's own write) it gets a number
     // that says the kernel's find is newer (`note_kernel_batch` / `found_set`).
     note_kernel_batch(&j.found[..count], now);
+    if let Some(noting) = noting {
+        ask_split::add_us(ask_split::NOTE_US, noting);
+    }
     Some(count)
 }
 

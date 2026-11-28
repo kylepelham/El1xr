@@ -28,6 +28,7 @@ pub(super) fn count_kernel(pages: usize) {
 }
 
 pub(crate) fn line(frames: f64) {
+    super::ask_split::line(frames);
     if stats() && frames > 0.0 {
         let _journal = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         let [calls, pages, regions] = STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
@@ -50,6 +51,16 @@ pub(super) fn covered(j: &Journal, first: usize, last: usize) -> bool {
 }
 
 fn region(page: usize) -> Option<(usize, usize, bool)> {
+    let asked = super::ask_split::asking().then(std::time::Instant::now);
+    let answer = region_query(page);
+    if let Some(asked) = asked {
+        super::ask_split::add_us(super::ask_split::REGION_US, asked);
+        super::ask_split::add(super::ask_split::REGIONS, 1);
+    }
+    answer
+}
+
+fn region_query(page: usize) -> Option<(usize, usize, bool)> {
     use windows_sys::Win32::System::Memory::{
         MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
     };
@@ -200,6 +211,15 @@ pub(super) fn ask_more(extra: &[(usize, usize)]) {
 }
 
 pub(super) fn ask(ranges: &[(usize, usize)]) {
+    use super::ask_split::{self as split, add_us};
+    let started = std::time::Instant::now();
+    let _asking = split::Asking::begin();
+    ask_timed(ranges, started);
+    add_us(split::ASK_US, started);
+}
+
+fn ask_timed(ranges: &[(usize, usize)], started: std::time::Instant) {
+    use super::ask_split::{self as split, add, add_us};
     // Sort and remove duplicates before taking the global mapping permit.
     let mut pieces: Vec<_> = ranges
         .iter()
@@ -209,6 +229,7 @@ pub(super) fn ask(ranges: &[(usize, usize)]) {
     pieces.sort_unstable();
     pieces.dedup();
     let Some(_mapping) = title_memory_reading_now(0, 0) else {
+        add(split::BUSY, 1);
         return;
     };
     // Classify entire 64 KiB pieces (the actual kernel-query range).
@@ -223,7 +244,11 @@ pub(super) fn ask(ranges: &[(usize, usize)]) {
         // Mapped views remain on the existing guard path.
         start < end && !known_view(start)
     });
+    add(split::PIECES, pieces.len() as u64);
+    add_us(split::FILTER_US, started);
+    let locking = std::time::Instant::now();
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    add_us(split::LOCK_US, locking);
     run(&mut j, &pieces);
     KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
 }

@@ -4599,34 +4599,7 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let t_ask = std::time::Instant::now();
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> =
-                std::collections::HashMap::new();
-            if step_index() {
-                for list in runs {
-                    for (shadow, from, to) in &list.deferred().refresh_spans {
-                        if !shadow.unwatched() {
-                            let span = spans
-                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                                .or_insert((*from, *to));
-                            *span = (span.0.min(*from), span.1.max(*to));
-                        }
-                    }
-                }
-            } else {
-                for list in runs {
-                    for step in &list.deferred().copies {
-                        if let Step::Refresh(shadow, address, len) = step
-                            && !shadow.unwatched()
-                        {
-                            let span = spans
-                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                                .or_insert((*address, *address + *len));
-                            *span = (span.0.min(*address), span.1.max(*address + *len));
-                        }
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges = ask::ranges(runs);
             crate::watch::ask_once(&ranges);
             PREP_PARTS[2].fetch_add(t_ask.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Behind flights: the title wrote memory that a flight's shaders
@@ -9218,6 +9191,8 @@ mod step_reads;
 mod run_split;
 #[path = "host_run_wait.rs"]
 mod run_wait;
+#[path = "host_ask.rs"]
+mod ask;
 use step_reads::blocked_by;
 
 #[cfg(test)]
