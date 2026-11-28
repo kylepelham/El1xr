@@ -13,6 +13,8 @@
 use std::mem::offset_of;
 
 #[cfg(windows)]
+mod barrier_dedup;
+#[cfg(windows)]
 pub(crate) mod uav_clear;
 
 use crate::object::{
@@ -905,6 +907,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        barrier_dedup::apply(&mut host);
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1157,7 +1160,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
-            crate::texture::host_written(dst);
+            crate::texture::host_written_in(dst, None, std::ptr::from_ref(list) as usize);
             if crate::bake_check::on() {
                 crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
             }
@@ -1367,9 +1370,10 @@ extern "system" fn copy_texture_region(
         if !same {
             crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         }
-        crate::texture::host_written_sub(
+        crate::texture::host_written_in(
             dst.resource,
             (dst.kind != FOOTPRINT).then_some(dst.footprint.offset as u32),
+            std::ptr::from_ref(list) as usize,
         );
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst.resource as usize, "copy", src.resource as usize);
@@ -1553,7 +1557,7 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written_sub(dst, Some(dst_sub));
+        crate::texture::host_written_in(dst, Some(dst_sub), std::ptr::from_ref(list) as usize);
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
         }

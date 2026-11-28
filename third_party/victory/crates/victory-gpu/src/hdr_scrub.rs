@@ -22,6 +22,15 @@
 //! squares over the bright window). Meant with `VICTORY_NAN_SCRUB=0 VICTORY_NAN_GUARD=0`:
 //! with either on, the title's shaders make a NaN or infinity 0 (or 65504) before they store
 //! it and there is nothing left to count.
+//!
+//! `VICTORY_HDR_SCRUB_GLASS=1` (with `VICTORY_HDR_SCRUB`; the post passes too): also counts the
+//! glass chain around the alpha trace `6d7fe7745ab9c6d8` and the transmission pyramid's first
+//! stage ([`GLASS`]: `CS_AlphTransmissionPrefilterMip`, which the post names miss by the title's
+//! spelling, the alpha fallbacks, ray miss, screen-space resolve, budgeting fill, alpha shade and
+//! filters, the reflection spatial filters and the caustics resolve the trace reads), and each
+//! frame line ends `first=<program>`: of the counted programs, the first in the card's order to
+//! leave a NaN or infinity in an image that frame (the count after each dispatch takes the slot
+//! only if no earlier one did). Candidates for `VICTORY_CS_STORE_CLAMP_ONLY` (#96).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -31,8 +40,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 /// The title's programs whose images are counted, by the name in their container: the first
-/// [`BASE`] always, the rest ([`POST`]) with `VICTORY_HDR_SCRUB_POST=1`.
-pub(crate) const NAMES: [&str; 15] = [
+/// [`BASE`] always, [`POST`] with `VICTORY_HDR_SCRUB_POST=1`, [`GLASS`] with
+/// `VICTORY_HDR_SCRUB_GLASS=1`.
+pub(crate) const NAMES: [&str; 26] = [
     "CS_ApplyCombinedDeferred",
     "CS_SceneColorTemporalResolve",
     "CS_TAA2_Resolve",
@@ -48,11 +58,52 @@ pub(crate) const NAMES: [&str; 15] = [
     "CS_MainBlur",
     "CS_MotionBlurDownSample",
     "CS_BilateralBlur",
+    "CS_AlphTransmissionPrefilterMip",
+    "CS_DeferredFallbacksAlpha",
+    "CS_RayMiss_",
+    "CS_ResolveScreenSpace",
+    "CS_DummyResolve",
+    "CS_RayBudgeting_Fill",
+    "CS_ShadeAlpha",
+    "CS_VarianceFilterAlpha",
+    "CS_SpatialFilterAlpha",
+    "CS_SpatialFilter_",
+    "CS_ScreenProbes_TemporalResolve_ReflectiveCaustics",
 ];
 /// The names counted without `VICTORY_HDR_SCRUB_POST`.
 const BASE: usize = 6;
+/// The end of the tiled post passes in [`NAMES`].
+const POST_END: usize = 15;
 /// The tiled post passes of [`NAMES`].
-pub(crate) const POST: &[&str] = NAMES.split_at(BASE).1;
+pub(crate) const POST: &[&str] = NAMES.split_at(POST_END).0.split_at(BASE).1;
+/// The glass chain of [`NAMES`].
+pub(crate) const GLASS: &[&str] = NAMES.split_at(POST_END).1;
+
+/// `VICTORY_HDR_SCRUB_GLASS=1`: [`POST`] and [`GLASS`] counted, the first writer named. Read
+/// once.
+fn glass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_HDR_SCRUB_GLASS").is_ok_and(|v| v.trim() == "1");
+        if on && mode() != 0 {
+            tracing::info!(
+                "HDR scrub counts the glass chain too and names each frame's first NaN/inf writer: {GLASS:?} (VICTORY_HDR_SCRUB_GLASS)"
+            );
+        }
+        on
+    })
+}
+
+/// How many of [`NAMES`] are counted.
+fn counted() -> usize {
+    if glass() {
+        NAMES.len()
+    } else if post() {
+        POST_END
+    } else {
+        BASE
+    }
+}
 
 /// `VICTORY_HDR_SCRUB_POST=1`: [`POST`] counted too. Read once.
 fn post() -> bool {
@@ -71,8 +122,14 @@ fn post() -> bool {
 const RING: u64 = 8;
 /// Presents after a frame that its counts are read.
 const LAG: u64 = 5;
-/// Bytes of the counts: per frame of the ring, per program, NaN and infinite texels.
-const COUNT_BYTES: u64 = RING * NAMES.len() as u64 * 8;
+/// Bytes of the counts: per frame of the ring, per program, NaN and infinite texels; then per
+/// frame of the ring the first program (its place in [`NAMES`] + 1) that had any.
+const COUNT_BYTES: u64 = RING * NAMES.len() as u64 * 8 + RING * 4;
+
+/// The byte offset of the first-writer word of ring frame `slot`.
+fn first_at(slot: u64) -> u32 {
+    (RING * NAMES.len() as u64 * 8 + slot * 4) as u32
+}
 /// Frame lines logged at most.
 const LOGGED: u64 = 2000;
 /// Frames between the summaries.
@@ -103,7 +160,7 @@ fn parse(value: Option<&str>) -> u8 {
 
 /// The program `container` is, of [`NAMES`].
 pub(crate) fn pass_of(container: &[u8]) -> Option<u8> {
-    pass_among(container, if post() { NAMES.len() } else { BASE })
+    pass_among(container, counted())
 }
 
 /// The program `container` is, of the first `names` of [`NAMES`].
@@ -138,8 +195,8 @@ pub(crate) fn kind_of(format: i32) -> Option<Kind> {
 }
 
 const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants = 4, b0), DescriptorTable(UAV(u0)), UAV(u1)"
-cbuffer Params : register(b0) { uint width; uint height; uint at; uint scrub; };
+#define RS "RootConstants(num32BitConstants = 6, b0), DescriptorTable(UAV(u0)), UAV(u1)"
+cbuffer Params : register(b0) { uint width; uint height; uint at; uint scrub; uint first_at; uint tag; };
 #if defined(F3)
 #define T float3
 #elif defined(F4)
@@ -200,6 +257,9 @@ void main(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex) {
         if (found[1] != 0) {
             counts.InterlockedAdd(at * 8 + 4, found[1], was);
         }
+        if (found[0] != 0 || found[1] != 0) {
+            counts.InterlockedCompareExchange(first_at, 0u, tag, was);
+        }
     }
 }
 "#;
@@ -243,7 +303,9 @@ impl Pass {
 
     /// Records the pass over `image` (a view in the bound shader-visible heap of an image of
     /// `kind`, `size`, in the unordered access state), its counts into `counts` (a buffer
-    /// address) at entry `at`.
+    /// address) at entry `at`; `tag` goes into the word at byte `first` if that is still 0 and
+    /// the pass found any.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         list: &ID3D12GraphicsCommandList,
@@ -253,8 +315,10 @@ impl Pass {
         at: u32,
         scrub: bool,
         counts: u64,
+        first: u32,
+        tag: u32,
     ) {
-        let words = [size[0], size[1], at, u32::from(scrub)];
+        let words = [size[0], size[1], at, u32::from(scrub), first, tag];
         let barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
             ..Default::default()
@@ -263,7 +327,7 @@ impl Pass {
         unsafe {
             list.ResourceBarrier(std::slice::from_ref(&barrier));
             list.SetComputeRootSignature(&self.root);
-            list.SetComputeRoot32BitConstants(0, 4, words.as_ptr().cast(), 0);
+            list.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
             list.SetComputeRootDescriptorTable(1, image);
             list.SetComputeRootUnorderedAccessView(2, counts);
             list.SetPipelineState(&self.pipelines[kind as usize]);
@@ -332,8 +396,18 @@ pub(crate) fn run(
     list.keep(&made.counts);
     // SAFETY: a live buffer.
     let counts = unsafe { made.counts.GetGPUVirtualAddress() };
-    made.pass
-        .record(&list.list, kind, image, size, at, mode() == 2, counts);
+    let first = first_at(frame % RING);
+    made.pass.record(
+        &list.list,
+        kind,
+        image,
+        size,
+        at,
+        mode() == 2,
+        counts,
+        first,
+        u32::from(pass) + 1,
+    );
     RUN[usize::from(pass)].fetch_add(1, Relaxed);
     true
 }
@@ -362,7 +436,7 @@ pub(crate) fn presented(frame: u64) {
     let mut found = [[0u32; 2]; NAMES.len()];
     // SAFETY: the mapped counts; frame `of`'s work is done and no list of a frame being
     // recorded writes these words.
-    unsafe {
+    let writer = unsafe {
         for (i, f) in found.iter_mut().enumerate() {
             for (k, n) in f.iter_mut().enumerate() {
                 let word = made.words.add((first + i) * 2 + k);
@@ -370,7 +444,11 @@ pub(crate) fn presented(frame: u64) {
                 word.write_volatile(0);
             }
         }
-    }
+        let word = made.words.add(first_at(of % RING) as usize / 4);
+        let writer = word.read_volatile();
+        word.write_volatile(0);
+        writer
+    };
     if found.iter().any(|f| f[0] != 0 || f[1] != 0) {
         let mut total = TOTAL.lock().unwrap_or_else(|e| e.into_inner());
         for (t, f) in total.iter_mut().zip(found) {
@@ -380,7 +458,8 @@ pub(crate) fn presented(frame: u64) {
         drop(total);
         BAD_FRAMES.fetch_add(1, Relaxed);
         if LINES.fetch_add(1, Relaxed) < LOGGED {
-            tracing::info!("hdr scrub: frame {of} {}", line(&found));
+            let writer = if glass() { writer } else { 0 };
+            tracing::info!("hdr scrub: frame {of} {}", line(&found, writer));
         }
     }
     if frame.is_multiple_of(TOLD_EVERY) {
@@ -388,15 +467,21 @@ pub(crate) fn presented(frame: u64) {
     }
 }
 
-/// The programs with NaN or infinite texels in `found`.
-fn line(found: &[[u32; 2]; NAMES.len()]) -> String {
+/// The programs with NaN or infinite texels in `found`, and the first to write one (`writer`:
+/// its place in [`NAMES`] + 1; 0: not named).
+fn line(found: &[[u32; 2]; NAMES.len()], writer: u32) -> String {
     let mut parts = Vec::new();
     for (name, f) in NAMES.iter().zip(found) {
         if f[0] != 0 || f[1] != 0 {
             parts.push(format!("{name} nan={} inf={}", f[0], f[1]));
         }
     }
-    format!("NaN/inf texels: {}", parts.join(", "))
+    let first = (writer as usize)
+        .checked_sub(1)
+        .and_then(|i| NAMES.get(i))
+        .map(|name| format!(" first={name}"))
+        .unwrap_or_default();
+    format!("NaN/inf texels: {}{first}", parts.join(", "))
 }
 
 fn summary(frame: u64) {
@@ -405,7 +490,7 @@ fn summary(frame: u64) {
         .iter()
         .zip(&total)
         .zip(&RUN)
-        .take(if post() { NAMES.len() } else { BASE })
+        .take(counted())
         .map(|((name, t), run)| {
             format!(
                 "{name} images={} nan={} inf={}",

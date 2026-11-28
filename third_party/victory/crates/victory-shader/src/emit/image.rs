@@ -273,10 +273,14 @@ impl Lower<'_> {
                     self.float_of(v)?
                 });
             }
+            let hold = crate::emit::store_hold::here()
+                .filter(|_| self.x.native.stage == crate::native::HwStage::Cs);
             let vals: Vec<V> = vals
                 .into_iter()
                 .map(|v| {
-                    if nan_scrub() {
+                    if hold.is_some() {
+                        v
+                    } else if nan_scrub() {
                         self.scrub_nan(v)
                     } else {
                         self.nan_guard(v, false)
@@ -288,6 +292,21 @@ impl Lower<'_> {
                 let k = self.s.m.f32(s.to_bits());
                 for v in &mut vals[..3] {
                     *v = self.s.m.bin(self.cur, Bin::Mul, *v, k);
+                }
+            }
+            let mut guard = guard;
+            if let Some(hold) = hold {
+                if hold == crate::emit::store_hold::Hold::KeepNan {
+                    let nan = self.any_nan(&vals);
+                    let t = self.s.m.bool(true);
+                    let write = self.s.m.bin(self.cur, Bin::Xor, nan, t);
+                    guard = Some(match guard {
+                        Some(g) => self.s.m.bin(self.cur, Bin::And, g, write),
+                        None => write,
+                    });
+                }
+                for v in &mut vals {
+                    *v = self.hold_store(*v);
                 }
             }
             let h = self.handle(site, src, false, props)?;

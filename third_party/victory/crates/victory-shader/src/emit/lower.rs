@@ -81,7 +81,9 @@ mod half_meet;
 pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_meets};
 
 #[path = "halves.rs"]
-mod halves;
+pub(super) mod halves;
+#[path = "f16_round.rs"]
+pub(super) mod f16_round;
 
 /// Infinities held at ±65504 by the NaN scrub, colours held to the HDR range
 /// (`VICTORY_NAN_SCRUB_INF=1`, `VICTORY_HDR_CLAMP`).
@@ -173,6 +175,11 @@ mod trips;
 pub(super) mod thread_limit;
 #[path = "loop_keep.rs"]
 pub(super) mod loop_keep;
+/// Plain-jump loops test their limit at their exits (`VICTORY_LIMIT_EXITS=1`).
+#[path = "limit_exits.rs"]
+pub(super) mod limit_exits;
+#[path = "loop_watch.rs"]
+pub(super) mod loop_watch;
 
 type Why = &'static str;
 
@@ -382,6 +389,8 @@ struct Lower<'a> {
     half_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// (`VICTORY_F16_ROUND_MODE`) [`f16_round::modes`], made at the first f16 result.
+    f16_modes: Option<HashMap<usize, Option<u8>>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -516,6 +525,8 @@ struct Lower<'a> {
     abort: Option<usize>,
     /// Loops closed by a plain jump, by header, with their blocks ([`loop_keep`]).
     jump_loops: Option<Vec<(usize, Vec<bool>)>>,
+    /// The plain-jump loops tested at their exits ([`limit_exits`]).
+    limit: limit_exits::LimitExits,
     /// Per-wave half-meet state ([`half_meet`]).
     meet: half_meet::HalfMeet,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
@@ -1289,11 +1300,15 @@ impl<'a> Lower<'a> {
                 let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
                 at(from) != usize::MAX && at(to) <= at(from)
             };
-            let cut_short =
-                x.st.exits
-                    .iter()
-                    .enumerate()
-                    .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+            // (`VICTORY_LIMIT_EXITS`) not for a latch that stays a plain jump
+            let stays = if limit_exits::on() && s.threads.is_some() && console_lanes {
+                limit_exits::limit_exits(p, x.st).plain
+            } else {
+                HashSet::new()
+            };
+            let cut_short = x.st.exits.iter().enumerate().any(|(b, e)| {
+                matches!(*e, LaneExit::Jump(t) if back(b, t)) && !stays.contains(&b)
+            });
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -1388,6 +1403,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
             halves_only: Default::default(),
+            f16_modes: None,
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1508,6 +1524,7 @@ impl<'a> Lower<'a> {
                 .any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             jump_loops: None,
+            limit: limit_exits::LimitExits::default(),
             meet,
             twin: paired.then(Box::default),
             upper: false,
@@ -2344,6 +2361,9 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if limit_exits::on() && self.s.threads.is_some() && self.s.mesh.is_none() && self.console_lanes {
+            self.limit = limit_exits::limit_exits(self.x.p, self.x.st);
         }
         self.cur = self.s.entry;
         self.thread_limit_init();
@@ -8269,9 +8289,14 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                if self.limit.plain.contains(&b) {
+                    self.next_iteration(t);
+                    Term::Br(self.block[t].expect("reachable"))
+                } else {
+                    let ok = self.count_iteration(t, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -8330,13 +8355,18 @@ impl<'a> Lower<'a> {
                 };
                 // (`VICTORY_LOOP_KEEP`) A loop closed by a plain jump leaves here at its limit.
                 let cond = self.keep_exit(b, taken, not_taken, cond);
+                let cond = self.limit_exit(b, taken, cond);
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
+                // (`VICTORY_LOOP_CAP_WATCH`) An exit at the limit is counted on its way.
+                let [(t, from_t), (f, from_f)] = self.watch_exits(b, (taken, t), (not_taken, f));
+                for (to, via, watched) in [(taken, t, from_t), (not_taken, f, from_f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
+                        let from = if let Some(from) = watched {
+                            from
+                        } else if Some(via) == self.block[to] {
                             self.cur
                         } else {
                             via
@@ -8376,12 +8406,32 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
+        let next = self.next_iteration(to);
+        let limit = self.iteration_limit(to);
+        let limit = self.s.m.i32(limit);
+        let over = self.s.m.cmp(self.cur, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
+    }
+
+    /// A back edge to header `to`: the count goes up. Returns the new count.
+    fn next_iteration(&mut self, to: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        next
+    }
+
+    /// The iterations a lane makes of loop `to` before it is taken out of it.
+    fn iteration_limit(&self, to: usize) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -8395,16 +8445,7 @@ impl<'a> Lower<'a> {
         // stop reading data that is not there yet.)
         // (`VICTORY_LOOP_ROOM` raises them, `loop_keep`.)
         let limit = self.loop_cap();
-        let limit = trips::counted_limit(limit, super::loop_limit(), self.trips.get(&to).copied());
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
+        trips::counted_limit(limit, super::loop_limit(), self.trips.get(&to).copied())
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -8413,6 +8454,10 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        // (`VICTORY_LOOP_CAP_WATCH`) Counted before the discard: a helper lane writes nothing.
+        if loop_watch::on() {
+            self.cap_hit(a, loop_watch::ENDED);
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

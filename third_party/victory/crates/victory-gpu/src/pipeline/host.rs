@@ -510,6 +510,7 @@ impl HostPipeline {
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
                             || slot == victory_shader::emit::SLOT_MEET
+                            || slot == victory_shader::emit::SLOT_LOOP_CAP
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_REMAP
@@ -902,7 +903,7 @@ fn state_summary(g: &GraphicsState, depth_bounds: bool) -> String {
     };
     let bounds = if depth_bounds { " bounds true" } else { "" };
     format!(
-        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {} bias {} slope {} clamp {} clip {}; blend {} src {} dst {} op {} mask {:#x}",
         d.DepthEnable.as_bool(),
         d.DepthWriteMask.0,
         d.DepthFunc.0,
@@ -913,6 +914,10 @@ fn state_summary(g: &GraphicsState, depth_bounds: bool) -> String {
         face(&d.BackFace),
         r.CullMode.0,
         r.FrontCounterClockwise.as_bool(),
+        r.DepthBias,
+        r.SlopeScaledDepthBias,
+        r.DepthBiasClamp,
+        r.DepthClipEnable.as_bool(),
         b.BlendEnable.as_bool(),
         b.SrcBlend.0,
         b.DestBlend.0,
