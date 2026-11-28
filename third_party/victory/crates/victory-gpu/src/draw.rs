@@ -2081,6 +2081,10 @@ impl State {
             self.draw_dump(list, p, compute);
         }
         #[cfg(windows)]
+        if !compute && crate::heap_find::follows() {
+            self.heap_find_follow(p);
+        }
+        #[cfg(windows)]
         if crate::heap_find::recording() {
             self.heap_find(list, p, compute);
         }

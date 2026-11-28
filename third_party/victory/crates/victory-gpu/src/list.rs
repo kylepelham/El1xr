@@ -982,6 +982,13 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if crate::heap_find::on() {
+        let at = |b: This, offset: u64| {
+            crate::resource::find_facts::object_span(b).map(|(s, _)| (s + offset, len))
+        };
+        crate::heap_find::copy("CopyBufferRegion", this as usize, at(dst, dst_offset), at(src, src_offset));
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -1119,6 +1126,10 @@ fn unlike(dst: This, src: This) -> bool {
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
+    if crate::heap_find::on() {
+        crate::heap_find::copy_resources("CopyResource", this as usize, dst, src);
+    }
+    #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
             return;
@@ -1212,6 +1223,9 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        if crate::heap_find::on() {
+            crate::heap_find::copy_resources("CopyTextureRegion", this as usize, dst.resource, src.resource);
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1506,6 +1520,10 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    if crate::heap_find::on() {
+        crate::heap_find::copy_resources("ResolveSubresource", this as usize, dst, src);
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1698,6 +1716,10 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    if crate::heap_find::on() {
+        crate::heap_find::copy("CopyMemory", this as usize, Some((dst, len)), Some((src, len)));
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0

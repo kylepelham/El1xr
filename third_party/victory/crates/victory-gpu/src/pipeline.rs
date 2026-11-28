@@ -1191,6 +1191,7 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    native_retry::made(&shaders);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
@@ -1296,10 +1297,11 @@ pub(crate) extern "system" fn create_compute_x(
 /// retries at 0x1f0 with its full shader container.
 pub(crate) extern "system" fn cached_compute(
     _: This,
-    _desc: *const u8,
+    desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    native_retry::refused(native_retry::Slot::Compute, desc);
     use std::sync::atomic::{AtomicU64, Ordering};
     static MISSES: AtomicU64 = AtomicU64::new(0);
     if !out.is_null() {
@@ -1422,6 +1424,7 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+pub(crate) mod native_retry;
 mod early;
 #[cfg(windows)]
 mod library;
