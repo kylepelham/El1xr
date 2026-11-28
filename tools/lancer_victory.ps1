@@ -289,7 +289,6 @@ if (-not $NoTunedSettings) {
         VICTORY_WIDE_WAKE_ONE            = '1'         # batch 5: spread work wakes one kept thread per job (+1.4 fps with WAIT_SPIN)
         VICTORY_WAIT_SPIN                = '50'        # batch 5: spin 50 us for the last helper before sleeping
         VICTORY_AMBIENT_ONCE             = '1'         # batch 5: ambient stand-in counts one bounce (steady p99 -11 ms)
-        VICTORY_PRESENT_SMOOTH_READY     = '2'         # batch 5: no present smoothing before the world (first world frame 20.3 s vs 26.1)
         VICTORY_HOLD_LAST_FRAME          = '1'         # batch 4: an all-black present shows the last good frame (40 of 71 hidden)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
