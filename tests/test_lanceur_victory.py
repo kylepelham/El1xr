@@ -68,6 +68,7 @@ REGLAGES = {
     "VICTORY_WIDE_WAKE_ONE": "1",
     "VICTORY_WAIT_SPIN": "50",
     "VICTORY_AMBIENT_ONCE": "1",
+    "VICTORY_SKIP_WC_BACK": "1",
     "VICTORY_HOLD_LAST_FRAME": "1",
     "VICTORY_MENU": "1",
     "VICTORY_ASYNC_SUBMIT": "1",
@@ -528,6 +529,29 @@ def test_mute_switch_sets_victory_mute_and_allows_override(tmp_path, faux_outil)
     )
     assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
     assert _valeurs(fini.stdout)["VICTORY_MUTE"] == "0"
+
+
+def test_frame_gen_switch_adds_what_dlss_g_needs(tmp_path, faux_outil):
+    noms = ("VICTORY_FRAME_GEN", "VICTORY_CAMERA_CAPTURE", "VICTORY_DLSSG_EVERY_FRAME", "VICTORY_STREAMLINE_DIR")
+    fini, _, _, _ = _lancer(tmp_path / "default", faux_outil, echo=noms)
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert all(_valeurs(fini.stdout)[n] == "unset" for n in noms)
+
+    sl = tmp_path / "sl"
+    sl.mkdir()
+    fini, _, _, _ = _lancer(tmp_path / "fg", faux_outil, echo=noms, commande=f"-FrameGen -StreamlineDir '{sl}'")
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    valeurs = _valeurs(fini.stdout)
+    assert valeurs["VICTORY_FRAME_GEN"] == "dlss"
+    assert valeurs["VICTORY_CAMERA_CAPTURE"] == "1" and valeurs["VICTORY_DLSSG_EVERY_FRAME"] == "1"
+    assert valeurs["VICTORY_STREAMLINE_DIR"] == str(sl)
+
+    fini, _, _, _ = _lancer(
+        tmp_path / "override", faux_outil, echo=noms,
+        commande=f"-FrameGen -StreamlineDir '{sl}' -Override @{{ VICTORY_DLSSG_EVERY_FRAME = '0' }}",
+    )
+    assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert _valeurs(fini.stdout)["VICTORY_DLSSG_EVERY_FRAME"] == "0"
 
 
 def test_skip_intro_data_dir_and_title_args(tmp_path, faux_outil):
