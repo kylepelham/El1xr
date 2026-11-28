@@ -364,7 +364,11 @@ fn views_remade_quiet() -> bool {
 /// cutscene the car seat was a green and blue checkerboard for two seconds.
 pub(crate) fn show_after() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| show_after_from(std::env::var_os("VICTORY_SHOW_AFTER").as_deref()))
+}
+
+fn show_after_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != std::ffi::OsStr::new("0"))
 }
 
 /// Commits a texture view slot whose host descriptor was held back by
@@ -5843,6 +5847,18 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry's default is what an unset `VICTORY_SHOW_AFTER` does
+    /// (the menu showed it off while it ran on).
+    #[test]
+    fn show_after_is_on_unless_zero_as_the_registry_says() {
+        use std::ffi::OsStr;
+        assert!(show_after_from(None));
+        assert!(show_after_from(Some(OsStr::new("1"))));
+        assert!(!show_after_from(Some(OsStr::new("0"))));
+        let default = victory_core::settings::info("VICTORY_SHOW_AFTER").unwrap().default;
+        assert_eq!(show_after_from(Some(OsStr::new(default))), show_after_from(None));
+    }
 
     #[test]
     fn the_reread_and_magenta_switches_are_live() {
