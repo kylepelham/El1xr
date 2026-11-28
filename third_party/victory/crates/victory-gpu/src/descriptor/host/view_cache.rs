@@ -146,7 +146,7 @@ impl Shard {
     }
 }
 
-struct ViewCache {
+pub(super) struct ViewCache {
     /// Held for its slots.
     _heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -160,7 +160,7 @@ unsafe impl Send for ViewCache {}
 // SAFETY: as above.
 unsafe impl Sync for ViewCache {}
 
-fn cache() -> Option<&'static ViewCache> {
+pub(super) fn cache() -> Option<&'static ViewCache> {
     static CACHE: std::sync::OnceLock<Option<ViewCache>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -213,6 +213,18 @@ impl ViewCache {
         key: [u32; 3],
         to: D3D12_CPU_DESCRIPTOR_HANDLE,
     ) -> Option<ID3D12Resource> {
+        self.copy_texture_memo(view, key, to).map(|(texture, _)| texture)
+    }
+
+    /// [`copy`](Self::copy), also returning whether the view may be memoized
+    /// per list (false for an empty tiled texture so `flicker::made_view` keeps
+    /// reporting it and level uploads show at once).
+    pub(super) fn copy_texture_memo(
+        &self,
+        view: &View,
+        key: [u32; 3],
+        to: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<(ID3D12Resource, bool)> {
         let placed;
         let shown = match view {
             View::Shader(..) => view,
@@ -231,9 +243,10 @@ impl ViewCache {
             title,
             copy: std::sync::Arc::as_ptr(&copy),
             first: crate::resource::first_shown(resource),
-            prefilled: copy.prefilled.load(Relaxed),
+            prefilled: copy.prefilled.load(std::sync::atomic::Ordering::Acquire),
             copies: [0; 2],
         };
+        let memoizable = copy.tiled.is_none() || shows.first.is_some();
         let device = &crate::host::host()?.device;
         let s = shard_of(&key);
         let base = s as u32 * PER_SHARD;
@@ -251,7 +264,7 @@ impl ViewCache {
                 )
             };
             COUNTS[0].fetch_add(1, Relaxed);
-            return Some(copy.texture.clone());
+            return Some((copy.texture.clone(), memoizable));
         }
         let slot = shard.take(key);
         let made = make(shown, self.slot(base + slot)).and_then(|(kept, _)| kept);
@@ -279,14 +292,14 @@ impl ViewCache {
             )
         };
         COUNTS[1].fetch_add(1, Relaxed);
-        Some(texture)
+        Some((texture, memoizable))
     }
 
     /// [`copy`](Self::copy) for a buffer shader view: from the cache while
     /// the host copies it reads are the ones its entry was made on, else
     /// made there on them first. `None`: not a buffer shader view, or one
     /// the host cannot make (nothing written).
-    fn copy_buffer(
+    pub(super) fn copy_buffer(
         &self,
         view: &View,
         key: [u32; 3],
@@ -406,7 +419,7 @@ pub(crate) fn line(frames: f64) {
 
 #[cfg(test)]
 #[path = "view_cache_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(test)]
 #[path = "view_cache_bench.rs"]

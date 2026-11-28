@@ -207,6 +207,7 @@ pub(super) fn loose_outside(
         Found::Make => {
             note(&made);
             map.insert(key, made.clone());
+            super::bump_view_epoch();
             Some(Some(made))
         }
     }

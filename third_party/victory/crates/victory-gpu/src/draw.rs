@@ -642,6 +642,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        crate::descriptor::host::view_memo::forget(self.recording);
         crate::descriptor::release_dynamic_many(&self.dynamic);
         self.commit_pending_shows();
     }
@@ -1393,6 +1394,7 @@ impl State {
         if fresh_tables.capacity() > 4096 {
             fresh_tables.shrink_to(1024);
         }
+        crate::descriptor::host::view_memo::forget(*recording);
         *recording = 0;
         crate::readable_once::forget();
         ready_tables.clear();
@@ -4985,10 +4987,12 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
-            if self.recording == 0 && crate::descriptor::host::list_views() {
+            let memo_on = crate::descriptor::host::view_memo::on();
+            if self.recording == 0 && (crate::descriptor::host::list_views() || memo_on) {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
+            let mut copy_batch = crate::descriptor::host::view_memo::CopyBatch::new();
             let mut plain = ready_tables_on() && !group.has_uav;
             let mut deferred = false;
             textures.clear();
@@ -5124,14 +5128,25 @@ impl State {
                             .flatten()
                         {
                             Some(shown) => host.make_at(index, &shown),
+                            // (`VICTORY_TABLE_VIEW_MEMO`) Memoized per list with batched copies.
                             // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
                             // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
                                 let record = crate::descriptor::record_at(table + u64::from(k) * 32);
-                                let listed = (crate::descriptor::host::view_cache::any_on()
-                                    && host.make_cached(record, index))
-                                    || crate::descriptor::host::list_views()
-                                        && host.make_listed(self.recording, record, index);
+                                let listed = if memo_on {
+                                    host.make_memoized(
+                                        self.recording,
+                                        record,
+                                        &view,
+                                        index,
+                                        &mut copy_batch,
+                                    )
+                                } else {
+                                    (crate::descriptor::host::view_cache::any_on()
+                                        && host.make_cached(record, index))
+                                        || (crate::descriptor::host::list_views()
+                                            && host.make_listed(self.recording, record, index))
+                                };
                                 if !listed {
                                     host.make_at(index, &view);
                                 }
@@ -5193,6 +5208,11 @@ impl State {
                         }
                     }
                 }
+            }
+            if !copy_batch.is_empty() {
+                let making = crate::table_prof::now();
+                copy_batch.flush(host);
+                crate::table_prof::part(crate::table_prof::P::Make, making);
             }
             views.clear();
             if !deferred {

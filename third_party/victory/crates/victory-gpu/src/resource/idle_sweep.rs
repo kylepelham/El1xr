@@ -150,7 +150,9 @@ fn take(
         if idle {
             crate::table_null::unstaged(at, crate::table_null::Why::Evicted);
             crate::texture::unstage(at as This);
-            made.take()
+            let gone = made.take();
+            super::bump_view_epoch();
+            gone
         } else {
             None
         }

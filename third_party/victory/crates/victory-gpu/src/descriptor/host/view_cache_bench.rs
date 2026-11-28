@@ -259,6 +259,38 @@ fn table_slot_costs() {
             step,
         ) / 8.0;
         println!("TABLE_SLOT_BENCH,CopyDescriptorsSimple(8) per slot,{eight:.1}");
+        // Eight scattered source slots into one contiguous 8-slot destination run.
+        let scattered_srcs = [
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 0 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 3 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 7 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 11 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 2 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 15 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 5 * step },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src + 9 * step },
+        ];
+        let src_ones = [1u32; 8];
+        let dst_size = [8u32; 1];
+        let gathered = ns_per(
+            |at| {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu + (at.ptr - cpu) / step / 8 * 8 * step,
+                };
+                device.CopyDescriptors(
+                    1,
+                    &at,
+                    Some(dst_size.as_ptr()),
+                    8,
+                    scattered_srcs.as_ptr(),
+                    Some(src_ones.as_ptr()),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                )
+            },
+            cpu,
+            step,
+        ) / 8.0;
+        println!("TABLE_SLOT_BENCH,CopyDescriptors(1x8 scattered) per slot,{gathered:.1}");
     }
     // Our paths: `make` of a title texture's view against the cache's hit.
     let Some(cache) = cache() else {
@@ -280,6 +312,188 @@ fn table_slot_costs() {
     let hit = ns_per(|at| drop(cache.copy_buffer(&view, key, at)), cpu, step);
     println!("TABLE_SLOT_BENCH,make placed buffer view (ours),{made:.1}");
     println!("TABLE_SLOT_BENCH,view cache hit placed buffer (ours),{hit:.1}");
+    // Per-list view memo (`VICTORY_TABLE_VIEW_MEMO=1`): 1-slot hit, 8-slot contiguous
+    // batch, and 8-slot scattered batch, for both texture SRVs and placed buffer SRVs.
+    let Some(mut memo) = super::super::view_memo::ViewMemo::new() else {
+        drop(title);
+        crate::resource::test_release_texture(image);
+        return;
+    };
+    let mut batch = super::super::view_memo::CopyBatch::new();
+    let tex_view = View::Shader(image as usize, None);
+    let tex_keys: [[u32; 3]; 8] = std::array::from_fn(|i| [super::super::VIEW_TAG, 0x7c_1000 + i as u32, 91]);
+    for (i, &k) in tex_keys.iter().enumerate() {
+        memo.resolve_slot(
+            1,
+            k,
+            &tex_view,
+            i as u32,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + i * step },
+            &mut batch,
+            true,
+            true,
+            |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+            |_| {},
+        );
+    }
+    batch.flush_raw(device, cpu, step, memo.start, memo.step);
+    let memo_tex_1 = ns_per(
+        |at| {
+            let idx = ((at.ptr - cpu) / step) as u32;
+            memo.resolve_slot(
+                1,
+                tex_keys[0],
+                &tex_view,
+                idx,
+                at,
+                &mut batch,
+                true,
+                true,
+                |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                |_| {},
+            );
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    );
+    let memo_tex_8_contig = ns_per(
+        |at| {
+            let base_idx = (((at.ptr - cpu) / step) / 8 * 8) as u32;
+            for k in 0..8u32 {
+                let dst = base_idx + k;
+                memo.resolve_slot(
+                    1,
+                    tex_keys[k as usize],
+                    &tex_view,
+                    dst,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + dst as usize * step },
+                    &mut batch,
+                    true,
+                    true,
+                    |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                    |_| {},
+                );
+            }
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    ) / 8.0;
+    let scatter_order = [0usize, 3, 6, 1, 4, 7, 2, 5];
+    let memo_tex_8_scat = ns_per(
+        |at| {
+            let base_idx = (((at.ptr - cpu) / step) / 8 * 8) as u32;
+            for (k, &src_k) in scatter_order.iter().enumerate() {
+                let dst = base_idx + k as u32;
+                memo.resolve_slot(
+                    1,
+                    tex_keys[src_k],
+                    &tex_view,
+                    dst,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + dst as usize * step },
+                    &mut batch,
+                    true,
+                    true,
+                    |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                    |_| {},
+                );
+            }
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    ) / 8.0;
+    println!("TABLE_SLOT_BENCH,view cache + memo hit texture 1-slot (ours),{memo_tex_1:.1}");
+    println!("TABLE_SLOT_BENCH,view cache + memo hit texture 8-contig/slot (ours),{memo_tex_8_contig:.1}");
+    println!("TABLE_SLOT_BENCH,view cache + memo hit texture 8-scattered/slot (ours),{memo_tex_8_scat:.1}");
+
+    let buf_keys: [[u32; 3]; 8] = std::array::from_fn(|i| [super::super::VIEW_TAG, 0x7c_2000 + i as u32, 92]);
+    for (i, &k) in buf_keys.iter().enumerate() {
+        memo.resolve_slot(
+            1,
+            k,
+            &view,
+            i as u32,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + i * step },
+            &mut batch,
+            true,
+            true,
+            |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+            |_| {},
+        );
+    }
+    batch.flush_raw(device, cpu, step, memo.start, memo.step);
+    let memo_buf_1 = ns_per(
+        |at| {
+            let idx = ((at.ptr - cpu) / step) as u32;
+            memo.resolve_slot(
+                1,
+                buf_keys[0],
+                &view,
+                idx,
+                at,
+                &mut batch,
+                true,
+                true,
+                |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                |_| {},
+            );
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    );
+    let memo_buf_8_contig = ns_per(
+        |at| {
+            let base_idx = (((at.ptr - cpu) / step) / 8 * 8) as u32;
+            for k in 0..8u32 {
+                let dst = base_idx + k;
+                memo.resolve_slot(
+                    1,
+                    buf_keys[k as usize],
+                    &view,
+                    dst,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + dst as usize * step },
+                    &mut batch,
+                    true,
+                    true,
+                    |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                    |_| {},
+                );
+            }
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    ) / 8.0;
+    let memo_buf_8_scat = ns_per(
+        |at| {
+            let base_idx = (((at.ptr - cpu) / step) / 8 * 8) as u32;
+            for (k, &src_k) in scatter_order.iter().enumerate() {
+                let dst = base_idx + k as u32;
+                memo.resolve_slot(
+                    1,
+                    buf_keys[src_k],
+                    &view,
+                    dst,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + dst as usize * step },
+                    &mut batch,
+                    true,
+                    true,
+                    |b, sb, ss| b.flush_raw(device, cpu, step, sb, ss),
+                    |_| {},
+                );
+            }
+            batch.flush_raw(device, cpu, step, memo.start, memo.step);
+        },
+        cpu,
+        step,
+    ) / 8.0;
+    println!("TABLE_SLOT_BENCH,view cache + memo hit placed buffer 1-slot (ours),{memo_buf_1:.1}");
+    println!("TABLE_SLOT_BENCH,view cache + memo hit placed buffer 8-contig/slot (ours),{memo_buf_8_contig:.1}");
+    println!("TABLE_SLOT_BENCH,view cache + memo hit placed buffer 8-scattered/slot (ours),{memo_buf_8_scat:.1}");
+    drop(memo);
     drop(title);
     crate::resource::test_release_texture(image);
 }
