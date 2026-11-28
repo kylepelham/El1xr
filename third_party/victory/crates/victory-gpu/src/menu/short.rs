@@ -90,6 +90,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_HEAP_BUFFER_ADDRESS", "Heap-picked buffers and table constants are read by title address."),
     ("VICTORY_HEAP_CAP", "Title views past the card's 1M heap: null (1-2), packed (3-5)."),
     ("VICTORY_HEAP_ROUND_AHEAD", "Asks a queued submission's heap-sync round when the title sends it."),
+    ("VICTORY_HEAP_SKIP_CBV_VIEWS", "With HEAP_BUFFER_ADDRESS=1, skips host CBV views on title slots."),
     ("VICTORY_HEAP_VIEW_ADDRESS", "Shaders that read a heap view's address as numbers get it from the host."),
     ("VICTORY_HEAP_WARM", "Prepares view heap buffers on the loading screen for a faster first frame."),
     ("VICTORY_HELPER_PRIORITY", "Priority of the helper threads a frame waits on, from -2 to 2."),

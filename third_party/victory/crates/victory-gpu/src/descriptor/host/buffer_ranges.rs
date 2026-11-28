@@ -1,19 +1,25 @@
 //! (`VICTORY_HEAP_BUFFER_ADDRESS=1`) The buffer range of the view at each title slot of a view
 //! heap, for shaders that pick buffers from the heap by an index they compute and read them by
 //! title address (`victory_shader::emit::SLOT_BUFFER_RANGES`): an upload buffer of
-//! `BUFFER_RANGES_COUNT` entries of four dwords, the range's first byte (low, high), its size in
-//! bytes and its element stride; all 0 for a slot with no buffer view. Such a buffer view needs
-//! no host slot, and a title slot past the host heap's reads its own buffer.
+//! `BUFFER_RANGES_COUNT` entries of four dwords:
+//! - Direct copy (`BUFFER_RANGE_DIRECT` set in dword 1): byte offset in the copy,
+//!   `BUFFER_RANGE_DIRECT | copy_number`, size in bytes, element stride. Skips the 64 KiB page
+//!   directory and fault buffer, works for small/unaligned buffers (including shader-written
+//!   constant buffers) and eliminates first-frame zero flash.
+//! - Fallback (bit 31 clear): first byte's title address (low, high), size in bytes, element
+//!   stride (resolved through `SLOT_MEMORY`); all 0 for a slot with no buffer view.
 //!
 //! The host heap's own title slots are written where the stride table is
-//! ([`super::HostHeap::note_buffer_into`]). Title slots past them have no host counterpart and
-//! nothing mirrors them: the pages the title writes there mark their chunks ([`note_writes`]),
-//! and [`refresh`] reads marked chunks (and every [`RESCAN_EVERY`] frames all of them, for a view
-//! let go without a write) and writes their entries, [`READ_BUDGET`] slots a call at most.
+//! ([`super::HostHeap::note_buffer_into`]) and upgraded to direct copies by `heap_buffers` and
+//! draw-time `ensure_slot`. Title slots past them have no host counterpart: API writes update
+//! them immediately ([`write_past`]), raw page writes mark their chunks ([`note_writes`]), and
+//! [`refresh`] reads marked chunks on the same submission (and every [`RESCAN_EVERY`] frames all
+//! of them, for a view let go without a write), [`READ_BUDGET`] slots a call at most.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
+use victory_shader::emit::BUFFER_RANGE_DIRECT;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use super::super::View;
@@ -54,6 +60,28 @@ struct Past {
 
 /// Slots read and entries changed past the host heap, and microseconds spent ([`say`]).
 static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Host CBV views skipped on title slots under `VICTORY_HEAP_SKIP_CBV_VIEWS=1`.
+static SKIPPED_CBV_VIEWS: AtomicU64 = AtomicU64::new(0);
+
+/// (`VICTORY_HEAP_SKIP_CBV_VIEWS=1`, requires `VICTORY_HEAP_BUFFER_ADDRESS=1`) Skip creating
+/// host CBV / raw-SRV descriptors on title view-heap slots (ranges table serves them directly).
+pub(super) fn skip_cbv_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    skip_cbv_views_for(
+        victory_shader::emit::heap_buffer_address(),
+        *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_HEAP_SKIP_CBV_VIEWS").is_some_and(|v| v == "1")
+        }),
+    )
+}
+
+fn skip_cbv_views_for(hba: bool, switch: bool) -> bool {
+    hba && switch
+}
+
+pub(super) fn note_cbv_view_skipped() {
+    SKIPPED_CBV_VIEWS.fetch_add(1, Relaxed);
+}
 
 /// The table for a new view heap, zeroed; none with the switch off.
 pub(super) fn make() -> Option<Table> {
@@ -87,31 +115,108 @@ impl Table {
     }
 }
 
-/// The entry shaders read for `view`: a buffer view's range and stride (a constant buffer's
-/// address and size, stride 0); zeros for anything else.
-pub(crate) fn entry(view: Option<&View>) -> [u32; 4] {
-    let range = match view {
-        Some(View::Constant(at, size)) => Some((*at, u64::from(*size), 0)),
-        Some(v) => {
-            super::buffer_range(v).map(|(at, len)| (at, len, super::view_stride(v).unwrap_or(0)))
-        }
+/// Extracts `(address, len, stride, is_cbv)` from a buffer view.
+fn view_parts(view: Option<&View>) -> Option<(u64, u64, u32, bool)> {
+    match view {
+        Some(View::Constant(at, size)) if *at != 0 => Some((*at, u64::from(*size), 0, true)),
+        Some(v) => super::buffer_range(v)
+            .filter(|&(at, _)| at != 0)
+            .map(|(at, len)| (at, len, super::view_stride(v).unwrap_or(0), false)),
         None => None,
-    };
-    match range {
-        Some((at, len, stride)) if at != 0 => [
+    }
+}
+
+/// Pure title-address entry (for unit tests and fallback when no direct copy is available).
+pub(crate) fn entry(view: Option<&View>) -> [u32; 4] {
+    match view_parts(view) {
+        Some((at, len, stride, _)) => [
             at as u32,
             (at >> 32) as u32,
             len.min(u64::from(u32::MAX)) as u32,
             stride,
         ],
-        _ => [0; 4],
+        None => [0; 4],
     }
 }
 
-/// Writes title slot `index`'s entry.
+/// Encodes a direct-copy entry pointing at `(copy_num, offset_in_copy)`.
+pub(crate) fn direct_entry(copy_num: u32, offset: u32, len: u64, stride: u32) -> [u32; 4] {
+    [
+        offset,
+        BUFFER_RANGE_DIRECT | copy_num,
+        len.min(u64::from(u32::MAX)) as u32,
+        stride,
+    ]
+}
+
+/// Builds the entry for `view`, registering a direct copy in [`crate::memory`] when the view
+/// fits in one host copy (creating the copy only when `create_shadow` is true and memory is
+/// committed), or premapping its pages on fallback.
+fn entry_for(view: Option<&View>, create_shadow: bool) -> [u32; 4] {
+    let Some((at, len, stride, is_cbv)) = view_parts(view) else {
+        return [0; 4];
+    };
+    if len > 0 {
+        if let Some((copy_num, off)) = crate::memory::register_buffer(at, len, is_cbv, create_shadow)
+        {
+            crate::memory::note_buffer_range_result(true);
+            return direct_entry(copy_num, off, len, stride);
+        }
+        crate::memory::note_buffer_range_result(false);
+        if create_shadow {
+            crate::memory::premap_range(at, len);
+        }
+    }
+    [
+        at as u32,
+        (at >> 32) as u32,
+        len.min(u64::from(u32::MAX)) as u32,
+        stride,
+    ]
+}
+
+/// Writes title slot `index`'s entry (non-creating: upgrades immediately if its shadow exists).
 pub(super) fn write(table: &Option<Table>, index: u32, view: Option<&View>) {
     let Some(table) = table else { return };
-    put(table, index, entry(view));
+    put(table, index, entry_for(view, false));
+}
+
+/// Updates title slot `index` past `host.count` when an API descriptor call writes `handle`.
+pub(super) fn write_past(table: &Table, index: u32, handle: u64) {
+    let view = super::super::view(handle);
+    put(table, index, entry_for(view.as_ref(), false));
+}
+
+/// Upgrades title slot `index`'s entry using the `shadow` already resolved by `heap_buffers`.
+pub(super) fn write_shadow(
+    table: &Option<Table>,
+    index: u32,
+    shadow: &Arc<crate::shadow::Shadow>,
+    at: u64,
+    len: u64,
+    stride: u32,
+) {
+    let Some(table) = table else { return };
+    if at == 0 || len == 0 {
+        return;
+    }
+    if let Some(off) = shadow.offset_in(at)
+        && shadow.left(at) >= len
+        && off.checked_add(len).is_some_and(|e| e <= u64::from(u32::MAX))
+        && let Some(copy_num) = crate::memory::register_shadow(shadow, false)
+    {
+        crate::memory::note_buffer_range_result(true);
+        put(table, index, direct_entry(copy_num, off as u32, len, stride));
+    }
+}
+
+/// Ensures title slot `index`'s entry and host copy are populated before a draw reads it
+/// (used for table constant buffers lowered to read by title address).
+pub(crate) fn ensure_slot(host: &super::HostHeap, index: u32, view: Option<&View>) {
+    let Some(table) = host.buffer_ranges() else {
+        return;
+    };
+    put(table, index, entry_for(view, true));
 }
 
 fn put(table: &Table, index: u32, words: [u32; 4]) {
@@ -168,7 +273,7 @@ fn mark(past: &mut Past, lo: u32, hi: u32, title: u32) {
 }
 
 /// Reads marked chunks of title slots past the host heap's (all of them every [`RESCAN_EVERY`]
-/// frames) and writes their entries; called once a frame per view heap.
+/// frames) and writes their entries; called on each heap sync after [`note_writes`].
 pub(crate) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32) {
     let Some(table) = host.buffer_ranges() else {
         return;
@@ -236,7 +341,7 @@ pub(crate) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
             let view = (key != 0)
                 .then(|| super::super::view_with(i, generation, &mut held))
                 .flatten();
-            put(table, slot, entry(view.as_ref()));
+            put(table, slot, entry_for(view.as_ref(), true));
             changed += 1;
         }
     }
@@ -258,10 +363,12 @@ fn say(frame: u64) {
         return;
     }
     let [read, changed, us] = [0, 1, 2].map(|k| COUNTS[k].swap(0, Relaxed));
+    let skipped_cbv_views = SKIPPED_CBV_VIEWS.swap(0, Relaxed);
     tracing::info!(
         frames = frame - last,
         read,
         changed,
+        skipped_cbv_views,
         ms = us as f64 / 1000.0,
         "heap buffer address: title slots past the host heap read for their buffer ranges"
     );
@@ -283,11 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_entry_sets_direct_bit_and_preserves_offset_size_and_stride() {
+        let e = direct_entry(42, 0x120, 0x340, 16);
+        assert_eq!(e, [0x120, BUFFER_RANGE_DIRECT | 42, 0x340, 16]);
+        assert_ne!(e[1] & BUFFER_RANGE_DIRECT, 0);
+        assert_eq!(e[1] & !BUFFER_RANGE_DIRECT, 42);
+    }
+
+    #[test]
     fn written_pages_mark_their_chunks_and_a_rescan_all() {
         let mut past = Past::default();
         mark(&mut past, 4096, 4097, 3 * CHUNK + 5);
         assert_eq!(past.chunks, [false, false, true, false]);
         mark(&mut past, 0, 3 * CHUNK + 5, 3 * CHUNK + 5);
         assert_eq!(past.chunks, [true; 4]);
+    }
+
+    #[test]
+    fn skip_cbv_views_requires_both_switches() {
+        assert!(!skip_cbv_views_for(false, false));
+        assert!(!skip_cbv_views_for(false, true));
+        assert!(!skip_cbv_views_for(true, false));
+        assert!(skip_cbv_views_for(true, true));
     }
 }

@@ -76,6 +76,10 @@ pub const SLOT_VIEW_ADDRESSES: u8 = 248;
 pub const SLOT_BUFFER_RANGES: u8 = 246;
 /// Entries of the [`SLOT_BUFFER_RANGES`] buffer: every title slot (1,245,184 in the retail title).
 pub const BUFFER_RANGES_COUNT: u32 = 1 << 21;
+/// Bit 31 of dword 1 of a [`SLOT_BUFFER_RANGES`] entry: the host already placed the view
+/// in a numbered copy of [`SLOT_MEMORY`], so dword 0 is the byte offset in that copy and
+/// dword 1 without this bit is the copy number (skipping the page directory and fault buffer).
+pub const BUFFER_RANGE_DIRECT: u32 = 1 << 31;
 /// Pairs of the [`SLOT_VIEW_ADDRESSES`] buffer.
 pub const VIEW_ADDRESSES_COUNT: u32 = 1 << 21;
 /// (`VICTORY_LOOP_CAP_WATCH=1`) The root UAV `u<SLOT_LOOP_CAP>` in [`ROOT_CBV_SPACE`]: two

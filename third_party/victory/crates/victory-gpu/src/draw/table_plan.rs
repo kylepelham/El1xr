@@ -36,6 +36,11 @@ pub(crate) struct TablePlan {
     /// Direct entries can interleave slots. Preserve their declaration order
     /// when recording resource reads, writes, and transitions.
     pub(crate) direct: Vec<(usize, usize)>,
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) `(root_slot, descriptor_index)` of table constant
+    /// buffers lowered to read by title address: their `buffer_ranges` entries and host copies
+    /// are ensured before `memory_ready` on each draw (covers per-draw tables in title slots past
+    /// the host heap or written by raw CPU copies). Sorted and deduplicated.
+    pub(crate) cbv_address_slots: Vec<(u8, u32)>,
 }
 
 pub(crate) struct TableGroup {
@@ -127,7 +132,25 @@ impl TablePlan {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
         }
-        Self { groups, direct }
+        let mut cbv_address_slots: Vec<(u8, u32)> = if by_address.is_empty() {
+            Vec::new()
+        } else {
+            used.iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.kind == ResourceType::Cbv
+                        && by_address.binary_search(&u.slot).is_ok()
+                })
+                .map(|u| (u.slot, u.table_offset_dwords / 8))
+                .collect()
+        };
+        cbv_address_slots.sort_unstable();
+        cbv_address_slots.dedup();
+        Self {
+            groups,
+            direct,
+            cbv_address_slots,
+        }
     }
 }
 
@@ -236,6 +259,7 @@ mod tests {
         let g3 = &after.groups[1];
         assert!(g3.has_cbv && !g3.cbv_by_address);
         assert_eq!(after.direct.len(), 2);
+        assert_eq!(after.cbv_address_slots, vec![(1, 0), (2, 0)]);
     }
 
     #[test]

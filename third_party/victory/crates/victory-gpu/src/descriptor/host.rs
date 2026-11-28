@@ -1951,6 +1951,19 @@ impl HostHeap {
         self.ranges.as_ref()
     }
 
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Upgrades slot `index`'s buffer range entry using the
+    /// already-resolved `shadow` from the heap buffer pass (avoids a second shadow lookup).
+    pub(crate) fn write_buffer_range_shadow(
+        &self,
+        index: u32,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        at: u64,
+        len: u64,
+        view: &View,
+    ) {
+        buffer_ranges::write_shadow(&self.ranges, index, shadow, at, len, view_stride(view).unwrap_or(0));
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
@@ -3729,6 +3742,9 @@ impl HostHeap {
         record_change: bool,
     ) -> Option<(View, Option<BufferCopy>)> {
         if !self.slot_in_bounds(index, for_draw) {
+            if let Some(table) = &self.ranges {
+                buffer_ranges::write_past(table, index, handle);
+            }
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -3904,6 +3920,10 @@ impl HostHeap {
                 crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsMade);
                 let prior = made[index as usize];
                 made[index as usize] = key;
+                if matches!(view, View::Constant(..)) && buffer_ranges::skip_cbv_views() {
+                    buffer_ranges::note_cbv_view_skipped();
+                    self.keep(index, None);
+                } else {
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
                         self.keep(index, kept);
@@ -3936,6 +3956,7 @@ impl HostHeap {
                             }
                         }
                     }
+                }
                 }
                 self.made_too[index as usize].store(key, std::sync::atomic::Ordering::Release);
             }

@@ -3125,10 +3125,10 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{
-            MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
-        };
+    /// The directory lookup of [`Lower::memory`]: `(copy_number, byte_in_copy)` before the
+    /// heap handle is built.
+    fn memory_lookup(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3183,14 +3183,21 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        (copy, byte)
+    }
+
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        use super::shader::USER_MEMORY_BASE;
+        let (copy, byte) = self.memory_lookup(lo, hi, guard);
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self
             .s
             .heap_handle(c, slot, false, true, (self.window_properties, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
     }
 

@@ -1978,6 +1978,47 @@ impl State {
         crate::memory::ready(list, heap, addresses.as_slice(), constants.as_slice(), writes)
     }
 
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Fast path for shaders that only use `SLOT_MEMORY` via
+    /// `SLOT_BUFFER_RANGES` (no raw-address pointers or stores): avoids scanning root constants.
+    fn memory_ready_buffers(&self, list: &HostList) -> Option<crate::memory::Ready> {
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host(),
+        }?;
+        crate::memory::ready_buffers(list, heap)
+    }
+
+    /// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Ensures `SLOT_BUFFER_RANGES` entries and host copies are
+    /// ready for every table constant buffer read by title address before the draw runs.
+    fn ensure_cbv_address_slots(&self, compute: bool, slots: &[(u8, u32)]) {
+        let roots = self.roots_ref(compute);
+        let mut last: Option<(u8, u64, &'static crate::descriptor::Heap, &crate::descriptor::host::HostHeap)> = None;
+        for &(root_slot, desc) in slots {
+            let (table, heap, host) = match last {
+                Some((s, t, hp, hh)) if s == root_slot => (t, hp, hh),
+                _ => {
+                    let Some(&Root::Table(table)) = roots.get(usize::from(root_slot)) else {
+                        continue;
+                    };
+                    let Some(heap) = self.heap_of(table) else {
+                        continue;
+                    };
+                    if heap.samplers() || (table - heap.start) % 32 != 0 {
+                        continue;
+                    }
+                    let Some(host) = heap.host() else {
+                        continue;
+                    };
+                    last = Some((root_slot, table, heap, host));
+                    (table, heap, host)
+                }
+            };
+            let title_slot = ((table - heap.start) / 32) as u32 + desc;
+            let view = crate::descriptor::view(table + u64::from(desc) * 32);
+            crate::descriptor::host::buffer_ranges::ensure_slot(host, title_slot, view.as_ref());
+        }
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -2246,15 +2287,37 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Populate table constant buffer ranges and
+            // copies before `memory_ready` so per-draw tables never flash zeros on frame 1.
+            if !t.tables.cbv_address_slots.is_empty() {
+                self.ensure_cbv_address_slots(compute, &t.tables.cbv_address_slots);
+            }
             // Title memory by address: what the shader finds it by.
             let memory = if t
                 .host
                 .root_srvs
                 .contains(&victory_shader::emit::SLOT_MEMORY)
             {
+                let hba = victory_shader::emit::heap_buffer_address();
+                let memory_writes = if hba {
+                    (t.memory_stores || !write_skip())
+                        && !crate::pipeline::builder_quarantined(self.pipeline as This)
+                } else {
+                    writes
+                };
+                let raw_memory = !hba
+                    || t.raw_memory
+                    || !t
+                        .host
+                        .root_srvs
+                        .contains(&victory_shader::emit::SLOT_BUFFER_RANGES);
                 let ready = {
                     let _lap = BindLap::start(3);
-                    self.memory_ready(list, compute, writes)
+                    if !raw_memory && !memory_writes {
+                        self.memory_ready_buffers(list)
+                    } else {
+                        self.memory_ready(list, compute, memory_writes)
+                    }
                 };
                 let Some(ready) = ready else {
                     self.scratch_made = made;
@@ -2932,6 +2995,9 @@ impl State {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            if victory_shader::emit::heap_buffer_address() {
+                host.write_buffer_range_shadow(index, &shadow, address, len, &view);
+            }
             ranges.keep(index, key, &shadow, [address, address + len], record, entry);
         }
         let views = ranges.views() as u32;

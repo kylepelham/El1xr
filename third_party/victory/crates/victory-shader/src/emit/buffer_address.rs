@@ -161,7 +161,9 @@ impl Lower<'_> {
         count: u32,
         guard: Option<V>,
     ) -> Vec<V> {
-        use super::super::shader::{BUFFER_RANGES_COUNT, SLOT_BUFFER_RANGES};
+        use super::super::shader::{
+            BUFFER_RANGES_COUNT, BUFFER_RANGE_DIRECT, SLOT_BUFFER_RANGES, USER_MEMORY_BASE,
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         // Inside the table whatever the slot (a root view has no bounds).
@@ -196,22 +198,43 @@ impl Lower<'_> {
             }
             None => off,
         };
-        // the address: the range's start plus the byte, with the carry
-        let sum = self.s.m.bin(c, Bin::Add, lo, byte);
-        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
-        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
-        let high = self.s.m.bin(c, Bin::Add, hi, one);
-        // a load wholly past the end touches no memory (no fault for it)
-        let inside = self.s.m.cmp(c, pred::IULT, byte, size);
-        let guard = match guard {
-            Some(g) => Some(self.s.m.bin(c, Bin::And, g, inside)),
-            None => Some(inside),
-        };
-        // past the end: the range's own first page is looked up, not wherever the sum points
-        let sum = self.s.m.select(c, inside, sum, lo);
-        let high = self.s.m.select(c, inside, high, hi);
-        let (h, at) = self.memory(sum, high, guard);
         let zero = self.s.m.i32(0);
+        // a load wholly past the end touches no memory (no fault for it, null copy 0)
+        let inside = self.s.m.cmp(c, pred::IULT, byte, size);
+        let active = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+            None => inside,
+        };
+        // Direct entry (`BUFFER_RANGE_DIRECT`): `lo` is byte offset in copy `hi & !DIRECT`.
+        // Skips the 64 KiB page directory and fault buffer (needed for small/unaligned buffers
+        // and eliminates per-load fault-sink stores). Out-of-bounds reads also take copy 0.
+        let direct_bit = self.s.m.i32(BUFFER_RANGE_DIRECT);
+        let direct_mask = self.s.m.i32(!BUFFER_RANGE_DIRECT);
+        let hi_flag = self.s.m.bin(c, Bin::And, hi, direct_bit);
+        let not_direct = self.s.m.cmp(c, pred::EQ, hi_flag, zero);
+        let direct_copy = self.s.m.bin(c, Bin::And, hi, direct_mask);
+        let direct_copy = self.s.m.select(c, inside, direct_copy, zero);
+        let direct_at = self.s.m.bin(c, Bin::Add, lo, byte);
+        let direct_at = self.s.m.select(c, inside, direct_at, zero);
+        let need_dir = self.s.m.bin(c, Bin::And, not_direct, active);
+        let at_guard = self.begin_guarded(Some(need_dir));
+        let (page_copy, page_at) = {
+            let b = self.cur;
+            // the address: the range's start plus the byte, with the carry
+            let sum = self.s.m.bin(b, Bin::Add, lo, byte);
+            let wrapped = self.s.m.cmp(b, pred::IULT, sum, lo);
+            let one = self.s.m.cast(b, Cast::ZExt, wrapped, i32t);
+            let high = self.s.m.bin(b, Bin::Add, hi, one);
+            self.memory_lookup(sum, high, Some(active))
+        };
+        let pair = self.end_guarded(at_guard, &[(page_copy, direct_copy), (page_at, direct_at)]);
+        let (copy, at) = (pair[0], pair[1]);
+        let c = self.cur;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let mem_slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = self
+            .s
+            .heap_handle(c, mem_slot, false, true, (self.window_properties, 0));
         let mut out = Vec::new();
         // four dwords a load, on in the same copy (a buffer's copy holds all of it)
         for first in (0..count).step_by(4) {

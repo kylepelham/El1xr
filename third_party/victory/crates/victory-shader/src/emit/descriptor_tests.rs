@@ -599,6 +599,7 @@ fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap
         [[0.0f32; 4]; 5 * 3],
         [[0.0f32; 4]; 9 * 2],
     );
+    let zeros = vec![0u32; FAULT_DWORDS as usize];
     let views = [
         View::Texture(13, 7, &t0),
         View::RawUav(4),
@@ -606,7 +607,7 @@ fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap
         View::Texture(5, 3, &t3),
         View::NullTexture,
         View::Texture(9, 2, &t5),
-        View::RawUav(FAULT_DWORDS),
+        View::RawUavData(&zeros),
     ];
     let mut table = vec![2u32; FULL_REMAP as usize];
     table[0] = 0;
@@ -1020,4 +1021,49 @@ fn a_tables_constant_buffer_reads_the_same_constants_by_title_address() {
     // No table: past every entry of the host's ranges table (its last entry, never written,
     // reads 0); not run here, where the table is 8 entries long and a root view has no bounds.
     const { assert!(NO_TABLE_SLOT >= BUFFER_RANGES_COUNT && NO_TABLE_SLOT < u32::MAX / 2) };
+}
+
+#[test]
+fn a_direct_buffer_range_reads_its_copy_without_touching_the_memory_directory() {
+    use super::shader::{BUFFER_RANGE_DIRECT, SLOT_BUFFER_RANGES, SLOT_MEMORY};
+    let program = heap_buffer_program();
+    let by_address = translate_buffer_address(&program, true);
+    assert!(by_address.root_srvs.contains(&SLOT_BUFFER_RANGES));
+    assert!(by_address.root_srvs.contains(&SLOT_MEMORY));
+    // A small unaligned 24-byte copy at offset 0x10 inside copy 1 (heap slot USER_MEMORY_BASE + 1 = 2).
+    let data = [0xAA11u32, 0xBB22, 0xCC33, 0xDD44, 0xEE55, 0xFF66];
+    let mut copy_bytes = vec![0xDEAD_BEEFu32; 64];
+    copy_bytes[4..10].copy_from_slice(&data);
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Raw,
+        },
+        View::RawUav(4),
+        View::RawUavData(&copy_bytes),
+    ];
+    // Slot 0: direct copy 1 at byte offset 0x10, size 24, stride 4.
+    // Slot 2: direct copy 1 at byte offset 0x18, size 16, stride 4.
+    // Slot 5: empty [0, 0, 0, 0].
+    let mut ranges = vec![0u32; 4 * 8];
+    ranges[..4].copy_from_slice(&[0x10, BUFFER_RANGE_DIRECT | 1, 24, 4]);
+    ranges[8..12].copy_from_slice(&[0x18, BUFFER_RANGE_DIRECT | 1, 16, 4]);
+    // Empty memory directory: proves direct entries never touch SLOT_MEMORY.
+    let directory = vec![0u32; 2 * 8];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 warp device; skipped");
+        return;
+    };
+    let run = |s0: u32, s1: u32| {
+        run_by_address(&host, "warp", &by_address, &views, &ranges, &directory, [s0, s1], 2)
+    };
+    assert_eq!(run(0, 0), [0xAA11, 0xBB22], "direct copy at offset 0x10");
+    assert_eq!(run(0, 8), [0xCC33, 0xDD44], "direct copy at offset 0x18");
+    assert_eq!(run(0, 20), [0xFF66, 0], "partial OOB returns 0 for trailing dword");
+    assert_eq!(run(0, 24), [0, 0], "OOB returns 0");
+    assert_eq!(run(2, 0), [0xCC33, 0xDD44], "second direct slot");
+    assert_eq!(run(5, 0), [0, 0], "empty slot returns 0");
 }

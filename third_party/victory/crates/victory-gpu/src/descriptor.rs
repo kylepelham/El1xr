@@ -240,7 +240,9 @@ pub(crate) fn sync_heaps() {
         if let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) {
             let null = victory_shader::emit::view_heap_limit();
             host::heap_cap::watch(start, u64::from(step), host, heap.desc.count, null);
-            host::buffer_ranges::refresh(start, u64::from(step), host, heap.desc.count);
+            if heap.written.is_none() {
+                host::buffer_ranges::refresh(start, u64::from(step), host, heap.desc.count);
+            }
         }
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
@@ -266,6 +268,7 @@ pub(crate) fn sync_heaps() {
         }
         host::heap_cap::note_writes(&ranges, start, step, host.count(), heap.desc.count);
         host::buffer_ranges::note_writes(host, &ranges, start, step, heap.desc.count);
+        host::buffer_ranges::refresh(start, step, host, heap.desc.count);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {

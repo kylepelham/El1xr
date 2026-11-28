@@ -2,7 +2,8 @@
 //! through raw 40-bit addresses (`victory_shader::emit::SLOT_MEMORY`: the
 //! console's ray-tracing structure builder and the programs that walk its
 //! structures; the structures themselves lie in plain title memory, in no
-//! buffer object).
+//! buffer object) and, under `VICTORY_HEAP_BUFFER_ADDRESS=1`, heap-picked
+//! buffers and table constant buffers (`victory_shader::emit::SLOT_BUFFER_RANGES`).
 //!
 //! The copies are the ones every other access uses ([`crate::shadow`]: a
 //! title buffer's copy, or the 4 MiB window of memory outside buffers), so
@@ -38,15 +39,18 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
-//! dirty-page mask written by the shader would bound both.
-//! `VICTORY_BVH_DECLARE_OUTPUTS=1` (`crate::bvh_declare`) declares written
-//! only the builds' outputs and what writing draws' root arguments name.
+//! there are at most [`COPIES`] of them by default ([`COPIES_BUFFER_ADDRESS`]
+//! under `VICTORY_HEAP_BUFFER_ADDRESS=1`, where the title has ~5,200+ live
+//! buffer host copies). Every dispatch of a raw-address shader brings
+//! per-list copies up to date and, if it can store, declares all of them
+//! written (the bytes are compared on the CPU afterwards, as for any
+//! unordered access view): a dirty-page mask written by the shader would
+//! bound both. `VICTORY_BVH_DECLARE_OUTPUTS=1` (`crate::bvh_declare`)
+//! declares written only the builds' outputs and what writing draws' root
+//! arguments name.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
@@ -56,13 +60,68 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
+/// Copies that can be numbered without `VICTORY_HEAP_BUFFER_ADDRESS=1` (the
+/// run of heap slots is one longer).
 const COPIES: u32 = 1023;
+/// Copies that can be numbered with `VICTORY_HEAP_BUFFER_ADDRESS=1`: the
+/// retail title warms ~5,192 distinct buffer copies on the loading screen
+/// alone plus ~500-900 loose windows. 16,384 dynamic slots (~6-9% of a view
+/// heap's dynamic pool) gives >3x headroom so pages never silently read 0.
+const COPIES_BUFFER_ADDRESS: u32 = 16_383;
+/// Bit 31 of [`Shadow::memory_copy`]: this copy is refreshed on every list's
+/// first use (raw-address copies and copies backing constant buffers).
+const PER_LIST_BIT: u32 = 1 << 31;
+/// Maximum 64 KiB pages premapped for one fallback multi-window buffer range.
+const PREMAP_MAX_PAGES: u64 = 256;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+
+fn max_copies() -> u32 {
+    max_copies_for(victory_shader::emit::heap_buffer_address())
+}
+
+fn max_copies_for(hba: bool) -> u32 {
+    if hba {
+        COPIES_BUFFER_ADDRESS
+    } else {
+        COPIES
+    }
+}
+
+/// Cached GPU addresses for lock-free [`ready_buffers`] fast path.
+static DIR_GPU: AtomicU64 = AtomicU64::new(0);
+static FAULTS_GPU: AtomicU64 = AtomicU64::new(0);
+/// Incremented whenever a copy is added or promoted to `per_list`; starts at 1
+/// so 0 (initial [`ListReady`] state) never matches.
+static GEN: AtomicU64 = AtomicU64::new(1);
+
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Counters since last summary:
+/// `[direct_ranges, fallback_ranges, faults_total, cap_misses, uav_refused]`.
+static HBA_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Per-[`HostList`] fast-path cache for [`ready_buffers`]: avoids locking the
+/// global `MEMORY` mutex on draws once the list is synced at the current
+/// `(frame, GEN, heap)`.
+#[derive(Default)]
+pub(crate) struct ListReady {
+    epoch: AtomicU64,
+    frame: AtomicU64,
+    heap: AtomicUsize,
+    base: AtomicU32,
+    seen: AtomicU32,
+}
+
+impl ListReady {
+    pub(crate) fn reset(&self) {
+        self.epoch.store(0, Ordering::Relaxed);
+        self.frame.store(0, Ordering::Relaxed);
+        self.heap.store(0, Ordering::Relaxed);
+        self.base.store(0, Ordering::Relaxed);
+        self.seen.store(0, Ordering::Relaxed);
+    }
+}
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -70,6 +129,19 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Frame when each copy was numbered (new copies are refreshed on every
+    /// list of their birth frame to avoid first-frame zero flash under parallel
+    /// list recording).
+    added_frame: Vec<u64>,
+    /// Indices into `copies` that must be refreshed on every list's first use
+    /// (raw-address copies and copies backing constant buffers).
+    per_list: Vec<usize>,
+    /// Parallel to `copies`: whether index `n` is in `per_list`.
+    per_list_flag: Vec<bool>,
+    /// Last frame on which all non-`per_list` copies were refreshed.
+    per_frame_refreshed: u64,
+    /// Last frame on which the `VICTORY_HEAP_BUFFER_ADDRESS=1` summary logged.
+    hba_last_log: u64,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -77,8 +149,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
-    /// The first copy numbered by [`premap`] since the last [`ready`]
-    /// (`usize::MAX`: none): the next draw brings it up to date.
+    /// The first copy numbered by [`premap`] or [`register_shadow`] since the
+    /// last [`ready`] (`usize::MAX`: none): the next draw brings it up to date.
     premapped: usize,
     /// (`VICTORY_BVH_DECLARE_OUTPUTS`, `crate::bvh_declare`) Per copy, the
     /// generation it became written in (0: read only), the last generation,
@@ -116,11 +188,23 @@ impl Memory {
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, data.cast::<u32>(), gpu))
         };
-        tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        let directory = make(u64::from(MEMORY_PAGES) * 2, "directory")?;
+        let faults = make(u64::from(MEMORY_FAULTS), "faults")?;
+        DIR_GPU.store(directory.2, Ordering::Release);
+        FAULTS_GPU.store(faults.2, Ordering::Release);
+        tracing::info!(
+            cap = max_copies(),
+            "title memory by address: a shader reads or writes through raw addresses"
+        );
         Some(Memory {
-            directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            directory,
+            faults,
             copies: Vec::new(),
+            added_frame: Vec::new(),
+            per_list: Vec::new(),
+            per_list_flag: Vec::new(),
+            per_frame_refreshed: u64::MAX,
+            hba_last_log: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -161,6 +245,71 @@ impl Memory {
         }
     }
 
+    /// Ensures `shadow` has a copy index `0..max_copies()`, maps all whole
+    /// 64 KiB pages it covers in the directory, and marks it `per_list` if asked.
+    fn insert_copy(&mut self, shadow: &Arc<Shadow>, per_list: bool, frame: u64) -> Option<usize> {
+        let raw = shadow.memory_copy.load(Ordering::Acquire);
+        let existing = raw & !PER_LIST_BIT;
+        if existing != 0 {
+            let n = existing as usize - 1;
+            if per_list && !self.per_list_flag[n] {
+                self.per_list_flag[n] = true;
+                self.per_list.push(n);
+                shadow
+                    .memory_copy
+                    .store(existing | PER_LIST_BIT, Ordering::Release);
+                GEN.fetch_add(1, Ordering::Release);
+            }
+            return Some(n);
+        }
+        let cap = max_copies() as usize;
+        if self.copies.len() >= cap {
+            HBA_STATS[3].fetch_add(1, Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    cap,
+                    "title memory by address: no number left for another copy; its pages read zeros"
+                )
+            });
+            return None;
+        }
+        self.copies.push(shadow.clone());
+        let n = self.copies.len() - 1;
+        self.added_frame.push(frame);
+        self.per_list_flag.push(per_list);
+        if per_list {
+            self.per_list.push(n);
+        }
+        let (s, l) = shadow.span();
+        let written = crate::bvh_declare::on() && crate::bvh_declare::cells().span_written(s, l);
+        self.generation += u64::from(written);
+        self.written_at.push(if written { self.generation } else { 0 });
+        let num = n as u32 + 1;
+        shadow.memory_copy.store(
+            num | if per_list { PER_LIST_BIT } else { 0 },
+            Ordering::Release,
+        );
+        self.premapped = self.premapped.min(n);
+        // Every page the copy holds whole, not only the one asked for: a
+        // structure is more than 64 KiB.
+        let mut at = s.next_multiple_of(PAGE);
+        while at + PAGE <= s + l && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+            // SAFETY: inside the directory's mapping.
+            let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+            // SAFETY: as above; the offset first, as below.
+            unsafe {
+                if other.read() == 0 {
+                    other.add(1).write_volatile((at - s) as u32);
+                    other.write_volatile(num);
+                }
+            }
+            at += PAGE;
+        }
+        GEN.fetch_add(1, Ordering::Release);
+        Some(n)
+    }
+
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
     fn map(&mut self, address: u64) {
@@ -199,46 +348,14 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             // (Neptune) A rebar window has none: refused for unordered access.
             if shadow.is_rebar() {
-                crate::shadow::REBAR[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::shadow::REBAR[7].fetch_add(1, Ordering::Relaxed);
             }
+            HBA_STATS[4].fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
-                let (s, l) = shadow.span();
-                let written = crate::bvh_declare::on() && crate::bvh_declare::cells().span_written(s, l);
-                self.generation += u64::from(written);
-                self.written_at.push(if written { self.generation } else { 0 });
-                // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB.
-                // shortcut: a page of a title buffer inside this one that
-                // has a copy of its own is given this copy too.
-                let (first, len) = shadow.span();
-                let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
-                            other.write_volatile(n as u32 + 1);
-                        }
-                    }
-                    at += PAGE;
-                }
-                n
-            }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
-            }
+        let frame = crate::frame::current();
+        let Some(n) = self.insert_copy(&shadow, true, frame) else {
+            return;
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
         // The offset first: a shader that sees the number sees it too.
@@ -265,12 +382,15 @@ impl Memory {
             }
         }
         if !pages.is_empty() {
+            HBA_STATS[2].fetch_add(pages.len() as u64, Ordering::Relaxed);
             // Each is an access that read 0 or was dropped.
-            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+            static SAID: AtomicU32 = AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 50 {
                 tracing::warn!(
                     pages = pages.len(),
                     first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
+                    copies = self.copies.len(),
+                    cap = max_copies(),
                     "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
                 );
             }
@@ -285,6 +405,165 @@ impl Memory {
     fn name(&mut self, address: u64) {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
+    }
+
+    /// Ensures `heap` has its run of `max_copies() + 1` dynamic slots and a
+    /// raw UAV for every numbered copy so far.
+    fn sync_heap(&mut self, heap: &HostHeap) -> Option<u32> {
+        let key = std::ptr::from_ref(heap) as usize;
+        let (base, made) = match self.heaps.get(&key) {
+            Some(&run) => run,
+            None => {
+                // Held for the heap's life: not given back with a list's slots.
+                let base = heap.dynamic(max_copies() + 1)?;
+                heap.null_raw_uav_at(base);
+                (base, 0)
+            }
+        };
+        for (n, shadow) in self.copies.iter().enumerate().skip(made as usize) {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        self.heaps.insert(key, (base, self.copies.len() as u32));
+        Some(base)
+    }
+
+    /// Refreshes copies needed on `list` under `VICTORY_HEAP_BUFFER_ADDRESS=1`:
+    /// per-list copies (CBVs and raw-address copies) and copies born this frame
+    /// on every list's first read; all other copies once per frame; any copies
+    /// newly added mid-list immediately.
+    fn refresh_for_list(&mut self, list: &HostList, frame: u64, first_read: bool, prev_seen: usize) {
+        if first_read {
+            for &n in &self.per_list {
+                let (start, len) = self.copies[n].span();
+                self.copies[n].refresh(list, start, len);
+            }
+            if self.per_frame_refreshed != frame {
+                self.per_frame_refreshed = frame;
+                for shadow in &self.copies {
+                    let (start, len) = shadow.span();
+                    shadow.refresh(list, start, len);
+                }
+            } else {
+                for (n, shadow) in self.copies.iter().enumerate() {
+                    if !self.per_list_flag[n] && self.added_frame[n] == frame {
+                        let (start, len) = shadow.span();
+                        shadow.refresh(list, start, len);
+                    }
+                }
+            }
+        } else if prev_seen < self.copies.len() {
+            for shadow in &self.copies[prev_seen..] {
+                let (start, len) = shadow.span();
+                shadow.refresh(list, start, len);
+            }
+        }
+    }
+
+    /// Periodic summary when `VICTORY_HEAP_BUFFER_ADDRESS=1`.
+    fn maybe_say_hba(&mut self, frame: u64) {
+        if !victory_shader::emit::heap_buffer_address() || frame < self.hba_last_log + SAY_EVERY {
+            return;
+        }
+        let frames = frame - self.hba_last_log;
+        self.hba_last_log = frame;
+        let [direct, fallback, faults, cap_misses, uav_refused] =
+            [0, 1, 2, 3, 4].map(|k| HBA_STATS[k].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            frames,
+            copies = self.copies.len(),
+            cap = max_copies(),
+            per_list = self.per_list.len(),
+            direct,
+            fallback,
+            faults,
+            cap_misses,
+            uav_refused,
+            "heap buffer address: memory directory copies and range lookups"
+        );
+    }
+}
+
+/// Counts direct vs fallback buffer range writes for the periodic summary.
+pub(crate) fn note_buffer_range_result(direct: bool) {
+    HBA_STATS[usize::from(!direct)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Registers `shadow` in the memory directory and returns its 1-based copy
+/// number (`1..=max_copies()`). Lock-free once registered (and promoted if
+/// `per_list`).
+pub(crate) fn register_shadow(shadow: &Arc<Shadow>, per_list: bool) -> Option<u32> {
+    let raw = shadow.memory_copy.load(Ordering::Acquire);
+    let num = raw & !PER_LIST_BIT;
+    if num != 0 && (!per_list || raw & PER_LIST_BIT != 0) {
+        return Some(num);
+    }
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        if shadow.is_rebar() {
+            crate::shadow::REBAR[7].fetch_add(1, Ordering::Relaxed);
+        }
+        HBA_STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let m = guard.as_mut()?;
+    let frame = crate::frame::current();
+    let n = m.insert_copy(shadow, per_list, frame)?;
+    Some(n as u32 + 1)
+}
+
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Finds (or creates if `create` and
+/// committed) the single [`Shadow`] covering `[at, at + len)`, registers it in
+/// the memory directory, and returns `(copy_number, byte_offset_in_copy)` for
+/// a `BUFFER_RANGE_DIRECT` entry. When `is_cbv`, marks the copy for per-list
+/// refresh and notifies [`crate::port_cbv::viewed`] so `CopyBufferRegion`
+/// keeps GPU copy order.
+pub(crate) fn register_buffer(at: u64, len: u64, is_cbv: bool, create: bool) -> Option<(u32, u32)> {
+    let shadow = crate::shadow::find_existing(at, len).or_else(|| {
+        if create && crate::texture::committed(at as *const u8, 1) {
+            crate::shadow::find(at, len)
+        } else {
+            None
+        }
+    })?;
+    let off = shadow.offset_in(at)?;
+    if shadow.left(at) < len {
+        return None;
+    }
+    if off.checked_add(len).is_none_or(|end| end > u64::from(u32::MAX)) {
+        return None;
+    }
+    let copy = register_shadow(&shadow, is_cbv)?;
+    if is_cbv {
+        crate::port_cbv::viewed(&shadow);
+    }
+    Some((copy, off as u32))
+}
+
+/// Fallback for a buffer range that spans multiple loose windows (cannot fit
+/// in a single direct copy): maps its 64 KiB pages into the memory directory
+/// ahead of draws so shaders do not flash zeros on frame 1.
+pub(crate) fn premap_range(at: u64, len: u64) {
+    if at == 0 || len == 0 {
+        return;
+    }
+    let first_page = at / PAGE;
+    let last_page = at.saturating_add(len - 1) / PAGE;
+    let pages = (last_page - first_page + 1).min(PREMAP_MAX_PAGES);
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let Some(m) = guard.as_mut() else {
+        return;
+    };
+    for p in first_page..first_page + pages {
+        m.map(p * PAGE);
     }
 }
 
@@ -328,6 +607,68 @@ pub(crate) fn hook(outputs: &[u64], named: &[u64]) {
     }
 }
 
+const READ: usize = usize::MAX - 0x6d;
+const WRITE: usize = usize::MAX - 0x6e;
+
+/// (`VICTORY_HEAP_BUFFER_ADDRESS=1`) Fast path for draws whose shader only
+/// uses `SLOT_MEMORY` via `SLOT_BUFFER_RANGES` (read-only, no raw-address
+/// root constants to scan): lock-free once `list` is synced at `(frame, GEN)`.
+pub(crate) fn ready_buffers(list: &HostList, heap: &HostHeap) -> Option<Ready> {
+    let frame = crate::frame::current();
+    let epoch = GEN.load(Ordering::Acquire);
+    let key = std::ptr::from_ref(heap) as usize;
+    if list.memory_ready.epoch.load(Ordering::Acquire) == epoch
+        && list.memory_ready.frame.load(Ordering::Relaxed) == frame
+        && list.memory_ready.heap.load(Ordering::Relaxed) == key
+    {
+        let directory = DIR_GPU.load(Ordering::Relaxed);
+        let faults = FAULTS_GPU.load(Ordering::Relaxed);
+        let base = list.memory_ready.base.load(Ordering::Relaxed);
+        if directory != 0 {
+            return Some(Ready {
+                directory,
+                faults,
+                base,
+            });
+        }
+    }
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let m = guard.as_mut()?;
+    if m.frame != frame {
+        m.frame = frame;
+        m.refused.clear();
+        m.take_faults();
+        if crate::bvh_declare::on() && frame.is_multiple_of(SAY_EVERY) {
+            say(m);
+        }
+        m.maybe_say_hba(frame);
+    }
+    let base = m.sync_heap(heap)?;
+    let first_read = list.first_use(READ);
+    let prev_seen = list.memory_ready.seen.load(Ordering::Relaxed) as usize;
+    m.refresh_for_list(list, frame, first_read, prev_seen);
+    if first_read {
+        list.keep(&m.directory.0);
+        list.keep(&m.faults.0);
+    }
+    let cur_gen = GEN.load(Ordering::Acquire);
+    list.memory_ready
+        .seen
+        .store(m.copies.len() as u32, Ordering::Relaxed);
+    list.memory_ready.heap.store(key, Ordering::Relaxed);
+    list.memory_ready.base.store(base, Ordering::Relaxed);
+    list.memory_ready.frame.store(frame, Ordering::Relaxed);
+    list.memory_ready.epoch.store(cur_gen, Ordering::Release);
+    Some(Ready {
+        directory: m.directory.2,
+        faults: m.faults.2,
+        base,
+    })
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -354,6 +695,7 @@ pub(crate) fn ready(
         if crate::bvh_declare::on() && frame.is_multiple_of(SAY_EVERY) {
             say(m);
         }
+        m.maybe_say_hba(frame);
     }
     let numbered = m.copies.len().min(std::mem::replace(&mut m.premapped, usize::MAX));
     // Only the builder's outputs are declared written (`crate::bvh_declare`).
@@ -367,27 +709,11 @@ pub(crate) fn ready(
             m.rejudge(address);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
-    }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let base = m.sync_heap(heap)?;
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     // With only the outputs declared: the written copies the list has not
@@ -408,13 +734,18 @@ pub(crate) fn ready(
     } else {
         Vec::new()
     };
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && !outputs && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+    if victory_shader::emit::heap_buffer_address() && !writes {
+        let prev_seen = list.memory_ready.seen.load(Ordering::Relaxed) as usize;
+        m.refresh_for_list(list, frame, first_read, prev_seen.min(numbered));
+    } else {
+        for (n, shadow) in m.copies.iter().enumerate() {
+            let (start, len) = shadow.span();
+            if first_read || n >= numbered {
+                shadow.refresh(list, start, len);
+            }
+            if writes && !outputs && (first_write || n >= numbered) {
+                shadow.gpu_writes(list, start, len);
+            }
         }
     }
     for n in declare {
@@ -428,6 +759,16 @@ pub(crate) fn ready(
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
+    let key = std::ptr::from_ref(heap) as usize;
+    list.memory_ready
+        .seen
+        .store(m.copies.len() as u32, Ordering::Relaxed);
+    list.memory_ready.heap.store(key, Ordering::Relaxed);
+    list.memory_ready.base.store(base, Ordering::Relaxed);
+    list.memory_ready.frame.store(frame, Ordering::Relaxed);
+    list.memory_ready
+        .epoch
+        .store(GEN.load(Ordering::Acquire), Ordering::Release);
     Some(Ready {
         directory: m.directory.2,
         faults: m.faults.2,
@@ -460,13 +801,11 @@ const SAY_EVERY: u64 = 300;
 
 /// Writing lists, copies they declared written, bytes, copies numbered,
 /// bytes, since the last summary.
-static DECLARED: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static DECLARED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// A writing list's first draw: what it declares written against what is
 /// numbered.
 fn count(m: &Memory) {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut d = [1, 0, 0, m.copies.len() as u64, 0];
     for (shadow, &at) in m.copies.iter().zip(&m.written_at) {
         let len = shadow.span().1;
@@ -477,14 +816,16 @@ fn count(m: &Memory) {
         }
     }
     for (total, add) in DECLARED.iter().zip(d) {
-        total.fetch_add(add, Relaxed);
+        total.fetch_add(add, Ordering::Relaxed);
     }
 }
 
 /// The declare summary since the last one.
 fn say(m: &Memory) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let d: Vec<u64> = DECLARED.iter().map(|c| c.swap(0, Relaxed)).collect();
+    let d: Vec<u64> = DECLARED
+        .iter()
+        .map(|c| c.swap(0, Ordering::Relaxed))
+        .collect();
     let lists = d[0].max(1);
     let [checks, found] = crate::bvh_declare::checks();
     let no_card = &crate::bvh_declare::READ_ONLY_NO_CARD;
@@ -498,8 +839,8 @@ fn say(m: &Memory) {
         d[0],
         m.written_at.iter().filter(|&&at| at > 0).count(),
         m.copies.len(),
-        no_card[0].load(Relaxed),
-        no_card[1].load(Relaxed) >> 20,
+        no_card[0].load(Ordering::Relaxed),
+        no_card[1].load(Ordering::Relaxed) >> 20,
     );
 }
 
@@ -520,4 +861,33 @@ fn check(m: &mut Memory, list: &HostList, frame: u64) {
     crate::bvh_declare::arm(shadow.id(), frame, shadow.shaders_wrote());
     let (start, len) = shadow.span();
     shadow.gpu_writes(list, start, len);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_cap_expands_under_heap_buffer_address_and_fits_direct_encoding() {
+        assert_eq!(max_copies_for(false), 1023);
+        assert_eq!(max_copies_for(true), 16_383);
+        assert!(max_copies_for(true) < victory_shader::emit::BUFFER_RANGE_DIRECT);
+        assert!(max_copies_for(true) < PER_LIST_BIT);
+    }
+
+    #[test]
+    fn list_ready_reset_clears_cached_state() {
+        let lr = ListReady::default();
+        lr.epoch.store(42, Ordering::Relaxed);
+        lr.frame.store(100, Ordering::Relaxed);
+        lr.heap.store(0x1000, Ordering::Relaxed);
+        lr.base.store(500, Ordering::Relaxed);
+        lr.seen.store(12, Ordering::Relaxed);
+        lr.reset();
+        assert_eq!(lr.epoch.load(Ordering::Relaxed), 0);
+        assert_eq!(lr.frame.load(Ordering::Relaxed), 0);
+        assert_eq!(lr.heap.load(Ordering::Relaxed), 0);
+        assert_eq!(lr.base.load(Ordering::Relaxed), 0);
+        assert_eq!(lr.seen.load(Ordering::Relaxed), 0);
+    }
 }
