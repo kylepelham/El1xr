@@ -64,6 +64,7 @@ impl State {
             _ => None,
         };
         if let Some(this) = object {
+            t.read_again = crate::target_reuse::read_again(this as usize, frame);
             t.card_written = crate::resource::host_written_mark(this);
             t.stand_in = crate::resource::stands_in(this);
             t.baked = crate::bake_check::result_of(this as usize);

@@ -243,6 +243,27 @@ pub(crate) fn black_texel(format: u32, p: &[u8]) -> bool {
     }
 }
 
+/// The mean colour (8-bit channels) of the texels a draw changed, in a format
+/// `crate::bake_check::rgba` reads: a face lit in one channel (batch 5 part Q, solid red)
+/// shows as `r` far above `g` and `b`. None when no changed texel could be read.
+pub(crate) fn changed_rgb(before: &[u8], after: &[u8], texel: usize, format: u32) -> Option<[u8; 3]> {
+    if texel == 0 {
+        return None;
+    }
+    let (mut sum, mut n) = ([0u64; 3], 0u64);
+    for (b, a) in before.chunks_exact(texel).zip(after.chunks_exact(texel)) {
+        if a != b
+            && let Some([r, g, bl, _]) = crate::bake_check::rgba(format, a)
+        {
+            for (s, c) in sum.iter_mut().zip([r, g, bl]) {
+                *s += u64::from(c);
+            }
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum.map(|s| (s / n) as u8))
+}
+
 /// Texels of `texel` bytes in `bytes`, and how many of them are all zero.
 pub(crate) fn zeros(bytes: &[u8], texel: usize) -> (u32, u32) {
     if texel == 0 {
@@ -255,9 +276,18 @@ pub(crate) fn zeros(bytes: &[u8], texel: usize) -> (u32, u32) {
 
 /// An output read-back landed: what draw `kind` (pixel shader `pixel`) of `frame` changed in
 /// the rows of its first target.
-pub(crate) fn output_landed(frame: u64, kind: &str, pixel: &str, target: &str, c: Change) {
+pub(crate) fn output_landed(
+    frame: u64,
+    kind: &str,
+    pixel: &str,
+    target: &str,
+    c: Change,
+    rgb: Option<[u8; 3]>,
+) {
     LINES.fetch_add(1, Relaxed);
+    let changed_rgb = rgb.map_or_else(|| "-".to_owned(), |[r, g, b]| format!("{r}/{g}/{b}"));
     tracing::info!(
+        changed_rgb,
         frame,
         kind,
         pixel,
@@ -388,6 +418,16 @@ mod tests {
         let lit = [9u8, 9, 7, 7, 5, 5];
         assert_eq!(verdict(change(&before, &lit, 2, black)), "lit");
         assert_eq!(verdict(Change::default()), "unread");
+    }
+
+    /// R8G8B8A8_UNORM (28): the mean of the changed texels only.
+    #[test]
+    fn the_changed_texels_mean_colour_is_read() {
+        let before = [0u8, 0, 0, 255, 9, 9, 9, 255, 1, 2, 3, 255];
+        let after = [200u8, 10, 20, 255, 9, 9, 9, 255, 100, 30, 0, 255];
+        assert_eq!(changed_rgb(&before, &after, 4, 28), Some([150, 20, 10]));
+        assert_eq!(changed_rgb(&before, &before, 4, 28), None);
+        assert_eq!(changed_rgb(&before, &after, 0, 28), None);
     }
 
     #[test]

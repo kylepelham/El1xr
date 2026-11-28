@@ -256,16 +256,18 @@ impl State {
                 .and_then(|p| p.stages.iter().find(|s| s.shader.stage == "pixel"))
                 .map_or_else(String::new, |s| s.shader.hash.clone());
             list.defer_after(move || {
-                let c = match (before.bytes(), after.bytes()) {
-                    (Some(b), Some(a)) => {
-                        crate::skin_watch::change(&b, &a, after.texel as usize, |t| {
+                let texel = after.texel as usize;
+                let (c, rgb) = match (before.bytes(), after.bytes()) {
+                    (Some(b), Some(a)) => (
+                        crate::skin_watch::change(&b, &a, texel, |t| {
                             crate::skin_watch::black_texel(after.format, t)
-                        })
-                    }
-                    _ => crate::skin_watch::Change::default(),
+                        }),
+                        crate::skin_watch::changed_rgb(&b, &a, texel, after.format),
+                    ),
+                    _ => (crate::skin_watch::Change::default(), None),
                 };
                 let shape = format!("f{} {}x{}", after.format, after.size[0], after.size[1]);
-                crate::skin_watch::output_landed(frame, kind, &pixel, &shape, c);
+                crate::skin_watch::output_landed(frame, kind, &pixel, &shape, c, rgb);
             });
         }
         if w.kind == LIGHTING && crate::skin_watch::take(w.frame, "inputs", 1) {
