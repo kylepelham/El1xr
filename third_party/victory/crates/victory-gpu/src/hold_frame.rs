@@ -504,6 +504,10 @@ impl Hold {
             return Some(std::mem::take(&mut self.stale));
         }
         self.stale = false;
+        // Present lists still on the card copy into or out of the old one.
+        if let Some((old, _)) = self.kept.take() {
+            crate::host::retire(old);
+        }
         let mut made = *desc;
         made.Flags = D3D12_RESOURCE_FLAG_NONE;
         made.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;

@@ -248,6 +248,10 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
         crate::poolslack::private_bytes(),
         memory_status().ullAvailPageFile,
     );
+    crate::idle_evict::tick(
+        crate::poolslack::private_bytes(),
+        memory_status().ullAvailPageFile,
+    );
     let mb = |v: u64| v >> 20;
     let (charged, limit, peak) = system_commit();
     let m = memory_status();
@@ -283,7 +287,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
          title virtual allocations {} MB (views of title pages {} MB, mapped, outside private); \
          the rest {} MB (driver, heaps: pipeline library file {} MB, translated shaders {} MB, containers {} MB, command allocators {}); \
          blocks MB/held by pieces MB/still cuttable MB: {}; \
-         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} sweeps, host copies let go {} ({} MB)), staging sweeps at 2 s {}; {}; {}",
+         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} sweeps, host copies let go {} ({} MB)), staging sweeps at 2 s {}; {}; {}; {}",
         mb(charged),
         mb(limit),
         mb(peak),
@@ -327,6 +331,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
         ACTED[5].load(Relaxed),
         crate::poolslack::summary(),
         crate::staging_hold::summary(),
+        crate::idle_evict::summary(),
     );
 }
 

@@ -3988,14 +3988,17 @@ impl Host {
     /// card, and what shaders wrote in them goes into title memory.
     /// `submitted` is the last value signalled on the fence. `seen` holds
     /// the pieces fetched already since the card was last waited for
-    /// (several submissions settled together name the same ones).
+    /// (several submissions settled together name the same ones). `plans`:
+    /// one, or with `VICTORY_CARD_BATCH=1` all those settled together, one
+    /// fetch for all (`host_card_batch.rs`).
     fn card_back(
         &self,
-        plan: &CardPlan,
+        plans: &[&CardPlan],
         submitted: &mut u64,
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
     ) {
-        if plan.ranges.is_empty() {
+        let ranges: Vec<&CardRange> = plans.iter().flat_map(|p| p.ranges.iter()).collect();
+        if ranges.is_empty() {
             return;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4009,28 +4012,27 @@ impl Host {
         };
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
-        let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
-        for (i, r) in plan.ranges.iter().enumerate() {
-            for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
-                    continue;
+        let (mut pieces, mut total) = card_batch::gather(
+            &ranges,
+            |r, keep| {
+                for p in 0..r.span.pieces {
+                    if r.compared && differs[(r.at + p) as usize] == 0 {
+                        continue;
+                    }
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo < hi && !crate::wc_skip::skip_back(r.declared, (hi - lo) as u64) {
+                        keep(lo, hi);
+                    }
                 }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi
-                    && !crate::wc_skip::skip_back(r.declared, (hi - lo) as u64)
-                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
-                {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
-                }
-            }
-            crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
-        }
+                crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            },
+            |r| std::sync::Arc::as_ptr(&r.shadow) as usize,
+            seen,
+        );
         crate::shadow::lazy::filter_indexed_pieces(&mut pieces, &mut total, |i| {
-            plan.ranges[i].shadow.clone()
+            ranges[i].shadow.clone()
         });
-        let mut written = vec![0usize; plan.ranges.len()];
+        let mut written = vec![0usize; ranges.len()];
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
@@ -4056,7 +4058,7 @@ impl Host {
                         list.CopyBufferRegion(
                             fetched,
                             at,
-                            &plan.ranges[i].shadow.buffer,
+                            &ranges[i].shadow.buffer,
                             lo as u64,
                             (hi - lo) as u64,
                         );
@@ -4095,7 +4097,7 @@ impl Host {
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new(
-                        (0..plan.ranges.len())
+                        (0..ranges.len())
                             .map(|_| std::sync::atomic::AtomicUsize::new(0))
                             .collect(),
                     );
@@ -4111,7 +4113,7 @@ impl Host {
                             u64,
                         )> = chunk
                             .iter()
-                            .map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at))
+                            .map(|&(i, lo, hi, at)| (ranges[i].shadow.clone(), i, lo, hi, at))
                             .collect();
                         let counts = counts.clone();
                         Box::new(move || {
@@ -4145,13 +4147,13 @@ impl Host {
                     let gpu = unsafe {
                         std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo)
                     };
-                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
-                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                    let merged = ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
                 }
             }
         }
-        for (r, written) in plan.ranges.iter().zip(written) {
+        for (r, written) in ranges.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
@@ -4412,12 +4414,13 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut cards: Vec<&CardPlan> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
                     };
                     if let Some(card) = &flight.card {
-                        self.card_back(card, submitted, &mut seen);
+                        cards.push(card);
                     }
                     for (shadow, ranges) in &flight.back {
                         match back
@@ -4435,6 +4438,9 @@ impl Host {
                         }
                     }
                 }
+                // The card's copies first, then the CPU-side copies, as when
+                // each flight's came first.
+                card_batch::fetch_all(&cards, |plans| self.card_back(plans, submitted, &mut seen));
                 hand_back(&back);
                 heap_landed(&items);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4567,6 +4573,7 @@ impl Host {
             }
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::descriptor::host::remade_safe::point(flying);
         crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {
@@ -4950,7 +4957,7 @@ impl Host {
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            self.card_back(&[card], &mut submitted, &mut std::collections::HashSet::new());
         }
         hand_back(&back);
         crate::round_share::touched(back.iter().flat_map(|(_, r)| r.iter().copied()));
@@ -9272,6 +9279,8 @@ mod pass_merge;
 mod diff_wide;
 #[path = "host_sparse_zero.rs"]
 mod sparse_zero;
+#[path = "host_card_batch.rs"]
+mod card_batch;
 use step_reads::blocked_by;
 
 #[cfg(test)]
