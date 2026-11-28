@@ -54,15 +54,33 @@ pub(crate) type Candidates = Arc<Vec<(u32, u32)>>;
 /// `bound` (an index or byte offset, from the heap's or a table's first
 /// slot, is never past the largest slot's byte offset), or one of `extra`
 /// (the found slots' handles, low half).
+/// (round 10, `low_bits`) A word whose bits under [`INDEX_BITS`] name a
+/// found slot is kept under those bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Filter {
     pub(crate) bound: u32,
     pub(crate) extra: Vec<u32>,
+    pub(crate) low_bits: bool,
 }
 
+/// The bits of a word a translated shader keeps of a view index: it
+/// multiplies the index by 32 in 32-bit arithmetic (`index << 5`, then the
+/// heap's byte address over 32), so bits 27-31 never reach the slot and
+/// the title may keep flags there.
+pub(crate) const INDEX_BITS: u32 = 0x07ff_ffff;
+
 impl Filter {
-    fn takes(&self, word: u32) -> bool {
+    fn plain(&self, word: u32) -> bool {
         (super::SMALLEST..=self.bound).contains(&word) || self.extra.contains(&word)
+    }
+
+    /// The number `word` is kept as, if it may name a found slot.
+    fn key(&self, word: u32) -> Option<u32> {
+        if self.plain(word) {
+            return Some(word);
+        }
+        let low = word & INDEX_BITS;
+        (self.low_bits && low != word && self.plain(low)).then_some(low)
     }
 
     /// A number for the buffer keys: buffers searched with another filter
@@ -70,7 +88,7 @@ impl Filter {
     pub(crate) fn id(&self) -> u64 {
         self.extra.iter().fold(u64::from(self.bound), |k, &e| {
             k.rotate_left(13) ^ u64::from(e)
-        })
+        }) ^ u64::from(self.low_bits) << 63
     }
 }
 
@@ -132,8 +150,7 @@ pub(crate) fn candidates(bytes: &[u8], filter: &Filter) -> Vec<(u32, u32)> {
         .0
         .iter()
         .enumerate()
-        .map(|(i, b)| (u32::from_le_bytes(*b), i as u32))
-        .filter(|&(w, _)| filter.takes(w))
+        .filter_map(|(i, b)| filter.key(u32::from_le_bytes(*b)).map(|k| (k, i as u32)))
         .collect();
     out.sort_unstable();
     out.dedup_by_key(|c| c.0);
@@ -243,6 +260,7 @@ mod tests {
         Filter {
             bound: 109_463 * 32,
             extra: vec![0x0b69_0000 + 109_463 * 32],
+            low_bits: false,
         }
     }
 
@@ -334,6 +352,29 @@ mod tests {
             Some(0)
         );
         assert_eq!(refs.start(3).searched, [8, 0], "changed: searched again");
+    }
+
+    /// (round 10) With `low_bits`, a word with flags in bits 27-31 over a
+    /// found slot's index is kept as that index; without, it is not. A
+    /// plain index still wins its place.
+    #[test]
+    fn flagged_indices_are_kept_under_their_low_bits() {
+        let plain = Filter {
+            bound: 94_434 * 32,
+            extra: Vec::new(),
+            low_bits: false,
+        };
+        let low = Filter {
+            low_bits: true,
+            ..plain.clone()
+        };
+        let words = [1.0f32.to_bits(), 0x8000_0000 | 94_434, 0xf800_0007];
+        assert!(candidates(&bytes(&words), &plain).is_empty());
+        assert_eq!(candidates(&bytes(&words), &low), vec![(94_434, 1)]);
+        assert_ne!(plain.id(), low.id(), "searched again when the switch flips");
+        let wanted: Vec<Wanted> = vec![(94_434, "slot 94434 as an index".into())];
+        let c = candidates(&bytes(&words), &low);
+        assert_eq!(lookup(&c, &wanted).map(|f| f.0), Some(1));
     }
 
     /// Large buffers spend their own budget: once it runs out the frame

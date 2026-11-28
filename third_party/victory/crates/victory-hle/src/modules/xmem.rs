@@ -164,6 +164,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if base.is_null() && !at.is_null() {
         victory_gpu::title_memory_reserved(at as usize, size, asked_protect);
     }
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_pages_committed(at as usize, size);
+    }
     if base.is_null() && !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 {
         victory_gpu::titlemem::title_range(at as usize, size, victory_gpu::titlemem::VIRTUAL);
     }
@@ -324,6 +327,8 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    // The host heap commits as it hands out: a run the guards keep as uncommitted is no more.
+    victory_gpu::title_pages_committed(block as usize, layout.size());
     // Only blocks that get their own pages: small ones are many and live in the host heap.
     if layout.size() >= HEAP_LISTED {
         victory_gpu::titlemem::title_range(
@@ -2015,6 +2020,7 @@ fn commit(base: usize, len: usize) -> bool {
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        victory_gpu::title_pages_committed(base, len);
         return true;
     }
     let error = std::io::Error::last_os_error();

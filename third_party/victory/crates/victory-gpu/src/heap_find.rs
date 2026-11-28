@@ -113,7 +113,14 @@
 //!   `stale_former_known` and `stale_target`, and the first
 //!   [`MOST_STALE_LINES`] such records a run that show other memory log
 //!   `heap find: stale slot` with that memory.
+//!
+//! (round 10) Part P: the Bink slot 94434 sat as dword 12985 of one 4 MiB
+//! material table every material draw binds, in frames 692-708 only
+//! (after the last Bink write, 692): `VICTORY_HEAP_FIND_ENTRY=1` watches
+//! that word every frame and names the draws whose constants point at its
+//! record ([`entry`]).
 
+pub(crate) mod entry;
 mod refs;
 
 use std::collections::{HashMap, HashSet};
@@ -355,6 +362,7 @@ pub(crate) fn recording() -> bool {
     }
     let frame = crate::frame::current();
     if DECIDED.load(Ordering::Relaxed) != frame && DECIDED.swap(frame, Ordering::Relaxed) != frame {
+        entry::watch(frame);
         decide(frame, find);
     }
     FINDING.load(Ordering::Relaxed) == frame
@@ -584,6 +592,7 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
         walk_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
         "heap find: scan"
     );
+    entry::summary(frame);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(HashMap::new);
     for (heap, index, record, view) in found {
@@ -853,6 +862,7 @@ pub(crate) fn filter(heap: u64, slots: &[u32]) -> Filter {
     Filter {
         bound: u32::try_from(bound).unwrap_or(u32::MAX),
         extra,
+        low_bits: entry::on(),
     }
 }
 

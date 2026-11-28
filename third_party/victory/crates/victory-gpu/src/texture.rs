@@ -32,6 +32,7 @@ mod mapped_holes;
 #[cfg(all(test, windows))]
 mod inside_copy_tests;
 pub(crate) mod prepare;
+pub(crate) mod prepare_fenced;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod recheck_mips;

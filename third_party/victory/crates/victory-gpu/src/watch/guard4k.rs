@@ -325,6 +325,29 @@ thread_local! {
     static JOIN_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// (feedcard, #88) `VICTORY_GUARD_STAMP_FRESH=1` (Live; off by default): with `VICTORY_GUARD_4K`
+/// a guard walk stamps each block's closed pages with a fresh asking, taken after they are
+/// read-only again, not with the one asking it took at its first block. That one predates a later
+/// block's close, so a refresh that copied such a page at an asking in between saw a stamp no
+/// newer than its own and never took a write made before the close: a stale copy until the page
+/// was written again (racing-refresh test: 10-40 of 300 rounds stale when off, none on). A
+/// suspect for the one-frame dark flicker beside the texture prepare threads. Costs one atomic
+/// increment per closed block. Not in the cache key: no shader or pipeline output.
+static STAMP_FRESH: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_GUARD_STAMP_FRESH");
+
+pub(super) fn stamp_fresh() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = STAMP_FRESH_FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    STAMP_FRESH.get_bool()
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static STAMP_FRESH_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The 4 KiB page ranges `[a, b)` of a block whose open pages are `pages` that the check makes
 /// read-only: each run of open pages, or with `join` one range over all of them.
 fn close_runs(pages: u64, join: bool) -> Vec<(usize, usize)> {

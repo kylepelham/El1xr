@@ -607,7 +607,8 @@ fn finish(job: Job, outcome: Outcome) {
         }
     };
     // Outside the lock: the last of the title's resource may go with it.
-    drop(replaced);
+    let n = usize::from(replaced.is_some());
+    super::prepare_fenced::let_go(replaced, n, false);
     crate::resource::let_go_kept(job.resource as This);
 }
 
@@ -641,7 +642,8 @@ pub(crate) fn take_ready(resource: This, first: u32, on_demand: bool) -> Option<
         crate::texture::take_by_table::on(),
         (prune_safe() == 1).then(crate::host::moment),
     )?;
-    drop(gone);
+    let n = gone.len();
+    super::prepare_fenced::let_go(gone, n, false);
     let staging = staging?;
     if staging.on_demand != on_demand {
         return None;
@@ -701,7 +703,8 @@ pub(crate) fn served(slot: u32, resource: This) {
         }
         gone
     };
-    drop(gone);
+    let n = gone.len();
+    super::prepare_fenced::let_go(gone, n, false);
 }
 
 /// The title released `resource`: what was made ready for it goes.
@@ -717,7 +720,8 @@ pub(crate) fn forget(resource: usize) {
         }
         gone
     };
-    drop(gone);
+    let n = gone.len();
+    super::prepare_fenced::let_go(gone, n, false);
 }
 
 /// Lets go of what was made ready two seconds and two frames ago and not
@@ -728,7 +732,8 @@ pub(crate) fn prune() {
     if threads() == 0 {
         return;
     }
-    let logs = crate::flicker_catch::on() || prune_safe() != 0;
+    super::prepare_fenced::tick();
+    let logs = crate::flicker_catch::on() || prune_safe() != 0 || super::prepare_fenced::on();
     let (gone, risky) = {
         let mut q = queue();
         if q.ready.is_empty() {
@@ -742,13 +747,19 @@ pub(crate) fn prune() {
         )
     };
     STATS[8].fetch_add(gone.len() as u64, Relaxed);
-    if !gone.is_empty() {
-        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::PrepPruned);
-        if logs {
-            tracing::info!("{}", prune_line(&gone, risky));
-        }
+    if gone.is_empty() {
+        return;
     }
-    drop(gone);
+    crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::PrepPruned);
+    let line = logs.then(|| prune_line(&gone, risky));
+    let n = gone.len();
+    let here_us = super::prepare_fenced::let_go(gone, n, false);
+    if let Some(line) = line {
+        tracing::info!(
+            "{line}; let go here in {here_us} us (VICTORY_PREPARE_FENCED={})",
+            u8::from(super::prepare_fenced::on())
+        );
+    }
 }
 
 /// Whether title texture `resource`'s host copy holds an upload from mip
