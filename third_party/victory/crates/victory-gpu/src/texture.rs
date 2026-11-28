@@ -578,7 +578,7 @@ impl Drop for Staging {
         // The last holder is gone: the texture's entry, and every list that recorded an
         // upload from it (a list is reset when the card has run it).
         let most = stage_pool_most();
-        if most != 0 {
+        if most != 0 && !crate::commitline::upload_over_cap() {
             let (class, size) = stage_class(self.bytes);
             let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
             if pool.bytes + size <= most {
@@ -610,6 +610,22 @@ static STAGE_POOL: Mutex<StagePool> = Mutex::new(StagePool {
     free: Vec::new(),
     bytes: 0,
 });
+
+/// (El1xr) Bytes the staging buffers' pool keeps, for the commit line.
+pub(crate) fn stage_pool_bytes() -> u64 {
+    STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes
+}
+
+/// (El1xr) Lets go of every upload buffer the staging buffers' pool keeps
+/// (`VICTORY_UPLOAD_CAP_MB`), outside its lock: how many.
+pub(crate) fn trim_stage_pool() -> u64 {
+    let free = {
+        let mut pool = STAGE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.bytes = 0;
+        std::mem::take(&mut pool.free)
+    };
+    free.iter().map(|class| class.len() as u64).sum()
+}
 
 /// Upload buffers taken from the pool, and made, since the start.
 pub(crate) static STAGE_POOLED: [std::sync::atomic::AtomicU64; 2] =

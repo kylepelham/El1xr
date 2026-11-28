@@ -252,6 +252,9 @@ struct Pool<B> {
     /// A thread is making a block for this pool outside its lock
     /// ([`take_from`]).
     making: bool,
+    /// (El1xr) A pool of the PC's memory: past `VICTORY_UPLOAD_CAP_MB` it
+    /// keeps no empty block (`crate::commitline`).
+    capped: bool,
 }
 
 impl<B: Clone> Pool<B> {
@@ -264,7 +267,19 @@ impl<B: Clone> Pool<B> {
             alive,
             fresh: false,
             making: false,
+            capped: false,
         }
+    }
+
+    /// The same, kept small past `VICTORY_UPLOAD_CAP_MB` ([`Pool::capped`]).
+    const fn capped(mut self) -> Pool<B> {
+        self.capped = true;
+        self
+    }
+
+    /// The empty blocks it keeps now: none past the cap.
+    fn spares(&self) -> usize {
+        if self.capped && crate::commitline::upload_over_cap() { 0 } else { SPARES.load(Ordering::Relaxed) }
     }
 
     /// A pool that cuts only fresh memory ([`Pool::fresh`]).
@@ -277,6 +292,7 @@ impl<B: Clone> Pool<B> {
             alive,
             fresh: true,
             making: false,
+            capped: false,
         }
     }
 
@@ -342,7 +358,7 @@ impl<B: Clone> Pool<B> {
     /// [`Pool::reclaim`] lets go of are put in `freed`, for the caller to
     /// drop outside its lock.
     fn cut(&mut self, len: u64, align: u64, now: u64, ripe: Ripe, freed: &mut Vec<B>) -> Option<(Piece, B, bool)> {
-        freed.extend(self.reclaim(now, crate::host::submissions_finished(), SPARES.load(Ordering::Relaxed)));
+        freed.extend(self.reclaim(now, crate::host::submissions_finished(), self.spares()));
         let mut found = None;
         let fresh = self.fresh;
         for (i, block) in self.blocks.iter_mut().enumerate() {
@@ -429,6 +445,19 @@ impl<B: Clone> Pool<B> {
     /// blocks past `spares` (and past the pool's most): returned, to be
     /// dropped outside the pool's lock (a block of mapped memory is
     /// unmapped and freed when it goes).
+    /// (El1xr) Frees the pieces that rested long enough, then takes every
+    /// empty block, kept or not (`VICTORY_UPLOAD_CAP_MB`).
+    fn trim(&mut self, now: u64, finished: u64) -> Vec<B> {
+        let mut gone = self.reclaim(now, finished, 0);
+        for block in &mut self.blocks {
+            if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                gone.extend(block.take().map(|b| b.memory));
+                self.alive.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        gone
+    }
+
     fn reclaim(&mut self, now: u64, finished: u64, spares: usize) -> Vec<B> {
         let mut gone = Vec::new();
         let mut any = false;
@@ -655,7 +684,29 @@ unsafe impl Send for Upload {}
 static TEXTURE_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static STAGING_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT, &TEXTURE_BLOCKS));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, &STAGING_BLOCKS));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT, &STAGING_BLOCKS).capped());
+
+/// (El1xr) Bytes of a block, for `crate::commitline`.
+pub(crate) const BLOCK_BYTES: u64 = BLOCK;
+
+/// (El1xr) Blocks alive per pool, as [`Which`] names them: texture,
+/// staging, card, shared, upload.
+pub(crate) fn blocks_alive() -> [u64; 5] {
+    let b = buffers::blocks_alive();
+    [TEXTURE_BLOCKS.load(Ordering::Relaxed), STAGING_BLOCKS.load(Ordering::Relaxed), b[0], b[1], b[2]]
+}
+
+/// (El1xr) Frees the pieces of the pools of the PC's memory (staging,
+/// shared, upload) that rested long enough and lets go of every empty block
+/// they keep (`VICTORY_UPLOAD_CAP_MB`): the blocks let go.
+pub(crate) fn trim_host_pools() -> u64 {
+    let at = now();
+    let finished = crate::host::submissions_finished();
+    let freed = lock(&STAGING).trim(at, finished);
+    let n = freed.len() as u64;
+    let_go(Which::Staging, freed);
+    n + buffers::trim(at, finished)
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -828,6 +879,19 @@ fn give_texture(piece: Piece) {
 /// to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, give: fn(Piece)) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+    attach(texture, &KEY, piece, give);
+}
+
+/// (El1xr) Tells `crate::commitline` that a committed upload buffer of
+/// `bytes` is gone when the last reference to `resource` goes.
+pub(crate) fn on_release(resource: &ID3D12Resource, bytes: u64) {
+    const KEY: GUID = GUID::from_u128(0x0c7e4a51_93d2_4f6b_8e1a_2b5d9c3f6a47);
+    attach(resource, &KEY, Piece { block: 0, start: 0, len: bytes }, |piece| crate::commitline::upload_gone(piece.len));
+}
+
+/// A [`Reclaim`] of `piece` under `key` of `texture`: `give` gets the piece
+/// when the resource's last reference goes.
+fn attach(texture: &ID3D12Resource, key: &GUID, piece: Piece, give: fn(Piece)) {
     let made = Box::into_raw(Box::new(Reclaim {
         methods: &RECLAIM.0,
         references: AtomicU32::new(1),
@@ -838,7 +902,7 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece, give: fn(Piece)) {
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if texture.SetPrivateDataInterface(key, &object).is_err() {
             // Never given back: the piece stays taken, nothing is placed
             // under a texture that may be alive.
             std::mem::forget(object);
@@ -1210,6 +1274,39 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30 + REST, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE, &ALIVE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    /// (El1xr) `VICTORY_UPLOAD_CAP_MB`: a trim lets go of every empty block,
+    /// also those kept as spares and those emptied before, but not of a
+    /// block with a piece in use or still resting.
+    #[test]
+    fn a_trim_lets_go_of_every_empty_block_and_only_those() {
+        static ALIVE_HERE: AtomicU64 = AtomicU64::new(0);
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT, &ALIVE_HERE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let half = BLOCK / 2;
+        let taken: Vec<Piece> = (0..8).map(|_| pool.take(half, 65536, 0, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 4);
+        // Three blocks emptied and kept as spares; a fourth keeps a piece.
+        for p in &taken[..6] {
+            pool.give(*p, 10);
+        }
+        assert!(pool.reclaim(10 + REST, 0, SPARE_KEPT).is_empty());
+        assert_eq!(pool.blocks(), 4);
+        // Of the last block one piece rests, one is in use.
+        pool.give(taken[6], 10 + REST);
+        let gone = pool.trim(10 + REST, 0);
+        assert_eq!(gone.len(), 3);
+        assert_eq!(pool.blocks(), 1);
+        assert_eq!(ALIVE_HERE.load(Ordering::Relaxed), 1);
+        // Once the last piece is back and rested, its block goes too.
+        pool.give(taken[7], 20 + REST);
+        assert_eq!(pool.trim(20 + 2 * REST, 0).len(), 1);
+        assert_eq!(pool.blocks(), 0);
     }
 
     #[test]

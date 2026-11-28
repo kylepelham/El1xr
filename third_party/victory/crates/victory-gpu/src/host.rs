@@ -240,7 +240,10 @@ pub(crate) fn vram_idle_ms_by_room(video_memory: Option<[u64; 4]>, room: bool) -
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_IDLE_BY_ROOM").is_none_or(|v| v != "0")) {
         return by_share;
     }
-    let [normal, moderate, _] = vram_idle_times([5_000, 2_500, 1_000]);
+    let [normal, moderate, high] = vram_idle_times([5_000, 2_500, 1_000]);
+    if crate::commitline::pressed() {
+        return high; // (El1xr) VICTORY_COMMIT_FLOOR_MB
+    }
     if room { normal } else { by_share.min(moderate) }
 }
 
@@ -7677,7 +7680,7 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => buffer.inspect(|b| crate::commitline::count_upload(b, size)).map(|b| (b, data.cast())),
             Err(e) => {
                 crate::alloc_backoff::note(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");

@@ -376,6 +376,7 @@ pub(crate) fn log() {
         upload_line(),
         rebar_line(),
     );
+    crate::commitline::log(card, c.PagefileUsage as u64, c.PeakPagefileUsage as u64);
 }
 
 /// (Neptune) The rebar window part of the ram line (`VICTORY_WINDOW_REBAR=1`), else nothing.
