@@ -272,7 +272,6 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_MOUSE_SENS", Apply::Live),
     ("VICTORY_NAN_GUARD", Apply::Retranslate),
     ("VICTORY_NAN_SCRUB_INF", Apply::Retranslate),
-    ("VICTORY_NATIVE_GLASS", Apply::Retranslate),
     ("VICTORY_NATIVE_PIPELINE_DIAG", Apply::Live),
     ("VICTORY_NO_COPY_BACK", Apply::Restart),
     ("VICTORY_NO_WATCHDOG", Apply::Restart),

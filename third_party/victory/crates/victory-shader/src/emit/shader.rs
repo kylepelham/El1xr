@@ -99,6 +99,11 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 /// Asked for by the structure builder's programs with
 /// `VICTORY_DISPATCHX_MASK=1` (`lower::thread_limit`).
 pub const USER_THREAD_LIMIT: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword the host sets: 1 when the
+/// dispatch has the glass trace's host top levels bound
+/// ([`SLOT_TLAS`], [`SLOT_TLAS_NEAR`]), else 0. Asked for by the spliced
+/// glass trace (`VICTORY_NATIVE_GLASS=1`, `glass_splice::SELECTOR`).
+pub const USER_GLASS_NATIVE: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

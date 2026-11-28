@@ -175,6 +175,10 @@ pub enum BvhNodes {
     /// (the title: the whole address space, or one structure's address in
     /// dword 0). Dwords 1 and 3, which hold its flags.
     Memory { word1: u32, word3: u32 },
+    /// Not a node test: the glass splice's marker (a trap temporary as the
+    /// descriptor, `emit::glass_splice::marker`), a ray query on a host top
+    /// level.
+    Native(crate::emit::glass_splice::Marker),
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -275,6 +279,9 @@ pub fn track(
                         _ => None,
                     };
                     match (word(1), word(3)) {
+                        _ if let Some(m) = crate::emit::glass_splice::marker(rsrc) => {
+                            out.bvh.push((site, BvhNodes::Native(m)));
+                        }
                         (Some(Term::Const(word1)), Some(Term::Const(word3)))
                             if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
                         {

@@ -32,6 +32,11 @@ mod dot;
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// The glass splice's ray query (`VICTORY_NATIVE_GLASS`), a child module so it shares the
+/// emitter's state.
+#[path = "glass_query.rs"]
+mod glass_query;
+
 /// DPP16 and DPP8 operand lowering, a child module so it shares the emitter's state.
 #[path = "dpp.rs"]
 mod dpp;
@@ -2539,6 +2544,12 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // The glass splice's selector (`glass_splice::SELECTOR`): the host's word.
+                    None if n == super::glass_splice::SELECTOR => Val::I32(self.host_word(
+                        RootType::Other(super::shader::USER_GLASS_NATIVE),
+                        0,
+                        0,
+                    )),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
