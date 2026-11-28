@@ -34,6 +34,7 @@ pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+pub(crate) mod settle_reread;
 mod short_remap;
 mod slice_len;
 mod stage_unlocked;
