@@ -241,13 +241,17 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     let mut turns = exchange_pairs::enabled();
     loop {
+        crate::lane_split::lowering_starts();
         match Lower::new(parts, &bad, turns).run() {
             // the turns saved no meeting: lowered again as with them off
             Ok(l) if turns && !l.turns_pay => {
                 turns = false;
                 bad.clear();
             }
-            Ok(l) => return Ok(l),
+            Ok(l) => {
+                crate::lane_split::lowered(&l.dxil);
+                return Ok(l);
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -4197,7 +4201,7 @@ impl<'a> Lower<'a> {
         {
             self.meet.group_barriers += 1;
         }
-        self.note_barrier(block);
+        self.note_barrier(block, true);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s
@@ -5580,7 +5584,7 @@ impl<'a> Lower<'a> {
                     self.cur = self.order_waves(self.cur, false);
                 } else {
                     if waits {
-                        self.note_barrier(self.cur);
+                        self.note_barrier(self.cur, false);
                     }
                     let mode = self.s.m.i32(mode);
                     let void = self.s.t.void;
