@@ -110,7 +110,14 @@ pub(crate) struct Tex {
     pub(crate) bake_released: bool,
     /// The start of a texture the host writes (a target) whose memory holds part of it now.
     pub(crate) over_target: Option<u64>,
+    /// (`VICTORY_TARGET_REUSE_REREAD`) Frames since its host copy was read again from title
+    /// memory, and whether that memory had changed since the read before
+    /// (`crate::target_reuse::read_again`).
+    pub(crate) read_again: Option<(u64, Option<bool>)>,
 }
+
+/// Frames a read again that changed the title bytes marks the slot `read_again`.
+pub(crate) const READ_AGAIN_FRAMES: u64 = 32;
 
 impl Tex {
     /// What [`in_result`] said of its memory; an earlier answer is kept.
@@ -148,12 +155,17 @@ pub(crate) fn reason(t: &Tex) -> Option<&'static str> {
         "other_bytes"
     } else if t.stand_in {
         "stand_in"
+    } else if t
+        .read_again
+        .is_some_and(|(ago, changed)| ago < READ_AGAIN_FRAMES && changed != Some(false))
+    {
+        "read_again"
     } else {
         return None;
     })
 }
 
-const REASONS: [&str; 11] = [
+const REASONS: [&str; 12] = [
     "empty",
     "null",
     "unmapped",
@@ -164,6 +176,7 @@ const REASONS: [&str; 11] = [
     "partly",
     "other_bytes",
     "stand_in",
+    "read_again",
     "ok",
 ];
 
@@ -192,6 +205,14 @@ pub(crate) fn tex_text(t: &Tex) -> String {
     }
     if let Some(at) = t.over_target {
         s.push_str(&format!(" over_target={at:#x}"));
+    }
+    if let Some((ago, changed)) = t.read_again {
+        let changed = match changed {
+            None => "first",
+            Some(true) => "yes",
+            Some(false) => "no",
+        };
+        s.push_str(&format!(" read_again={ago}f changed={changed}"));
     }
     s
 }

@@ -17,6 +17,11 @@
 //!
 //! shortcut: by time, not by what the title wrote: a texture over a target is read again every
 //! [`EVERY`] frames whether its bytes changed or not (a few hundred kilobytes each).
+//!
+//! With `VICTORY_FACE_WATCH` each read again also hashes the title memory it reads and says
+//! whether it changed since the texture's last read again (`changed=`), which
+//! `crate::face_watch` shows per record slot (`read_again`): batch 5 part Q, a face turned solid
+//! red for two seconds in the ON run while textures over target `0xb58000000` were read again.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -42,6 +47,40 @@ const EVERY: u64 = 16;
 static SEEN: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
 /// Textures read again, in all.
 static REREAD: AtomicU64 = AtomicU64::new(0);
+
+/// (`VICTORY_FACE_WATCH`) By texture: the frame it was last read again, the hash of the title
+/// memory read then, and whether that hash differed from the one before (None: the first).
+type Again = (u64, blake3::Hash, Option<bool>);
+static AGAIN: Mutex<Option<HashMap<usize, Again>>> = Mutex::new(None);
+
+/// A read again of `resource` at `frame` whose title memory hashed `hash`: whether that
+/// memory changed since the texture's last read again (None: the first).
+fn note_again(again: &mut HashMap<usize, Again>, resource: usize, frame: u64, hash: blake3::Hash) -> Option<bool> {
+    if again.len() >= MOST && !again.contains_key(&resource) {
+        again.clear();
+    }
+    let changed = again.get(&resource).map(|&(_, was, _)| was != hash);
+    again.insert(resource, (frame, hash, changed));
+    changed
+}
+
+/// (`VICTORY_FACE_WATCH`) When texture `resource` was last read again (frames before
+/// `frame`), and whether its title memory had changed since the read again before.
+pub(crate) fn read_again(resource: usize, frame: u64) -> Option<(u64, Option<bool>)> {
+    let again = AGAIN.lock().unwrap_or_else(|e| e.into_inner());
+    again
+        .as_ref()?
+        .get(&resource)
+        .map(|&(at, _, changed)| (frame.saturating_sub(at), changed))
+}
+
+/// The hash of title memory `[address, address + len)`, read as a staging refresh reads it.
+#[cfg(windows)]
+fn title_hash(address: u64, len: u64) -> blake3::Hash {
+    let mut bytes = vec![0u8; len as usize];
+    crate::host::copy_mapped(bytes.as_mut_ptr(), address as *const u8, bytes.len(), false);
+    blake3::hash(&bytes)
+}
 
 /// Whether texture `resource`, now (frame `frame`) over the target starting at `over` (None:
 /// over none), is to be read again; remembered in `seen`.
@@ -105,7 +144,8 @@ pub(crate) fn reread(resource: usize, address: u64, len: u64) -> bool {
     if !ON.get_bool() {
         return false;
     }
-    let over = crate::resource::placed_inside::target_over(address, len).or_else(|| {
+    let live = crate::resource::placed_inside::target_over(address, len);
+    let over = live.or_else(|| {
         released_over(&GONE.lock().unwrap_or_else(|e| e.into_inner()), address, len)
     });
     let again = {
@@ -119,13 +159,26 @@ pub(crate) fn reread(resource: usize, address: u64, len: u64) -> bool {
     };
     if again {
         let n = REREAD.fetch_add(1, Relaxed) + 1;
-        if n <= 16 || n.is_power_of_two() {
+        let changed = crate::face_watch::on().then(|| {
+            let hash = title_hash(address, len);
+            let mut again = AGAIN.lock().unwrap_or_else(|e| e.into_inner());
+            note_again(again.get_or_insert_with(HashMap::new), resource, crate::frame::current(), hash)
+        });
+        let changed = match changed {
+            None => "unhashed",
+            Some(None) => "first",
+            Some(Some(true)) => "yes",
+            Some(Some(false)) => "no",
+        };
+        if n <= 64 || n.is_power_of_two() || changed == "yes" && n <= 4096 {
             tracing::info!(
                 n,
                 resource = format_args!("{resource:#x}"),
                 address = format_args!("{address:#x}"),
                 bytes = len,
                 target = format_args!("{:#x}", over.unwrap_or(0)),
+                over = if live.is_some() { "live" } else { "released" },
+                changed,
                 "target reuse: a texture the title fills lies in a target's memory: read again from title memory"
             );
         }
@@ -137,6 +190,9 @@ pub(crate) fn reread(resource: usize, address: u64, len: u64) -> bool {
 pub(crate) fn forget(resource: usize) {
     if let Some(seen) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         seen.remove(&resource);
+    }
+    if let Some(again) = AGAIN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        again.remove(&resource);
     }
 }
 
@@ -176,6 +232,18 @@ mod tests {
         }
         assert_eq!(gone.len(), RELEASED);
         assert_eq!(released_over(&gone, 0x1000, 0x10), None, "the oldest went");
+    }
+
+    /// Whether the title memory changed is told from the second read again on.
+    #[test]
+    fn a_read_again_says_whether_title_memory_changed() {
+        let mut again = HashMap::new();
+        let (a, b) = (blake3::hash(b"a"), blake3::hash(b"b"));
+        assert_eq!(note_again(&mut again, 1, 10, a), None);
+        assert_eq!(note_again(&mut again, 1, 26, a), Some(false));
+        assert_eq!(note_again(&mut again, 1, 42, b), Some(true));
+        assert_eq!(note_again(&mut again, 2, 42, b), None);
+        assert_eq!(again[&1], (42, b, Some(true)));
     }
 
     #[test]
