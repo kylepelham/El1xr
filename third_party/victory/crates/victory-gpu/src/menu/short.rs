@@ -164,6 +164,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_WAVE_PAIRS_VT", "A ported list of compute programs run in paired wave form."),
     ("VICTORY_WAVE_WHY", "Diagnoses whether brown face patches come from the face network."),
     ("VICTORY_WAVE_WIDE_MORE", "More wave64 programs run in wave-wide form on 32-lane hardware."),
+    ("VICTORY_WIDE_LOCK", "Listed shaders keep their wave-wide form when translated at once."),
     ("VICTORY_WIDE_REFRESH", "Spreads a flush's host copy refreshes over helper threads."),
     ("VICTORY_WIDE_WAKE_ONE", "Wakes only as many helper threads as there are jobs."),
     ("VICTORY_WREXEC_SCC", "Waterfall loops leave SCC false after them, instead of a refusal."),
