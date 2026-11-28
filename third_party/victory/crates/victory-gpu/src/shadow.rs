@@ -3379,6 +3379,32 @@ const WIDE_JOB: usize = 1 << 20;
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
+/// (Tests) Takes out the notes in [`SNAPS`] from the copy at `data` (`len`
+/// bytes), which is going or giving its snapshot back, and fails the test
+/// that left them. A submission notes and takes its snapshots under its lock
+/// while its lists hold the copy, so a note is never left for a copy that
+/// goes; a test that declares writes by hand (`Shadow::writing`) without
+/// `take_snapshots` left one for the next submission of any test, which
+/// copied from the freed copy into the freed snapshot (0xC0000005 in
+/// `take_snapshots`, #78).
+#[cfg(test)]
+fn no_notes_left(data: *mut u8, len: usize) {
+    if data.is_null() {
+        return;
+    }
+    let lo = data as usize;
+    let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let had = snaps.len();
+    snaps.retain(|&(from, _, _)| from < lo || from >= lo + len);
+    let left = had - snaps.len();
+    drop(snaps);
+    assert!(
+        left == 0 || std::thread::panicking(),
+        "{left} snapshot notes of a copy that is going were never taken: declare writes under \
+         the submission lock and take_snapshots() before it goes (#78)"
+    );
+}
+
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
@@ -4434,6 +4460,8 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] =
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        #[cfg(test)]
+        no_notes_left(self.data, self.len as usize);
         if self.deferred_count.load(Ordering::Acquire) > 0
             || self.resync_count.load(Ordering::Acquire) > 0
         {
@@ -5788,6 +5816,8 @@ impl Shadow {
             kept.0.clear();
         }
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            #[cfg(test)]
+            no_notes_left(self.data, self.len as usize);
             give_back(bytes);
         }
     }
