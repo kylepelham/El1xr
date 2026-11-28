@@ -135,6 +135,9 @@ impl Lower<'_> {
             Some(g) => Some(self.s.m.bin(c, Bin::And, g, inside)),
             None => Some(inside),
         };
+        // past the end: the range's own first page is looked up, not wherever the sum points
+        let sum = self.s.m.select(c, inside, sum, lo);
+        let high = self.s.m.select(c, inside, high, hi);
         let (h, at) = self.memory(sum, high, guard);
         let zero = self.s.m.i32(0);
         let mut out = Vec::new();
