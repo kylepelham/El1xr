@@ -99,6 +99,8 @@ mod intersect_tests;
 mod glass_splice_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+pub mod host_tlas;
 mod idiom;
 mod link;
 mod null_view_size;
