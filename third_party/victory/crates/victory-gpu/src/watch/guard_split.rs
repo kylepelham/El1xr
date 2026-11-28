@@ -41,9 +41,15 @@ pub(super) enum S {
     FaultCalls,
     FaultUs,
     FaultLockUs,
+    /// Of the checks before the walk: guard calls, those answered there without the walk, and the
+    /// queries of uncommitted holes they made (each call asks again).
+    PreCalls,
+    PreSettled,
+    PreHoleCalls,
+    PreHoleNs,
 }
 
-const S_COUNT: usize = S::FaultLockUs as usize + 1;
+const S_COUNT: usize = S::PreHoleNs as usize + 1;
 static STATS: [AtomicU64; S_COUNT] = [const { AtomicU64::new(0) }; S_COUNT];
 
 /// Who held the guards' lock alone.
@@ -88,6 +94,14 @@ pub(super) fn add(what: S, n: u64) {
 #[inline]
 pub(super) fn start() -> Option<Instant> {
     on().then(Instant::now)
+}
+
+/// [`finish`] in nanoseconds, for calls of a microsecond or less.
+#[inline]
+pub(super) fn finish_ns(what: S, started: Option<Instant>) {
+    if let Some(t) = started {
+        STATS[what as usize].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
 }
 
 #[inline]
@@ -170,7 +184,8 @@ pub(super) fn log(frames: f64) {
     }
     tracing::info!(
         "guard path split per frame (VICTORY_FLUSH_PROF, VICTORY_GUARD_NOTE_ONCE={}): \
-         shared lock {:.0} holds, {:.2} ms waiting; checks before the walk {:.2} ms; \
+         shared lock {:.0} holds, {:.2} ms waiting; checks before the walk {:.2} ms ({:.0} calls, \
+         {:.0} answered there; their hole queries {:.0} in {:.2} ms); \
          walk {:.2} ms (alias lookups {:.2} ms; its VirtualProtects are the split line's); \
          noting after it {:.2} ms (publish {:.2} ms, {:.1} blocks left unpublished, \
          VICTORY_GUARD_PUBLISH_TRY={}); VirtualQuery {:.0} in {:.2} ms (all threads); \
@@ -181,6 +196,10 @@ pub(super) fn log(frames: f64) {
         per(S::LockCalls),
         ms(S::LockWaitUs),
         ms(S::PreUs),
+        per(S::PreCalls),
+        per(S::PreSettled),
+        per(S::PreHoleCalls),
+        ms(S::PreHoleNs) / 1000.0,
         ms(S::WalkUs),
         ms(S::AliasUs),
         ms(S::NoteUs),

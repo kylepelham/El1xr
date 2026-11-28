@@ -3463,9 +3463,15 @@ fn guard_with_epochs_flags(
     let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let pre = guard_split::start();
+    if pre.is_some() {
+        guard_split::add(guard_split::S::PreCalls, 1);
+    }
     if !ask && first < last && clean_all(first, last) {
         // (Neptune) All clean, so all guarded and a view: said without the lock.
         count(4, 1);
+        if pre.is_some() {
+            guard_split::add(guard_split::S::PreSettled, 1);
+        }
         guard_split::finish(guard_split::S::PreUs, pre);
         return Some((Vec::new(), Vec::new()));
     }
@@ -3498,7 +3504,12 @@ fn guard_with_epochs_flags(
                     // Ordinary reservations (or when placeholder skip is disabled):
                     // reuse one VirtualQuery across the contiguous uncommitted region.
                     if block >= uncommitted_until {
+                        let t = if pre.is_some() { guard_split::start() } else { None };
                         uncommitted_until = holes::uncommitted_end_cached(block);
+                        if t.is_some() {
+                            guard_split::add(guard_split::S::PreHoleCalls, 1);
+                            guard_split::finish_ns(guard_split::S::PreHoleNs, t);
+                        }
                     }
                     if block < uncommitted_until {
                         continue;
@@ -3511,6 +3522,9 @@ fn guard_with_epochs_flags(
         }
         if settled {
             count(4, 1);
+            if pre.is_some() {
+                guard_split::add(guard_split::S::PreSettled, 1);
+            }
             guard_split::finish(guard_split::S::PreUs, pre);
             return Some((written, Vec::new()));
         }
