@@ -1892,7 +1892,8 @@ impl State {
         if kind == victory_shader::emit::USER_THREAD_LIMIT {
             return crate::rt_diag::thread_limit();
         }
-        // The spliced glass trace takes its ray queries only with both host top levels bound.
+        // The spliced traces (glass, shadow) take their ray queries only with their host top
+        // levels bound.
         if kind == victory_shader::emit::USER_GLASS_NATIVE {
             return u32::from(self.glass_tlas.is_some());
         }
@@ -2332,9 +2333,10 @@ impl State {
                         && (slot == victory_shader::emit::SLOT_TLAS
                             || slot == victory_shader::emit::SLOT_TLAS_NEAR)
                     {
-                        // Ours: the host top levels the glass dispatch was
-                        // matched to (`crate::rt_bind`), null when it was
-                        // not, and then the shader takes the title's walk.
+                        // Ours: the host top levels the glass or shadow
+                        // dispatch was matched to (`crate::rt_bind`), null
+                        // when it was not, and then the shader takes the
+                        // title's walk.
                         let near = usize::from(slot == victory_shader::emit::SLOT_TLAS_NEAR);
                         let at = self.glass_tlas.map_or(0, |m| m[near]);
                         self.bind_resource(list, compute, param, RootResource::Srv(at));

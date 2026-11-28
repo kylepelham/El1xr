@@ -52,79 +52,79 @@ const MERGE: usize = 0x9024;
 const OWN: u8 = 86;
 
 // Operand codes.
-const ZERO: u32 = 0x80;
-const ONE: u32 = 0x81;
-const MINUS_ONE: u32 = 0xc1;
-const MINUS_ONE_F: u32 = 0xf3;
-const LITERAL: u32 = 0xff;
-const VCC_LO: u32 = 106;
-const EXEC_LO: u32 = 126;
-const TTMP0: u32 = 108;
-const TTMP15: u32 = 123;
+pub(super) const ZERO: u32 = 0x80;
+pub(super) const ONE: u32 = 0x81;
+pub(super) const MINUS_ONE: u32 = 0xc1;
+pub(super) const MINUS_ONE_F: u32 = 0xf3;
+pub(super) const LITERAL: u32 = 0xff;
+pub(super) const VCC_LO: u32 = 106;
+pub(super) const EXEC_LO: u32 = 126;
+pub(super) const TTMP0: u32 = 108;
+pub(super) const TTMP15: u32 = 123;
 /// The program's SGPRs the arm reads: the lanes of loops L1/L3, the
 /// exec the merge restores, `CB 0x7c8`.
 const S3: u32 = 3;
 const S54: u32 = 54;
 const S53: u32 = 53;
 
-fn v(n: u8) -> u32 {
+pub(super) fn v(n: u8) -> u32 {
     256 + u32::from(n)
 }
 
-fn s_mov(dst: u32, src: u32) -> u32 {
+pub(super) fn s_mov(dst: u32, src: u32) -> u32 {
     0xbe80_0300 | dst << 16 | src
 }
 
 /// SOP2 `op` (`s_and_b32` 14, `s_or_b32` 16, `s_andn2_b32` 20).
-fn sop2(op: u32, dst: u32, s0: u32, s1: u32) -> u32 {
+pub(super) fn sop2(op: u32, dst: u32, s0: u32, s1: u32) -> u32 {
     0x8000_0000 | op << 23 | dst << 16 | s1 << 8 | s0
 }
-const S_AND: u32 = 14;
-const S_OR: u32 = 16;
-const S_ANDN2: u32 = 20;
+pub(super) const S_AND: u32 = 14;
+pub(super) const S_OR: u32 = 16;
+pub(super) const S_ANDN2: u32 = 20;
 
-fn v_mov(dst: u8, src: u32) -> u32 {
+pub(super) fn v_mov(dst: u8, src: u32) -> u32 {
     0x7e00_0200 | u32::from(dst) << 17 | src
 }
 
 /// VOP2 `op` (`v_add_f32` 3, `v_add_nc_u32` 0x25).
-fn vop2(op: u32, dst: u8, src0: u32, vsrc1: u8) -> u32 {
+pub(super) fn vop2(op: u32, dst: u8, src0: u32, vsrc1: u8) -> u32 {
     op << 25 | u32::from(dst) << 17 | u32::from(vsrc1) << 9 | src0
 }
 const V_ADD_F32: u32 = 3;
 const V_ADD_NC_U32: u32 = 0x25;
 
 /// VOPC `op` into VCC (`v_cmp_gt_f32` 4, `v_cmp_ne_u32` 0xc5).
-fn vopc(op: u32, src0: u32, vsrc1: u8) -> u32 {
+pub(super) fn vopc(op: u32, src0: u32, vsrc1: u8) -> u32 {
     0x7c00_0000 | op << 17 | u32::from(vsrc1) << 9 | src0
 }
-const V_CMP_GT_F32: u32 = 4;
-const V_CMP_NE_U32: u32 = 0xc5;
+pub(super) const V_CMP_GT_F32: u32 = 4;
+pub(super) const V_CMP_NE_U32: u32 = 0xc5;
 
 /// `v_cndmask_b32 dst, src0, src1, mask` (VOP3: `src1` where `mask`).
-fn cndmask(dst: u8, src0: u32, src1: u32, mask: u32) -> [u32; 2] {
+pub(super) fn cndmask(dst: u8, src0: u32, src1: u32, mask: u32) -> [u32; 2] {
     [0xd501_0000 | u32::from(dst), mask << 18 | src1 << 9 | src0]
 }
 
 /// SOPP `op` (`s_branch` 2, `s_cbranch_scc1` 5, `s_cbranch_vccnz` 7) to
 /// `target` from the instruction at `at`.
-fn sopp(op: u32, at: usize, target: usize) -> u32 {
+pub(super) fn sopp(op: u32, at: usize, target: usize) -> u32 {
     let delta = (target as i64 - (at as i64 + 4)) / 4;
     let delta = i16::try_from(delta).expect("a branch within 128 KiB");
     0xbf80_0000 | op << 16 | u32::from(delta as u16)
 }
-const S_BRANCH: u32 = 2;
-const S_CBRANCH_SCC1: u32 = 5;
-const S_CBRANCH_VCCNZ: u32 = 7;
+pub(super) const S_BRANCH: u32 = 2;
+pub(super) const S_CBRANCH_SCC1: u32 = 5;
+pub(super) const S_CBRANCH_VCCNZ: u32 = 7;
 
 /// `s_cmp_lg_u32 s0, s1`.
-fn s_cmp_lg(s0: u32, s1: u32) -> u32 {
+pub(super) fn s_cmp_lg(s0: u32, s1: u32) -> u32 {
     0xbf07_0000 | s1 << 8 | s0
 }
 
 /// A marker: `image_bvh64_intersect_ray v[data:data+3], v[addr:addr+11],
 /// ttmp[k:k+3]` (the twelve addresses in order, NSA form).
-fn marker(data: u8, addr: u8, ttmp: u32) -> [u32; 5] {
+pub(super) fn marker(data: u8, addr: u8, ttmp: u32) -> [u32; 5] {
     let a = |k: u8| u32::from(addr + k);
     [
         0xf19c_9f07,
@@ -177,7 +177,8 @@ fn region(start: usize) -> Vec<u32> {
 fn arm(w: &mut Vec<u32>) {
     use at::*;
     w.push(s_mov(S54, EXEC_LO));
-    w.extend([v_mov(RAY, ZERO), v_mov(RAY + 1, ZERO)]);
+    // The instance mask where the node pointer goes: every instance.
+    w.extend([v_mov(RAY, LITERAL), 0xff, v_mov(RAY + 1, ZERO)]);
     w.extend([v_mov(EXTENT, LITERAL), 10000.0f32.to_bits()]);
     w.push(vop2(V_ADD_F32, ORIGIN, v(31), 32));
     w.push(vop2(V_ADD_F32, ORIGIN + 1, v(39), 37));
@@ -245,7 +246,7 @@ fn arm(w: &mut Vec<u32>) {
     w.push(v_mov(21, 31 + ZERO));
 }
 
-fn fnv(bytes: &[u8]) -> u64 {
+pub(super) fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })

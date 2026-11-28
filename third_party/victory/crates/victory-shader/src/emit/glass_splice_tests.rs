@@ -268,6 +268,8 @@ fn traced(
     for t in 0..32 {
         let r = &all[t.min(all.len() - 1)];
         let words = &mut record[16 * t..];
+        // The instance mask in the node pointer's place: every instance.
+        words[0] = 0xff;
         words[2] = r.extent.to_bits();
         for k in 0..3 {
             words[3 + k] = r.origin[k].to_bits();
