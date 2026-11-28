@@ -3,29 +3,62 @@
 //! hands it to a thread that writes `%USERPROFILE%\Pictures\Neptune\neptune-<date>_<time>.png`.
 //! The overlay is a window of its own, so the worker draws the same panel ([`crate::overlay::render`])
 //! onto the picture, from the stats current at capture time.
+//! (El1xr) A `VICTORY_MENU_SELFTEST` picture ([`crate::menu_shot`]) rides the same readback.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 static WANTED: AtomicBool = AtomicBool::new(false);
+/// What the last [`take`] found asked, for the [`read_back`] that follows it.
+static TAKEN: Mutex<Option<Asks>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Asks {
+    f12: bool,
+    menu: Option<crate::menu_shot::Ask>,
+}
 
 pub(crate) fn request() {
     WANTED.store(true, Ordering::Relaxed);
 }
 
-/// Whether a screenshot was asked for (and clears the ask).
+/// Whether a screenshot (F12 or a menu selftest picture) was asked for (and clears the ask).
 pub(crate) fn take() -> bool {
-    WANTED.swap(false, Ordering::Relaxed)
+    let f12 = WANTED.swap(false, Ordering::Relaxed);
+    let menu = crate::menu_shot::take();
+    let asked = f12 || menu.is_some();
+    if asked {
+        *TAKEN.lock().unwrap_or_else(PoisonError::into_inner) = Some(Asks { f12, menu });
+    }
+    asked
 }
 
 pub(crate) struct Shot {
     buffer: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    asks: Asks,
 }
 
-/// Records a copy of `texture` (in the copy-source state) into a readback buffer.
+/// Records a copy of `texture` (in the copy-source state) into a readback buffer, for what the
+/// last [`take`] found asked.
 pub(crate) fn read_back(device: &ID3D12Device, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) -> Option<Shot> {
+    let asks = TAKEN.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap_or_default();
+    let copied = copy_out(device, list, texture);
+    if copied.is_none()
+        && let Some(ask) = &asks.menu
+    {
+        tracing::warn!("menu selftest: {} not written: the presented texture could not be read back", ask.name);
+    }
+    copied.map(|(buffer, footprint)| Shot { buffer, footprint, asks })
+}
+
+fn copy_out(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
@@ -59,7 +92,7 @@ pub(crate) fn read_back(device: &ID3D12Device, list: &ID3D12GraphicsCommandList,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some(Shot { buffer, footprint })
+        Some((buffer, footprint))
     }
 }
 
@@ -79,13 +112,23 @@ pub(crate) fn finish(shot: Shot) {
         shot.buffer.Unmap(0, None);
         rgb
     };
+    let Asks { f12, menu } = shot.asks;
     let Some(rgb) = rgb else {
         tracing::warn!(format = f.Format.0, "screenshot not saved: format not handled");
+        if let Some(ask) = menu {
+            tracing::warn!(format = f.Format.0, "menu selftest: {} not written: presented format not handled", ask.name);
+        }
         return;
     };
-    let stats = crate::overlay::snapshot();
+    let stats = f12.then(crate::overlay::snapshot).flatten();
     let _ = std::thread::Builder::new().name("victory-screenshot".into()).spawn(move || {
         let mut rgb = rgb;
+        if let Some(ask) = menu {
+            crate::menu_shot::write(ask, w, h, if f12 { rgb.clone() } else { std::mem::take(&mut rgb) });
+        }
+        if !f12 {
+            return;
+        }
         if let Some(panel) = stats.and_then(|s| crate::overlay::render(&s, h)) {
             let m = crate::overlay::margin(h);
             crate::pixels::blend_onto_rgb(&mut rgb, w, h, &panel, m, m);

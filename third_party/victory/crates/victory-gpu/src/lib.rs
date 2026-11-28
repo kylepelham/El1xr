@@ -119,6 +119,8 @@ mod list_reap;
 #[cfg(windows)]
 mod output_views;
 pub mod menu;
+#[cfg(windows)]
+mod menu_shot;
 pub mod modmenu;
 #[cfg(windows)]
 mod overlay;

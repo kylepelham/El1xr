@@ -13,6 +13,7 @@ pub mod emit;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
+mod lane_split;
 mod loop_skips;
 pub mod native;
 pub mod resource;
