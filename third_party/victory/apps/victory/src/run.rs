@@ -46,6 +46,8 @@ pub fn run(
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     victory_hle::runtime::set_image_size(image.base(), image.info().size_of_image as usize);
+    // SAFETY: the title image stays mapped for the whole run.
+    unsafe { victory_gpu::modmenu::init(image.base(), image.info().size_of_image as usize) };
     let effective_args = victory_hle::modules::cmdline::set_title_command_line(exe, title_args);
     if !effective_args.is_empty() {
         println!("title args     {}", effective_args.join(" "));

@@ -31,6 +31,10 @@ pub trait MenuModel: Send {
     fn presets(&self) -> &[Preset] {
         &[]
     }
+    /// What the menu is, after the name in its header.
+    fn title(&self) -> &'static str {
+        "Settings"
+    }
 }
 
 /// The live registry. `save` is the registry's unless a test swaps it.

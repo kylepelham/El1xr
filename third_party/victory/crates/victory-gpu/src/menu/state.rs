@@ -62,7 +62,9 @@ pub fn tabs(model: &dyn MenuModel, expert: bool) -> Vec<Tab> {
         .filter(|&&g| g != EXPERIMENTAL)
         .map(|&g| Tab::Group(g))
         .collect();
-    out.push(Tab::Presets);
+    if !model.presets().is_empty() {
+        out.push(Tab::Presets);
+    }
     if groups.contains(&EXPERIMENTAL) {
         out.push(Tab::Group(EXPERIMENTAL));
     }
@@ -123,6 +125,18 @@ impl Default for Menu {
 }
 
 impl Menu {
+    /// A closed menu on `model`'s first tab when it has no Display tab.
+    pub fn for_model(model: &dyn MenuModel) -> Self {
+        let mut menu = Menu::default();
+        let tabs = menu.tabs(model);
+        if !tabs.contains(&menu.tab)
+            && let Some(&first) = tabs.first()
+        {
+            menu.tab = first;
+        }
+        menu
+    }
+
     pub fn tabs(&self, model: &dyn MenuModel) -> Vec<Tab> {
         tabs(model, self.expert)
     }
