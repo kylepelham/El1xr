@@ -2551,6 +2551,7 @@ pub(crate) fn ask_once_end() {
     if !ask_once_active() && !reservation::enabled() {
         return;
     }
+    reservation::outside::ENDS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept || reservation::enabled() {
         j.kept = false;

@@ -8,8 +8,9 @@
 //! one key poll every 30 ms, and F12 screenshots (taken from the back buffer) leave it out.
 //!
 //! It works on the settings registry (`victory_core::settings`) through [`model::Registry`]: tabs
-//! are the registry's groups, each row's LIVE / RESTART / REBUILD tag is `apply_of`, changes go
-//! through `settings::set`, and SAVE writes the settings file.
+//! are the registry's groups (Display in headed sections), each row's LIVE / RESTART / REBUILD
+//! tag is `apply_of`, changes go through `settings::set`, a change that waits for the next start
+//! is written to the settings file at once, and SAVE writes the live ones too.
 //!
 //! The trainer menu ([`crate::modmenu`], `VICTORY_MOD_MENU=1`, F8) is a second window of the same
 //! kind over its own model, with its own hotkey and press counters; either one open blocks the
@@ -209,9 +210,10 @@ impl Driver {
     /// Lays the menu out for a `w` x `h` game picture.
     pub fn layout(&mut self, w: i32, h: i32) -> layout::Layout {
         let tabs = self.menu.tabs(&*self.model);
-        let rows = self.menu.rows(&*self.model).len();
+        let rows = self.menu.rows(&*self.model);
         let pending = !self.model.pending_restart().is_empty();
-        layout::layout(w, h, &mut self.menu, &tabs, rows, pending)
+        let heading = |i: usize| rows.get(i).is_some_and(|r| !state::selectable(r));
+        layout::layout(w, h, &mut self.menu, &tabs, rows.len(), &heading, pending)
     }
 
     /// Whether the title's input is blocked.
@@ -322,22 +324,25 @@ mod tests {
         let _lock = registry_lock();
         let mut d = driver();
         d.tick(0, &[Key::Hotkey], 0, 0);
-        d.tick(30, &[], DOWN, 0);
+        // Row 0 is the Display tab's first section title: the menu opens on row 1.
         assert_eq!(d.menu.selected, 1);
-        d.tick(60, &[], 0, -240);
-        assert_eq!(d.menu.selected, 3);
-        d.tick(90, &[], 0, 120);
+        assert!(!d.click(Some(Hit::Row(0))), "a section title is never selected");
+        d.tick(30, &[], DOWN, 0);
         assert_eq!(d.menu.selected, 2);
-        assert!(d.click(Some(Hit::ValueRight(1))));
+        d.tick(60, &[], 0, -240);
+        assert_eq!(d.menu.selected, 4);
+        d.tick(90, &[], 0, 120);
+        assert_eq!(d.menu.selected, 3);
+        assert!(d.click(Some(Hit::ValueRight(2))));
         assert_eq!(
             (d.menu.selected, d.model.get("VICTORY_UPSCALE").as_deref()),
-            (1, Some("stretch"))
+            (2, Some("stretch"))
         );
-        assert!(d.click(Some(Hit::ValueLeft(1))));
+        assert!(d.click(Some(Hit::ValueLeft(2))));
         assert_eq!(d.model.get("VICTORY_UPSCALE").as_deref(), Some("off"));
         assert!(d.click(Some(Hit::Tab(state::Tab::Presets))));
         assert!(d.click(Some(Hit::ValueLeft(0))));
-        assert_eq!(d.menu.status.as_deref(), Some("Quality preset applied"));
+        assert_eq!(d.menu.status.as_deref(), Some("Quality preset applied, saved"));
         let undo = d.menu.rows(&*d.model).len() - 1;
         assert!(d.click(Some(Hit::ValueLeft(undo))));
         assert!(d.model.pending_restart().is_empty());

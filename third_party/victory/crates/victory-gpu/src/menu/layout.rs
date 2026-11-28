@@ -75,17 +75,21 @@ const TAB_GAP: f32 = 4.0;
 const BANNER_H: f32 = 40.0;
 const FOOTER_H: f32 = 46.0;
 const ROW_H: f32 = 60.0;
+/// A section title's row.
+const HEADING_H: f32 = 34.0;
 const VALUE_W: f32 = 236.0;
 const BADGE_W: f32 = 98.0;
 
 /// Lays the menu out for a `frame_w` x `frame_h` picture with `tabs` and `rows` rows in the
-/// current tab, and scrolls `menu` so its selected row is visible.
+/// current tab (`heading(i)`: row `i` is a section title, a shorter row), and scrolls `menu` so
+/// its selected row is visible.
 pub fn layout(
     frame_w: i32,
     frame_h: i32,
     menu: &mut Menu,
     tabs: &[Tab],
     rows: usize,
+    heading: &dyn Fn(usize) -> bool,
     pending: bool,
 ) -> Layout {
     let s = scale(frame_h);
@@ -174,20 +178,21 @@ pub fn layout(
         h: (footer.y - px(6.0) - y).max(0),
     };
     let row_h = px(ROW_H);
+    // Counted as full rows, so a page with section titles always fits.
     let visible = (list.h / row_h.max(1)).max(1) as usize;
     menu.follow(visible, rows);
+    let mut top = list.y;
     let rows = (menu.scroll..rows.min(menu.scroll + visible))
-        .enumerate()
-        .map(|(k, i)| {
-            (
-                i,
-                Rect {
-                    x: list.x,
-                    y: list.y + k as i32 * row_h,
-                    w: list.w,
-                    h: row_h,
-                },
-            )
+        .map(|i| {
+            let h = if heading(i) { px(HEADING_H) } else { row_h };
+            let r = Rect {
+                x: list.x,
+                y: top,
+                w: list.w,
+                h,
+            };
+            top += h;
+            (i, r)
         })
         .collect();
     Layout {
@@ -275,7 +280,7 @@ mod tests {
     #[test]
     fn panel_scales_with_the_picture_and_fits() {
         for (fw, fh) in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
-            let l = layout(fw, fh, &mut open(), &tabs(), 6, true);
+            let l = layout(fw, fh, &mut open(), &tabs(), 6, &|_| false, true);
             assert!(l.window.w <= fw && l.window.h <= fh, "{fw}x{fh}");
             assert!(l.footer.y >= l.list.bottom());
             assert!(
@@ -289,16 +294,16 @@ mod tests {
             let row = l.rows[0].1;
             assert!(l.badge(row).x > row.x + row.w / 3, "label room");
         }
-        let small = layout(1920, 1080, &mut open(), &tabs(), 6, false);
-        let big = layout(3840, 2160, &mut open(), &tabs(), 6, false);
+        let small = layout(1920, 1080, &mut open(), &tabs(), 6, &|_| false, false);
+        let big = layout(3840, 2160, &mut open(), &tabs(), 6, &|_| false, false);
         assert_eq!(big.panel.w, small.panel.w * 2);
         assert_eq!(big.visible, small.visible);
     }
 
     #[test]
     fn banner_takes_room_from_the_list() {
-        let without = layout(1920, 1080, &mut open(), &tabs(), 30, false);
-        let with = layout(1920, 1080, &mut open(), &tabs(), 30, true);
+        let without = layout(1920, 1080, &mut open(), &tabs(), 30, &|_| false, false);
+        let with = layout(1920, 1080, &mut open(), &tabs(), 30, &|_| false, true);
         assert!(with.banner.is_some() && without.banner.is_none());
         assert!(with.list.y > without.list.y);
         assert!(with.visible <= without.visible);
@@ -310,7 +315,7 @@ mod tests {
             selected: 25,
             ..open()
         };
-        let l = layout(1920, 1080, &mut m, &tabs(), 30, false);
+        let l = layout(1920, 1080, &mut m, &tabs(), 30, &|_| false, false);
         assert_eq!(l.rows.last().unwrap().0, 25);
         assert_eq!(l.rows.len(), l.visible);
         assert_eq!(m.scroll, 26 - l.visible);
@@ -319,7 +324,7 @@ mod tests {
     #[test]
     fn hits() {
         let mut m = open();
-        let l = layout(1920, 1080, &mut m, &tabs(), 4, false);
+        let l = layout(1920, 1080, &mut m, &tabs(), 4, &|_| false, false);
         let centre = |r: Rect| (r.x + r.w / 2, r.y + r.h / 2);
         let (x, y) = centre(l.close);
         assert_eq!(l.hit(x, y), Some(Hit::Close));

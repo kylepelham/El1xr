@@ -40,7 +40,11 @@ mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod ambient_cover;
+#[cfg(windows)]
 mod ambient_miss;
+#[cfg(windows)]
+mod ambient_places;
 #[cfg(windows)]
 mod ambient_reflect;
 #[cfg(windows)]
@@ -50,6 +54,10 @@ mod bake_ahead;
 mod boot_prof;
 #[cfg(windows)]
 mod bake_check;
+#[cfg(windows)]
+mod bake_fresh;
+#[cfg(windows)]
+mod bake_name;
 #[cfg(windows)]
 mod bake_inputs;
 #[cfg(windows)]
@@ -68,6 +76,8 @@ mod hang_watch;
 mod raw_watch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod drop_why;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pieces_diag;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -152,6 +162,8 @@ mod primitive;
 mod heap_pass;
 pub mod query;
 pub mod queue;
+/// (mandy 6e80eb8648) `VICTORY_ALIAS_LATER=1`: page-mapping copies mapped behind the title's call.
+pub mod alias_later;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

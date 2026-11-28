@@ -156,6 +156,7 @@ pub(crate) fn pipeline(this: usize) {
 /// pipeline `this` for the reason last noted on this thread.
 pub(crate) fn count_of(site: &'static str, this: usize) {
     crate::flicker_catch::dropped(this);
+    crate::pieces_diag::dropped(this);
     if on() {
         PIPELINE.set(this);
         count(site);
