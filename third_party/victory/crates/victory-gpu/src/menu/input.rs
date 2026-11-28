@@ -30,6 +30,8 @@ pub const PAD_RT: u32 = 0x2_0000;
 pub const CHORD: u32 = PAD_VIEW | PAD_MENU;
 /// The trainer's chord: both stick clicks.
 pub const TRAINER_CHORD: u32 = PAD_LS | PAD_RS;
+/// The report key's chord (`VICTORY_REPORT_KEY`): View + RS.
+pub const REPORT_CHORD: u32 = PAD_VIEW | PAD_RS;
 /// Bits [`Inputs::update`] reads.
 const PAD_BITS: u32 = 18;
 
