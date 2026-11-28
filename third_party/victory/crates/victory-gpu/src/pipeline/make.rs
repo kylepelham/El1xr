@@ -135,18 +135,37 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT").is_some_and(|v| v == "1")) {
         return false;
     }
-    shaders.iter().any(|s| {
-        matches!(
-            s.hash.as_str(),
-            "970c4fbb3b017c0e"
-                | "068c90badc86f1fd"
-                | "e4a7e088c7780ce8"
-                | "ebe4e53f031f5249"
-                | "2cc4c197ee29e291"
-                | "369cbe906ea72764"
-        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
-            || crate::bake_name::extra(s)
-    })
+    static MORE: OnceLock<bool> = OnceLock::new();
+    let more = *MORE.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUT_MORE").is_some_and(|v| v == "1"));
+    shaders.iter().any(|s| scene_input_named(s.stage, &s.hash, &s.container, more) || crate::bake_name::extra(s))
+}
+
+/// Whether one shader makes its pipeline a [`scene_input`]: by hash, and
+/// with `more` (`VICTORY_SCENE_INPUT_MORE=1`, after L7aj7med/victory-nvidia
+/// 9ac9998064, a port of ScarlettPort PR #25) also the passes the title runs
+/// once: the vertex program of the six draws that build the environment
+/// BRDF, area-light and scattering tables, and by container name every
+/// permutation of the head/skin decoration bakes and of `CS_CompressBC`,
+/// which block-compresses what they baked (dropped once, the face samples
+/// zero for the run), and the head blend-shape map
+/// `CS_ComputeBlendshapeMappings` (compute `61e54e90adccaf6a`, after
+/// TaynanGT/Vice-Tay #372 3e3fd57: dispatched before its pipeline exists,
+/// the face map is never built; a 4090 measured it 29.8 s late).
+fn scene_input_named(stage: &str, hash: &str, container: &[u8], more: bool) -> bool {
+    const RUN_ONCE: [&[u8]; 3] = [b"BakeDecorations", b"DecorationBlend", b"CS_CompressBC"];
+    matches!(
+        hash,
+        "970c4fbb3b017c0e"
+            | "068c90badc86f1fd"
+            | "e4a7e088c7780ce8"
+            | "ebe4e53f031f5249"
+            | "2cc4c197ee29e291"
+            | "369cbe906ea72764"
+    ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&hash)
+        || (more
+            && ((stage == "vertex" && hash == "ce57291b5a1750ca")
+                || (stage == "compute" && hash == "61e54e90adccaf6a")
+                || RUN_ONCE.iter().any(|name| container.windows(name.len()).any(|w| w == *name))))
 }
 
 /// The longest one scene-input wait may be, whatever is asked.
@@ -1290,6 +1309,26 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.scene_waited.load(Ordering::Relaxed));
         assert!(matches!(p.made.get(), Some(None)), "the first use waits until the worker has answered");
+    }
+
+    /// `VICTORY_SCENE_INPUT_MORE`'s run-once passes are scene inputs only with it; the
+    /// face network's and the listed bakes' hashes are with or without it.
+    #[test]
+    fn the_run_once_passes_are_scene_inputs_only_with_more() {
+        let blend = b"\x00DXBC..\x00PS_DecorationBlend_0011_Wrapped\x00";
+        let bake = b"\x00PS_BakeDecorations_0003\x00";
+        let compress = b"\x00CS_CompressBC_BC7_Wrapped\x00";
+        for more in [false, true] {
+            assert_eq!(scene_input_named("vertex", "ce57291b5a1750ca", b"", more), more);
+            assert_eq!(scene_input_named("compute", "61e54e90adccaf6a", b"", more), more);
+            assert_eq!(scene_input_named("pixel", "0123456789abcdef", blend, more), more);
+            assert_eq!(scene_input_named("pixel", "0123456789abcdef", bake, more), more);
+            assert_eq!(scene_input_named("compute", "0123456789abcdef", compress, more), more);
+            assert!(scene_input_named("pixel", "970c4fbb3b017c0e", b"", more));
+            assert!(scene_input_named("pixel", crate::draw::BAKE_PIXEL_SHADERS[0], b"", more));
+            assert!(!scene_input_named("pixel", "ce57291b5a1750ca", b"", more), "only its vertex stage");
+            assert!(!scene_input_named("compute", "0123456789abcdef", b"\x00CS_Compress\x00", more));
+        }
     }
 
     /// The water light's two tiled programs are named, and no other shader; with
