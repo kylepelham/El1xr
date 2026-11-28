@@ -142,4 +142,111 @@ mod tests {
             assert!(gone.load(Ordering::Relaxed), "let go when the allocator is destroyed");
         }
     }
+
+    /// (El1xr) What a direct command allocator keeps of the process's commit
+    /// on the host card: 128 allocators, each with a list that records `n`
+    /// commands (copies of 256 bytes and barriers, about what a host list
+    /// records per draw), measured after recording, after a reset (kept for
+    /// the next recording) and after the allocators go; then the same sizes
+    /// again. `cargo test -p victory-gpu allocator_memory -- --ignored --nocapture`.
+    ///
+    /// RTX 5090, 2026-11-28: about 20 KiB an allocator at 100 commands, 100 KiB
+    /// at 1,000, 1.4 MiB at 10,000, 6 MiB at 50,000; a reset keeps all of it,
+    /// and allocators destroyed give none back to the process's commit: the
+    /// driver keeps it and hands it to the next allocators (the second 1,000
+    /// and 50,000 rounds took 3-12 KiB each). So destroying or remaking large
+    /// idle allocators cuts no commit; only fewer commands held at once do.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn allocator_memory() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        let private = || {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            c.PagefileUsage as i64
+        };
+        // SAFETY: plain object creation and recording on the host device;
+        // nothing is executed.
+        unsafe {
+            let buffer = |size: u64| {
+                let mut made: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: size,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+                made.unwrap()
+            };
+            let (a, b) = (buffer(1 << 20), buffer(1 << 20));
+            const N: usize = 128;
+            let first = private();
+            for n in [0usize, 100, 1000, 10_000, 50_000, 1000, 50_000] {
+                let start = private();
+                let mut kept = Vec::with_capacity(N);
+                for _ in 0..N {
+                    let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                    let list: ID3D12GraphicsCommandList =
+                        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                    for i in 0..n {
+                        let at = (i as u64 % 4096) * 256;
+                        if i % 8 == 7 {
+                            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                        pResource: std::mem::ManuallyDrop::new(None),
+                                    }),
+                                },
+                                ..Default::default()
+                            }]);
+                        } else {
+                            list.CopyBufferRegion(&b, at, &a, at, 256);
+                        }
+                    }
+                    list.Close().unwrap();
+                    kept.push((allocator, list));
+                }
+                let recorded = private();
+                for (allocator, list) in &kept {
+                    allocator.Reset().unwrap();
+                    list.Reset(allocator, None).unwrap();
+                    list.Close().unwrap();
+                }
+                let reset = private();
+                drop(kept);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let gone = private();
+                let kib = |v: i64| v as f64 / N as f64 / 1024.0;
+                eprintln!(
+                    "allocator memory: {n} commands: {:.0} KiB each recorded, {:.0} KiB kept after a reset, {:.0} KiB left after they go",
+                    kib(recorded - start),
+                    kib(reset - start),
+                    kib(gone - start),
+                );
+                eprintln!("allocator memory: process private {} MiB over the first", (private() - first) >> 20);
+            }
+        }
+    }
 }

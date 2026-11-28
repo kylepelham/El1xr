@@ -18,6 +18,8 @@
 //! same way. A committed buffer starts as zeros, so a piece does too: a
 //! piece of the card's memory is cut only from memory no piece used before
 //! (heaps are made cleared; a block is let go once all its pieces are back),
+//! or (El1xr, `VICTORY_CARD_BLOCK_REUSE=1`) zeroed since on a copy queue
+//! (`super::reuse`),
 //! and a piece of mapped memory used before is cleared through its mapping.
 //! Pieces come back with the buffer's last reference and rest as texture
 //! pieces do; blocks are made ahead and made resident before use as texture
@@ -38,7 +40,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 use super::{
-    BLOCK, Piece, Pool, Ripe, give_back_with, lock, made_resident, now, switch, wait_resident,
+    BLOCK, Piece, Pool, Ripe, give_back_with, lock, made_resident, now, reuse, switch, wait_resident,
 };
 
 /// The kinds of buffer, as `crate::host` makes them.
@@ -83,10 +85,14 @@ pub(super) fn trim(at: u64, finished: u64) -> u64 {
 /// it, mapped once, that the pieces' mappings are cut from (a `Map` of each
 /// piece of upload memory cost about as much as the allocation it spared:
 /// 523 us a MiB on the 5090).
+///
+/// (El1xr) A card block has the buffer over all of it too, not mapped, while
+/// its pieces are zeroed and cut again (`VICTORY_CARD_BLOCK_REUSE`): the copy
+/// queue writes the zeros through it.
 #[derive(Clone)]
 struct Mem {
     heap: ID3D12Heap,
-    _whole: Option<ID3D12Resource>,
+    whole: Option<ID3D12Resource>,
     data: *mut u8,
 }
 // SAFETY: D3D12 objects are free-threaded; the mapping is written by the
@@ -239,14 +245,73 @@ fn block(device: &ID3D12Device, kind: Kind) -> Option<Mem> {
             return None;
         }
         whole = made;
+    } else if reuse::on() {
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a buffer over the whole live heap, which the pieces alias;
+        // written only by the zeros over pieces no buffer holds (`reuse`).
+        let placed = unsafe {
+            device.CreatePlacedResource(
+                &heap,
+                0,
+                &buffer_desc(BLOCK, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            )
+        };
+        if let Err(e) = placed {
+            tracing::warn!(error = %e, "a block of card buffer memory has no buffer over it to zero its pieces");
+            return None;
+        }
+        whole = made;
     }
     STATS[kind.at()][2].fetch_add(1, Ordering::Relaxed);
     crate::host::name(&heap, || format!("host {} buffers (a block)", kind.name()));
     Some(Mem {
         heap,
-        _whole: whole,
+        whole,
         data: data.cast(),
     })
+}
+
+/// (El1xr) A round of card block reuse at most this often (ms).
+const REUSE_ROUND_MS: u64 = 10;
+
+/// (El1xr) `VICTORY_CARD_BLOCK_REUSE=1`: the zeroer is made with the first
+/// card piece asked for, before any card block, and the card pool reuses
+/// from then on; a round of it at most every [`REUSE_ROUND_MS`], by one
+/// thread at a time (`reuse::round`).
+fn card_reuse(device: &ID3D12Device) {
+    static ZEROER: OnceLock<Option<Mutex<reuse::Zeroer>>> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if !reuse::on() {
+        return;
+    }
+    let zeroer = ZEROER.get_or_init(|| match reuse::Zeroer::new(device) {
+        Ok(zeroer) => {
+            lock(&CARD).reuse = true;
+            tracing::info!("card buffer blocks: pieces back are zeroed on a copy queue and cut again (VICTORY_CARD_BLOCK_REUSE=1)");
+            Some(Mutex::new(zeroer))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "card block reuse: no copy queue to zero pieces; card blocks stay fresh-only");
+            None
+        }
+    });
+    let Some(zeroer) = zeroer else {
+        return;
+    };
+    let at = now();
+    let last = LAST.load(Ordering::Relaxed);
+    if at < last + REUSE_ROUND_MS || LAST.compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let Ok(mut zeroer) = zeroer.try_lock() else {
+        return;
+    };
+    let gone = reuse::round(&CARD, &mut zeroer, |mem: &Mem| mem.whole.clone());
+    drop(zeroer);
+    super::let_go(super::Which::Card, gone);
 }
 
 pub(super) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
@@ -282,6 +347,9 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
         return None;
     }
     let started = std::time::Instant::now();
+    if kind == Kind::Card {
+        card_reuse(device);
+    }
     let taken = super::take_from(
         kind.pool(),
         kind.which(),
@@ -333,7 +401,7 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
             super::time(kind.which(), super::T_ZERO_US, super::us(began));
         }
     } else {
-        debug_assert!(!again, "a card piece is cut only from fresh memory");
+        debug_assert!(!again || reuse::on(), "a card piece is cut only from fresh or zeroed memory");
     }
     let us = started.elapsed().as_micros() as u64;
     let n = STATS[kind.at()][0].fetch_add(1, Ordering::Relaxed) + 1;
