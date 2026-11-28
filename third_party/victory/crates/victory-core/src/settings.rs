@@ -20,7 +20,7 @@ pub mod ray_tracing;
 pub mod schedule;
 mod table;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -155,6 +155,9 @@ pub enum SetError {
 struct Store {
     /// The settings file's values, as read at start (or last saved).
     file: BTreeMap<String, String>,
+    /// The settings file's values as read at start: what a cleared change
+    /// goes back to.
+    start: BTreeMap<String, String>,
     /// Changes made while running; an empty value clears the setting back
     /// to its launch value.
     changed: BTreeMap<String, String>,
@@ -163,6 +166,7 @@ struct Store {
 
 static STORE: Mutex<Store> = Mutex::new(Store {
     file: BTreeMap::new(),
+    start: BTreeMap::new(),
     changed: BTreeMap::new(),
     hooks: Vec::new(),
 });
@@ -275,8 +279,29 @@ fn read_file() -> Loaded {
         problems,
         ray_tracing: None,
     };
-    store().file = file;
+    let mut s = store();
+    s.start = file.clone();
+    s.file = file;
+    drop(s);
     loaded
+}
+
+/// The settings whose value came from the settings file: those `init` put
+/// into the environment, and those the environment holds with the file's
+/// value (the launcher copies the file into it first).
+pub fn from_file() -> BTreeSet<String> {
+    let start = store().start.clone();
+    file_values_in_env(&start, |name| std::env::var(name).ok())
+}
+
+fn file_values_in_env(
+    file: &BTreeMap<String, String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> BTreeSet<String> {
+    file.iter()
+        .filter(|(name, value)| env(name).is_none_or(|v| v == **value))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// The file's names the environment leaves unset (to put there) and those
@@ -456,8 +481,9 @@ pub fn on_change(name: &'static str, f: fn(&str)) {
 }
 
 /// Writes the settings file: the file's values with this run's changes on
-/// top (a cleared setting leaves the file). Only values someone chose are
-/// written, never the launcher's or the defaults.
+/// top (a cleared setting goes back to the file's value at start, or leaves
+/// the file). Only values someone chose are written, never the launcher's or
+/// the defaults.
 pub fn save() -> std::io::Result<()> {
     let path = file_path().ok_or_else(|| {
         std::io::Error::new(
@@ -467,7 +493,7 @@ pub fn save() -> std::io::Result<()> {
     })?;
     let merged = {
         let s = store();
-        merged(&s.file, &s.changed)
+        merged(&s.file, &s.start, &s.changed)
     };
     write_file(&path, &merged)?;
     store().file = merged;
@@ -476,12 +502,16 @@ pub fn save() -> std::io::Result<()> {
 
 fn merged(
     file: &BTreeMap<String, String>,
+    start: &BTreeMap<String, String>,
     changed: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut out = file.clone();
     for (k, v) in changed {
         if v.is_empty() {
-            out.remove(k);
+            match start.get(k) {
+                Some(was) => out.insert(k.clone(), was.clone()),
+                None => out.remove(k),
+            };
         } else {
             out.insert(k.clone(), v.clone());
         }

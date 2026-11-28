@@ -32,6 +32,9 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+/// (mandy 6e80eb8648) `VICTORY_ALIAS_LATER=1`: page-mapping copies looked up in the call, mapped behind it.
+mod alias_later;
+pub use alias_later::map_aliases_later;
 mod probe;
 mod section_mb;
 mod side_by_side;
@@ -1111,6 +1114,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    // After the page-mapping copies behind the title's calls that map there.
+    victory_gpu::alias_later::wait_touching(&[(address as u64, n.saturating_mul(PAGE) as u64)]);
     let _call = Call::begin();
     let mut physical = physical();
     let pages = (!pages.is_null()).then(|| {
@@ -1244,6 +1249,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let want = |i: usize| pages.map(|p| p[i]).filter(|&p| p != 0);
     victory_gpu::priority::stream_thread();
+    if victory_gpu::alias_later::pending() {
+        let at: Vec<(u64, u64)> = addresses.iter().map(|&a| (a as u64, PAGE as u64)).collect();
+        victory_gpu::alias_later::wait_touching(&at);
+    }
     let _call = Call::begin();
     let mut physical = physical();
     if !scatter_runs() && side_by_side::threads() > 1 {
@@ -2575,7 +2584,7 @@ mod tests {
         FORCE.with(|f| f.set([None; 2]));
     }
 
-    fn query(address: *const c_void) -> BasicInformation {
+    pub(super) fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
         // SAFETY: a pseudo handle needs no closing.
@@ -3008,7 +3017,7 @@ mod tests {
 
     /// `n` pages of one new allocation in one section, whatever
     /// `VICTORY_SECTION_MB` says.
-    fn allocate_whole(n: usize) -> Vec<usize> {
+    pub(super) fn allocate_whole(n: usize) -> Vec<usize> {
         let first = section_mb::allocate_physical(n, usize::MAX).expect("allocated");
         (0..n).map(|k| first + k * FRAMES).collect()
     }

@@ -53,6 +53,10 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(crate::fence::FenceRef, u64),
+    /// (mandy 6e80eb8648) Page mappings the title asked for before what follows
+    /// (`VICTORY_ALIAS_LATER=1`, [`crate::alias_later`]): the line stands here until the
+    /// mapping thread has done that batch (its number).
+    Alias(u64),
 }
 
 /// The queues that hold something (their addresses).
@@ -552,6 +556,7 @@ pub(crate) fn release_held(all: bool) {
                     {
                         break;
                     }
+                    Some(&Held::Alias(number)) if !all && !crate::alias_later::done(number) => break,
                     Some(&Held::Value(wait)) if !all => {
                         let met = if async_submit() {
                             // `late_met` can wait for GPU writes to reach title memory;
@@ -677,6 +682,8 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
+                    // Done, or a present runs the lines out: waited for all the same.
+                    Held::Alias(number) => crate::alias_later::wait(number),
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
@@ -741,7 +748,7 @@ fn take_along(
             held.iter().map(|h| match h {
                 Held::Wait(fence, value) if crate::fence::completed(fence.as_this()) >= *value => Next::Met,
                 Held::Value(wait) if wait.met() => Next::Met,
-                Held::Wait(..) | Held::Value(_) | Held::Signal(..) => Next::Stop,
+                Held::Wait(..) | Held::Value(_) | Held::Signal(..) | Held::Alias(_) => Next::Stop,
                 Held::Run(more, more_order) => {
                     let after: Vec<&crate::host::HostList> = more_order.iter().map(|&i| more[i].host()).collect();
                     if crate::host::joinable(&runs, &after) {
@@ -1352,9 +1359,10 @@ const PAGE: u64 = 64 << 10;
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// submission has run. With `VICTORY_ALIAS_LATER=1` behind the call instead
+/// ([`crate::alias_later`], [`alias_later_mapper`]).
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1373,6 +1381,20 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    let later = alias_later_mapper(this);
+    if later.is_none() {
+        // What was asked for behind earlier calls lands first.
+        crate::alias_later::drain();
+    }
+    let mut ops: Vec<crate::alias_later::AliasOp> = Vec::new();
+    let mut op = |to: u64, from: u64, len: u64, constant: bool| match (later, map_const) {
+        (Some(_), _) => {
+            ops.push(crate::alias_later::AliasOp { to, from, len, constant });
+            true
+        }
+        (None, Some(fill)) if constant => fill(to, from, len),
+        _ => map(to, from, len),
+    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1391,7 +1413,7 @@ extern "system" fn copy_page_mappings(
                 0 => {
                     let len = u64::from(pages) * PAGE;
                     let source = pool + u64::from(r.start) * PAGE;
-                    ok &= inside(r.start, pages) && map(at, source, len);
+                    ok &= inside(r.start, pages) && op(at, source, len, false);
                     at += len;
                 }
                 1 => {
@@ -1406,10 +1428,10 @@ extern "system" fn copy_page_mappings(
                     let len = u64::from(pages) * PAGE;
                     let source = pool + u64::from(r.start) * PAGE;
                     ok &= if inside(r.start, 1) {
-                        if let Some(fill) = map_const {
-                            fill(at, source, len)
+                        if map_const.is_some() {
+                            op(at, source, len, true)
                         } else {
-                            (0..u64::from(pages)).all(|k| map(at + k * PAGE, source, PAGE))
+                            (0..u64::from(pages)).all(|k| op(at + k * PAGE, source, PAGE, false))
                         }
                     } else {
                         false
@@ -1425,7 +1447,7 @@ extern "system" fn copy_page_mappings(
                         next += 1;
                     }
                     let len = u64::from(pages) * PAGE;
-                    ok &= map(at, 0, len);
+                    ok &= op(at, 0, len, false);
                     at += len;
                 }
                 3 => {
@@ -1439,11 +1461,91 @@ extern "system" fn copy_page_mappings(
             i = next;
         }
     }
+    if let Some(later) = later
+        && !ops.is_empty()
+    {
+        ok &= alias_later(this, later, &ops, map, map_const);
+    }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// The mapper that maps a page-mapping copy behind the title's call
+/// (`VICTORY_ALIAS_LATER=1`), when the queue has a line to stand in
+/// (`VICTORY_ASYNC_SUBMIT=1`) and the runtime gave one.
+fn alias_later_mapper(this: This) -> Option<crate::alias_later::LaterPageMapper> {
+    #[cfg(windows)]
+    if !this.is_null() && async_submit() && crate::alias_later::on() && crate::resource::constant_page_mapper().is_some() {
+        return crate::alias_later::mapper();
+    }
+    let _ = this;
+    None
+}
+
+/// `ops`, gathered from one page-mapping copy, to the mapping thread, with an entry in the
+/// queue's line that what the title gives the queue afterwards stands behind. Mapped here
+/// if the runtime cannot split them or there is no thread: whether nothing failed so far.
+fn alias_later(
+    this: This,
+    later: crate::alias_later::LaterPageMapper,
+    ops: &[crate::alias_later::AliasOp],
+    map: crate::resource::PageMapper,
+    map_const: Option<crate::resource::PageMapper>,
+) -> bool {
+    let work = match later(ops) {
+        Some(work) => {
+            crate::alias_later::count_pages(ops);
+            match crate::alias_later::send(work, crate::alias_later::touched(ops)) {
+                Ok(number) => {
+                    alias_into_line(this, number);
+                    return true;
+                }
+                Err(work) => work,
+            }
+        }
+        None => {
+            crate::alias_later::drain();
+            return ops.iter().fold(true, |ok, op| {
+                let done = match map_const {
+                    Some(fill) if op.constant => fill(op.to, op.from, op.len),
+                    _ => map(op.to, op.from, op.len),
+                };
+                ok & done
+            });
+        }
+    };
+    crate::alias_later::drain();
+    work()
+}
+
+/// Puts batch `number`'s entry in the queue's line (or aside, behind a present waiting
+/// its turn), and wakes the thread that runs the lines.
+#[cfg(windows)]
+fn alias_into_line(this: This, number: u64) {
+    if let Some(pieces) = later(this as usize, vec![Held::Alias(number)]) {
+        lock(&queue(this).held).extend(pieces);
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+    }
+    if async_submit() {
+        wake_releaser();
+    }
+}
+
+#[cfg(not(windows))]
+fn alias_into_line(_: This, _: u64) {}
+
+/// The mapping thread finished a batch: the line that stands at it may go on.
+pub(crate) fn alias_done() {
+    #[cfg(windows)]
+    if async_submit() {
+        wake_releaser();
+    }
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1581,5 +1683,58 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// (`VICTORY_ALIAS_LATER=1`) A signal the title gives a queue after a page-mapping copy
+    /// stands behind the copy's entry in the line until the mapping thread has done it; a
+    /// present that runs the lines out waits for it.
+    #[cfg(windows)]
+    #[test]
+    fn what_follows_a_page_mapping_copy_waits_for_its_mapping() {
+        let _one = crate::alias_later::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let read = |fence: This| slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence);
+        for forced in [false, true] {
+            let mut fence = null;
+            assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let mapped = std::sync::Arc::new(AtomicBool::new(false));
+            let number = {
+                let mapped = mapped.clone();
+                crate::alias_later::send(
+                    Box::new(move || {
+                        wait.recv().unwrap();
+                        mapped.store(true, Ordering::Release);
+                        true
+                    }),
+                    vec![(0x7000_0000, 0x7001_0000)],
+                )
+                .unwrap_or_else(|_| panic!("no mapping thread"))
+            };
+            alias_into_line(q, number);
+            let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
+            assert_eq!(signal(q, fence, 7), S_OK);
+            release_held(false);
+            assert_eq!(read(fence), 0, "the signal went ahead of the mapping");
+            if forced {
+                let releaser = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    go.send(()).unwrap();
+                });
+                release_held(true);
+                assert!(mapped.load(Ordering::Acquire));
+                releaser.join().unwrap();
+            } else {
+                go.send(()).unwrap();
+                crate::alias_later::drain();
+                release_held(false);
+            }
+            assert_eq!(read(fence), 7);
+            assert!(lock(&queue(q).held).is_empty());
+        }
     }
 }
