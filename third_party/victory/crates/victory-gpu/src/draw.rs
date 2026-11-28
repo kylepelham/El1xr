@@ -3948,7 +3948,7 @@ impl State {
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
-            && crate::ambient::on()
+            && crate::ambient::on(role)
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
             && self.ambient(list, p, role)
         {
@@ -5188,7 +5188,7 @@ impl State {
                 crate::ambient::Role::Miss => crate::ambient::specular().is_some() || crate::ambient_sky::sky_bound().is_some(),
                 role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
             }
-            && crate::ambient::on()
+            && crate::ambient::on(role)
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;

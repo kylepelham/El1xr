@@ -199,7 +199,11 @@ extern "C" fn dtor(this: *mut u8) {
 }
 
 extern "C" fn morton(this: *mut u8, on: u8) {
-    tracing::info!(on, "bvh hook: 64-bit Morton codes");
+    // The title switches it around every build (batch 5 part F: 14 lines a second): the first few only.
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        tracing::info!(on, "bvh hook: 64-bit Morton codes (the first 4 calls)");
+    }
     // SAFETY: (`this`, bool).
     let f: extern "C" fn(*mut u8, u8) = unsafe { original(&MORTON) };
     f(this, on)

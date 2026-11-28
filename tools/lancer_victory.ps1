@@ -17,6 +17,11 @@
   (XboxBvhBuilder.dll, amd_fidelityfx_upscaler_xbox.dll), with the same environment variables as the game.
   Combine with -Warm to cover every archive as well.
 
+.PARAMETER PrecompileRayTracing
+  Optional. With -Precompile, also warms the other ray tracing variant (VICTORY_RAY_TRACING on if this launch has it
+  off, else off): its switches are in the shader cache key, so turning Ray tracing on or off in the menu then does
+  not translate the title's shaders again at the next launch.
+
 .PARAMETER NoGame
   Optional. Stops after -Warm / -Precompile without starting the title (an offline prewarm: `dev.py prewarm`).
 
@@ -115,6 +120,7 @@ param(
     [Parameter(Mandatory = $true)][string]$GameDir,
     [switch]$Warm,
     [switch]$Precompile,
+    [switch]$PrecompileRayTracing,
     [switch]$NoGame,
     [int]$WarmJobs = 0,
     [switch]$WarmNoPipelines,
@@ -411,6 +417,23 @@ if ($Precompile) {
         $ErrorActionPreference = $prevErrorAction
     }
     if ($LASTEXITCODE -ne 0) { throw "victory warm failed (exit code $LASTEXITCODE)." }
+    if ($PrecompileRayTracing) {
+        # VIctory adds the ray tracing switches itself at start (settings/ray_tracing.rs): flipping the one setting
+        # makes the other cache variant.
+        $rayTracing = $env:VICTORY_RAY_TRACING
+        $other = if ($rayTracing -eq 'on') { 'off' } else { 'on' }
+        Write-Host "Precompiling the ray tracing $other variant too..."
+        $prevErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $env:VICTORY_RAY_TRACING = $other
+            & $exe warm @warmArgs $shaders $gameExe @dlls
+        } finally {
+            $ErrorActionPreference = $prevErrorAction
+            if ($null -eq $rayTracing) { Remove-Item -Path Env:VICTORY_RAY_TRACING -ErrorAction SilentlyContinue } else { $env:VICTORY_RAY_TRACING = $rayTracing }
+        }
+        if ($LASTEXITCODE -ne 0) { throw "victory warm failed for the ray tracing $other variant (exit code $LASTEXITCODE)." }
+    }
 }
 
 if ($NoGame) {

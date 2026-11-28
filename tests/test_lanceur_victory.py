@@ -510,6 +510,26 @@ def test_precompile_warms_shaders_the_game_and_its_dlls_before_the_game(tmp_path
     assert appels[2].startswith("victory run ")
 
 
+def test_precompile_ray_tracing_also_warms_the_other_variant(tmp_path, faux_outil):
+    nom = "VICTORY_RAY_TRACING"
+    fini, appels, _, jeu = _lancer(tmp_path / "off", faux_outil, options=("-Precompile", "-PrecompileRayTracing"),
+                                   code_victory=0, echo=(nom,))
+    assert fini.returncode == 0, fini.stderr
+    assert [a.split()[1] for a in appels[1:]] == ["warm", "warm", "run"], appels
+    assert appels[1] == appels[2]
+    vus = [l.split("=", 1)[1] for l in fini.stdout.splitlines() if l.startswith(nom + "=")]
+    assert vus == ["unset", "on", "unset"]
+
+    fini, appels, _, _ = _lancer(tmp_path / "on", faux_outil, echo=(nom,), code_victory=0,
+                                 commande=f"-Precompile -PrecompileRayTracing -Override @{{ {nom} = 'on' }}")
+    assert fini.returncode == 0, fini.stderr
+    vus = [l.split("=", 1)[1] for l in fini.stdout.splitlines() if l.startswith(nom + "=")]
+    assert vus == ["on", "off", "on"]
+
+    fini, appels, _, _ = _lancer(tmp_path / "seul", faux_outil, options=("-Precompile",), code_victory=0)
+    assert [a.split()[1] for a in appels[1:]] == ["warm", "run"], appels
+
+
 def test_mute_switch_sets_victory_mute_and_allows_override(tmp_path, faux_outil):
     texte = _lanceur()
     assert "[switch]$Mute" in texte

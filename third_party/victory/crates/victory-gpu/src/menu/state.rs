@@ -674,6 +674,29 @@ mod tests {
         assert_eq!(m.status.as_deref(), Some("Nothing to undo"));
     }
 
+    /// (rtlight) Ray tracing is a Display row with its RESTART tag: a step turns it on for the
+    /// next launch, and clearing it leaves the restart band.
+    #[test]
+    fn ray_tracing_is_a_display_row_that_waits_for_a_restart() {
+        let _lock = registry_lock();
+        let name = settings::ray_tracing::NAME;
+        if std::env::var_os(name).is_some() {
+            return;
+        }
+        let mut model = Registry::with_save(|| Ok(()));
+        let mut m = opened(&mut model);
+        assert_eq!(model.apply_of(name), Apply::Restart);
+        let row = row_of(&model, Tab::DISPLAY, name);
+        m.act(&mut model, Action::SelectRow(row));
+        assert_eq!(model.get(name).as_deref(), Some("off"));
+        m.act(&mut model, Action::Right);
+        assert_eq!(model.get(name).as_deref(), Some("on"));
+        assert_eq!(m.status.as_deref(), Some("Ray tracing: On after a restart"));
+        assert!(model.pending_restart().contains(&name));
+        model.set(name, "").unwrap();
+        assert!(!model.pending_restart().contains(&name));
+    }
+
     #[test]
     fn save_says_why_it_failed() {
         let mut model = Registry::with_save(|| Err(std::io::ErrorKind::PermissionDenied.into()));

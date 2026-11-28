@@ -416,6 +416,22 @@ def test_prewarm_is_a_no_op_when_stamped(tmp_path, monkeypatch, capsys):
     assert ran == [True, False, False], "a cleared cache is cold whatever the stamps say"
 
 
+def test_prewarm_of_both_ray_tracing_variants_needs_both_stamps(tmp_path, monkeypatch, capsys):
+    dev = load_dev()
+    monkeypatch.setattr(dev, "DEV_DIR", tmp_path / "dev")
+    ran = []
+    monkeypatch.setattr(dev, "prewarm_work", lambda args: ran.append(args.ray_tracing_both) or 0)
+    fake_cache(tmp_path, monkeypatch)
+    overrides, _ = dev.apply_mute_default({"VICTORY_X": "1"}, False)
+    dev_warm.write_stamp(dev.warm_dir(), dev.warm_signature(overrides), False, {}, overrides, "prewarm")
+    assert dev.main(["prewarm", "--override", "VICTORY_X=1", "--ray-tracing-both"]) == 0
+    assert ran == [True], "the ray tracing on variant is not stamped"
+    other = {**overrides, "VICTORY_RAY_TRACING": "on"}
+    dev_warm.write_stamp(dev.warm_dir(), dev.warm_signature(other), False, {}, other, "prewarm")
+    assert dev.main(["prewarm", "--override", "VICTORY_X=1", "--ray-tracing-both"]) == 0
+    assert ran == [True] and "skipped=warm" in capsys.readouterr().out
+
+
 def test_greps_from_all_reads_every_ready_md(tmp_path, monkeypatch, capsys):
     dev = load_dev()
     coord = tmp_path / "coord"
