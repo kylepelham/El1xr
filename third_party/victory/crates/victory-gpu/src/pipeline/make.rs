@@ -34,6 +34,7 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 mod compute_wait;
+mod head_map;
 mod screen_wait;
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -65,6 +66,8 @@ pub(crate) struct Pending {
     /// A pass over the screen ([`GraphicsState::screen_pass`],
     /// [`screen_wait`]).
     screen: bool,
+    /// The head blend-shape map's ([`head_map`]).
+    head_map: bool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -248,8 +251,11 @@ impl Pending {
                 .as_bytes(),
         );
         let left_out = left_out(&shaders);
-        let scene_input = left_out.is_none() && scene_input(&shaders);
+        let head_map = head_map::is_head_map(shaders.iter().map(|s| (s.stage, s.hash.as_str())));
+        let scene_input = left_out.is_none()
+            && head_map::scene_input(scene_input(&shaders), head_map, head_map::wait_on());
         Pending {
+            head_map,
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             scene_input,
             scene_waited: AtomicBool::new(false),
@@ -451,6 +457,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
         super::eager::first_use(origin(p), p.made.get().is_some());
     }
+    let head_map = head_map::first(p);
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
         screen_wait::front(p);
@@ -462,6 +469,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         compute_wait::after(p, crate::frame::current());
         screen_wait::after(p, crate::frame::current());
         super::eager::waited(p.made.get().is_some());
+    }
+    if let Some(first) = head_map {
+        head_map::said(p, first);
     }
     p.made.get()?.as_ref()
 }
@@ -535,6 +545,9 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
     if p.scene_input {
         start(p, REQUESTED, 0);
+        if p.head_map {
+            compute_wait::to_front(p);
+        }
         return;
     }
     if let Some(rank) = super::library::wanted_early(&p.key) {
