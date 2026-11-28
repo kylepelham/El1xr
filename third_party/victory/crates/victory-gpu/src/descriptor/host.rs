@@ -7476,4 +7476,50 @@ mod dynamic_bits_tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    /// (blackface) The tiled lighting's light-range volume: `CS_PrescalarizeLightLoop` writes a
+    /// 320x180x13 R32_UINT volume (one texel a screen tile of 8x8, a slice a kind of light)
+    /// through a 3D unordered view, and 180 tiled lighting pixel shaders (skin's
+    /// `TL_PS_*SSS*` among them, table 1 dword 80) `image_load` it as `IMG_3D`. Both views
+    /// mirror onto one host 3D texture with its 13 slices.
+    #[test]
+    fn the_light_range_volume_gets_its_unordered_and_shader_views() {
+        use super::*;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let at = 0x7fed_3000_0000u64;
+        // 3D, 320x180, 13 slices and 1 mip, R32_UINT, 1 sample, unordered access allowed.
+        let volume = [4, 0, 0, 0, 320, 0, 180, 0x1_000d, 42, 1, 0, 0, 0x4, 0];
+        let mut uav = [0u32; 16];
+        (uav[0], uav[1], uav[4]) = (42, 8, 13);
+        (uav[10], uav[11]) = (at as u32, (at >> 32) as u32);
+        let uav = View::Placed(true, volume, uav);
+        let Some(View::Unordered(written, _, _)) = placed_texture(&uav) else {
+            panic!("expected the volume's unordered view");
+        };
+        assert!(make(&uav, heap.cpu(0)).and_then(|k| k.0).is_some());
+        let mut srv = [0u32; 16];
+        (srv[0], srv[1], srv[2], srv[5]) = (42, 8, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 1);
+        (srv[10], srv[11]) = (at as u32, (at >> 32) as u32);
+        let srv = View::Placed(false, volume, srv);
+        let Some(View::Shader(read, _)) = placed_texture(&srv) else {
+            panic!("expected the volume's shader view");
+        };
+        assert!(make(&srv, heap.cpu(1)).and_then(|k| k.0).is_some(), "the shader view is made");
+        let texture = crate::resource::host_resource(read as crate::object::This)
+            .or_else(|| crate::resource::host_resource(written as crate::object::This))
+            .expect("a host texture");
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert_eq!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+        assert_eq!((d.Width, d.Height, d.DepthOrArraySize), (320, 180, 13));
+        assert_eq!(d.Format, DXGI_FORMAT_R32_UINT);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }

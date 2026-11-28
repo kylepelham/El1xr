@@ -17,7 +17,8 @@ pub(super) struct Rows {
     rows: Vec<(u64, u32)>,
     texel: u32,
     format: u32,
-    size: [u32; 2],
+    /// Width, height and depth (or slices).
+    size: [u32; 3],
 }
 
 impl Rows {
@@ -54,7 +55,8 @@ pub(super) struct Watch {
 
 /// Records the copies of a few rows (inside `rect`, x y w h; all of it when empty) of
 /// subresource 0 of `copy` into a read-back buffer, from whatever state the list holds it in
-/// and back.
+/// and back. A volume (the tiled lighting's light-range volume) has the rows of each of its
+/// first [`crate::skin_watch::SLICES`] slices read.
 fn read_rows(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
@@ -63,11 +65,21 @@ fn read_rows(
     let host = crate::host::host()?;
     // SAFETY: a live texture.
     let desc = unsafe { copy.texture.GetDesc() };
-    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count > 1 {
+    let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if !volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.SampleDesc.Count > 1
+    {
         return None;
     }
-    let size = [desc.Width as u32, desc.Height];
-    let rows = crate::skin_watch::rows(rect, size);
+    let size = [desc.Width as u32, desc.Height, u32::from(desc.DepthOrArraySize)];
+    let slices = if volume { size[2].min(crate::skin_watch::SLICES) } else { 1 };
+    let rows: Vec<_> = (0..slices)
+        .flat_map(|z| {
+            crate::skin_watch::rows(rect, [size[0], size[1]])
+                .into_iter()
+                .map(move |(x, y, n)| (x, y, z, n))
+        })
+        .collect();
     if rows.is_empty() {
         return None;
     }
@@ -93,7 +105,7 @@ fn read_rows(
     if texel == 0 || texel > 16 || u64::from(texel) * desc.Width != row_bytes {
         return None;
     }
-    let pitch = (u64::from(rows[0].2) * u64::from(texel)).next_multiple_of(512);
+    let pitch = (u64::from(rows[0].3) * u64::from(texel)).next_multiple_of(512);
     let bytes = rows.len() as u64 * pitch;
     let buffer = bake_check::read_back_buffer(&host.device, bytes)?;
     let back = list.transition_held(copy, COPY_SOURCE);
@@ -107,7 +119,7 @@ fn read_rows(
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     let mut out = Vec::new();
-    for (k, &(x, y, n)) in rows.iter().enumerate() {
+    for (k, &(x, y, z, n)) in rows.iter().enumerate() {
         let offset = k as u64 * pitch;
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -137,10 +149,10 @@ fn read_rows(
         let area = D3D12_BOX {
             left: x,
             top: y,
-            front: 0,
+            front: z,
             right: x + n,
             bottom: y + 1,
-            back: 1,
+            back: z + 1,
         };
         // SAFETY: an open list, live resources, a box inside the texture.
         unsafe {
@@ -283,8 +295,10 @@ impl State {
         }
     }
 
-    /// Skin's probe inputs (`crate::skin_fill::ATLAS`, `LAYERS`): a few rows of each read, the
-    /// all-zero texels counted once the list has run.
+    /// Skin's probe atlas (`crate::skin_fill::ATLAS`, its all-zero texels counted) and the
+    /// tiled lighting's light-range volume (`crate::skin_fill::LAYERS`, its tiles without
+    /// lights and widest light range counted): a few rows of each read, counted once the list
+    /// has run.
     fn skin_watch_inputs(&self, list: &HostList, frame: u64) {
         let read = |(slot, offset): (u8, u32)| {
             let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
@@ -312,7 +326,7 @@ impl State {
         };
         for (name, place) in [
             ("atlas", crate::skin_fill::ATLAS),
-            ("layers", crate::skin_fill::LAYERS),
+            ("light_ranges", crate::skin_fill::LAYERS),
         ] {
             let rows = match read(place) {
                 Ok(rows) => rows,
@@ -322,10 +336,17 @@ impl State {
                 }
             };
             list.defer_after(move || {
-                let counts = rows.bytes().map_or((0, 0), |b| {
-                    crate::skin_watch::zeros(&b, rows.texel as usize)
-                });
-                let shape = format!("f{} {}x{}", rows.format, rows.size[0], rows.size[1]);
+                let bytes = rows.bytes().unwrap_or_default();
+                let counts = crate::skin_watch::zeros(&bytes, rows.texel as usize);
+                let [w, h, d] = rows.size;
+                let mut shape = format!("f{} {w}x{h}x{d}", rows.format);
+                if name == "light_ranges" && rows.texel == 4 {
+                    let r = crate::skin_watch::light_ranges(&bytes);
+                    shape.push_str(&format!(
+                        " no_lights={} widest={} bad={}",
+                        r.none, r.widest, r.bad
+                    ));
+                }
                 crate::skin_watch::input_landed(frame, name, &shape, counts);
             });
         }
