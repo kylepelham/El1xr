@@ -84,7 +84,8 @@ type Emitted<T> = Result<(T, Option<u32>), ShaderError>;
 /// `first`, the translation whose structure took `wide` branches wave-wide (none: nothing this
 /// switch changed); where it was refused, or needs 64-lane waves a host of `host_wave` lanes
 /// does not have, the translation `retry` makes with every branch split per lane, as with the
-/// switch off, if that one does better.
+/// switch off, if that one does better; for a refused one, that translation's result, error
+/// and all.
 pub(crate) fn again<T>(
     first: Emitted<T>,
     wide: usize,
@@ -100,9 +101,11 @@ pub(crate) fn again<T>(
         return first;
     }
     let again = per_lane(retry);
+    // (a refused program takes the per-lane result whatever it is, its error too: the caller's
+    // next forms go on from the error the switch-off form gives)
     let better = match (&first, &again) {
-        (_, Err(_)) => false,
-        (Err(_), Ok(_)) => true,
+        (Err(_), _) => true,
+        (Ok(_), Err(_)) => false,
         (Ok(_), Ok((_, w))) => !narrow(w),
     };
     if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
@@ -148,6 +151,11 @@ mod tests {
             Ok((1, Some(32)))
         });
         assert!(matches!(r, Ok((1, Some(32)))));
+        // the per-lane error replaces the wave-wide one
+        let other = again(refused(), 1, 32, || -> Emitted<u8> {
+            Err(ShaderError::Unsupported { offset: 4, what: "an opaque lane mask" })
+        });
+        assert!(matches!(other, Err(ShaderError::Unsupported { what: "an opaque lane mask", .. })));
         // nothing to split: no retry
         assert!(again(refused(), 0, 32, || unreachable!()).is_err());
         // a program that runs keeps its form
