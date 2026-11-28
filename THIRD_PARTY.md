@@ -88,6 +88,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | [bolado-dev/mandy-port](https://github.com/bolado-dev/mandy-port) (bolado-dev ; d'après avatarmanz `84eae35`) | GPL-3.0 | | Dispatches indirects de calcul jusqu'à 2^20 groupes en x exécutés en entier au lieu d'être coupés à 65 535 (`e5e11b3e`, `VICTORY_INDIRECT_WIDE=1`) ; Journal des ouvertures de vidéos Bink : `BinkOpenWithOptions` de `Bink2Scarlett.dll` passé par nous, nom, taille, images et cadence lus dans l'enregistrement `BINK` (`3648d14a`, `4f05b594`, `VICTORY_BINK_OPEN_LOG=1`) |
 | [elaboratecl/VIctory-AMD-4K](https://github.com/elaboratecl/VIctory-AMD-4K) (elaboratecl) | GPL-3.0 | | Après les programmes de couleur HDR de la scène, compte des texels NaN et infinis de leurs images, nettoyage en option (`221ece13e1`, `VICTORY_HDR_SCRUB=1/2`) |
 | [zm0kiemedia/Neptune_VI](https://github.com/zm0kiemedia/Neptune_VI) (zm0kie) | GPL-3.0 | | Emplacement périmé gardé jusqu'à son remplacement, au plus 120 s (`61f2206058`, `VICTORY_FLICKER_KEEP_MS`) |
+| [Kemerd/VIctory-NVIDIA-RT](https://github.com/Kemerd/VIctory-NVIDIA-RT) (D Everett Hinton ; appliqué par TheUnrealZaka dans TheUnrealZaka/VIctoryUnified-DLSS `aeeb2f72`) | GPL-3.0 | | Envoi des soumissions envoyées en avance (ExecuteCommandLists, signal de la barrière) par un fil à nous, l'ordre de la file gardé par une attente avant tout autre envoi (`host/send_thread.rs`, idée portée à la main : `VICTORY_SEND_THREAD=1`, `victory-gpu/src/host_send_thread.rs`) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
