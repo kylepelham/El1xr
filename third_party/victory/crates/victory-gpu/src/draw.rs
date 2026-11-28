@@ -3310,8 +3310,9 @@ impl State {
             bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
             crate::texture::prepare::threads(),
         );
-        // While loading, the frame's cap: a pass with none left looks at the bake's own slots alone.
-        let load_left = (spread && !world).then(|| crate::bake_spread::load_left(frame, spread_mode));
+        // The frame's cap (while loading; in the world with `VICTORY_BAKE_SPREAD_FRAME`): a pass with
+        // none left looks at the bake's own slots alone.
+        let load_left = crate::bake_spread::frame_left(spread, world, frame, spread_mode);
         let only = bake_pass::ONLY.get();
         let none_left = load_left.is_some_and(|left| left.is_zero());
         let (mut due, census) =
@@ -3857,7 +3858,7 @@ impl State {
             add(C::Handed, handed);
             add(C::Us, entered.elapsed().as_micros() as u64);
             if load_left.is_some() {
-                crate::bake_spread::load_took(frame, entered.elapsed().as_micros() as u64);
+                crate::bake_spread::frame_took(frame, entered.elapsed().as_micros() as u64, !world);
             }
         }
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
