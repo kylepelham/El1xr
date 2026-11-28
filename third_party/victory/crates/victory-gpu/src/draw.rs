@@ -5973,6 +5973,7 @@ mod bake_check;
 mod bake_fresh;
 mod bake_publish;
 mod bake_replay;
+mod bake_zero;
 mod material_pass;
 mod skin_views;
 mod zero_views;
