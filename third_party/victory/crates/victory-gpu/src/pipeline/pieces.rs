@@ -160,10 +160,14 @@ fn compute_container(d: &ComputeDesc) -> Result<Vec<u8>, Refusal> {
 }
 
 /// `VICTORY_PIPELINE_PIECES=1`, read once (device.rs makes the pipelines
-/// from pieces under the same switch).
+/// from pieces under the same switch). Not part of the translation
+/// fingerprint: the translator reads only the container, a container made
+/// from pieces has a part no title's container has, and a title's container
+/// translates the same with the switch on or off, so its cached translation
+/// and library pipelines still serve.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var(victory_shader::pieces::SWITCH).is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES").is_ok_and(|v| v == "1"))
 }
 
 /// Whether `container` is one made from pieces (it has their part).

@@ -118,11 +118,6 @@ use crate::native::{
 };
 
 /// What starts the part of ours.
-/// The switch under which the host makes pipelines from pieces. Named here
-/// so it is part of the translation fingerprint (the build script lists the
-/// switches this crate names): pipelines from pieces are new translations.
-pub const SWITCH: &str = "VICTORY_PIPELINE_PIECES";
-
 pub const MAGIC: &[u8; 4] = b"VPP1";
 /// The lengths of a compute description's first two pieces.
 pub const COMPUTE_PACKET: usize = 0x1c;
@@ -2518,6 +2513,73 @@ mod tests {
         assert!(refused(&|s| put(s, S_BLOCK + 8 + 9 + 8, 1)));
         // An empty layout is one.
         assert!(Graphics::parse(&packet, &state_piece(&[]), false).is_ok());
+    }
+
+    #[test]
+    fn containers_from_pieces_reach_the_translator() {
+        // Run b5i (PIPELINE_PIECES=1): 2,568 stages made from pieces were refused with "no DXIL
+        // part", the translator looking only at DXIL and ACCC, and every draw of their pipelines
+        // was dropped (a black screen).
+        let cs_code = code(4);
+        let meta = metadata(COMPUTE_METADATA, cs_code.len(), &[hash()]);
+        let cs = fill(
+            compute(&compute_packet(6), cs_code.len(), meta.len()).unwrap(),
+            &cs_code,
+            &meta,
+        );
+        let c = crate::Container::parse(&cs).unwrap();
+        assert_eq!(crate::emit::program_part(&c).unwrap().fourcc, FourCC::PIECES);
+        assert!(crate::emit::translate(&cs).is_ok(), "{:?}", crate::emit::translate(&cs).err());
+        let packet = graphics_packet(true, 1, &[(0, false)]);
+        let g = Graphics::parse(&packet, &state_piece(&ELEMENTS), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        for stage in [
+            fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta),
+            fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta),
+        ] {
+            let found = crate::native_programs(
+                crate::emit::program_part(&crate::Container::parse(&stage).unwrap())
+                    .unwrap()
+                    .data,
+            )
+            .unwrap();
+            assert_eq!(found.len(), 1);
+            assert_ne!(
+                crate::emit::translate(&stage).err(),
+                Some(ShaderError::Malformed("no DXIL part"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_container_is_read_as_before() {
+        // The lookup takes the pieces' part only where no title part is: a title's container
+        // (which never has it) gives its DXIL part as it always did.
+        let both = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::PIECES, &[3; 8]),
+            (FourCC::DXIL, &[1; 8]),
+        ]);
+        let c = crate::Container::parse(&both).unwrap();
+        assert_eq!(crate::emit::program_part(&c).unwrap().fourcc, FourCC::DXIL);
+        let title = crate::dxbc::build(&[(FourCC::SFI0, &[0; 8]), (FourCC::DXIL, &[1; 8])]);
+        let c = crate::Container::parse(&title).unwrap();
+        assert_eq!(crate::emit::program_part(&c).unwrap().data, &[1; 8]);
+        let none = crate::dxbc::build(&[(FourCC::SFI0, &[0; 8])]);
+        let c = crate::Container::parse(&none).unwrap();
+        assert!(crate::emit::program_part(&c).is_none());
+    }
+
+    #[test]
+    fn the_switch_is_not_part_of_the_translation_fingerprint() {
+        // Run b5i: with the switch in the fingerprint every title shader missed the cache and
+        // was translated again (boot 55.6 s). The translator reads only the container, so the
+        // switch stays out of the key: a title's container translates and is found as with it off.
+        // (Named in two halves so that this test does not put it in the key.)
+        let switch = ["VICTORY", "PIPELINE_PIECES"].join("_");
+        assert!(!env!("VICTORY_SHADER_SWITCHES").split(',').any(|n| n == switch));
+        assert!(!String::from_utf8_lossy(&crate::emit::translation_fingerprint()).contains(&switch));
     }
 
     /// Every description captured by `VICTORY_PIPELINE_DUMP` in the folder
