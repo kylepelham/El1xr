@@ -44,6 +44,8 @@ pub(crate) mod refresh_stamp;
 pub(crate) mod merge_due;
 #[path = "shadow_wide_wake.rs"]
 pub(crate) mod wide_wake;
+#[path = "shadow_warm.rs"]
+pub(crate) mod warm;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -1198,6 +1200,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
+    window_card_base().saturating_add(builder_windows::more())
+}
+
+/// [`window_card_most`] without the structure builder's windows
+/// (`builder_windows`: a card side past it is asked for there).
+fn window_card_base() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         // (Neptune) Unset: 4,096 MB where the system gives the process 14 GB of
@@ -1211,7 +1219,6 @@ fn window_card_most() -> u64 {
         // (`VICTORY_CARD_SIDE=1`: never under the placement's total.)
         let switch = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         placement::windows_most(switch, if switch.is_none() { unset() << 20 } else { 0 }, placement::set())
-            .saturating_add(builder_windows::more())
     })
 }
 
@@ -1229,12 +1236,14 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
+    let card = host.video_memory();
+    if let Some([budget, used, ..]) = card
         && used + size > placement::window_line(budget, card_room_kept_on())
     {
         return None;
     }
-    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+    let held = WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+    if held + size > most || !builder_windows::admits(size, window_card_base(), held, card.map(|[b, u, ..]| [b, u])) {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
@@ -1269,11 +1278,13 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let most = window_card_most();
+    let card = host.video_memory();
     let room = most != 0
-        && host
-            .video_memory()
-            .is_none_or(|[budget, used, ..]| used + size <= placement::window_line(budget, card_room_kept_on()));
-    if !room || WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        && card.is_none_or(|[budget, used, ..]| used + size <= placement::window_line(budget, card_room_kept_on()));
+    if !room || {
+        let held = WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+        held + size > most || !builder_windows::admits(size, window_card_base(), held, card.map(|[b, u, ..]| [b, u]))
+    } {
         if room {
             WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         }

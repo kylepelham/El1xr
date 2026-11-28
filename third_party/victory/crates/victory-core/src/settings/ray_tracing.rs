@@ -28,15 +28,21 @@ pub const NAME: &str = "VICTORY_RAY_TRACING";
 /// quarantine, the title gets its read-backs), hits for the glass and
 /// opaque reflections' trace only, and room on the card for the windows the
 /// builder writes, so their writes are compared there and not snapshotted on
-/// the CPU (part F: 9.7 GB snapshotted a frame, 0.75 fps).
+/// the CPU (part F: 9.7 GB snapshotted a frame, 0.75 fps). 2,048 MB, not
+/// the 8,192 of part I (5.4 fps, then out of the PC's commit at 70 s); past
+/// the windows' own total a card side also needs the card under eight
+/// tenths and the PC's commit above a floor (`VICTORY_BVH_COMMIT_FLOOR_MB`).
+/// The texture prepare threads commit their first MiB of stack at start
+/// (part I's stack overflow on a PC out of commit).
 pub const ON: &[(&str, &str)] = &[
     ("VICTORY_BVH_BUILDER", "1"),
     ("VICTORY_BVH_BUILDER_EARLY", "1"),
-    ("VICTORY_BVH_CARD_WINDOWS_MB", "8192"),
+    ("VICTORY_BVH_CARD_WINDOWS_MB", "2048"),
     ("VICTORY_BVH_HOOK", "1"),
     ("VICTORY_BVH_PREMAP", "1"),
     ("VICTORY_DISPATCHX_MASK", "1"),
     ("VICTORY_DISPATCHX_THREADS", "1"),
+    ("VICTORY_PREPARE_STACK_COMMIT", "1"),
     ("VICTORY_RT_HIT_ONLY", "6d7fe7745ab9c6d8"),
 ];
 
@@ -104,7 +110,7 @@ mod tests {
         assert_eq!(added.len(), ON.len() - 2);
         assert!(added.iter().all(|(n, _)| *n != "VICTORY_BVH_PREMAP" && *n != "VICTORY_RT_HIT_ONLY"));
         let line = line(Some("on"), &added).unwrap();
-        assert!(line.contains("added 6 (VICTORY_BVH_BUILDER=1 "), "{line}");
+        assert!(line.contains("added 7 (VICTORY_BVH_BUILDER=1 "), "{line}");
         assert!(line.ends_with("2 kept as set (VICTORY_BVH_PREMAP VICTORY_RT_HIT_ONLY)"), "{line}");
     }
 

@@ -1225,6 +1225,54 @@ fn preludes_reset_ahead_record_and_run() {
     run_wait::FORCED.with(|f| f.set(None));
 }
 
+/// (critpath #88) `VICTORY_RESET_ASIDE`: a list reset on another thread (as
+/// `victory-land-aside` lands it) leaves its prelude reset and open, and the
+/// next submission records into it as it was left and runs it.
+#[test]
+fn preludes_reset_aside_at_landing_record_and_run() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else { return };
+    let copy = test_texture(host);
+    for on in [false, true] {
+        run_wait::FORCED.with(|f| f.set(Some((false, false))));
+        let mut list = host.new_list().unwrap();
+        for round in 0..4 {
+            list.settle(&copy, COPY_DEST);
+            list.settle(&copy, COPY_SOURCE);
+            list.close();
+            host.execute(&[&list]);
+            // Moved to the other thread and back, as a landing owns it.
+            struct Landed(HostList);
+            // SAFETY: as `Line`: D3D12 objects (free-threaded) and a host
+            // list nothing records into.
+            unsafe impl Send for Landed {}
+            let landed = Landed(list);
+            list = std::thread::spawn(move || {
+                let landed = landed;
+                crate::land_aside::FORCED.with(|f| f.set(Some(on)));
+                run_wait::FORCED.with(|f| f.set(Some((false, false))));
+                landed.0.reset();
+                landed
+            })
+            .join()
+            .unwrap()
+            .0;
+            assert_eq!(list.prelude_open.load(Relaxed), on, "on={on} round={round}: reset ahead at the landing");
+        }
+        // The last one is recorded into as it was left (no reset now).
+        list.settle(&copy, COPY_DEST);
+        list.settle(&copy, COPY_SOURCE);
+        list.close();
+        host.execute(&[&list]);
+        assert!(!list.prelude_open.load(Relaxed), "on={on}: taken by the prelude");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "on={on}");
+        list.reset();
+        list.close();
+    }
+    run_wait::FORCED.with(|f| f.set(None));
+}
+
 const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
 

@@ -319,6 +319,9 @@ if (-not $NoTunedSettings) {
         VICTORY_SEND_THREAD              = '1'         # batch 5J: lists sent and fences signalled on a thread of their own (exec_submit 1.56 -> 0.11 ms)
         VICTORY_CARD_RECORD_SEND         = '1'         # batch 5J: card sync/compare lists recorded on the send thread (card_before 2.13 -> 0.57, prep -0.98, +0.8 fps)
         VICTORY_COPIED_SHARED            = '1'         # batch 5J: page-stamp reads share the host copy's lock (batch_flush -0.6, prep -0.55)
+        VICTORY_TEXTURE_HASH_BEHIND      = '1'         # batch 5K: guarded-texture looks for missed writes on threads of their own (run_other 7.83 -> 6.30, prep -1.78)
+        VICTORY_RESULT_RING              = '1'         # batch 5K: compare result slices handed back as read (prep -0.47, +0.85 fps)
+        VICTORY_FLUSH_BESIDE             = '1'         # batch 5J/K: final flush refreshes beside the preludes (batch_flush 7.88 -> 6.23, prep -0.85)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
