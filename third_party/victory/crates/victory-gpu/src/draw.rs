@@ -2896,6 +2896,9 @@ impl State {
             let _hitch = crate::hitch::span(crate::hitch::Phase::HeapTextures);
             self.heap_textures(list, heap, host);
         }
+        // (heapcap, `VICTORY_HEAP_CAP=3`) Title slots past the capped host heap, packed: readied
+        // as the slots above are, then shown in the remap table.
+        crate::descriptor::host::heap_cap::ready_packed(host, |view| ready_packed(list, view));
         HEAP_PASS_PARTS[0].fetch_add(
             textures_began.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -6239,6 +6242,29 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 fn ready_tables_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_READY_TABLES").is_none_or(|v| v != "0"))
+}
+
+/// (heapcap) Readies a packed view as `heap_textures` readies a slot: the
+/// upload of a texture (its staging buffer let go after, unless a table
+/// draw staged it already) or the copy of a buffer's range. The bytes it
+/// staged.
+fn ready_packed(list: &HostList, view: &View) -> u64 {
+    let placed = crate::descriptor::host::placed_texture(view);
+    let resource = match placed.as_ref().unwrap_or(view) {
+        View::Shader(resource, _) => Some(*resource as This),
+        _ => None,
+    };
+    let tabled = resource.is_some_and(crate::texture::is_staged);
+    readable(list, ResourceType::Srv, view);
+    let Some(resource) = resource.filter(|_| !tabled) else {
+        return 0;
+    };
+    let Some((bytes, _)) = crate::texture::staged(resource) else {
+        return 0;
+    };
+    crate::table_null::unstaged(resource as usize, crate::table_null::Why::Pass);
+    crate::texture::unstage(resource);
+    bytes
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
