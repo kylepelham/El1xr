@@ -64,6 +64,31 @@ impl ImportResolver for HleResolver {
     }
 }
 
+/// Resolves through `inner` (the title's DLLs among what it sees), and
+/// puts ours between the title and the few exports of its own DLLs we
+/// stand in for ([`modules::bink::interpose`], `VICTORY_BINK_OPEN_LOG=1`).
+pub struct Interposed<'a> {
+    pub inner: &'a dyn ImportResolver,
+}
+
+impl ImportResolver for Interposed<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        let found = self.inner.resolve(dll, symbol);
+        if let Resolution::Found {
+            address,
+            provenance: Provenance::Title,
+        } = found
+            && let Some(ours) = modules::bink::interpose(dll, &symbol.to_string(), address)
+        {
+            return Resolution::Found {
+                address: ours,
+                provenance: Provenance::Hle,
+            };
+        }
+        found
+    }
+}
+
 // The registry is code-only, so the "Missing" outcome can be checked on any
 // host; host pass-through itself needs Windows.
 #[cfg(test)]

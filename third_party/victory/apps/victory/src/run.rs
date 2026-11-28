@@ -106,10 +106,12 @@ pub fn run(
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,
     };
-    let with_dlls = WithTitleDlls {
+    let title_dlls = WithTitleDlls {
         inner: &resolver,
         dlls: &dlls,
     };
+    // VICTORY_BINK_OPEN_LOG=1: the title's video opens go through us.
+    let with_dlls = victory_hle::Interposed { inner: &title_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
