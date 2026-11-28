@@ -56,6 +56,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_EXPOSURE_EARLY", "Makes the auto-exposure pipelines early, so the world is not black."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
+    ("VICTORY_FAULT_UNLOCKED", "Write faults stop waiting for a guard walk closing their block."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
     ("VICTORY_FLUSH_ONE_PASS", "Runs a wide flush in one pass on helper threads, without barriers."),
