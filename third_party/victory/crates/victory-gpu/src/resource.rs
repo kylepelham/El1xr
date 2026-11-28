@@ -1628,6 +1628,21 @@ pub(crate) fn test_release_texture(this: This) {
     crate::object::release_boxed::<Resource>(this);
 }
 
+/// Lets texture `this`'s host copy go, as [`let_go_idle`] does for an idle
+/// one: the next use makes another.
+#[cfg(all(test, windows))]
+pub(crate) fn test_let_go_host_copy(this: This) {
+    let r = resource(this);
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        crate::texture::unstage(this);
+        made.take()
+    };
+    if gone.is_some() {
+        r.host.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Holds texture `this`'s lock, as a thread making its host copy does.
 #[cfg(all(test, windows))]
 pub(crate) fn test_hold_texture(this: This) -> Box<dyn std::any::Any> {

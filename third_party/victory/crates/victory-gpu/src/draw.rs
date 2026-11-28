@@ -5014,13 +5014,13 @@ impl State {
                         {
                             Some(shown) => host.make_at(index, &shown),
                             // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
+                            // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
-                                let listed = crate::descriptor::host::list_views()
-                                    && host.make_listed(
-                                        self.recording,
-                                        crate::descriptor::record_at(table + u64::from(k) * 32),
-                                        index,
-                                    );
+                                let record = crate::descriptor::record_at(table + u64::from(k) * 32);
+                                let listed = (crate::descriptor::host::view_cache::on()
+                                    && host.make_cached(record, index))
+                                    || crate::descriptor::host::list_views()
+                                        && host.make_listed(self.recording, record, index);
                                 if !listed {
                                     host.make_at(index, &view);
                                 }

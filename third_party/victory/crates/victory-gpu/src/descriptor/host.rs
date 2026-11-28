@@ -32,6 +32,7 @@ mod slot_wait;
 mod srgb_cast;
 pub(crate) mod view_ages;
 mod view_addresses;
+pub(crate) mod view_cache;
 pub(crate) use list_views::on as list_views;
 
 /// [`HostHeap::slot_flags`]: title slot `index` is in the queue of
