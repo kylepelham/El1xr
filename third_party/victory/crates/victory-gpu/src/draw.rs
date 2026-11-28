@@ -5038,7 +5038,7 @@ impl State {
                             // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
                                 let record = crate::descriptor::record_at(table + u64::from(k) * 32);
-                                let listed = (crate::descriptor::host::view_cache::on()
+                                let listed = (crate::descriptor::host::view_cache::any_on()
                                     && host.make_cached(record, index))
                                     || crate::descriptor::host::list_views()
                                         && host.make_listed(self.recording, record, index);
