@@ -85,6 +85,8 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_GUARD_STAMP_FRESH", "Stamps closed pages fresh at each guard check to avoid stale copies."),
     ("VICTORY_HANG_WATCH", "Logs in-flight work when the card stalls this many seconds."),
     ("VICTORY_HEAP_CAP", "Title views past the card's 1M heap: null (1-2), packed (3-5)."),
+    ("VICTORY_HEAP_NET_IN_PLACE", "Updates the heap pass's safety-net look in place, not from empty."),
+    ("VICTORY_HEAP_PASS_SPLIT", "Looks at the heap-buffers pass's slots on helper threads."),
     ("VICTORY_HEAP_ROUND_AHEAD", "Asks a queued submission's heap-sync round when the title sends it."),
     ("VICTORY_HEAP_VIEW_ADDRESS", "Shaders that read a heap view's address as numbers get it from the host."),
     ("VICTORY_HEAP_WARM", "Prepares view heap buffers on the loading screen for a faster first frame."),
