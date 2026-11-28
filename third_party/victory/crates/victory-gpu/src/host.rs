@@ -6168,6 +6168,7 @@ impl HostList {
                     .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
                 // And its records over the budget (`VICTORY_INDIRECT_REST`).
                 crate::indirect::rest::take(words, crate::indirect::budget::log2().unwrap_or(27));
+                crate::indirect::wide::take(words);
                 for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
@@ -7851,6 +7852,7 @@ impl Meter {
         crate::indirect::budget::line(frames);
         crate::indirect::rest::line(frames);
         crate::indirect::raw_check::line(frames);
+        crate::indirect::wide::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
