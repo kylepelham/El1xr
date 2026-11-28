@@ -167,7 +167,13 @@ impl TpFind {
             self.list.len(),
             show(before)
         ));
-        move_to(call, hash, slots, ped, target);
+        if !move_to(call, hash, slots, ped, target) {
+            log(format!(
+                "teleport find skip {hash:#018x}: no call (faulted or not in this build)"
+            ));
+            self.idx += 1;
+            return;
+        }
         let w = Wait {
             ticks: WAIT_TICKS,
             before,
@@ -417,6 +423,7 @@ mod tests {
                     Some([x, y, 0, 0])
                 }
                 0xa => Some([0; 4]),
+                0xe => None,
                 0xb => {
                     self.pos[0] += 0.3;
                     Some([0; 4])
@@ -489,6 +496,12 @@ mod tests {
         assert_eq!(f.found, Some((0xc, 4)));
         assert!(lines[0].contains("try 1/1 0x000000000000000c"));
         assert!(lines[1].contains("(after a wait)"), "{lines:?}");
+        let (f, _, lines) = run(&[(0xe, 4), (0xc, 4)], &[]);
+        assert_eq!(f.found, Some((0xc, 4)), "a native that faults is passed over");
+        assert_eq!(
+            lines[1],
+            "teleport find skip 0x000000000000000e: no call (faulted or not in this build)"
+        );
         let (f, _, lines) = run(&[(0xa, 4)], &[]);
         assert_eq!((f.found, f.done), (None, true));
         assert_eq!(

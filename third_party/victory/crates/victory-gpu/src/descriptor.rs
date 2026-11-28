@@ -1383,6 +1383,67 @@ pub(crate) fn evictable_slots(
         .collect()
 }
 
+/// (El1xr) What kind of slot shows a host texture, for `crate::resource::idle_sweep`, from
+/// the safest: a title slot a draw read through a table lately (that table read makes it
+/// again by itself), a title slot a table read only earlier, a slot no table ever read
+/// (shaders pick it by index: nothing would make it again) or a dynamic one.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum SlotClass {
+    Lately,
+    Earlier,
+    Never,
+}
+
+/// (El1xr) [`evictable_slots`] for `crate::resource::idle_sweep`: of the host textures `raws`
+/// (raw pointer to title texture), those shown only by [`SlotClass::Lately`] slots (and, if
+/// `wide`, [`SlotClass::Earlier`] ones), with those slots as (heap, index); and for the others
+/// shown by any slot, the least safe kind that shows them.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn slots_by_class(
+    raws: &std::collections::HashMap<usize, usize>,
+    frame: u64,
+    wide: bool,
+) -> (
+    std::collections::HashMap<usize, Vec<(usize, u32)>>,
+    std::collections::HashMap<usize, SlotClass>,
+) {
+    let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
+    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> =
+        std::collections::HashMap::new();
+    let mut worst: std::collections::HashMap<usize, SlotClass> = std::collections::HashMap::new();
+    if !set.is_empty() {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
+            let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
+                continue;
+            };
+            for (index, raw, class) in host.slots_by_class(&set, frame) {
+                if class == SlotClass::Lately || (wide && class == SlotClass::Earlier) {
+                    by_texture.entry(raw).or_default().push((at, index));
+                } else {
+                    let w = worst.entry(raw).or_insert(class);
+                    *w = (*w).max(class);
+                }
+            }
+        }
+    }
+    by_texture.retain(|raw, _| !worst.contains_key(raw));
+    let at = |raw: usize| raws.get(&raw).copied();
+    (
+        by_texture
+            .into_iter()
+            .filter_map(|(raw, slots)| Some((at(raw)?, slots)))
+            .collect(),
+        worst
+            .into_iter()
+            .filter_map(|(raw, class)| Some((at(raw)?, class)))
+            .collect(),
+    )
+}
+
 /// Puts the slots of title texture `resource` back to waiting for its host
 /// copy ([`evictable_slots`]): null now, made again when the texture is
 /// (`make_waiting`) or by the draw that reads them. Returns how many were

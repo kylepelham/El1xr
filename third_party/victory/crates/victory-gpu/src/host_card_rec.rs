@@ -66,6 +66,10 @@ pub(super) struct SyncItem {
     pub(super) masked: Vec<(usize, usize, usize)>,
     /// Declared for the first time: hashed whole.
     pub(super) whole: bool,
+    /// (`VICTORY_SEND_OWN`) Where its sends read the bytes taken at preparing:
+    /// the chunk's buffer and offset, and each copy's offset after it (the
+    /// masked runs' blocks are at their third field).
+    pub(super) own: Option<(ID3D12Resource, u64, Vec<u64>)>,
 }
 
 /// Everything the sync list records.
@@ -81,6 +85,71 @@ pub(super) struct SyncRec {
     pub(super) differs: ID3D12Resource,
     /// Rehash runs joined (`rehash_runs`, `under_writes_runs`).
     pub(super) join: bool,
+    /// (`VICTORY_SEND_OWN`) The chunks the items' `own` point into; the plan
+    /// takes them and keeps them until its submission has run.
+    pub(super) own: Vec<crate::windowup::Chunk>,
+}
+
+/// (`VICTORY_SEND_OWN`) Takes each item's sends out of its CPU side into a
+/// chunk of its own: masked blocks whole (table entries read from the plan's
+/// mask buffer), then the copies' ranges. An item whose chunk cannot be had
+/// sends from its CPU side as before (counted).
+fn take_own(
+    items: &mut [SyncItem],
+    masks: Option<&(ID3D12Resource, usize, u64)>,
+) -> Vec<crate::windowup::Chunk> {
+    use crate::send_own::{BLOCK, TAKEN, layout};
+    let mut chunks = Vec::new();
+    for item in items.iter_mut() {
+        let copies = item.copies.as_deref().unwrap_or(item.ranges.as_slice());
+        // The blocks of the masked runs, in table order (entry: first byte in the copy).
+        let mut blocks: Vec<usize> = Vec::new();
+        if let Some(&(_, data, _)) = masks {
+            for &(table_at, n, _) in &item.masked {
+                for k in 0..n {
+                    // SAFETY: the plan's mask buffer, written by `card_before` with
+                    // `n` table entries of two words at `table_at`; no list reads it yet.
+                    let x = unsafe { ((data + table_at + k * 8) as *const u32).read_unaligned() };
+                    blocks.push(x as usize);
+                }
+            }
+        }
+        let (block_at, range_at, bytes) = layout(blocks.len(), copies);
+        if bytes == 0 {
+            continue;
+        }
+        let Some(chunk) = crate::windowup::alloc(bytes) else {
+            TAKEN[3].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let base = chunk.ptr();
+        let mut whole = true;
+        for (&x, &at) in blocks.iter().zip(&block_at) {
+            let len = BLOCK.min((item.size as usize).saturating_sub(x));
+            // SAFETY: inside the chunk (`layout` gave each block BLOCK bytes).
+            whole &= unsafe { item.shadow.card_side_take(x, len, base.add(at as usize)) };
+        }
+        for (&(a, b), &at) in copies.iter().zip(&range_at) {
+            // SAFETY: inside the chunk (`layout` gave the range its bytes).
+            whole &= unsafe { item.shadow.card_side_take(a, b - a, base.add(at as usize)) };
+        }
+        if !whole {
+            TAKEN[3].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        TAKEN[0].fetch_add(bytes, Ordering::Relaxed);
+        TAKEN[1].fetch_add(1, Ordering::Relaxed);
+        TAKEN[2].fetch_add(blocks.len() as u64, Ordering::Relaxed);
+        // Each masked run's first block, in the chunk.
+        let mut first = 0;
+        for run in &mut item.masked {
+            run.2 = block_at.get(first).copied().unwrap_or(0) as usize;
+            first += run.1;
+        }
+        item.own = Some((chunk.buffer().clone(), chunk.offset, range_at));
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 impl SyncRec {
@@ -109,10 +178,13 @@ impl SyncRec {
                 copies,
                 masked,
                 whole: whole.iter().any(|s| Arc::ptr_eq(s, shadow)),
+                own: None,
             });
         }
+        let own = if crate::send_own::on() { take_own(&mut items, masks) } else { Vec::new() };
         SyncRec {
             items,
+            own,
             uploads: uploads
                 .iter()
                 .map(|(shadow, parts)| {
@@ -159,14 +231,12 @@ impl SyncRec {
             for item in &self.items {
                 let copies = item.copies.as_deref().unwrap_or(item.ranges.as_slice());
                 crate::prep_cut::add(crate::prep_cut::F::SyncCopies, copies.len() as u64);
-                for &(a, b) in copies {
-                    list.CopyBufferRegion(
-                        &item.shadow.buffer,
-                        a as u64,
-                        &item.staging,
-                        a as u64,
-                        (b - a) as u64,
-                    );
+                for (i, &(a, b)) in copies.iter().enumerate() {
+                    let (from, at) = match &item.own {
+                        Some((chunk, base, at)) => (chunk, base + at[i]),
+                        None => (&item.staging, a as u64),
+                    };
+                    list.CopyBufferRegion(&item.shadow.buffer, a as u64, from, at, (b - a) as u64);
                 }
                 total_bytes += item
                     .ranges
@@ -231,8 +301,13 @@ impl SyncRec {
                             3,
                             item.shadow.buffer.GetGPUVirtualAddress(),
                         );
-                        for &(table_at, blocks, _) in &item.masked {
-                            let constants = [table_at as u32, blocks as u32];
+                        for &(table_at, blocks, own_at) in &item.masked {
+                            let mut constants = [table_at as u32, blocks as u32];
+                            if let Some((chunk, base, _)) = &item.own {
+                                let at = chunk.GetGPUVirtualAddress() + base + own_at as u64;
+                                list.SetComputeRootShaderResourceView(1, at);
+                                constants[1] |= crate::send_own::OWN_BIT;
+                            }
                             list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
                             list.Dispatch(16 * blocks as u32, 1, 1);
                         }

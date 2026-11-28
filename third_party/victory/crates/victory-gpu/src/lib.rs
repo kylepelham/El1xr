@@ -30,6 +30,8 @@ mod commitline;
 mod poolslack;
 #[cfg(windows)]
 mod staging_hold;
+#[cfg(windows)]
+mod idle_evict;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
@@ -177,6 +179,8 @@ mod hold_frame;
 mod flicker_catch;
 #[cfg(windows)]
 mod present_own;
+#[cfg(windows)]
+mod send_own;
 mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;
@@ -241,11 +245,16 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shader_pack;
 #[cfg(windows)]
+mod shader_prefetch;
+#[cfg(windows)]
 mod wave_more;
 mod zero_out;
 mod zero_fill;
+mod shadow_idle;
 #[cfg(windows)]
 mod face_watch;
+#[cfg(windows)]
+mod exposure_watch;
 #[cfg(windows)]
 mod target_reuse;
 #[cfg(windows)]
@@ -294,6 +303,10 @@ mod scratch_landing;
 mod submit_chunk;
 #[cfg(windows)]
 mod timeline;
+/// (critpath #88) The title's thread placement calls; `VICTORY_OWN_CPUS`, `VICTORY_TITLE_BOOST`.
+pub mod title_threads;
+/// (critpath #88) `VICTORY_TITLE_WAITS=1`: the title's threads' time in our faults, and their die.
+mod title_waits;
 #[cfg(windows)]
 mod merge_runs;
 #[cfg(windows)]

@@ -15,6 +15,8 @@ mod camera_tap;
 mod draw_dump;
 #[cfg(windows)]
 mod heap_find;
+#[cfg(windows)]
+mod exposure_watch;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2124,6 +2126,7 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let _whole = BindLap::start(0);
         let _hitch = crate::hitch::span(crate::hitch::Phase::Bind);
+        crate::title_waits::bind();
         let l = &list.list;
         if crate::bake_watch::on() {
             let stages = p.stages.iter().map(|s| s.shader.hash.as_str());
@@ -2142,6 +2145,10 @@ impl State {
         #[cfg(windows)]
         if crate::heap_find::recording() {
             self.heap_find(list, p, compute);
+        }
+        #[cfg(windows)]
+        if crate::exposure_watch::on() {
+            self.exposure_watch(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
@@ -3293,8 +3300,22 @@ impl State {
             Some((_, bytes, _)) if bytes >= (1 << 30) => usize::MAX,
             _ => 4096,
         };
+        // (`VICTORY_BAKE_SPREAD`, `VICTORY_BAKE_LOAD_SPREAD` while loading) A bake pass hands all
+        // but the bake's own textures to the prepare threads and checks its time before each slot.
+        let world = crate::load_rate::in_world();
+        let spread_mode = crate::bake_spread::mode_now(world);
+        let spread = crate::bake_spread::spreads(
+            spread_mode,
+            PASS_BUDGET.get().is_some_and(|(_, _, now)| now),
+            bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
+            crate::texture::prepare::threads(),
+        );
+        // While loading, the frame's cap: a pass with none left looks at the bake's own slots alone.
+        let load_left = (spread && !world).then(|| crate::bake_spread::load_left(frame, spread_mode));
         let only = bake_pass::ONLY.get();
-        let (mut due, census) = host.texture_slots_due(frame, if only { 0 } else { slot_limit });
+        let none_left = load_left.is_some_and(|left| left.is_zero());
+        let (mut due, census) =
+            host.texture_slots_due(frame, if only || none_left { 0 } else { slot_limit });
         // (`VICTORY_BAKE_INPUTS`) A bake draw's own textures go first, outside the budgets, in a
         // pass whose uploads must be there now.
         let pinned = if PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
@@ -3314,16 +3335,6 @@ impl State {
             }
             None => 0,
         };
-        // (`VICTORY_BAKE_SPREAD`) In the world, a bake pass hands all but the bake's own textures
-        // to the prepare threads and checks its time before each slot.
-        let spread_mode = crate::bake_spread::mode();
-        let spread = crate::bake_spread::spreads(
-            spread_mode,
-            PASS_BUDGET.get().is_some_and(|(_, _, now)| now),
-            bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
-            crate::load_rate::in_world(),
-            crate::texture::prepare::threads(),
-        );
         // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
         if !only && crate::material_demand::on() {
             let wanted = host.texture_slots_pick(&crate::material_demand::take());
@@ -3482,7 +3493,8 @@ impl State {
             }
             let took = ahead.elapsed();
             crate::bake_spread::add(crate::bake_spread::C::AheadUs, took.as_micros() as u64);
-            budget = crate::bake_spread::budget_left(spread_mode, budget, took);
+            let capped = load_left.map_or(budget, |left| budget.min(left));
+            budget = crate::bake_spread::budget_left(spread_mode, capped, took);
         } else if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
             let ahead = std::time::Instant::now();
             crate::bake_ahead::host_copies(heap, &due, budget, PASS_BUDGET.get().map_or(0, |b| b.1));
@@ -3556,7 +3568,10 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go. (`VICTORY_BAKE_KEEP_GONE=1`:
                     // not a bake draw's own input, which would read the null view.)
-                    if !crate::bake_publish::keeps_gone(i < pinned) {
+                    // (`VICTORY_AWAY_GRACE`: its own view's slot keeps its last upload a while.)
+                    if !crate::bake_publish::keeps_gone(i < pinned)
+                        && !host.texture_slot_keeps_away(index, heap.handle(index), frame)
+                    {
                         host.texture_slot_gone(index);
                     }
                     host.texture_slot_later(index, write, frame, most);
@@ -3841,6 +3856,9 @@ impl State {
             add(C::Pinned, pinned as u64);
             add(C::Handed, handed);
             add(C::Us, entered.elapsed().as_micros() as u64);
+            if load_left.is_some() {
+                crate::bake_spread::load_took(frame, entered.elapsed().as_micros() as u64);
+            }
         }
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
         let [made, made_us] = crate::resource::made_here();
@@ -4037,6 +4055,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         note_defrag(p, Some(u64::from(x) * u64::from(y) * u64::from(z)));
         match group_base(p) {
+            // (`VICTORY_SHADOW_TRACE_IDLE`) Bound and declared, run with no groups.
+            _ if crate::pipeline::shadow_idle(self.pipeline as This) => crate::shadow_idle::idled(),
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
                 // SAFETY: an open list with everything set; the parameter
@@ -5014,13 +5034,13 @@ impl State {
                         {
                             Some(shown) => host.make_at(index, &shown),
                             // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
+                            // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
-                                let listed = crate::descriptor::host::list_views()
-                                    && host.make_listed(
-                                        self.recording,
-                                        crate::descriptor::record_at(table + u64::from(k) * 32),
-                                        index,
-                                    );
+                                let record = crate::descriptor::record_at(table + u64::from(k) * 32);
+                                let listed = (crate::descriptor::host::view_cache::on()
+                                    && host.make_cached(record, index))
+                                    || crate::descriptor::host::list_views()
+                                        && host.make_listed(self.recording, record, index);
                                 if !listed {
                                     host.make_at(index, &view);
                                 }
@@ -5524,6 +5544,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // (`VICTORY_SHADOW_TRACE_IDLE`) Bound and declared, run with no groups.
+        let idle = kind == DISPATCH && crate::pipeline::shadow_idle(self.pipeline as This);
+        if idle {
+            crate::shadow_idle::idled();
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -5646,18 +5671,20 @@ impl State {
                     false,
                 )
             });
-            // SAFETY: an open list with everything set; the list keeps the host copy
-            // alive, and the signature is cached.
-            unsafe {
-                list.list.ExecuteIndirect(
-                    signature,
-                    1,
-                    &args.buffer,
-                    args.offset(arguments),
-                    None::<&ID3D12Resource>,
-                    0,
-                )
-            };
+            if !idle {
+                // SAFETY: an open list with everything set; the list keeps the host copy
+                // alive, and the signature is cached.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        1,
+                        &args.buffer,
+                        args.offset(arguments),
+                        None::<&ID3D12Resource>,
+                        0,
+                    )
+                };
+            }
             #[cfg(feature = "diagnostics")]
             self.check_rtv_formats(Some(p), "ExecuteIndirect");
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -5786,18 +5813,20 @@ impl State {
                     || crate::pipeline::shaders_of(self.pipeline as This),
                 );
             }
-            // SAFETY: an open list with everything set; the list keeps the host copies
-            // alive, and the signature is cached.
-            unsafe {
-                list.list.ExecuteIndirect(
-                    signature,
-                    max.max(1),
-                    &args.buffer,
-                    args.offset(arguments),
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-                )
-            };
+            if !idle {
+                // SAFETY: an open list with everything set; the list keeps the host copies
+                // alive, and the signature is cached.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        max.max(1),
+                        &args.buffer,
+                        args.offset(arguments),
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                };
+            }
             if kind == MESH {
                 self.mesh_scissor(list, false);
             }
@@ -6070,22 +6099,24 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            if let Some((base, signature)) = parts {
-                crate::indirect::execute_parts(&list.list, base, signature, (&bounded, 0));
-            } else {
-                list.list.ExecuteIndirect(
-                    signature,
-                    max,
-                    &bounded,
-                    at,
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-                )
-            }
-        };
+        if !idle {
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe {
+                if let Some((base, signature)) = parts {
+                    crate::indirect::execute_parts(&list.list, base, signature, (&bounded, 0));
+                } else {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        max,
+                        &bounded,
+                        at,
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                }
+            };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

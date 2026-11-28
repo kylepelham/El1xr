@@ -27,6 +27,7 @@
 pub mod candidates;
 pub mod census;
 pub mod finder;
+pub mod guard;
 pub mod model;
 pub mod natives;
 pub mod probe;
@@ -67,6 +68,12 @@ struct Table {
 }
 
 static TABLE: OnceLock<Result<Table, String>> = OnceLock::new();
+/// Natives that faulted this run ([`guard`]): never called again.
+static FAULTED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn faulted(hash: u64) -> bool {
+    FAULTED.lock().unwrap_or_else(|e| e.into_inner()).contains(&hash)
+}
 pub(crate) static QUEUE: LazyLock<Queue> = LazyLock::new(Queue::default);
 static SELFTEST_QUEUED: AtomicBool = AtomicBool::new(false);
 static TICKS: AtomicUsize = AtomicUsize::new(0);
@@ -172,9 +179,22 @@ pub fn game_tick() {
     stats::hold(TICKS.load(Relaxed), &QUEUE);
     let mut native = |hash: u64, args: &[u64]| {
         let rva = table.scan.find(hash)?;
+        if candidates::FAULTS.contains(&hash) || faulted(hash) {
+            return None;
+        }
         // SAFETY: a handler the scan found in the mapped image, on the title's thread; the
         // options, scripts and finders pass each native the slots its shape takes.
-        Some(unsafe { natives::invoke(table.base + rva as usize, args) })
+        match unsafe { natives::invoke(table.base + rva as usize, args) } {
+            Ok(r) => Some(r),
+            Err(f) => {
+                tracing::warn!(
+                    "mod menu: native {hash:#018x} faulted ({}); not called again this run",
+                    f.describe(table.base)
+                );
+                FAULTED.lock().unwrap_or_else(|e| e.into_inner()).push(hash);
+                None
+            }
+        }
     };
     finder::tick(&mut native);
     if QUEUE.idle() {

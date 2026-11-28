@@ -273,7 +273,7 @@ pub const OPTIONS: &[Opt] = &[
             "MOD_HEALTH",
             "Player",
             "Health (unverified)",
-            "The player's health through the title's health getter (peds: 1000 is full).",
+            "The player's health through the title's health getter (part T read 130 of 130).",
             Kind::Text,
         ),
         effect: Effect::Read {

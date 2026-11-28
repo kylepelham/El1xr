@@ -299,6 +299,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// (El1xr) Logs the first texture in each of the console's own formats the host has no
+/// match for, or names another format by (116/117 10-bit float colour, 189 signed 10-bit
+/// colour, 190 two 4-bit channels, 191: A4B4G4R4 on the host, 4 bytes a texel on the
+/// console): `console format:`.
+#[cfg(windows)]
+fn console_only(format: u32, flags: u32) {
+    static SEEN: [std::sync::Once; 5] = [const { std::sync::Once::new() }; 5];
+    let Some(i) = [116, 117, 189, 190, 191].iter().position(|&f| f == format) else {
+        return;
+    };
+    SEEN[i].call_once(|| {
+        tracing::warn!(format, flags, "console format: a texture in a format the host does not have as the console does");
+    });
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -1347,6 +1362,8 @@ pub(crate) mod placed_inside;
 pub(crate) mod alias_compatible;
 #[cfg(windows)]
 pub(crate) mod find_facts;
+#[cfg(windows)]
+pub(crate) mod idle_sweep;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
@@ -1628,6 +1645,21 @@ pub(crate) fn test_release_texture(this: This) {
     crate::object::release_boxed::<Resource>(this);
 }
 
+/// Lets texture `this`'s host copy go, as [`let_go_idle`] does for an idle
+/// one: the next use makes another.
+#[cfg(all(test, windows))]
+pub(crate) fn test_let_go_host_copy(this: This) {
+    let r = resource(this);
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        crate::texture::unstage(this);
+        made.take()
+    };
+    if gone.is_some() {
+        r.host.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Holds texture `this`'s lock, as a thread making its host copy does.
 #[cfg(all(test, windows))]
 pub(crate) fn test_hold_texture(this: This) -> Box<dyn std::any::Any> {
@@ -1774,6 +1806,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        crate::idle_evict::made_again(this as usize);
         *made = Some((std::sync::Arc::new(host), twin));
         crate::readable_once::bump(this as usize);
         // Slots the title wrote with views of it while it had no host copy
@@ -2607,6 +2640,8 @@ pub(crate) fn let_go_idle() {
     }
     slot_evict(&all, video, idle_ms, IDLE_FRAMES);
     drop(all);
+    // (El1xr) VICTORY_IDLE_EVICT_S: copies only table slots show, on a thread of its own.
+    crate::idle_evict::start();
     if floor {
         crate::commitline::floor_report(&floor_went);
     }
@@ -3187,6 +3222,7 @@ fn host_texture_as(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    console_only(d.format, d.flags);
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);

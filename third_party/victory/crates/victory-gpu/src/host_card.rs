@@ -168,13 +168,14 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
             let mut code: Option<ID3DBlob> = None;
+            let source = crate::send_own::patch_source(CARD_PATCH, crate::send_own::on());
             // SAFETY: the source and names live through the call; the out
             // pointer is ours. The blob's own bytes; the root signature is
             // inside the shader.
             unsafe {
                 D3DCompile(
-                    CARD_PATCH.as_ptr().cast(),
-                    CARD_PATCH.len(),
+                    source.as_ptr().cast(),
+                    source.len(),
                     windows::core::s!("card patch"),
                     None,
                     None,
@@ -467,6 +468,8 @@ impl Host {
         let mut pending_check: Option<(CheckRec, Prelude)> = None;
         // (Neptune) The masks this plan's send reads (`under_writes_masks`).
         let mut masks: Option<(ID3D12Resource, usize, u64)> = None;
+        // (`VICTORY_SEND_OWN`) The chunks the sync list's sends read.
+        let mut own: Vec<crate::windowup::Chunk> = Vec::new();
         if !dirty.is_empty() || !uploads.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!(
@@ -539,7 +542,8 @@ impl Host {
                 sends.resize_with(dirty.len(), || (None, Vec::new()));
             }
             lap.mark(P::Masks);
-            let rec = SyncRec::new(work, &mut dirty, sends, &uploads, masks.as_ref(), &whole);
+            let mut rec = SyncRec::new(work, &mut dirty, sends, &uploads, masks.as_ref(), &whole);
+            own = std::mem::take(&mut rec.own);
             // SAFETY (both recordings): the list's last run finished (it ran
             // ahead of a submission that was waited for, and came back after
             // that); live buffers, and the ranges lie in them.
@@ -582,6 +586,7 @@ impl Host {
             _uploads: uploads
                 .into_iter()
                 .flat_map(|(_, parts)| parts.into_iter().map(|p| p.2))
+                .chain(own)
                 .collect(),
             lists: used,
             sent_as,

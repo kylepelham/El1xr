@@ -1168,7 +1168,7 @@ fn host_steps_alone_skip_the_texture_join_and_the_next_join_takes_it() {
             std::thread::sleep(std::time::Duration::from_millis(30));
             seen.lock().unwrap().push("check");
         });
-        let (_, textures) = list.run_deferred(&mut batch, false);
+        let (_, textures) = list.run_deferred(&mut batch, false, &mut ask_aside::Gate::open());
         assert!(textures.is_empty());
         assert_eq!(batch.early.started(), host_first, "switch={switch} alone={alone}");
         // The join the preludes are made after.
@@ -1178,6 +1178,40 @@ fn host_steps_alone_skip_the_texture_join_and_the_next_join_takes_it() {
         list.close();
     }
     run_wait::FORCED.with(|f| f.set(None));
+}
+
+/// (critpath #88) `VICTORY_ASK_ASIDE`: the walk joins the asking at its first host step, before
+/// the step's work, and once only; a walk with nothing that needs it leaves the gate to its end.
+#[test]
+fn the_aside_asking_is_joined_before_the_first_host_step() {
+    use std::sync::{Arc, Mutex};
+    let Some(host) = host() else { return };
+    let events: Arc<Mutex<Vec<&str>>> = Arc::default();
+    let list = host.new_list().unwrap();
+    for _ in 0..2 {
+        let seen = events.clone();
+        list.defer_host(move || seen.lock().unwrap().push("host"));
+    }
+    let mut batch = Batch::default();
+    let seen = events.clone();
+    let mut pass = move || {
+        seen.lock().unwrap().push("gate");
+        false
+    };
+    let mut gate = ask_aside::Gate::new(&mut pass);
+    list.run_deferred(&mut batch, false, &mut gate);
+    assert!(!gate.pending() && !gate.settled);
+    drop(gate);
+    assert_eq!(*events.lock().unwrap(), ["gate", "host", "host"]);
+    list.close();
+    // Nothing that needs the asking: still pending after the walk.
+    let empty = host.new_list().unwrap();
+    let mut pass = || true;
+    let mut gate = ask_aside::Gate::new(&mut pass);
+    empty.run_deferred(&mut Batch::default(), false, &mut gate);
+    assert!(gate.pending());
+    assert!(gate.pass(false) && gate.settled);
+    empty.close();
 }
 
 /// (feedcard #88) `VICTORY_PRELUDE_AHEAD`: a prelude reset with its list is
