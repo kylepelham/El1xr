@@ -57,6 +57,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::host;
 
 pub(crate) mod ahead;
+#[cfg(test)]
+mod bench;
+pub(crate) mod serial;
 
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
@@ -209,7 +212,8 @@ fn make_heap(device: &ID3D12Device) -> Option<ID3D12Heap> {
     };
     let mut made: Option<ID3D12Heap> = None;
     // SAFETY: plain creation; the out pointer is ours.
-    if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+    let created = serial::call(serial::on(), || unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) });
+    if let Err(e) = created {
         tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
         return None;
     }
@@ -708,26 +712,29 @@ impl Tiled {
         let mut mapped = 0u32;
         for (_, mut batch) in batches {
             given.runs.reserve(batch.runs.len());
-            let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours;
-            // `batch.coords.len()` regions of `batch.sizes` tiles from each
-            // subresource's first tile; `batch.starts.len()` ranges whose
-            // counts add up to `batch.total_tiles`, in three arrays of that
-            // length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    batch.coords.len() as u32,
-                    Some(batch.coords.as_ptr()),
-                    Some(batch.sizes.as_ptr()),
-                    &batch.heap,
-                    batch.starts.len() as u32,
-                    Some(batch.flags.as_ptr()),
-                    Some(batch.starts.as_ptr()),
-                    Some(batch.counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
-            }
+            let began = serial::call(serial::on(), || {
+                let began = std::time::Instant::now();
+                // SAFETY: a live reserved texture and a live heap of ours;
+                // `batch.coords.len()` regions of `batch.sizes` tiles from each
+                // subresource's first tile; `batch.starts.len()` ranges whose
+                // counts add up to `batch.total_tiles`, in three arrays of that
+                // length that live through the call.
+                unsafe {
+                    queue.UpdateTileMappings(
+                        texture,
+                        batch.coords.len() as u32,
+                        Some(batch.coords.as_ptr()),
+                        Some(batch.sizes.as_ptr()),
+                        &batch.heap,
+                        batch.starts.len() as u32,
+                        Some(batch.flags.as_ptr()),
+                        Some(batch.starts.as_ptr()),
+                        Some(batch.counts.as_ptr()),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
+                began
+            });
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             ahead::mapped(began);
@@ -893,6 +900,7 @@ pub(crate) fn status() {
         s[10],
     );
     ahead::line();
+    serial::line();
 }
 
 /// On the card, without the title: what levels on demand relies on, with

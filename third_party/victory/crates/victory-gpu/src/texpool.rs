@@ -1119,7 +1119,8 @@ fn texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
     };
     let mut heap: Option<ID3D12Heap> = None;
     // SAFETY: plain creation; the out pointer is ours.
-    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+    let made = crate::tiles::serial::call(crate::tiles::serial::on(), || unsafe { device.CreateHeap(&desc, &mut heap) });
+    if let Err(e) = made {
         crate::alloc_backoff::note(&e);
         tracing::warn!(error = %e, "no block of texture memory");
         return None;
@@ -1141,7 +1142,7 @@ fn texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
 fn made_resident(device: &ID3D12Device, heap: &ID3D12Heap) -> windows::core::Result<()> {
     let pageable: ID3D12Pageable = heap.cast()?;
     // SAFETY: a live heap of the device's.
-    unsafe { device.MakeResident(&[Some(pageable)]) }?;
+    crate::tiles::serial::call(crate::tiles::serial::on(), || unsafe { device.MakeResident(&[Some(pageable)]) })?;
     mapped(device)
 }
 
