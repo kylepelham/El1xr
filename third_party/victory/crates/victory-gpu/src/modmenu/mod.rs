@@ -20,6 +20,9 @@
 //! Health, armour and wanted ([`stats`]): god mode and never wanted are holds run here every
 //! [`stats::HOLD_EVERY`] ticks once Find stats has named their setters.
 //!
+//! Weather ([`weather`]) and vehicle spawn ([`vehicle`]) have finders too; Find all runs every
+//! finder and keeps what they found in the settings file ([`found`], read here at start).
+//!
 //! Teleport ([`teleport`]) needs a set-coords native that offline analysis did not pin: Find
 //! teleport ([`finder`]) names it in game, or `VICTORY_MOD_MENU_TP_NATIVE=<hash>:<slots>` does at
 //! start (logged as `mod menu: teleport native <hash> from VICTORY_MOD_MENU_TP_NATIVE`).
@@ -27,6 +30,7 @@
 pub mod candidates;
 pub mod census;
 pub mod finder;
+pub mod found;
 pub mod guard;
 pub mod model;
 pub mod natives;
@@ -34,6 +38,8 @@ pub mod probe;
 pub mod queue;
 pub mod stats;
 pub mod teleport;
+pub mod vehicle;
+pub mod weather;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -140,6 +146,11 @@ pub unsafe fn init(base: usize, size: usize) {
                     ),
                 }
             }
+            if let Some(v) = victory_core::settings::get(found::SETTING) {
+                for line in found::apply(&v) {
+                    tracing::info!("mod menu: {line}");
+                }
+            }
             Ok(Table { base, scan })
         }
         Err(e) => {
@@ -196,6 +207,11 @@ pub fn game_tick() {
             }
         }
     };
+    if weather::wanted() && TICKS.load(Relaxed) % 30 == 0 {
+        // SAFETY: the mapped image the scan ran over; every read is checked readable first.
+        weather::refresh(|| unsafe { weather::read_table(table.base) });
+    }
+    vehicle::spawn_tick(&mut native);
     finder::tick(&mut native);
     if QUEUE.idle() {
         return;
