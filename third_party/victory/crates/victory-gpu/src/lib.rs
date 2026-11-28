@@ -212,6 +212,8 @@ mod sweep_every;
 #[cfg(windows)]
 mod card_prof;
 #[cfg(windows)]
+mod prep_cut;
+#[cfg(windows)]
 mod compare_apart;
 #[cfg(windows)]
 mod fresh_open;

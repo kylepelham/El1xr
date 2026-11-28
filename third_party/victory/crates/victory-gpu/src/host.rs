@@ -4753,11 +4753,13 @@ impl Host {
         if late {
             let t_exec = std::time::Instant::now();
             *submitted += 1;
+            let mut t_lists = crate::prep_cut::now();
             let signalled = {
                 let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
                 // SAFETY: closed lists; the fence is ours.
                 let signalled = unsafe {
                     self.queue.ExecuteCommandLists(&lists);
+                    crate::prep_cut::lap(crate::prep_cut::F::ExecLists, &mut t_lists);
                     crate::compare_apart::send(&self.queue, &apart);
                     self.queue.Signal(&self.fence, *submitted)
                 };
@@ -4781,6 +4783,7 @@ impl Host {
                 .iter()
                 .flat_map(|l| l.deferred().writes.clone())
                 .collect();
+            crate::prep_cut::lap(crate::prep_cut::F::ExecRest, &mut t_lists);
             PREP_PARTS[9].fetch_add(t_exec.elapsed().as_micros() as u64, Ordering::Relaxed);
             let prep_us = (prepared - started).saturating_sub(settled).as_micros() as u64;
             SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);

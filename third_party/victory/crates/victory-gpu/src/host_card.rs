@@ -433,6 +433,24 @@ impl Host {
             }
         }
         lap.mark(P::Before);
+        // (entryhitch) `VICTORY_CARD_CHECK_ASIDE`: the compare's ranges placed
+        // now, and its list recorded on a kept thread beside the sync list.
+        let aside = crate::prep_cut::check_aside() && (!dirty.is_empty() || !uploads.is_empty());
+        let mut early: Option<(Vec<CardRange>, Option<Prelude>)> = None;
+        if aside {
+            let ranges = card_ranges(&declared, joined_decl, &mut work.taken, work.differs.2);
+            lap.mark(P::Spans);
+            let check = ranges.iter().any(|r| r.compared).then(|| {
+                work.check.pop().or_else(|| self.make_prelude()).unwrap_or_else(|| {
+                    fail(format_args!(
+                        "no host list for the compare of host copies in the card's memory"
+                    ))
+                })
+            });
+            early = Some((ranges, check));
+        }
+        let early_keep = early.as_ref().and_then(|_| keep_of(&work.snap, flown));
+        let mut checked: Option<CheckRecorded> = None;
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut sync_list: Option<ID3D12CommandList> = None;
         // (Neptune) The masks this plan's send reads (`under_writes_masks`).
@@ -513,10 +531,12 @@ impl Host {
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
-            let recorded = unsafe {
+            let record = || unsafe {
+                let mut t = crate::prep_cut::now();
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::prep_cut::lap(crate::prep_cut::F::SyncOpen, &mut t);
                     crate::gpucost::begin(list, crate::gpucost::CARD_SYNC);
                     // Resolve each dirty copy's card sides once and execute in
                     // 3 batched phases (Copy -> CARD_PATCH -> Rehash) to
@@ -718,9 +738,22 @@ impl Host {
                         CARD_PASSES[1].fetch_add(piece_count, Ordering::Relaxed);
                     }
                     crate::gpucost::end(list);
+                    crate::prep_cut::restart(&mut t);
                     list.Close()?;
+                    crate::prep_cut::lap(crate::prep_cut::F::SyncClose, &mut t);
                     list.cast()
                 })()
+            };
+            let recorded = match &early {
+                Some((ranges, Some(check))) => {
+                    crate::prep_cut::add(crate::prep_cut::F::Aside, 1);
+                    let (recorded, check) = crate::prep_cut::both_out(record, || {
+                        record_check(work, ranges, early_keep, flown, check)
+                    });
+                    checked = Some(check);
+                    recorded
+                }
+                _ => record(),
             };
             match recorded {
                 Ok(cmd) => sync_list = Some(cmd),
@@ -753,196 +786,42 @@ impl Host {
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
-        let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let joined_here;
-            let spans: &[(usize, usize)] = if joined_decl {
-                ranges
-            } else {
-                let mut sorted = ranges.clone();
-                sorted.sort_unstable();
-                let mut spans: Vec<(usize, usize)> = Vec::new();
-                for (from, to) in sorted {
-                    match spans.last_mut() {
-                        Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                        _ => spans.push((from, to)),
-                    }
-                }
-                joined_here = spans;
-                &joined_here
-            };
-            crate::card_prof::add(P::DeclOut, spans.len() as u64);
-            let twin = shadow
-                .card_sides()
-                .is_some_and(|(_, before, _)| before.is_some());
-            let mut run = crate::card_share::Run::new(crate::card_share::on() && !inflight_fetch());
-            for &(from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let slot = twin
-                    .then(|| run.slot(span.first, span.pieces, &mut at, work.differs.2 / 4))
-                    .flatten();
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at: slot.unwrap_or(at),
-                    compared: slot.is_some(),
-                });
+        let (ranges, early_check) = match early {
+            Some((ranges, check)) => (ranges, check),
+            None => {
+                let ranges = card_ranges(&declared, joined_decl, &mut work.taken, work.differs.2);
+                (ranges, None)
             }
-        }
-        work.taken = at;
+        };
+        plan.ranges = ranges;
         lap.mark(P::Spans);
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = early_check
+                .or_else(|| work.check.pop())
+                .or_else(|| self.make_prelude())
+            else {
                 fail(format_args!(
                     "no host list for the compare of host copies in the card's memory"
                 ));
             };
-            let (allocator, list) = &check;
             // (Neptune) Sent ahead, with a queue of the fetch's own: the
             // compare that keeps what it flags, told which slots are free
             // (`relay_own_queue`). The count of slots done with only grows,
             // so one read a moment ago is on the safe side.
-            let keep = work
-                .snap
-                .as_ref()
-                .filter(|_| flown && !SNAP_OFF.load(Ordering::Acquire))
-                .map(|snap| (snap, SNAP_DONE.load(Ordering::Acquire)));
-            // SAFETY: the list's last run finished (its submission was
-            // waited for, and it came back after that); live buffers; the
-            // compare's own root signature.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<ID3D12CommandList> {
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    crate::gpucost::begin(list, crate::gpucost::CARD_CHECK);
-                    // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(None),
-                            }),
-                        },
-                    }]);
-                    match keep {
-                        Some((snap, _)) => {
-                            list.SetComputeRootSignature(&snap.root);
-                            list.SetPipelineState(&snap.pso);
-                            list.SetComputeRootUnorderedAccessView(
-                                4,
-                                snap.buffer.GetGPUVirtualAddress(),
-                            );
-                        }
-                        None => {
-                            list.SetComputeRootSignature(&work.root);
-                            list.SetPipelineState(&work.pso);
-                        }
-                    }
-                    let (snap_base, snap_slots, words) =
-                        keep.map_or((0, 0, 6), |(snap, base)| (base, snap.slots, 8));
-                    list.SetComputeRootUnorderedAccessView(
-                        3,
-                        work.differs.0.GetGPUVirtualAddress(),
-                    );
-                    let key = |r: &CardRange| {
-                        let copy = Arc::as_ptr(&r.shadow) as usize;
-                        r.compared
-                            .then_some((copy, r.span.first, r.span.pieces, r.at))
-                    };
-                    for (i, first, pieces, at) in
-                        crate::card_share::passes(plan.ranges.iter().map(key))
-                    {
-                        let r = &plan.ranges[i];
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
-                            continue;
-                        };
-                        let constants = [
-                            first,
-                            r.span.skew,
-                            size as u32,
-                            pieces,
-                            at * 4,
-                            if flown { 2 } else { 1 },
-                            snap_base,
-                            snap_slots,
-                        ];
-                        list.SetComputeRoot32BitConstants(0, words, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(
-                            1,
-                            r.shadow.buffer.GetGPUVirtualAddress(),
-                        );
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(pieces.min(65_535), 1, 1);
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
-                    }
-                    // The fetch inside the flight (`inflight_fetch`): behind
-                    // every compare of the list, the pieces they flagged go
-                    // to slots in the PC's memory.
-                    if flown && let Some(inflight) = &work.inflight {
-                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                    pResource: std::mem::ManuallyDrop::new(None),
-                                }),
-                            },
-                        }]);
-                        list.SetComputeRootSignature(&inflight.root);
-                        list.SetPipelineState(&inflight.pso);
-                        list.SetComputeRootUnorderedAccessView(
-                            2,
-                            work.differs.0.GetGPUVirtualAddress(),
-                        );
-                        list.SetComputeRootUnorderedAccessView(
-                            3,
-                            inflight.table.0.GetGPUVirtualAddress(),
-                        );
-                        list.SetComputeRootUnorderedAccessView(
-                            4,
-                            inflight.fetched.0.GetGPUVirtualAddress(),
-                        );
-                        let mut every = true;
-                        for r in plan.ranges.iter().filter(|r| r.compared) {
-                            let Some((_, Some(_), size)) = r.shadow.card_sides() else {
-                                every = false;
-                                continue;
-                            };
-                            let groups = r.span.pieces.clamp(1, 65535);
-                            let constants = [
-                                r.span.first,
-                                r.span.skew,
-                                size as u32,
-                                r.span.pieces,
-                                r.at * 4,
-                                inflight.landed,
-                                inflight.fetched.2,
-                                groups,
-                            ];
-                            list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                            list.SetComputeRootShaderResourceView(
-                                1,
-                                r.shadow.buffer.GetGPUVirtualAddress(),
-                            );
-                            list.Dispatch(groups, 1, 1);
-                        }
-                        plan.inflight = every;
-                        plan.inflight_landed = inflight.landed;
-                    }
-                    crate::gpucost::end(list);
-                    list.Close()?;
-                    list.cast()
-                })()
+            let keep = if checked.is_some() { early_keep } else { keep_of(&work.snap, flown) };
+            let (recorded, inflight) = match checked {
+                Some(done) => done,
+                None => record_check(work, &plan.ranges, keep, flown, &check),
             };
             match recorded {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!(
                     "the compare of host copies in the card's memory could not be recorded ({e})"
                 )),
+            }
+            if let Some((every, landed)) = inflight {
+                plan.inflight = every;
+                plan.inflight_landed = landed;
             }
             plan.snap = keep.map(|(_, base)| base);
             plan.lists.push((true, check));
@@ -1610,4 +1489,213 @@ impl Host {
         }
         true
     }
+}
+
+/// The compare's list recorded ([`record_check`]): the list, and with the
+/// fetch inside the flight, whether every range has it and the slots landed.
+type CheckRecorded = (windows::core::Result<ID3D12CommandList>, Option<(bool, u32)>);
+
+/// `card_before`'s compare ranges: each copy's declared ranges joined, each
+/// placed in the compare's results from `taken` on (moved past them).
+fn card_ranges(
+    declared: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    joined_decl: bool,
+    taken: &mut u32,
+    differs_bytes: u64,
+) -> Vec<CardRange> {
+    let mut at = *taken;
+    let mut out: Vec<CardRange> = Vec::new();
+    for (shadow, ranges) in declared {
+        let joined_here;
+        let spans: &[(usize, usize)] = if joined_decl {
+            ranges
+        } else {
+            let mut sorted = ranges.clone();
+            sorted.sort_unstable();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for (from, to) in sorted {
+                match spans.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => spans.push((from, to)),
+                }
+            }
+            joined_here = spans;
+            &joined_here
+        };
+        crate::card_prof::add(crate::card_prof::P::DeclOut, spans.len() as u64);
+        let twin = shadow
+            .card_sides()
+            .is_some_and(|(_, before, _)| before.is_some());
+        let mut run = crate::card_share::Run::new(crate::card_share::on() && !inflight_fetch());
+        for &(from, to) in spans {
+            let Some(span) = shadow.card_span(from, to) else {
+                continue;
+            };
+            let slot = twin
+                .then(|| run.slot(span.first, span.pieces, &mut at, differs_bytes / 4))
+                .flatten();
+            out.push(CardRange {
+                shadow: shadow.clone(),
+                declared: (from, to),
+                span,
+                at: slot.unwrap_or(at),
+                compared: slot.is_some(),
+            });
+        }
+    }
+    *taken = at;
+    out
+}
+
+/// The snapshot the compare keeps what it flags in, if it does, and the
+/// slots done with as read now.
+fn keep_of(snap: &Option<CardSnap>, flown: bool) -> Option<(&CardSnap, u32)> {
+    snap.as_ref()
+        .filter(|_| flown && !SNAP_OFF.load(Ordering::Acquire))
+        .map(|snap| (snap, SNAP_DONE.load(Ordering::Acquire)))
+}
+
+/// Records `card_before`'s compare of `ranges` into `check`.
+fn record_check(
+    work: &CardWork,
+    ranges: &[CardRange],
+    keep: Option<(&CardSnap, u32)>,
+    flown: bool,
+    check: &Prelude,
+) -> CheckRecorded {
+    use std::sync::Arc;
+    let (allocator, list) = check;
+    let mut inflight_out = None;
+    let mut t = crate::prep_cut::now();
+    // SAFETY: the list's last run finished (its submission was
+    // waited for, and it came back after that); live buffers; the
+    // compare's own root signature.
+    let recorded = unsafe {
+        (|| -> windows::core::Result<ID3D12CommandList> {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            crate::prep_cut::lap(crate::prep_cut::F::CheckOpen, &mut t);
+            crate::gpucost::begin(list, crate::gpucost::CARD_CHECK);
+            // What the submission's shaders wrote, first.
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+            match keep {
+                Some((snap, _)) => {
+                    list.SetComputeRootSignature(&snap.root);
+                    list.SetPipelineState(&snap.pso);
+                    list.SetComputeRootUnorderedAccessView(
+                        4,
+                        snap.buffer.GetGPUVirtualAddress(),
+                    );
+                }
+                None => {
+                    list.SetComputeRootSignature(&work.root);
+                    list.SetPipelineState(&work.pso);
+                }
+            }
+            let (snap_base, snap_slots, words) =
+                keep.map_or((0, 0, 6), |(snap, base)| (base, snap.slots, 8));
+            list.SetComputeRootUnorderedAccessView(
+                3,
+                work.differs.0.GetGPUVirtualAddress(),
+            );
+            let key = |r: &CardRange| {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                r.compared
+                    .then_some((copy, r.span.first, r.span.pieces, r.at))
+            };
+            for (i, first, pieces, at) in
+                crate::card_share::passes(ranges.iter().map(key))
+            {
+                let r = &ranges[i];
+                let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                    continue;
+                };
+                let constants = [
+                    first,
+                    r.span.skew,
+                    size as u32,
+                    pieces,
+                    at * 4,
+                    if flown { 2 } else { 1 },
+                    snap_base,
+                    snap_slots,
+                ];
+                list.SetComputeRoot32BitConstants(0, words, constants.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(
+                    1,
+                    r.shadow.buffer.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                list.Dispatch(pieces.min(65_535), 1, 1);
+                CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+            }
+            // The fetch inside the flight (`inflight_fetch`): behind
+            // every compare of the list, the pieces they flagged go
+            // to slots in the PC's memory.
+            if flown && let Some(inflight) = &work.inflight {
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                list.SetComputeRootSignature(&inflight.root);
+                list.SetPipelineState(&inflight.pso);
+                list.SetComputeRootUnorderedAccessView(
+                    2,
+                    work.differs.0.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    3,
+                    inflight.table.0.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    4,
+                    inflight.fetched.0.GetGPUVirtualAddress(),
+                );
+                let mut every = true;
+                for r in ranges.iter().filter(|r| r.compared) {
+                    let Some((_, Some(_), size)) = r.shadow.card_sides() else {
+                        every = false;
+                        continue;
+                    };
+                    let groups = r.span.pieces.clamp(1, 65535);
+                    let constants = [
+                        r.span.first,
+                        r.span.skew,
+                        size as u32,
+                        r.span.pieces,
+                        r.at * 4,
+                        inflight.landed,
+                        inflight.fetched.2,
+                        groups,
+                    ];
+                    list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                    list.SetComputeRootShaderResourceView(
+                        1,
+                        r.shadow.buffer.GetGPUVirtualAddress(),
+                    );
+                    list.Dispatch(groups, 1, 1);
+                }
+                inflight_out = Some((every, inflight.landed));
+            }
+            crate::gpucost::end(list);
+            crate::prep_cut::restart(&mut t);
+            list.Close()?;
+            crate::prep_cut::lap(crate::prep_cut::F::CheckClose, &mut t);
+            list.cast()
+        })()
+    };
+    (recorded, inflight_out)
 }

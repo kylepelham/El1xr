@@ -71,6 +71,7 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
     lap.mark(P::StaleWalk);
     if late_exact() {
         crate::card_prof::add(P::StaleCopies, spans.len() as u64);
+        crate::prep_cut::add(crate::prep_cut::F::StaleCopies, spans.len() as u64);
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
@@ -78,6 +79,19 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
         // (Neptune) Each copy on a thread of the refreshes' (`wide_refresh`), with the budget of
         // runs to itself: a copy's merge reads title memory and writes that copy alone, and
         // one after the other on the submitting thread they were a sixth of its time.
+        // (entryhitch) Below `VICTORY_STALE_WIDE_MIN` copies the caller merges
+        // them itself, as the threads would: a budget each, every copy merged.
+        if wide_refresh() && spans.len() >= 2 && spans.len() < crate::prep_cut::stale_wide_min() {
+            use crate::prep_cut::F;
+            crate::prep_cut::add(F::StaleSerial, spans.len() as u64);
+            let mut stale = false;
+            for (shadow, from, to) in &spans {
+                // As a kept thread's job runs it (wide work inside stays here).
+                stale |= crate::shadow::as_wide_job(|| merge_one(shadow, *from, *to));
+            }
+            lap.mark(P::StaleMerge);
+            return stale;
+        }
         if wide_refresh() && spans.len() >= 2 {
             let stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = spans
@@ -85,8 +99,7 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
                 .map(|(shadow, from, to)| {
                     let stale = stale.clone();
                     Box::new(move || {
-                        let mut runs_left = under_writes_runs();
-                        if shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                        if merge_one(&shadow, from, to) {
                             stale.store(true, Ordering::Relaxed);
                         }
                     }) as Box<dyn FnOnce() + Send>
@@ -106,6 +119,17 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans
         .iter()
         .any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+}
+
+/// One copy's merge under writes in `stale_under_flights`, with a budget
+/// of runs of its own: the job of a kept thread, or of the caller below
+/// `VICTORY_STALE_WIDE_MIN`. Whether a settle is still due.
+fn merge_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
+    let mut t = crate::prep_cut::now();
+    let mut runs_left = under_writes_runs();
+    let stale = shadow.merge_under_writes(from, to - from, &mut runs_left);
+    crate::prep_cut::lap(crate::prep_cut::F::StaleWork, &mut t);
+    stale
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -741,6 +765,7 @@ pub(super) fn late_line(frames: f64) {
         );
         flush::log(frames);
         crate::card_prof::log(frames);
+        crate::prep_cut::log(frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; the flights were settled all the same {:.1} times: {unwatched:.1} for memory \
