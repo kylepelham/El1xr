@@ -92,6 +92,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_IDLE_EVICT_WIDE", "Idle eviction also takes textures a table read only long ago."),
     ("VICTORY_JOINED_APART", "Returns changed ranges as they are when already in order and apart."),
     ("VICTORY_LDS_UNIFORM_STRICT", "Stricter check before treating a shared-memory read as wave-uniform."),
+    ("VICTORY_LIMIT_EXITS", "Plain-jump compute loops test their limit at their exits."),
     ("VICTORY_LOG", "Log filter, such as info or debug."),
     ("VICTORY_LOOPS_WAVE", "Translates wave64 compute loops so each host wave branches together."),
     ("VICTORY_LOOP_KEEP", "Loops cut at the iteration limit keep their result, not discarding."),
