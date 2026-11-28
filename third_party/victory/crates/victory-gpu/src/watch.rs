@@ -67,6 +67,8 @@ pub(crate) fn guard_split_log(frames: f64) {
     guard_split::log(frames);
 }
 pub(crate) mod empty_notice;
+pub(crate) mod alias_skip;
+mod claim_narrow;
 mod hole_marks;
 mod holes;
 pub(crate) mod ask_split;
@@ -663,30 +665,52 @@ thread_local! {
 /// the block's claim ([`Claims`] / [`ClaimOne`]).
 static BUSY: Bits = Bits::new();
 
+/// Takes `block`'s exclusive claim if it is free: its busy bit, and no fault holding it shared
+/// (`VICTORY_GUARD_CLAIM_NARROW`; none when the switch was never on).
+fn busy_try(block: usize) -> bool {
+    if !BUSY.try_set(block) {
+        return false;
+    }
+    if claim_narrow::shared(block) != 0 {
+        BUSY.clear(block);
+        return false;
+    }
+    true
+}
+
+/// Takes `block`'s exclusive claim, waiting: its busy bit first (no new shared holder comes in
+/// after it), then for the shared holders to go. Returns the spins.
+fn busy_wait(block: usize) -> u64 {
+    let mut tries = 0u32;
+    let spin = |tries: &mut u32| {
+        *tries += 1;
+        if *tries < 64 {
+            std::hint::spin_loop();
+        } else {
+            // Another thread's `VirtualProtect` of the block.
+            std::thread::yield_now();
+        }
+    };
+    while !BUSY.try_set(block) {
+        spin(&mut tries);
+    }
+    while claim_narrow::shared(block) != 0 {
+        spin(&mut tries);
+    }
+    u64::from(tries)
+}
+
 /// Single-block claim on [`BUSY`] with zero heap allocation (used on the
 /// unaliased write-fault fast path and [`publish`]).
 struct ClaimOne(usize);
 
 impl ClaimOne {
     fn wait(block: usize) -> Self {
-        if BUSY.try_set(block) {
+        if busy_try(block) {
             return Self(block);
         }
         let waiting = guard_split::start();
-        let mut spun = 0u64;
-        let mut tries = 0u32;
-        loop {
-            tries += 1;
-            spun += 1;
-            if tries < 64 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-            if BUSY.try_set(block) {
-                break;
-            }
-        }
+        let spun = busy_wait(block).max(1);
         port6_count(P6_CLAIM_SPINS, spun);
         guard_split::add(guard_split::S::ClaimWaits, 1);
         guard_split::finish(guard_split::S::ClaimWaitUs, waiting);
@@ -697,7 +721,7 @@ impl ClaimOne {
     fn try_get(block: usize) -> Option<Self> {
         // Not `then_some(Self(block))`: that builds the claim either way, and dropping the
         // unused one clears the bit of whoever holds the block (batch 5 part M's crash).
-        BUSY.try_set(block).then(|| Self(block))
+        busy_try(block).then(|| Self(block))
     }
 }
 
@@ -717,17 +741,7 @@ impl Claims {
         debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
         let mut spun = 0u64;
         for &block in blocks {
-            let mut tries = 0u32;
-            while !BUSY.try_set(block) {
-                tries += 1;
-                spun += 1;
-                if tries < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    // Another thread's `VirtualProtect` of the block.
-                    std::thread::yield_now();
-                }
-            }
+            spun += busy_wait(block);
         }
         if spun != 0 {
             port6_count(P6_CLAIM_SPINS, spun);
@@ -737,7 +751,7 @@ impl Claims {
 
     /// The claim of `block` if it is free; never waits.
     fn try_one(&mut self, block: usize) -> bool {
-        let got = BUSY.try_set(block);
+        let got = busy_try(block);
         if got {
             self.0.push(block);
         } else {
@@ -3896,6 +3910,12 @@ fn guard_shared(
                 if let Some((rf, rt)) = run.take() {
                     protect_claimed(&g, rf, rt, coalesce, alias_batch, &mut epochs);
                 }
+                if guard4k::on() && guard4k::runs() {
+                    let cut = (coalesce, alias_batch);
+                    close_protected_runs(&g, d, prot_end, cut, &mut now, &mut pages_only, &mut epochs);
+                    d = prot_end;
+                    continue;
+                }
                 for blk in d..prot_end {
                     let mut claims = Claims::none();
                     if claims.try_one(blk) && g.protected.contains(blk) && !g.clean.contains(blk) {
@@ -3979,6 +3999,51 @@ fn guard_shared(
     (written, epochs)
 }
 
+/// (#88) `VICTORY_GUARD_4K_RUNS`: the protected blocks `[from, to)` of a guard walk, claimed
+/// together, their open 4 KiB pages closed in runs over neighbouring blocks
+/// ([`guard4k::close_many`]), then each noted as the walk's block-by-block form does.
+fn close_protected_runs(
+    g: &Guards,
+    from: usize,
+    to: usize,
+    (coalesce, alias_batch): (bool, bool),
+    now: &mut dyn FnMut() -> u64,
+    pages_only: &mut Vec<usize>,
+    epochs: &mut Vec<(usize, usize, u64)>,
+) {
+    let mut claims = Claims::none();
+    let (mut held, mut blocks) = (Vec::new(), Vec::new());
+    for blk in from..to {
+        if claims.try_one(blk) && g.protected.contains(blk) {
+            held.push(blk);
+            if !g.clean.contains(blk) {
+                blocks.push(blk);
+            }
+        }
+    }
+    let closed = guard4k::close_many(&blocks, |b| held.binary_search(&b).is_ok(), now);
+    for (&blk, closed) in blocks.iter().zip(closed) {
+        match closed {
+            guard4k::Closed::Failed => continue,
+            guard4k::Closed::Pages { only: true } => pages_only.push(blk),
+            guard4k::Closed::Kept => unreachable!("not with VICTORY_GUARD_4K_KEEP"),
+            guard4k::Closed::Pages { only: false } | guard4k::Closed::None => {}
+        }
+        let uncovered = if view_guard() {
+            cover_aliases_claimed(g, blk, blk + 1, coalesce, alias_batch, &mut claims)
+        } else {
+            Vec::new()
+        };
+        if uncovered.is_empty() {
+            g.clean.insert(blk);
+            let ep = clean_set(blk, true);
+            if ep != 0 {
+                epochs.push((blk, blk + 1, ep));
+            }
+        }
+    }
+}
+
 /// [`protect`] of `[from, to)` under shared `GUARDS.read()`: claims every
 /// free block via `try_one` and protects each claimed run together with its
 /// alias views (leaving any contended block unguarded for the next asking).
@@ -3992,17 +4057,25 @@ fn protect_claimed(
 ) {
     let mut claims = Claims::none();
     let mut start = None;
+    // (#88) `VICTORY_GUARD_CLAIM_NARROW`: each finished part let go of at once.
+    let narrow = claim_narrow::on();
     for block in from..to {
         if claims.try_one(block) {
             if g.clean.contains(block) || g.absent.contains(block) {
                 if let Some(s) = start.take() {
                     protect_run_claimed(g, s, block, coalesce, alias_batch, epochs, &mut claims);
                 }
+                if narrow {
+                    claims = Claims::none();
+                }
             } else {
                 start.get_or_insert(block);
             }
         } else if let Some(s) = start.take() {
             protect_run_claimed(g, s, block, coalesce, alias_batch, epochs, &mut claims);
+            if narrow {
+                claims = Claims::none();
+            }
         }
     }
     if let Some(s) = start {
@@ -4089,6 +4162,9 @@ fn cover_aliases_claimed_untimed(
     alias_batch: bool,
     claims: &mut Claims,
 ) -> Vec<usize> {
+    if alias_skip::skip(from, to) {
+        return Vec::new();
+    }
     if alias_batch {
         let (sources, all_aliased, peers) =
             crate::inplace::aliases_in_range(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK));
@@ -4444,6 +4520,9 @@ fn note_protected(g: &Guards, from: usize, to: usize, mark_clean: bool) -> u64 {
         absent_set_range(from, to, ABSENT_NONE);
     }
     guard4k::ready(from, to);
+    if guard4k::on() {
+        claim_narrow::ready(from, to);
+    }
     g.protected.insert_range(from, to);
     PROTECTED.set_range(from, to);
     VIEWS.set_range(from, to);
@@ -4866,6 +4945,21 @@ fn open_faulted_untimed(at: usize) -> (usize, bool) {
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
     guard_split::add(guard_split::S::FaultLockUs, waited.as_micros() as u64);
+    // (#88) `VICTORY_GUARD_CLAIM_NARROW`: a 4 KiB page alone under the block's shared claim.
+    if guard4k::on()
+        && claim_narrow::on()
+        && let Some(_shared) = claim_narrow::SharedClaim::wait(block, || BUSY.any(block, block + 1))
+    {
+        if !g.protected.contains(block) {
+            return (0, writable(at));
+        }
+        if !g.aliased.contains(block)
+            && let Some(answer) = guard4k::fault(&g, block, at)
+        {
+            return answer;
+        }
+        claim_narrow::upgraded();
+    }
     // Zero-allocation fast path for the common single-block unaliased fault.
     {
         let _claim = ClaimOne::wait(block);

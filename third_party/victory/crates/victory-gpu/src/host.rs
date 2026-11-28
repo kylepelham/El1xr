@@ -9249,6 +9249,8 @@ pub(crate) mod send_thread;
 mod card_rec;
 #[path = "host_one_pass.rs"]
 mod one_pass;
+#[path = "host_pass_order.rs"]
+mod pass_order;
 #[path = "host_step_reads.rs"]
 mod step_reads;
 #[path = "host_run_split.rs"]

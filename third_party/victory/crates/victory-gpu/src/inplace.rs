@@ -403,7 +403,14 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
-            v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
+            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
+            shown.push(at + k * K64);
+            // (#88) The guards' lock-free alias bits (`VICTORY_GUARD_ALIAS_SKIP`).
+            match shown.len() {
+                n if (2..=crate::watch::MANY_VIEWS).contains(&n) => crate::watch::alias_skip::note(shown, true),
+                n if n == crate::watch::MANY_VIEWS + 1 => crate::watch::alias_skip::note(shown, false),
+                _ => {}
+            }
         }
     }
     // This view is writable from now on: a guard over the same bytes at
@@ -435,6 +442,8 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             if let Some(pages) = v.pages.get_mut(&key) {
                 let page = base + k * K64;
                 pages.retain(|&shown| shown != page);
+                crate::watch::alias_skip::note(&[page], false);
+                crate::watch::alias_skip::note(pages, (2..=crate::watch::MANY_VIEWS).contains(&pages.len()));
                 if pages.is_empty() {
                     v.pages.remove(&key);
                 }
