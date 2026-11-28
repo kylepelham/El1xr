@@ -7,8 +7,8 @@
 use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Graphics::Gdi::*;
 
-use super::layout::{Layout, Rect};
-use super::model::{Apply, Kind, MenuModel};
+use super::layout::{ABOUT_LINES, Layout, Rect};
+use super::model::{Apply, Info, Kind, MenuModel};
 use super::state::{Menu, Row, selectable, shown};
 use crate::pixels::Bitmap;
 
@@ -178,6 +178,24 @@ impl Text {
         (size.cx, size.cy)
     }
 
+    /// `text` in lines of whole words no wider than `width` (a longer word keeps a line of its own).
+    fn wrap(&self, font: usize, text: &str, width: i32) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut line = String::new();
+        for word in text.split_whitespace() {
+            let longer = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if line.is_empty() || self.measure(font, &longer).0 <= width {
+                line = longer;
+            } else {
+                lines.push(std::mem::replace(&mut line, word.to_string()));
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
+    }
+
     /// `text` cut with an ellipsis to fit `width`.
     fn fit(&self, font: usize, text: &str, width: i32) -> String {
         if self.measure(font, text).0 <= width {
@@ -299,6 +317,41 @@ impl Drop for Text {
                 DeleteDC(self.dc);
             }
         }
+    }
+}
+
+/// The line under a setting's label: what it gives (`detail`) or its help, then the switch's
+/// name for experts only (players read the label and the line).
+pub(super) fn setting_line(info: &Info, model: &dyn MenuModel, expert: bool) -> String {
+    let detail = model.detail(info.name);
+    match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
+        (help, true) => help.to_string(),
+        ("", false) => info.name.to_string(),
+        (help, false) if expert => format!("{help}   {}", info.name),
+        (help, false) => help.to_string(),
+    }
+}
+
+/// The selected row's whole description for the band under the list: a setting's full help
+/// (its line when it has none) and its switch's name for experts, a preset's help.
+pub(super) fn about(row: Row, model: &dyn MenuModel, expert: bool) -> String {
+    match row {
+        Row::Setting(i) => {
+            let info = &model.infos()[i];
+            let help = match info.help {
+                "" => model.detail(info.name).unwrap_or_default(),
+                help => help.to_string(),
+            };
+            match (help.is_empty(), expert && info.label != info.name) {
+                (_, false) => help,
+                (true, true) => info.name.to_string(),
+                (false, true) => format!("{help}   {}", info.name),
+            }
+        }
+        Row::Preset(p) => model.presets()[p].help.to_string(),
+        Row::Save => "Writes every changed value to the settings file; changes that apply at the next start are written as soon as they are made.".into(),
+        Row::Undo => "Every setting changed while running back to its launch value.".into(),
+        Row::Heading(_) => String::new(),
     }
 }
 
@@ -436,6 +489,21 @@ impl Painter {
             };
             fill(&mut bm, thumb, 0.0, 255, DIM);
         }
+        // The selected row's whole description, wrapped under the list.
+        if let Some(&row) = rows.get(menu.selected) {
+            let a = l.about;
+            rule(&mut bm, l, a.x, a.y, a.w, RULE);
+            let text = about(row, model, menu.expert);
+            let line_h = t.measure(HELP, "Ag").1;
+            let mut lines = t.wrap(HELP, &text, a.w);
+            if lines.len() > ABOUT_LINES {
+                let rest = lines.split_off(ABOUT_LINES - 1).join(" ");
+                lines.push(t.fit(HELP, &rest, a.w));
+            }
+            for (k, line) in lines.iter().enumerate() {
+                t.draw(&mut bm, HELP, line, a.x, a.y + px(10.0) + k as i32 * line_h, SOFT);
+            }
+        }
         // Footer: hints, then the last change's outcome at the right.
         let f = l.footer;
         rule(&mut bm, l, f.x + pad, f.y, f.w - 2 * pad, RULE);
@@ -477,15 +545,7 @@ impl Painter {
                     _ => (value, true),
                 };
                 self.value(bm, l, l.value(r), info.name, info.kind, &value, selected, chosen);
-                // The switch's name only for experts: players read the label and the line.
-                let detail = model.detail(info.name);
-                let help = match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
-                    (help, true) => help.to_string(),
-                    ("", false) => info.name.to_string(),
-                    (help, false) if expert => format!("{help}   {}", info.name),
-                    (help, false) => help.to_string(),
-                };
-                (info.label.to_string(), help)
+                (info.label.to_string(), setting_line(&info, model, expert))
             }
             Row::Preset(p) => {
                 let preset = model.presets()[p];
@@ -612,5 +672,75 @@ fn short_path(path: &std::path::Path) -> String {
             format!("%LOCALAPPDATA%{}", &full[base.len()..])
         }
         _ => full,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::model::{Registry, registry_lock};
+    use super::super::state::{Tab, rows, tabs};
+    use super::*;
+
+    /// What would be cut at `w` x `h` on every tab, the expert one too: a label wider than its
+    /// room, a Display row's line wider than its room (players read those in the row), and a
+    /// description longer than the band under the list.
+    fn cut(w: i32, h: i32) -> Vec<String> {
+        let model = Registry::default();
+        let mut menu = Menu::default();
+        let all = tabs(&model, true);
+        let l = super::super::layout::layout(w, h, &mut menu, &all, 6, &|_| false, false);
+        let text = Text::new(l.s).expect("fonts");
+        let r = l.rows[0].1;
+        let x = r.x + l.px(16.0);
+        let room = l.badge(r).x - l.px(16.0) - x;
+        let mut cut = Vec::new();
+        for tab in all {
+            for row in rows(&model, tab, true) {
+                let name = match row {
+                    Row::Setting(i) => model.infos()[i].name.to_string(),
+                    Row::Preset(p) => model.presets()[p].name.to_string(),
+                    _ => format!("{row:?}"),
+                };
+                let mut wide = |font: usize, what: &str, s: &str, room: i32| {
+                    let px = text.measure(font, s).0;
+                    if px > room {
+                        cut.push(format!("{w}x{h} {} {name} {what} +{}px: {s}", tab.title(), px - room));
+                    }
+                };
+                if let Row::Setting(i) = row {
+                    let info = &model.infos()[i];
+                    wide(LABEL, "label", info.label, room);
+                    if tab == Tab::DISPLAY && !info.expert {
+                        wide(HELP, "line", &setting_line(info, &model, false), room);
+                    }
+                }
+                for expert in [false, true] {
+                    let lines = text.wrap(HELP, &about(row, &model, expert), l.about.w);
+                    if lines.len() > ABOUT_LINES {
+                        cut.push(format!("{w}x{h} {} {name} about: {} lines", tab.title(), lines.len()));
+                    }
+                }
+            }
+        }
+        cut
+    }
+
+    #[test]
+    fn nothing_is_cut_at_1080_or_1440() {
+        let _lock = registry_lock();
+        let cut: Vec<String> = [(1920, 1080), (2560, 1440)].iter().flat_map(|&(w, h)| cut(w, h)).collect();
+        assert!(cut.is_empty(), "{} cut:\n{}", cut.len(), cut.join("\n"));
+    }
+
+    #[test]
+    fn wrapping_keeps_whole_words_within_the_width() {
+        let text = Text::new(1.0).expect("fonts");
+        let s = "the selected row's whole description, wrapped under the list in whole words";
+        let width = text.measure(HELP, "the selected row's whole").0;
+        let lines = text.wrap(HELP, s, width);
+        assert!(lines.len() > 2);
+        assert_eq!(lines.join(" "), s);
+        assert!(lines.iter().all(|l| text.measure(HELP, l).0 <= width), "{lines:?}");
+        assert!(text.wrap(HELP, "", width).is_empty());
     }
 }
