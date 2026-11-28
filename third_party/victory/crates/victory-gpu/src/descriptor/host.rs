@@ -2651,6 +2651,38 @@ impl HostHeap {
             .collect()
     }
 
+    /// (El1xr) [`HostHeap::slots_showing`] for `crate::resource::idle_sweep`: every slot
+    /// showing one of the host textures `raws`, as (index, raw, its kind).
+    pub(crate) fn slots_by_class(
+        &self,
+        raws: &std::collections::HashSet<usize>,
+        frame: u64,
+    ) -> Vec<(u32, usize, super::SlotClass)> {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                // (A lock to a slot: see `kept`.)
+                let raw = {
+                    let r = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    windows::core::Interface::as_raw(r.as_ref()?) as usize
+                };
+                raws.contains(&raw).then(|| {
+                    let i = i as u32;
+                    let title = i < self.count && !self.sampler;
+                    let class = if title && self.tabled_lately(i, frame) {
+                        super::SlotClass::Lately
+                    } else if title && tabled_out() && self.tabled_stamp(i) != 0 {
+                        super::SlotClass::Earlier
+                    } else {
+                        super::SlotClass::Never
+                    };
+                    (i, raw, class)
+                })
+            })
+            .collect()
+    }
+
     /// This heap, for `view_ages`.
     fn ages_key(&self) -> usize {
         std::ptr::from_ref(self) as usize

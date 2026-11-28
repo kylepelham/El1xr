@@ -30,6 +30,8 @@ mod commitline;
 mod poolslack;
 #[cfg(windows)]
 mod staging_hold;
+#[cfg(windows)]
+mod idle_evict;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
