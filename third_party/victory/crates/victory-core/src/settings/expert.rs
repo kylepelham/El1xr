@@ -302,6 +302,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_SAVE_OP", Apply::Restart),
     ("VICTORY_SAVE_STOP", Apply::Restart),
     ("VICTORY_SCC_LOCAL_ANY", Apply::Retranslate),
+    ("VICTORY_SCENE_INPUT_MORE", Apply::Restart),
     ("VICTORY_SCENE_INPUT_TOTAL_MS", Apply::Live),
     ("VICTORY_SCENE_INPUT_WAIT_MS", Apply::Live),
     ("VICTORY_SCISSOR_TEST", Apply::Restart),
