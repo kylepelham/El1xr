@@ -147,7 +147,10 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
 /// BRDF, area-light and scattering tables, and by container name every
 /// permutation of the head/skin decoration bakes and of `CS_CompressBC`,
 /// which block-compresses what they baked (dropped once, the face samples
-/// zero for the run).
+/// zero for the run), and the head blend-shape map
+/// `CS_ComputeBlendshapeMappings` (compute `61e54e90adccaf6a`, after
+/// TaynanGT/Vice-Tay #372 3e3fd57: dispatched before its pipeline exists,
+/// the face map is never built; a 4090 measured it 29.8 s late).
 fn scene_input_named(stage: &str, hash: &str, container: &[u8], more: bool) -> bool {
     const RUN_ONCE: [&[u8]; 3] = [b"BakeDecorations", b"DecorationBlend", b"CS_CompressBC"];
     matches!(
@@ -161,6 +164,7 @@ fn scene_input_named(stage: &str, hash: &str, container: &[u8], more: bool) -> b
     ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&hash)
         || (more
             && ((stage == "vertex" && hash == "ce57291b5a1750ca")
+                || (stage == "compute" && hash == "61e54e90adccaf6a")
                 || RUN_ONCE.iter().any(|name| container.windows(name.len()).any(|w| w == *name))))
 }
 
@@ -1316,6 +1320,7 @@ mod tests {
         let compress = b"\x00CS_CompressBC_BC7_Wrapped\x00";
         for more in [false, true] {
             assert_eq!(scene_input_named("vertex", "ce57291b5a1750ca", b"", more), more);
+            assert_eq!(scene_input_named("compute", "61e54e90adccaf6a", b"", more), more);
             assert_eq!(scene_input_named("pixel", "0123456789abcdef", blend, more), more);
             assert_eq!(scene_input_named("pixel", "0123456789abcdef", bake, more), more);
             assert_eq!(scene_input_named("compute", "0123456789abcdef", compress, more), more);
