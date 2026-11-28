@@ -31,6 +31,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+mod poll_wait;
 mod scratch;
 mod timing;
 use timing::{Phase, mark};
@@ -363,8 +364,19 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
+///
+/// `VICTORY_DSTORAGE_POLL_WAIT`: a poll in that loop waits for the entry
+/// ([`poll_wait`]).
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+    if poll_wait::mode().is_none() {
+        return status_result(this, index) != E_PENDING;
+    }
+    // SAFETY: an array we created and the title still holds.
+    let entries = &unsafe { &*this }.state.entries;
+    let Some(entry) = entries.get(index as usize) else {
+        return true;
+    };
+    poll_wait::poll(this as usize, index, entry, |e| e.load(Ordering::Acquire) == E_PENDING)
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -788,6 +800,7 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            poll_wait::written(status.array as usize, status.index);
         }
     }
 }

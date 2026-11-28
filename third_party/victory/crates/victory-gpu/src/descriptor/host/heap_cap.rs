@@ -166,6 +166,12 @@ pub(crate) fn remap_root(list: &crate::host::HostList, host: &super::HostHeap) -
     super::heap_remap::root(list, host)
 }
 
+/// The `=3` readiness of packed views, once a frame from `draw.rs`
+/// `heap_buffers` ([`super::heap_remap::ready_pass`]).
+pub(crate) fn ready_packed(host: &super::HostHeap, ready: impl FnMut(&super::super::View) -> u64) {
+    super::heap_remap::ready_pass(host, ready);
+}
+
 /// Counts of title slots past the host heap since the last line: views
 /// made there, their lowest and highest slot.
 static MADE: [AtomicU64; 1] = [AtomicU64::new(0)];

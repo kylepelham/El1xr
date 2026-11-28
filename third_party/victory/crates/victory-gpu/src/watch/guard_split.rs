@@ -163,6 +163,8 @@ pub(super) fn log(frames: f64) {
     }
     let s: Vec<u64> = STATS.iter().map(|a| a.swap(0, Relaxed)).collect();
     let marks = super::hole_marks::STATS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+    let alias = super::alias_skip::STATS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+    let narrow = super::claim_narrow::STATS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
     let ms = |p: S| s[p as usize] as f64 / (frames * 1000.0);
     let per = |p: S| s[p as usize] as f64 / frames;
     let mut excl = String::new();
@@ -189,10 +191,12 @@ pub(super) fn log(frames: f64) {
          {:.0} answered there; their hole queries {:.0} in {:.2} ms; holes kept {:.0}, \
          VICTORY_GUARD_HOLES_KEPT={}; hole marks {:.0} answered, {:.0} queries, {:.0} runs marked, \
          {:.0} free left unmarked, {:.0} lost to a commit told meanwhile, VICTORY_GUARD_HOLE_MARKS={}); \
-         walk {:.2} ms (alias lookups {:.2} ms; its VirtualProtects are the split line's); \
+         walk {:.2} ms (alias lookups {:.2} ms, {:.0} answered without the views' lock, {:.0} took it, \
+         VICTORY_GUARD_ALIAS_SKIP={}; its VirtualProtects are the split line's); \
          noting after it {:.2} ms (publish {:.2} ms, {:.1} blocks left unpublished, \
          VICTORY_GUARD_PUBLISH_TRY={}); VirtualQuery {:.0} in {:.2} ms (all threads); \
-         claims waited for {:.0} in {:.2} ms (faults and publish); \
+         claims waited for {:.0} in {:.2} ms (faults and publish; {:.0} faults held a block shared, {:.0} of them \
+         beside another, {:.0} took it whole after, VICTORY_GUARD_CLAIM_NARROW={}); \
          faults {:.0} handled in {:.2} ms (waiting for the shared lock {:.2} ms); \
          held alone {:.1} times, {:.2} ms waiting, {:.2} ms held{}",
         u8::from(note_once()),
@@ -213,6 +217,9 @@ pub(super) fn log(frames: f64) {
         super::hole_marks::mode(),
         ms(S::WalkUs),
         ms(S::AliasUs),
+        alias[0],
+        alias[1],
+        u8::from(super::alias_skip::on()),
         ms(S::NoteUs),
         ms(S::PublishUs),
         per(S::PublishSkipped),
@@ -221,6 +228,10 @@ pub(super) fn log(frames: f64) {
         ms(S::QueryUs),
         per(S::ClaimWaits),
         ms(S::ClaimWaitUs),
+        narrow[0],
+        narrow[1],
+        narrow[2],
+        u8::from(super::claim_narrow::on()),
         per(S::FaultCalls),
         ms(S::FaultUs),
         ms(S::FaultLockUs),

@@ -585,6 +585,8 @@ pub(crate) struct State {
     /// avoid per-draw heap allocations.
     scratch_made: Vec<(u8, u32)>,
     scratch_selected: Vec<u32>,
+    /// (`VICTORY_ROOT_VIEW_MEMO`) Root views bound and refreshed in the list.
+    root_memo: crate::root_memo::RootMemo<std::sync::Arc<crate::shadow::Shadow>>,
     /// (`VICTORY_TABLE_VIEWS_ONCE`) The views of the table being made, looked up together.
     table_views: crate::descriptor::views_once::TableViews,
     scratch_textures: Vec<usize>,
@@ -973,6 +975,7 @@ impl Drop for BindLap {
 /// With the frame line: [`BIND_NS`] per frame over `frames`, taken.
 pub(crate) fn bind_split_line(frames: f64) {
     crate::table_prof::line(frames);
+    crate::root_memo::stats::line(frames);
     crate::descriptor::host::mirror_known::line(frames);
     if !bind_split() {
         return;
@@ -1148,6 +1151,41 @@ pub(crate) fn dispatched() -> u64 {
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+    root_view_found(list, address, srv).map(|(gpu, _)| gpu)
+}
+
+/// [`root_view`] through the title list's memo (`VICTORY_ROOT_VIEW_MEMO=1`, `crate::root_memo`).
+fn root_view_memo(
+    memo: &mut crate::root_memo::RootMemo<std::sync::Arc<crate::shadow::Shadow>>,
+    list: &HostList,
+    address: u64,
+    srv: bool,
+) -> Option<u64> {
+    if !crate::root_memo::on() {
+        return root_view(list, address, srv);
+    }
+    let at = (
+        (std::ptr::from_ref(list) as usize, list.changes.load(Ordering::Relaxed)),
+        crate::shadow::shape(),
+    );
+    if let Some((gpu, shadow)) = memo.view(at, address, srv) {
+        shadow.touch();
+        return Some(gpu);
+    }
+    let (gpu, shadow) = root_view_found(list, address, srv)?;
+    if let Some(shadow) = shadow {
+        memo.note_view(at, address, srv, gpu, shadow);
+    }
+    Some(gpu)
+}
+
+/// [`root_view`], with the copy it brought up to date when another bind of the same address may
+/// skip both (not a root CBV copied into scratch memory).
+fn root_view_found(
+    list: &HostList,
+    address: u64,
+    srv: bool,
+) -> Option<(u64, Option<std::sync::Arc<crate::shadow::Shadow>>)> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -1160,16 +1198,16 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
-        return Some(gpu);
+        return Some((gpu, Some(shadow)));
     }
     if let Some((_, gpu)) = crate::card_constants::snapshot(list, address, len) {
-        return Some(gpu);
+        return Some((gpu, None));
     }
     static REUSE_ROOT_CBV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let reuse = *REUSE_ROOT_CBV
         .get_or_init(|| std::env::var_os("VICTORY_REUSE_ROOT_CBV").is_some_and(|v| v == "1"));
     let (gpu, _) = list.fill_root_cbv(address as *const u8, len, reuse)?;
-    Some(gpu)
+    Some((gpu, None))
 }
 
 macro_rules! once {
@@ -1257,6 +1295,7 @@ impl State {
             scratch_selected,
             scratch_textures,
             table_views,
+            root_memo,
             fresh_tables,
             recording,
             ready_tables,
@@ -1321,6 +1360,7 @@ impl State {
         scratch_made.clear();
         scratch_selected.clear();
         table_views.clear();
+        root_memo.clear();
         scratch_textures.clear();
         fresh_tables.clear();
         if fresh_tables.capacity() > 4096 {
@@ -2322,7 +2362,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = root_view_memo(&mut self.root_memo, list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -2617,7 +2657,13 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
+            let len = s.left(*a);
+            let at = (std::ptr::from_ref(list) as usize, list.changes.load(Ordering::Relaxed));
+            if !(crate::root_memo::on()
+                && self.root_memo.refreshed(at, std::sync::Arc::as_ptr(s) as usize, *a, len))
+            {
+                s.refresh(list, *a, len);
+            }
         }
         let handle = host.gpu_handle(index);
         self.bind_resource(list, compute, param, RootResource::Table(handle.ptr));
@@ -2850,6 +2896,9 @@ impl State {
             let _hitch = crate::hitch::span(crate::hitch::Phase::HeapTextures);
             self.heap_textures(list, heap, host);
         }
+        // (heapcap, `VICTORY_HEAP_CAP=3`) Title slots past the capped host heap, packed: readied
+        // as the slots above are, then shown in the remap table.
+        crate::descriptor::host::heap_cap::ready_packed(host, |view| ready_packed(list, view));
         HEAP_PASS_PARTS[0].fetch_add(
             textures_began.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -6193,6 +6242,29 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 fn ready_tables_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_READY_TABLES").is_none_or(|v| v != "0"))
+}
+
+/// (heapcap) Readies a packed view as `heap_textures` readies a slot: the
+/// upload of a texture (its staging buffer let go after, unless a table
+/// draw staged it already) or the copy of a buffer's range. The bytes it
+/// staged.
+fn ready_packed(list: &HostList, view: &View) -> u64 {
+    let placed = crate::descriptor::host::placed_texture(view);
+    let resource = match placed.as_ref().unwrap_or(view) {
+        View::Shader(resource, _) => Some(*resource as This),
+        _ => None,
+    };
+    let tabled = resource.is_some_and(crate::texture::is_staged);
+    readable(list, ResourceType::Srv, view);
+    let Some(resource) = resource.filter(|_| !tabled) else {
+        return 0;
+    };
+    let Some((bytes, _)) = crate::texture::staged(resource) else {
+        return 0;
+    };
+    crate::table_null::unstaged(resource as usize, crate::table_null::Why::Pass);
+    crate::texture::unstage(resource);
+    bytes
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
