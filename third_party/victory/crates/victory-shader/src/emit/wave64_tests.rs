@@ -623,6 +623,87 @@ fn a_branch_on_a_masks_scc_is_the_waves_and_its_arms_keep_their_guards() {
     }
 }
 
+/// `ptfx_CS_lightAtlas_Sprite`'s light loop (`2561af9577c47289`) in small: the threads below s0
+/// enter it behind `s_cbranch_execz`, count rounds in s2 and v2, and leave on `s_cbranch_vccz`
+/// once a vector compare finds the round equal to s1 (v3, which the structure cannot see is the
+/// same in every lane); then each stores its count.
+fn vcc_closed_loop() -> NativeProgram {
+    native(&[
+        0xBF8C_0000, // s_waitcnt 0 for the descriptor
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz to the restore
+        0x2C06_0086, // v_lshrrev_b32 v3, 6, v0 (0 in every thread)
+        0x4A06_0601, // v_add_nc_u32 v3, s1, v3
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x8002_8102, // s_add_u32 s2, s2, 1 (the loop)
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D84_0602, // v_cmp_eq_u32 vcc, s2, v3
+        0xBF86_FFFC, // s_cbranch_vccz to the loop
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ])
+}
+
+/// `VICTORY_LANE_MASK_WIDE=1` takes the loop's closing `s_cbranch_vccz` for the wave. The form
+/// that takes it so leaves the entry's skip out and puts the two host waves' exchange of that
+/// decision into the loop, where a console wave with no thread below s0 never sets VCC and
+/// goes round for ever (batch 5 part J: device removed on `2561af9577c47289`). Such a program
+/// keeps the per-lane form, the one the switch off gives; that one ends on the card, with no
+/// thread in the loop and with some.
+#[test]
+fn a_wave_wide_loop_exit_that_puts_a_barrier_in_the_loop_keeps_the_per_lane_form() {
+    let native = vcc_closed_loop();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let translate = |on: bool| {
+        let was = crate::lane_split::TEST_LANE_MASK_WIDE.replace(Some(on));
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let host = lower::TEST_HOST_WAVE.replace(Some(32));
+        let r = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(host);
+        crate::lane_split::TEST_LANE_MASK_WIDE.set(was);
+        (st.wide.len(), r.expect("translates"))
+    };
+    let (wide_off, off) = translate(false);
+    let (wide_on, on) = translate(true);
+    assert_eq!(wide_off, 0);
+    assert!(wide_on > 0, "on, the loop's closing branch is the wave's");
+    // the wave-wide form alone: the skip left out, and a barrier of the translator's in the loop
+    let form = ir::without_skips(&p, false).expect("removable EXEC skip");
+    let was = crate::lane_split::TEST_LANE_MASK_WIDE.replace(Some(true));
+    let (wide_form, looped) = crate::lane_split::watch(
+        || lowered(&native, &form, &HashSet::new()).map(|s| (s, None)),
+        |s: &HostShader| &s.dxil,
+    );
+    crate::lane_split::TEST_LANE_MASK_WIDE.set(was);
+    let wide_form = wide_form.expect("the wave-wide form lowers").0;
+    assert!(looped, "the wave-wide form exchanges the loop's decision inside the loop");
+    assert_ne!(wide_form.dxil, off.dxil);
+    assert_eq!(on.dxil, off.dxil, "on, the program keeps the per-lane form");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = on.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (below, rounds) in [(0u32, 3u32), (40, 3), (64, 1), (10, 7)] {
+        let Some(out) = whole_uav(&on, [below, rounds], 64) else {
+            return;
+        };
+        let want: Vec<u32> = (0..64).map(|t| if t < below { rounds } else { 0 }).collect();
+        assert_eq!(out, want, "{below} threads in the loop, {rounds} rounds");
+    }
+}
+
 /// A 64-bit mask the program does not track (s[0:1], root constants), read as a number by a
 /// select, in a console wave of 64 run as two host waves of 32 (the DPP move makes it take the
 /// console's lanes, so the halves form): each lane takes its own bit, lanes 32-63 the high

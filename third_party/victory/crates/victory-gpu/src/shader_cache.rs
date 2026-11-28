@@ -215,11 +215,20 @@ pub fn wave_pairs_vt_listed(container: &[u8]) -> bool {
 }
 
 /// [`translate_container`], for a container [`allow_wave_pairs_vt`] names inside
-/// `with_wave_pairs_vt`, with one log line saying what the paired form made of it.
+/// `with_wave_pairs_vt`, with one log line saying what the paired form made of it. A container
+/// [`allow_wave_pairs`] names is translated with `VICTORY_LANE_MASK_WIDE` off: the paired form
+/// is what keeps those programs from hanging the card, and the switch changed them.
 fn translate_vt(container: &[u8], wide: bool, pairs: bool, vt: bool) -> Result<HostShader, String> {
-    victory_shader::emit::with_rays_missed(crate::rt_hit_only::misses(container), || {
-        translate_paired_vt(container, wide, pairs, vt)
-    })
+    let translate = || {
+        victory_shader::emit::with_rays_missed(crate::rt_hit_only::misses(container), || {
+            translate_paired_vt(container, wide, pairs, vt)
+        })
+    };
+    if pairs {
+        victory_shader::emit::without_lane_mask_wide(translate)
+    } else {
+        translate()
+    }
 }
 
 /// [`translate_vt`] inside `VICTORY_RT_HIT_ONLY`'s choice.

@@ -442,6 +442,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// `f` (translations) with `VICTORY_LANE_MASK_WIDE` off on this thread: the runtime gives the
+/// programs it pairs (`VICTORY_WAVE_PAIRS_ONLY`) the structure as before ([`crate::lane_split`]).
+pub fn without_lane_mask_wide<R>(f: impl FnOnce() -> R) -> R {
+    crate::lane_split::per_lane(f)
+}
+
 /// Runs `f` as on a host whose widest wave has `lanes` lanes, on this
 /// thread only (tests outside this module that translate for both kinds of
 /// host).
@@ -545,8 +551,14 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let first = emit_any_once(c, native, p, st, io, res);
-    crate::lane_split::again(first, st.wide.len(), lower::host_max_wave(), || {
+    // (a program whose wave-wide form puts a group barrier of the translator's into a loop
+    // keeps the per-lane form as well)
+    let (first, looped) = if st.wide.is_empty() {
+        (emit_any_once(c, native, p, st, io, res), false)
+    } else {
+        crate::lane_split::watch(|| emit_any_once(c, native, p, st, io, res), |s| &s.dxil)
+    };
+    crate::lane_split::again(first, st.wide.len(), looped, lower::host_max_wave(), || {
         let per_lane = || {
             let st = structure::structure(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
