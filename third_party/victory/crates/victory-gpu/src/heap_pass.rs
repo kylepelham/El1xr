@@ -98,6 +98,11 @@ pub(crate) struct Picked<C> {
     scan_every: u64,
     /// Number of passes across which periodic full rescans are sliced (1: all at once).
     rescan_slices: u64,
+    /// The last plan forgot all and looked at every slot.
+    last_all: bool,
+    /// The incremental pass's looks at every slot keep what they know
+    /// (`VICTORY_HEAP_NET_IN_PLACE`): [`Picked::look_at_all`].
+    net_in_place: bool,
 }
 
 impl<C: Clone> Picked<C> {
@@ -120,7 +125,44 @@ impl<C: Clone> Picked<C> {
             full,
             scan_every: scan_every.max(1),
             rescan_slices: rescan_slices.clamp(1, 1024),
+            last_all: false,
+            net_in_place: false,
         }
+    }
+
+    /// Whether the incremental pass's looks at every slot keep what they
+    /// know instead of forgetting it first ([`Picked::look_at_all`]).
+    pub(crate) fn set_net_in_place(&mut self, on: bool) {
+        self.net_in_place = on;
+    }
+
+    /// The incremental pass looks at every slot (its safety net, or frees it
+    /// was not told of): all forgotten, and every slot taken in anew. With
+    /// [`Picked::set_net_in_place`] only the slots that hold no buffer view
+    /// now are let go, and the others are looked at over what is kept: a
+    /// slot found as it was is updated in place, as `keep` and `orphan` do
+    /// between full looks. The slots, orphans and spans come out the same
+    /// (test `a_look_at_all_in_place_keeps_what_forgetting_first_does`);
+    /// only `by_entry` keeps names it would have dropped, which are checked
+    /// when used.
+    fn look_at_all(&mut self, mut all: Vec<u32>) -> Vec<u32> {
+        if !self.net_in_place {
+            self.clear();
+            return all;
+        }
+        self.last_all = true;
+        if !all.is_sorted() {
+            all.sort_unstable();
+        }
+        let mut due = Vec::with_capacity(all.len());
+        self.rescan_slice(all, 0, 1, &mut due);
+        due
+    }
+
+    /// Whether the last plan forgot all and looked at every slot (the line of a
+    /// long pass, `heap_pass_split`).
+    pub(crate) fn last_all(&self) -> bool {
+        self.last_all
     }
 
     /// View table entries were freed (`None`: some were, which is not
@@ -169,6 +211,7 @@ impl<C: Clone> Picked<C> {
     ) -> Vec<u32> {
         let pass = self.passes;
         self.passes += 1;
+        self.last_all = false;
         let forgotten = self.forgotten.replace(Vec::new());
         if self.full {
             if self.rescan_slices <= 1 {
@@ -196,12 +239,10 @@ impl<C: Clone> Picked<C> {
             return due;
         }
         let Some(forgotten) = forgotten else {
-            self.clear();
-            return all();
+            return self.look_at_all(all());
         };
         if self.rescan_slices <= 1 && pass.is_multiple_of(FULL_EVERY) {
-            self.clear();
-            return all();
+            return self.look_at_all(all());
         }
         let mut due = changed;
         if self.rescan_slices > 1 && pass > 0 {
@@ -286,6 +327,7 @@ impl<C: Clone> Picked<C> {
     }
 
     fn clear(&mut self) {
+        self.last_all = true;
         self.slots.clear();
         self.copies.clear();
         self.orphans.clear();
@@ -705,5 +747,84 @@ mod tests {
         let expected: Vec<u32> = (0..32).filter(|&s| s != 18).collect();
         assert_eq!(rescanned, expected);
         assert_eq!(p.views(), 31);
+    }
+
+    /// One pass where a slot's record picks its copy and span (and, now
+    /// and then, no copy: an orphan).
+    fn varied_pass(p: &mut Picked<u32>, heap: &Heap, changed: Vec<u32>) -> Vec<u32> {
+        p.note_forgotten(Some(&[]));
+        let due = p.plan(
+            changed,
+            || {
+                let mut all: Vec<u32> = heap.records.keys().copied().collect();
+                all.sort_unstable();
+                all
+            },
+            |s| heap.record(s),
+            entry,
+        );
+        for &slot in &due {
+            let Some(record) = heap.record(slot) else {
+                p.forget(slot);
+                continue;
+            };
+            if record[2] % 7 == 0 {
+                p.orphan(slot, record, entry(record));
+                continue;
+            }
+            let copy = slot / 4 + record[2] % 3;
+            let from = u64::from(slot) * 16 + u64::from(record[2] % 5);
+            p.keep(slot, copy as usize, &copy, [from, from + 16 + u64::from(record[2] % 11)], record, entry(record));
+        }
+        due
+    }
+
+    #[test]
+    fn a_look_at_all_in_place_keeps_what_forgetting_first_does() {
+        let mut heap = heap(600);
+        let (mut forget, mut in_place) = (Picked::new(false), Picked::new(false));
+        in_place.set_net_in_place(true);
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut alls = 0;
+        for pass in 0..(3 * FULL_EVERY + 5) {
+            // Records written past the API (found by the scan), slots gone
+            // without a word, and new slots: the full look finds them all.
+            let mut changed = Vec::new();
+            for _ in 0..6 {
+                let slot = next(700) as u32;
+                match next(4) {
+                    0 => {
+                        heap.records.remove(&slot);
+                    }
+                    1 => {
+                        heap.records.insert(slot, [1, 100 + slot, next(40) as u32]);
+                        changed.push(slot);
+                    }
+                    _ => {
+                        heap.records.insert(slot, [1, 100 + slot, next(40) as u32]);
+                    }
+                }
+            }
+            let a = varied_pass(&mut forget, &heap, changed.clone());
+            let b = varied_pass(&mut in_place, &heap, changed);
+            assert_eq!(a, b, "pass {pass}: slots looked at");
+            assert_eq!(forget.last_all(), in_place.last_all(), "pass {pass}");
+            alls += usize::from(in_place.last_all());
+            let (mut sa, mut sb) = (forget.spans(), in_place.spans());
+            sa.sort_unstable();
+            sb.sort_unstable();
+            assert_eq!(sa, sb, "pass {pass}: spans");
+            assert_eq!(forget.views(), in_place.views(), "pass {pass}");
+            assert_eq!(forget.orphans, in_place.orphans, "pass {pass}: orphans");
+            let records = |p: &Picked<u32>| p.slots.iter().map(|(&s, k)| (s, k.copy, k.from, k.to, k.record)).collect::<Vec<_>>();
+            assert_eq!(records(&forget), records(&in_place), "pass {pass}: slots kept");
+        }
+        assert_eq!(alls, 4);
     }
 }

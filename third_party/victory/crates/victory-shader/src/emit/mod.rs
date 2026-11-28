@@ -124,6 +124,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod shadow_raster;
+mod store_hold;
 mod sync_full;
 mod threading;
 mod underwater;
@@ -423,11 +424,13 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    miss_sky::with_container(container, || match translate_retried(container) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
-            structure::without_live_quads(|| translate_retried(container))
-        }
-        other => other,
+    store_hold::with_container(container, || {
+        miss_sky::with_container(container, || match translate_retried(container) {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+                structure::without_live_quads(|| translate_retried(container))
+            }
+            other => other,
+        })
     })
 }
 
