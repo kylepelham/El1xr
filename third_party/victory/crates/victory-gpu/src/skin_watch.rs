@@ -95,7 +95,15 @@ pub(crate) struct Pass {
     pub(crate) why: &'static str,
     /// What the first draw that ran was bound with (depth target, state).
     pub(crate) bound: Option<String>,
+    /// Other bindings draws of the pass ran with this frame, and how many draws each (at most
+    /// [`OTHER_BINDINGS`]): batch 5 R2/S logs showed 13-16 frames a run whose first skin
+    /// lighting draw tested a 16-bit depth without a twin, drawn as triangles, beside the six
+    /// tiled draws against the material plane.
+    pub(crate) others: Vec<(String, u32)>,
 }
+
+/// Bindings besides the first a frame line names per pass.
+pub(crate) const OTHER_BINDINGS: usize = 4;
 
 struct Book {
     frame: u64,
@@ -213,8 +221,8 @@ pub(crate) fn note(
     let p = b.passes.entry(kind).or_default();
     if ran {
         p.ran += 1;
-        if p.bound.is_none() {
-            p.bound = bound();
+        if let Some(seen) = bound() {
+            note_binding(p, seen);
         }
     } else {
         p.dropped += 1;
@@ -224,7 +232,20 @@ pub(crate) fn note(
     }
 }
 
-/// The frame line's text: `name=ran/dropped[why]{bound}` per pass.
+/// A draw of the pass ran bound with `seen`: the first binding, or counted among the others.
+fn note_binding(p: &mut Pass, seen: String) {
+    match &p.bound {
+        None => p.bound = Some(seen),
+        Some(first) if *first == seen => {}
+        Some(_) => match p.others.iter().position(|(b, _)| *b == seen) {
+            Some(i) => p.others[i].1 += 1,
+            None if p.others.len() < OTHER_BINDINGS => p.others.push((seen, 1)),
+            None => {}
+        },
+    }
+}
+
+/// The frame line's text: `name=ran/dropped[why]{bound}{other n=draws}...` per pass.
 pub(crate) fn line(passes: &BTreeMap<&'static str, Pass>) -> String {
     passes
         .iter()
@@ -235,6 +256,9 @@ pub(crate) fn line(passes: &BTreeMap<&'static str, Pass>) -> String {
             }
             if let Some(b) = &p.bound {
                 s.push_str(&format!("{{{b}}}"));
+            }
+            for (b, n) in &p.others {
+                s.push_str(&format!("{{{b} n={n}}}"));
             }
             s
         })
@@ -473,6 +497,7 @@ mod tests {
                 dropped: 1,
                 why: "MissingHostPipeline",
                 bound: Some("depth=f44 twin=true func=3 stencil=false".to_owned()),
+                others: Vec::new(),
             },
         );
         passes.insert(
@@ -485,6 +510,34 @@ mod tests {
         assert_eq!(
             line(&passes),
             "skin_light=4/1[MissingHostPipeline]{depth=f44 twin=true func=3 stencil=false} sss_tiles=1/0"
+        );
+    }
+
+    /// A pass whose draws ran with other bindings than the first names each, with its draws
+    /// (batch 5 R2/S: one skin lighting draw against a 16-bit depth before six tiled ones).
+    #[test]
+    fn other_bindings_are_named_with_their_draws() {
+        let mut p = Pass::default();
+        let odd = "depth=f53 twin=false func=3 stencil=false rects=no ps=cdeb13e0";
+        let tiled = "depth=f44 twin=true func=3 stencil=false rects=gs ps=677ea27c";
+        note_binding(&mut p, odd.to_owned());
+        for _ in 0..6 {
+            note_binding(&mut p, tiled.to_owned());
+        }
+        note_binding(&mut p, odd.to_owned());
+        assert_eq!(p.bound.as_deref(), Some(odd));
+        assert_eq!(p.others, vec![(tiled.to_owned(), 6)]);
+        for k in 0..2 * OTHER_BINDINGS {
+            note_binding(&mut p, format!("depth=f{k}"));
+        }
+        assert_eq!(p.others.len(), OTHER_BINDINGS);
+        p.ran = 7;
+        let mut passes = BTreeMap::new();
+        p.others.truncate(1);
+        passes.insert(LIGHTING, p);
+        assert_eq!(
+            line(&passes),
+            format!("skin_light=7/0{{{odd}}}{{{tiled} n=6}}")
         );
     }
 
