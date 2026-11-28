@@ -55,6 +55,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_DSTORAGE_POLL_WAIT", "The game's disk-read poll returns as reads finish, not a timer tick later."),
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_EXPOSURE_EARLY", "Makes the auto-exposure pipelines early, so the world is not black."),
+    ("VICTORY_EXPOSURE_WATCH", "Logs the exposure passes' targets and the constants they read."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
