@@ -386,6 +386,7 @@ fn watch(from: &mpsc::Receiver<Job>) {
     let mut kept: VecDeque<(u64, Vec<u32>)> = VecDeque::new();
     let (mut judged, mut flickers, mut blacks, mut logged, mut saved) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut regions = 0u64;
     while let Ok(job) = from.recv() {
         while crate::host::submissions_finished() < job.flown {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -398,6 +399,7 @@ fn watch(from: &mpsc::Receiver<Job>) {
             continue;
         };
         let frame = job.taken.frame;
+        detector.region = super::region::tiles();
         let events = detector.push(frame, detect::tiles_of(&pixels));
         kept.push_back((frame, pixels));
         while kept.len() > KEPT {
@@ -413,6 +415,10 @@ fn watch(from: &mpsc::Receiver<Job>) {
                 Event::Black { frame, frames } => {
                     blacks += 1;
                     (frame, frame + u64::from(frames))
+                }
+                Event::Region { frame, .. } => {
+                    regions += 1;
+                    (frame, frame + 1)
                 }
             };
             if logged >= LOGGED {
@@ -433,7 +439,7 @@ fn watch(from: &mpsc::Receiver<Job>) {
         }
         if judged % TOLD_EVERY == 0 {
             tracing::info!(
-                "flicker catch, since the start: {judged} frames judged, {flickers} flickers, {blacks} black stretches, {} presents not read back",
+                "flicker catch, since the start: {judged} frames judged, {flickers} flickers, {blacks} black stretches, {regions} regions, {} presents not read back",
                 MISSED.load(Relaxed)
             );
         }

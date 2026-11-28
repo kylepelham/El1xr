@@ -4690,11 +4690,13 @@ impl Host {
             |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
                 for (list, textures) in pending.drain(..) {
                     let mut uploads = Vec::new();
+                    let claims = run_split::claims();
                     for upload in textures {
                         if let Some(first_upload) = upload.finish_refresh() {
                             uploads.push((upload, first_upload));
                         }
                     }
+                    drop(claims);
                     firsts.push(lists.len());
                     let _laps = run_split::prelude();
                     if let Some(prelude) = run_wait::prelude(|| list.prelude(&uploads)) {
@@ -5545,6 +5547,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(self, &depth.texture, &plane.texture);
+        crate::tile_args_watch::plane_drawn(std::ptr::from_ref(twin) as usize, self.ops.id());
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5641,6 +5644,7 @@ impl HostList {
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            crate::tile_args_watch::twin_written(std::sync::Arc::as_ptr(&u.twin) as usize, self.ops.id());
             self.changes.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5750,7 +5754,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| run_split::made(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -6417,6 +6421,16 @@ impl HostList {
         }
         self.kept_pipeline.store(pipeline, Ordering::Relaxed);
         !self.deferred().bound.insert(pipeline)
+    }
+
+    /// The texture uploads the list deferred to its submission (tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_textures(&self) -> Vec<crate::texture::PreludeUpload> {
+        let deferred = self.deferred();
+        deferred.copies.iter().filter_map(|step| match step {
+            Step::Texture(upload) => Some(upload.clone()),
+            _ => None,
+        }).collect()
     }
 
     /// The shader-visible descriptor heaps the list keeps (tests).
@@ -8468,6 +8482,7 @@ impl Meter {
                 ram_mb = self.ram_mb
             );
             crate::defrag::log_progress();
+            crate::loop_cap::log();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

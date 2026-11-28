@@ -126,11 +126,26 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if victory_shader::emit::native_shadow() {
         h.update(b"VICTORY_NATIVE_SHADOW=1");
     }
+    if victory_shader::emit::native_shadow_auto() {
+        h.update(b"VICTORY_NATIVE_SHADOW_AUTO=1");
+    }
     if victory_shader::emit::heap_view_address() {
         h.update(b"VICTORY_HEAP_VIEW_ADDRESS=1");
     }
     if victory_shader::emit::mask_elsewhere() {
         h.update(b"VICTORY_MASK_ELSEWHERE=1");
+    }
+    match victory_shader::emit::half_views_off() {
+        victory_shader::emit::HalfViewsOff::No => {}
+        victory_shader::emit::HalfViewsOff::All => {
+            h.update(b"VICTORY_HALF_VIEWS_OFF=1");
+        }
+        victory_shader::emit::HalfViewsOff::Loads => {
+            h.update(b"VICTORY_HALF_VIEWS_OFF=loads");
+        }
+    }
+    if victory_shader::emit::f16_round_mode() {
+        h.update(b"VICTORY_F16_ROUND_MODE=1");
     }
     if victory_shader::emit::div_inf_zero() {
         h.update(b"VICTORY_DIV_INF_ZERO=1");

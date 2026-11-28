@@ -879,6 +879,10 @@ fn record_ahead_with(
     let mut first = vec![uav_barrier()];
     let mut second = vec![uav_barrier()];
     for (buffer, argument) in &chunks[..used] {
+        // (racefix) After its submission ended the buffer decayed to
+        // `COMMON`; naming the indirect-argument state here is still well
+        // formed: a buffer in `COMMON` is promoted to it (the debug layer,
+        // GPU-based validation too, takes it: `debug_layer_tests`).
         let from = if *argument {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
         } else {
@@ -1001,6 +1005,9 @@ void main() {
     #[path = "../send_own_warp_tests.rs"]
     mod send_own_warp_tests;
 
+    #[path = "../debug_layer_tests.rs"]
+    mod debug_layer_tests;
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
@@ -1011,6 +1018,10 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// The debug layer's messages, with `VICTORY_TEST_D3D12_DEBUG=1`
+        /// ([`debug_layer_tests`]), and those read after each submission.
+        debug: Option<ID3D12InfoQueue>,
+        messages: Vec<String>,
         /// Held for the harness's life, dropped after its D3D12 objects:
         /// the software adapter's device is one per process, and its
         /// shader compiler crashed the test binary (access violation in
@@ -1034,9 +1045,11 @@ void main() {
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     return None;
                 }
+                debug_layer_tests::enable();
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
+                let debug = debug_layer_tests::messages(&device);
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1065,6 +1078,8 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    debug,
+                    messages: Vec::new(),
                     _serial: serial,
                 })
             }
@@ -1186,6 +1201,7 @@ void main() {
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
+            debug_layer_tests::drain(self.debug.as_ref(), &mut self.messages);
         }
     }
 

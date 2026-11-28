@@ -14,10 +14,11 @@ LANGUAGE_COUNT = 9
 # dizaines de branches en parallèle) entrent en conflit sur cette seule ligne.
 TEST_COUNT_STEP = 100
 TEST_COUNT_LAG_STEPS = 1
-# Libellé de la ligne « N+ tests automatisés » dans chaque langue.
+# Libellé de la ligne « N+ tests réussis » dans chaque langue. Elle compte tout ce que lance
+# `dev.py gate` : les tests Rust (cargo test) et la suite pytest.
 TEST_COUNT_ROW = re.compile(
-    r"^\| *(\d+)\+ *(?:automated tests|automatisierte Tests|pruebas automatizadas|tests automatisés"
-    r"|test automatizzati|件の自動テスト|testes automatizados|个自动化测试|автоматических тестов) *\|", re.M)
+    r"^\| *(\d+)\+ *(?:tests passing|bestandene Tests|pruebas superadas|tests réussis"
+    r"|test superati|件のテストが合格|testes aprovados|项测试通过|тестов проходят) *\|", re.M)
 IMAGE = re.compile(r"\(([^()\s]*\.(?:svg|png))\)")
 
 
@@ -33,6 +34,13 @@ def claim_holds(claimed, collected):
     return claimed % TEST_COUNT_STEP == 0 and expected - TEST_COUNT_LAG_STEPS * TEST_COUNT_STEP <= claimed <= expected
 
 
+def claim_covers_pytest(claimed, pytest_collected):
+    """L'annonce compte cargo test et pytest ; pytest ne voit que sa part, donc il ne vérifie
+    qu'un plancher : une centaine, pas sous ce que `claim_holds` accepterait pour pytest seul."""
+    floor = rounded_test_count(pytest_collected) - TEST_COUNT_LAG_STEPS * TEST_COUNT_STEP
+    return claimed % TEST_COUNT_STEP == 0 and claimed >= floor
+
+
 def table_row_count(text):
     return sum(1 for line in text.splitlines() if line.startswith("|"))
 
@@ -43,7 +51,7 @@ def images(text):
 
 def claimed_test_count(text):
     found = TEST_COUNT_ROW.findall(text)
-    assert len(found) == 1, f"ligne « N+ tests automatisés » trouvée {len(found)} fois"
+    assert len(found) == 1, f"ligne « N+ tests réussis » trouvée {len(found)} fois"
     return int(found[0])
 
 
@@ -76,9 +84,9 @@ def test_claimed_count_matches_suite(request, texts):
         pytest.skip("suite partielle : le nombre de tests n'est comparé que sur un lancement complet")
     collected = len(request.session.items)
     claimed = claimed_test_count(texts["README.md"])
-    expected = rounded_test_count(collected)
-    assert claim_holds(claimed, collected), (f"les README annoncent {claimed}+ tests, la suite en compte {collected} : "
-                                             f"écrire « {expected}+ » dans les 9 README")
+    assert claim_covers_pytest(claimed, collected), (
+        f"les README annoncent {claimed}+ tests, pytest seul en compte {collected} : écrire dans les 9 README "
+        f"le total de `dev.py gate` (cargo test + pytest) arrondi à la centaine inférieure")
 
 
 @pytest.mark.parametrize("collected, announced", [(806, 800), (800, 800), (899, 800), (900, 900), (99, 0)])
@@ -92,3 +100,10 @@ def test_rounded_test_count(collected, announced):
 ])
 def test_claim_may_lag_one_step(claimed, collected, holds):
     assert claim_holds(claimed, collected) is holds
+
+
+@pytest.mark.parametrize("claimed, pytest_collected, covers", [
+    (3900, 1887, True), (1700, 1887, True), (1600, 1887, False), (3950, 1887, False), (0, 99, True),
+])
+def test_claim_covers_pytest_share(claimed, pytest_collected, covers):
+    assert claim_covers_pytest(claimed, pytest_collected) is covers
