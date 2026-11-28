@@ -975,6 +975,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // (Both asked of the texture itself, not of the shared tables: every
     // read of every texture by every recording thread asked them.)
     let host_written = crate::resource::host_written_mark(resource);
+    if host_written && crate::descriptor::host::swap_watch::on() {
+        crate::descriptor::host::swap_watch::host_kept(resource, texture);
+    }
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written

@@ -39,7 +39,7 @@ fn on() -> bool {
 
 /// Whether the host lets a view of a typed texture name another format of
 /// its family (`CastingFullyTypedFormatSupported`), asked once.
-fn casts_typed() -> bool {
+pub(super) fn casts_typed() -> bool {
     static CASTS: OnceLock<bool> = OnceLock::new();
     *CASTS.get_or_init(|| {
         let Some(host) = crate::host::host() else {

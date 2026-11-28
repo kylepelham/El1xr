@@ -173,6 +173,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HALVES_LANE", Apply::Retranslate),
     ("VICTORY_HDR_CLAMP", Apply::Retranslate),
     ("VICTORY_HDR_SCRUB", Apply::Restart),
+    ("VICTORY_HDR_SCRUB_POST", Apply::Restart),
     ("VICTORY_HEAD_MAP_WAIT", Apply::Restart),
     ("VICTORY_HEAP_CAP_COMPACT", Apply::Restart),
     ("VICTORY_HEAP_CAP_DYNAMIC", Apply::Restart),
@@ -400,6 +401,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STREAMLINE_DIR", Apply::Restart),
     ("VICTORY_STRICT_JOINS", Apply::Retranslate),
     ("VICTORY_SUBMIT_CHUNKS", Apply::Restart),
+    ("VICTORY_SWAP_WATCH", Apply::Live),
     ("VICTORY_SWEEP", Apply::Restart),
     ("VICTORY_SWEEP_EVERY_MS", Apply::Restart),
     // Not live: each view heap keeps record bytes (on) or hashes (off), kept by one path only;
