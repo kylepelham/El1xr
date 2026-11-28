@@ -47,6 +47,8 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_DEFAULT_NO_BACK", "Large shader writes to big card buffers are not copied back to memory."),
     ("VICTORY_DOT2_ACC_NEG", "Fixes a dot product instruction negating its accumulator twice."),
     ("VICTORY_DROP_REASONS", "Logs per frame why draws and dispatches were dropped."),
+    ("VICTORY_DSTORAGE_AUTO_SUBMIT", "title: DirectStorage reads start at the title's Submit, as on console."),
+    ("VICTORY_DSTORAGE_FILE_REF", "A DirectStorage read keeps its file open until the read is done."),
     ("VICTORY_DSTORAGE_POLL_WAIT", "The game's disk-read poll returns as reads finish, not a timer tick later."),
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),

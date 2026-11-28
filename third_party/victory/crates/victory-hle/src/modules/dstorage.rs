@@ -31,6 +31,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+mod auto_submit;
+mod file_hold;
 mod poll_wait;
 mod scratch;
 mod timing;
@@ -181,15 +183,20 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// name), plus DSTORAGE_QUEUE_DESC1's options, which the title sets to 1
+/// ([`AUTO_SUBMIT_DISABLED`]).
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+
+/// Queue option: the queue never submits itself; its reads start at the
+/// title's Submit (darkworldhm, fxceless #575).
+const AUTO_SUBMIT_DISABLED: u64 = 1;
 
 extern "system" fn create_queue(
     _: Factory,
@@ -207,7 +214,7 @@ extern "system" fn create_queue(
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        options = desc.options,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -222,7 +229,13 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                id,
+                submits_itself: auto_submit::submits_itself(desc.options),
+            },
+        ),
     )
 }
 
@@ -392,6 +405,10 @@ static STATUS_VTABLE: Methods<5> = Methods([
 /// A queue object: its lane in the scheduler.
 struct Queue {
     id: u64,
+    /// Whether the queue submits itself once half full: always, unless
+    /// `VICTORY_DSTORAGE_AUTO_SUBMIT=title` and the title asked for
+    /// [`AUTO_SUBMIT_DISABLED`] ([`auto_submit`]).
+    submits_itself: bool,
 }
 
 impl Drop for Queue {
@@ -455,7 +472,7 @@ struct Lane {
     held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, Request, file_hold::FileHold)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -473,6 +490,8 @@ struct Job {
     seq: u64,
     request: Request,
     staging: u64,
+    /// The read's reference on its file (`VICTORY_DSTORAGE_FILE_REF=1`).
+    file: file_hold::FileHold,
 }
 
 // SAFETY: as for `Lane`.
@@ -586,7 +605,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -595,6 +614,8 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
+        // (darkworldhm) The file is let go before the title can see the read done.
+        drop(std::mem::take(&mut job.file));
         mark(Phase::Other);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
@@ -664,14 +685,14 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let &(seq, request, _) = lane.reads.front()?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (_, _, file) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -684,6 +705,7 @@ impl Lanes {
             seq,
             request,
             staging,
+            file,
         })
     }
 
@@ -735,7 +757,7 @@ impl Lanes {
         for command in commands {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Read(r, _) => r.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
@@ -745,11 +767,11 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => {
+                Command::Read(request, file) => {
                     if timing::on() {
                         timing::submitted([seq]);
                     }
-                    lane.reads.push_back((seq, request))
+                    lane.reads.push_back((seq, request, file))
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
@@ -878,7 +900,8 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    /// A read, with its reference on its file (`VICTORY_DSTORAGE_FILE_REF=1`).
+    Read(Request, file_hold::FileHold),
     Status(Status),
 }
 
@@ -908,7 +931,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     as_enqueued(&request);
-    queue(this, Command::Read(request));
+    let file = file_hold::FileHold::new(&request);
+    queue(this, Command::Read(request, file));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -929,7 +953,8 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 /// submits on its own once half of it is enqueued, as the console does.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let state = &unsafe { &*this }.state;
+    let (id, submits_itself) = (state.id, state.submits_itself);
     let Some(scheduler) = scheduler() else {
         return;
     };
@@ -943,8 +968,10 @@ fn queue(this: QueueRef, command: Command) {
             break;
         }
         // Full with reads held for a Submit the title cannot make while it
-        // waits here: they go now, page lists as they are.
-        if !lane.held.is_empty() {
+        // waits here: they go now, page lists as they are. (A queue that
+        // does not submit itself, `VICTORY_DSTORAGE_AUTO_SUBMIT=title`: its
+        // unsubmitted commands too, or nothing would ever free a slot.)
+        if !lane.held.is_empty() || (!submits_itself && !lane.unsubmitted.is_empty()) {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
@@ -961,7 +988,9 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if !submits_itself {
+        auto_submit::left_for_the_title();
+    } else if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         let capacity = lane.capacity;
         let before = waiting_reads(&lanes);
         lanes.submit_as(id, false);
@@ -1261,7 +1290,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         mark(Phase::Read);
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the title keeps it open (or, with
+    // `VICTORY_DSTORAGE_FILE_REF=1`, the read holds a reference on it).
     let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     // (Neptune) Through a handle of this read's own, so that it does not wait for the
     // other workers' reads of the same file.
@@ -1699,7 +1729,7 @@ mod tests {
             capacity: 0x80,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1792,7 +1822,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -1899,7 +1929,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"small".as_ptr(),
-            unknown: 1,
+            options: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1934,7 +1964,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, file_hold::FileHold::default()));
     }
 
     #[test]
@@ -2198,7 +2228,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"pages".as_ptr(),
-            unknown: 1,
+            options: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -2348,5 +2378,47 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+
+    /// (darkworldhm, fxceless #621) `VICTORY_DSTORAGE_FILE_REF=1`: the title
+    /// releases its file right after enqueueing; the read still runs on it.
+    #[test]
+    fn a_file_released_after_enqueue_stays_open_until_its_read_is_done() {
+        file_hold::FORCE.store(true, Ordering::Relaxed);
+        let plain = pattern(4096);
+        let (_dir, file) = file_with(&plain);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; 512];
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), out.len(), file, 128, out.len()),
+        );
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release(file), 1, "the queued read holds the file");
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain[128..640]);
+        void(queue, 0x40);
+    }
+
+    /// The same: a read the queue drops unstarted lets its file go.
+    #[test]
+    fn closing_a_queue_lets_go_of_its_unstarted_reads_files() {
+        file_hold::FORCE.store(true, Ordering::Relaxed);
+        let (_dir, file) = file_with(&pattern(256));
+        let queue = new_queue(0);
+        let mut out = [0u8; 64];
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), out.len(), file, 0, out.len()),
+        );
+        let add: extern "system" fn(*mut c_void) -> u32 = call(file, 0x08);
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(add(file), 3, "the title's, the read's and this one");
+        assert_eq!(release(file), 2);
+        void(queue, 0x40);
+        assert_eq!(release(file), 0, "the read let its reference go");
     }
 }
