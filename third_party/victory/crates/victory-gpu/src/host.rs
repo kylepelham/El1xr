@@ -3692,6 +3692,7 @@ impl Host {
                 let allocator: ID3D12CommandAllocator = self
                     .device
                     .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                crate::alloc_count::track(&allocator);
                 let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                     0,
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -3719,6 +3720,7 @@ impl Host {
             let allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -4669,13 +4671,17 @@ impl Host {
             .load(Ordering::Relaxed)
             .saturating_sub(flush_one_before);
         PREP_PARTS[5].fetch_add(def_us.saturating_sub(flush_one_delta), Ordering::Relaxed);
-        let t_flush = std::time::Instant::now();
-        flush::last(|| batch.flush());
-        crate::watch::ask_once_end();
-        PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let t_pre = std::time::Instant::now();
-        finalize_preludes(&mut pending_preludes);
-        PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if beside::wanted(&batch, !pending_preludes.is_empty()) {
+            beside::run(&mut batch, || finalize_preludes(&mut pending_preludes));
+        } else {
+            let t_flush = std::time::Instant::now();
+            flush::last(|| batch.flush());
+            crate::watch::ask_once_end();
+            PREP_PARTS[6].fetch_add(t_flush.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let t_pre = std::time::Instant::now();
+            finalize_preludes(&mut pending_preludes);
+            PREP_PARTS[5].fetch_add(t_pre.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6378,7 +6384,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_copy(dst, src, len);
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -7019,6 +7025,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    read_sparse_with(src, dst, len, sparse_zero::on());
+}
+
+/// [`read_sparse`]; `safe_zero`: the zeros for what is not there go only
+/// where the destination is committed (`VICTORY_SPARSE_ZERO_SAFE`).
+fn read_sparse_with(src: *const u8, dst: *mut u8, len: usize, safe_zero: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -7041,8 +7053,12 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-            // SAFETY: this path is only used with a writable host destination.
-            unsafe { to.write_bytes(0, n) };
+            if safe_zero {
+                sparse_zero::zero(to, n);
+            } else {
+                // SAFETY: this path is only used with a writable host destination.
+                unsafe { to.write_bytes(0, n) };
+            }
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
@@ -7062,8 +7078,12 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if sparse_zero::on() {
+                        sparse_zero::zero(to, n);
+                    } else {
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
@@ -8010,6 +8030,7 @@ impl Meter {
         crate::submit_chunk::line(frames);
         crate::copy_profile::line(frames);
         crate::watch::reservation_line(frames);
+        crate::alias_later::line(frames);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
             [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9183,16 +9204,22 @@ mod sweep_aside;
 
 #[path = "host_flush.rs"]
 mod flush;
+#[path = "host_flush_beside.rs"]
+mod beside;
 #[path = "host_one_pass.rs"]
 mod one_pass;
 #[path = "host_step_reads.rs"]
 mod step_reads;
 #[path = "host_run_split.rs"]
 mod run_split;
+#[path = "host_scoped_flush.rs"]
+mod scoped_flush;
 #[path = "host_run_wait.rs"]
 mod run_wait;
 #[path = "host_ask.rs"]
 mod ask;
+#[path = "host_sparse_zero.rs"]
+mod sparse_zero;
 use step_reads::blocked_by;
 
 #[cfg(test)]

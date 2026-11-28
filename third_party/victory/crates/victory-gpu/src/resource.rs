@@ -3492,6 +3492,9 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+            if let Backing::Committed(ref memory) = self.backing {
+                crate::default_back::freed(memory.ptr.as_ptr() as usize);
+            }
         }
     }
 }
@@ -3524,6 +3527,12 @@ pub(crate) extern "system" fn create_committed(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    crate::default_back::committed(
+        memory.ptr.as_ptr() as usize,
+        info.size as usize,
+        heap.kind,
+        desc.dimension == BUFFER,
+    );
     hand_out_resource(
         desc,
         heap,

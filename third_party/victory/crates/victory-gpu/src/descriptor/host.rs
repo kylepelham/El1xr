@@ -24,6 +24,7 @@ pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 mod slot_wait;
+mod srgb_cast;
 pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
 
@@ -3863,6 +3864,21 @@ impl HostHeap {
         (made, textures.slots.get(&index).map(|w| w.due <= frame))
     }
 
+    /// (`VICTORY_BAKE_FRESH`) Slot `index`'s memory and fingerprint at its last whole upload, and
+    /// whether it is live, while it is looked at again (None: not uploaded whole, or the looks
+    /// are over).
+    pub(crate) fn texture_slot_print(&self, index: u32) -> Option<((u64, u64), u64, bool)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.rechecks.get(&index).map(|r| (r.at, r.print, r.live))
+    }
+
+    /// (`VICTORY_BAKE_FRESH`) Slot `index` is due at `frame` as one written now.
+    pub(crate) fn texture_slot_refresh(&self, index: u32, frame: u64) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.changed(index, frame, frame);
+        self.note_slot(index, SLOT_IN_TEXTURES, true);
+    }
+
     /// What the queue of textures picked by index knows of title slot
     /// `index` at `frame`, in a few words (diagnostics, `VICTORY_BAKE_WHY`).
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
@@ -4775,9 +4791,10 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// family takes the texture's format, but for its sRGB or linear twin with
+/// `VICTORY_SRGB_CAST=1` on a host that casts ([`srgb_cast`]).
+/// shortcut: without that, such a view (sRGB of UNORM, say) reads without
+/// its conversion.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4828,6 +4845,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !srgb_cast::keeps(view, own, unordered)
     {
         *format = d.Format;
     }

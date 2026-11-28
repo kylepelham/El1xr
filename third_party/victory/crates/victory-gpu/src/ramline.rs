@@ -284,11 +284,13 @@ pub(crate) fn log() {
     let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
     let k = crate::pipeline::kept();
     let (idle, idle_bytes) = crate::list::idle_pool();
+    let allocators = crate::alloc_count::counts();
     let drops = [0, 1, 2].map(|i| crate::pipeline::DXIL_DROPS[i].load(Relaxed));
     tracing::info!(
         "ram line (shaders): containers {} {} MB, translations {} with host code {} MB kept (let go so far {} MB, \
          brought back {}x {} MB; VICTORY_DROP_DXIL), pipeline library file {} MB; idle host lists {} (upload {} MB, \
-         destroyed by VICTORY_LIST_POOL_IDLE_S {}); rust heap {} MB; title bytes told written after view writes (VICTORY_DS_NOTIFY) {} MB",
+         destroyed by VICTORY_LIST_POOL_IDLE_S {}); rust heap {} MB; title bytes told written after view writes (VICTORY_DS_NOTIFY) {} MB; \
+         command allocators alive {} (most {}, made {})",
         k[0],
         mb(k[1]),
         k[2],
@@ -302,6 +304,9 @@ pub(crate) fn log() {
         crate::list::TRIMMED_LISTS.load(Relaxed),
         mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
         mb(crate::watch::NOTIFIED.swap(0, Relaxed)),
+        allocators.0,
+        allocators.2,
+        allocators.1,
     );
     tracing::info!(
         "ram line: process working set {} MB, private {} MB; PC free {} MB, free commit {} MB; \

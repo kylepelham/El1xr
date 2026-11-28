@@ -30,6 +30,11 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//!
+//! The title's six resolve variants keep the light at other places in their
+//! tables: `crate::ambient_places` (`VICTORY_AMBIENT_VARIANTS=1` finds them
+//! by register). What the stand-in did per program and which frames it left
+//! dark: `crate::ambient_cover`'s `ambient cover:` line every 5 s.
 //! `VICTORY_AMBIENT_MOST=<multiple>` caps what the title's resolve leaves (4 when unset).
 //! `VICTORY_AMBIENT_SETTLE=<ms>[,<jump factor>]` sets time-based settling (default `250,3`; `0` for per-frame `0.04`).
 //!
@@ -129,14 +134,8 @@ fn is_miss(container: &[u8]) -> bool {
     })
 }
 
-/// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
-/// and reads the scene's depth, and where the other writes the light of
-/// visible surfaces: root parameter and place in its table, in dwords.
-pub(crate) const LIGHT: (u8, u32) = (1, 176);
-pub(crate) const DEPTH: (u8, u32) = (0, 464);
-pub(crate) const RADIANCE: (u8, u32) = (1, 16);
-/// Where the light the air scatters is.
-pub(crate) const AIR: (u8, u32) = (1, 32);
+// Where the resolve, the radiance cache and the air have their images:
+// `crate::ambient_places`.
 /// Where the miss program writes the reflected light (R11G11B10, half the
 /// picture's size) and where it reads the depth it is given (a 32-bit depth
 /// of the picture's size).
@@ -229,6 +228,28 @@ fn rays_find(role: Role, ray_tracing: bool, reflections: bool, probes: bool) -> 
         _ if !ray_tracing => true,
         Role::Miss | Role::Reflect | Role::Knee => reflections,
         Role::Resolve | Role::Radiance | Role::Air => probes,
+    }
+}
+
+/// Whether the stand-in of `role` (the resolve, the radiance cache, the
+/// air) is asked for by the switches at all, as [`after`] has it.
+pub(crate) fn light_asked(role: Role) -> bool {
+    match (role, set()) {
+        (Role::Radiance, Set::Off) => specular().is_some(),
+        (_, Set::Off) | (Role::Air, Set::Constant(_)) => false,
+        (Role::Air, _) => air() > 0.0,
+        _ => true,
+    }
+}
+
+/// Why [`after`] recorded nothing for a role [`light_asked`] for.
+pub(crate) fn not_recorded() -> &'static str {
+    if pass().is_none() {
+        "the passes did not build"
+    } else if !KEPT.load(std::sync::atomic::Ordering::Relaxed) {
+        "the light of the frame before is not kept yet"
+    } else {
+        "recorded nothing"
     }
 }
 
