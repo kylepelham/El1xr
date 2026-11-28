@@ -1924,9 +1924,6 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if filled >= FLOOR && crate::commitline::pressed() {
-        return false; // (El1xr) VICTORY_COMMIT_FLOOR_MB
-    }
     if let Some(limit) = texture_budget_limit() {
         return filled < limit;
     }
@@ -2522,6 +2519,10 @@ pub(crate) fn let_go_idle() {
     let video = crate::host::host().and_then(|h| h.video_memory());
     let idle_ms = crate::host::vram_idle_ms_by_room(video, room_lately());
     account(idle_ms);
+    // (El1xr) VICTORY_COMMIT_FLOOR_MB: under the floor, copies out of use a shorter time go
+    // too (never one a slot or a list holds); those only it let go are logged.
+    let (floor_ms, floor_frames, floor) = crate::commitline::floor_idle(idle_ms, IDLE_FRAMES);
+    let mut floor_went = Vec::new();
     // Under pressure (`VICTORY_VRAM_EVICT`): the least recently used copies
     // that are idle by the shorter measure go, enough to get under it.
     let pressed = pressure_victims(video);
@@ -2542,7 +2543,7 @@ pub(crate) fn let_go_idle() {
                 let (ms, frames) = if pressed.binary_search(&at).is_ok() {
                     (PRESSED_MS, PRESSED_FRAMES)
                 } else {
-                    (idle_ms, IDLE_FRAMES)
+                    (floor_ms, floor_frames)
                 };
                 crate::host::long_ago(r.host.used.load(Relaxed), ms, frames)
                     && std::sync::Arc::strong_count(host) == 1
@@ -2564,6 +2565,11 @@ pub(crate) fn let_go_idle() {
             if pressed.binary_search(&at).is_ok() {
                 EVICTED[0].fetch_add(1, Relaxed);
                 EVICTED[1].fetch_add(host.bytes, Relaxed);
+            } else if floor {
+                let used = r.host.used.load(Relaxed);
+                if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+                    floor_went.push((at, host.bytes, used));
+                }
             }
             went += 1;
             bytes += host.bytes;
@@ -2575,6 +2581,9 @@ pub(crate) fn let_go_idle() {
     }
     slot_evict(&all, video, idle_ms, IDLE_FRAMES);
     drop(all);
+    if floor {
+        crate::commitline::floor_report(&floor_went);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(

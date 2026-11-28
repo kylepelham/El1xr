@@ -458,6 +458,21 @@ impl<B: Clone> Pool<B> {
         gone
     }
 
+    /// (El1xr) For the commit line: bytes its pieces in use hold (resting ones not counted),
+    /// and bytes a new piece may still be cut from (in a fresh pool only above what was ever
+    /// used). The rest of its blocks is resting or, in a fresh pool, used once and never cut
+    /// again until the whole block is back.
+    fn usage(&self) -> [u64; 2] {
+        let (mut held, mut cuttable) = (0u64, 0u64);
+        for block in self.blocks.iter().flatten() {
+            let free: u64 = block.free.0.values().sum();
+            held += BLOCK - free;
+            cuttable += if self.fresh { BLOCK - block.used_to } else { free };
+        }
+        let resting: u64 = self.resting.iter().map(|(_, piece)| piece.len).sum();
+        [held.saturating_sub(resting), cuttable]
+    }
+
     fn reclaim(&mut self, now: u64, finished: u64, spares: usize) -> Vec<B> {
         let mut gone = Vec::new();
         let mut any = false;
@@ -694,6 +709,13 @@ pub(crate) const BLOCK_BYTES: u64 = BLOCK;
 pub(crate) fn blocks_alive() -> [u64; 5] {
     let b = buffers::blocks_alive();
     [TEXTURE_BLOCKS.load(Ordering::Relaxed), STAGING_BLOCKS.load(Ordering::Relaxed), b[0], b[1], b[2]]
+}
+
+/// (El1xr) Per pool, as [`blocks_alive`] names them: bytes held by pieces in use, and bytes
+/// a piece may still be cut from (`Pool::usage`).
+pub(crate) fn pool_usage() -> [[u64; 2]; 5] {
+    let b = buffers::usage();
+    [lock(&TEXTURES).usage(), lock(&STAGING).usage(), b[0], b[1], b[2]]
 }
 
 /// (El1xr) Frees the pieces of the pools of the PC's memory (staging,
@@ -1307,6 +1329,28 @@ mod tests {
         pool.give(taken[7], 20 + REST);
         assert_eq!(pool.trim(20 + 2 * REST, 0).len(), 1);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    /// (El1xr) A fresh pool's usage counts what was cut once and given back as neither held
+    /// nor cuttable: the memory the card buffer blocks hold for nothing; a plain pool cuts it
+    /// again.
+    #[test]
+    fn usage_tells_held_cuttable_and_lost() {
+        static ALIVE_HERE: AtomicU64 = AtomicU64::new(0);
+        let make = || Some(0u32);
+        const K64: u64 = 64 << 10;
+        for fresh in [true, false] {
+            let mut pool: Pool<u32> = if fresh { Pool::fresh(2, &ALIVE_HERE) } else { Pool::new(2, &ALIVE_HERE) };
+            let a = pool.take(4 * K64, K64, 0, make).unwrap().0;
+            let _b = pool.take(K64, K64, 0, make).unwrap().0;
+            assert_eq!(pool.usage(), [5 * K64, BLOCK - 5 * K64]);
+            pool.give(a, 0);
+            // Resting: neither held nor cuttable.
+            assert_eq!(pool.usage(), [K64, BLOCK - 5 * K64]);
+            pool.reclaim(REST, 0, 2);
+            let lost = if fresh { 4 * K64 } else { 0 };
+            assert_eq!(pool.usage(), [K64, BLOCK - K64 - lost]);
+        }
     }
 
     #[test]

@@ -761,6 +761,8 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    // (El1xr) VICTORY_UPLOAD_CAP_MB / VICTORY_COMMIT_FLOOR_MB: past either, 2 s.
+    let idle_ms = crate::commitline::staging_idle_ms(idle_ms);
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
