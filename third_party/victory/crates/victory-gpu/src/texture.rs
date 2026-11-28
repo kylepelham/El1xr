@@ -44,6 +44,7 @@ mod slice_len;
 mod stage_unlocked;
 pub(crate) mod staged_ask;
 mod stale_audit;
+mod staging_flight;
 pub(crate) mod stream_ahead;
 pub(crate) mod take_by_table;
 
@@ -106,6 +107,9 @@ pub(crate) struct Staging {
     /// buffer then holds the title's bytes as laid out, and the prelude
     /// detiles them into this one's buffer, which its copies read.
     gpu: Option<gpu_detile::Gpu>,
+    /// The submission that last recorded a copy from it
+    /// (`VICTORY_STAGING_UNDER_FLIGHT`, [`staging_flight`]; 0: none seen).
+    sent: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -1162,6 +1166,7 @@ impl PreludeUpload {
                 crate::descriptor::host::levels_waiting(self.staging.memory as u64);
             }
         }
+        staging_flight::copied(&self.staging.sent);
         Some(first_upload)
     }
 
@@ -2023,6 +2028,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        staging_flight::detiled(self.resource, &self.sent, tiled.len());
         crate::readable_once::bump(self.resource);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
@@ -2804,6 +2810,7 @@ fn build_staging_untimed(
         base,
         piece,
         gpu,
+        sent: std::sync::atomic::AtomicU64::new(0),
     });
     Some(s)
 }
