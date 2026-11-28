@@ -140,15 +140,15 @@ pub const SECTIONS: &[(&str, Sections)] = &[(
     "Display",
     &[
         (
-            "Resolution and upscaling",
+            "Picture",
             &[
                 "VICTORY_RESOLUTION",
                 "VICTORY_UPSCALE",
                 "VICTORY_UPSCALE_QUALITY",
+                "VICTORY_RAY_TRACING",
+                "VICTORY_FRAME_GEN",
                 "VICTORY_DLSS_SHARPNESS",
                 "VICTORY_DLSS_PRESET",
-                "VICTORY_FRAME_GEN",
-                "VICTORY_RAY_TRACING",
             ],
         ),
         (
