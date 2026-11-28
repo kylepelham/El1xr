@@ -470,6 +470,7 @@ pub(super) fn log(frames: f64) {
     super::beside::line(frames);
     super::pass_order::line(frames);
     super::pass_merge::line(frames);
+    crate::shadow::run_lean::line(frames);
     super::send_thread::line(frames);
     super::card_rec::line(frames);
     crate::land_aside::line(frames);

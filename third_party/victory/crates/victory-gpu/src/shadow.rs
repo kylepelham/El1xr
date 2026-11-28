@@ -46,6 +46,8 @@ pub(crate) mod merge_due;
 pub(crate) mod wide_wake;
 #[path = "shadow_warm.rs"]
 pub(crate) mod warm;
+#[path = "shadow_run_lean.rs"]
+pub(crate) mod run_lean;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,
@@ -3842,6 +3844,10 @@ pub(crate) fn merged_stats() -> [u64; 7] {
 /// the stretches that differ go in and up. What also changes: title bytes written again
 /// with the value the copy holds do not go up over what a shader has written there since.
 pub(crate) fn copy_changed() -> bool {
+    #[cfg(test)]
+    if let Some(on) = run_lean::COPY_CHANGED_IN_TEST.with(std::cell::Cell::get) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_CHANGED").is_some_and(|v| v == "1"))
 }
@@ -6631,10 +6637,16 @@ impl Shadow {
         }
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
         let planning = crate::refresh_prof::start();
+        let lean = run_lean::on();
+        let mut tally = run_lean::Tally::default();
         let mut page_mask = |page: usize, prev: u64, sub: Option<(u64, u16)>| {
             let mask = if four_k {
                 let m = crate::watch::stale_mask(page, prev);
-                crate::watch::note_4k(m);
+                if lean {
+                    tally.page(m);
+                } else {
+                    crate::watch::note_4k(m);
+                }
                 m
             } else {
                 let found = sub
@@ -6687,8 +6699,14 @@ impl Shadow {
             runs
         };
         let total: usize = bytes_runs.iter().map(|&(a, b)| b - a).sum();
+        if lean {
+            tally.add();
+        }
         if !in_wide() && total >= 128 * 1024 && wide_threads() > 1 {
             return self.copy_runs_wide(bytes_runs.into_iter());
+        }
+        if lean {
+            return self.copy_runs_lean(&run_lean::join(bytes_runs));
         }
         self.copy_runs_here(bytes_runs.into_iter())
     }
