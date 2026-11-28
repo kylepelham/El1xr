@@ -283,6 +283,7 @@ fn waiting_for_the_card_leaves_submitted_free() {
     assert!(done.load(Ordering::Acquire));
     // SAFETY: a plain fence query.
     assert!(unsafe { host.fence.GetCompletedValue() } >= target);
+    crate::test_d3d12_debug::assert_clean_queue(host.messages.as_ref(), "host::new_warp");
 }
 
 mod mask_tests {

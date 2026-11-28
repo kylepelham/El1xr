@@ -141,6 +141,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_PLACED_FIRST_MIP_ARRAY", "Uses first mip on 1-slice 2D array views so tails do not evict neighbours."),
     ("VICTORY_PLAN_SNAPSHOT", "Plans stale copy refreshes from a snapshot, without holding the lock."),
     ("VICTORY_PLAN_SPLIT", "Holds a copy's lock only for the first part of refresh planning."),
+    ("VICTORY_POOL_FENCE_REST", "Pooled buffer and texture pieces wait for flights, not the 2.5 s timer."),
     ("VICTORY_POOL_SLACK_MB", "Below this much free system memory, pools keep fewer spare blocks, in MB."),
     ("VICTORY_PORT_CBV", "Binds aligned constant buffers in place instead of copying them."),
     ("VICTORY_PORT_CBV_COPIES", "Reads constant buffers in host copies directly instead of copying."),

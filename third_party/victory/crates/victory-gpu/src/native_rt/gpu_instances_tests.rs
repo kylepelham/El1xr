@@ -46,6 +46,7 @@ fn on_warp(instances: &[[u8; 64]], pairs: Vec<(u64, u64)>) -> Option<Vec<u8>> {
     // SAFETY: plain object creation and use on a device of our own; the
     // submission is waited for before what it wrote is read.
     unsafe {
+        crate::test_d3d12_debug::enable();
         let Ok(adapter) = crate::host::warp_adapter() else {
             eprintln!("no WARP adapter: skipped");
             return None;
@@ -121,7 +122,7 @@ fn on_warp(instances: &[[u8; 64]], pairs: Vec<(u64, u64)>) -> Option<Vec<u8>> {
             D3D12_HEAP_TYPE_DEFAULT,
             size,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
         );
         let back = made(
             D3D12_HEAP_TYPE_READBACK,
@@ -155,6 +156,7 @@ fn on_warp(instances: &[[u8; 64]], pairs: Vec<(u64, u64)>) -> Option<Vec<u8>> {
         back.Map(0, None, Some(&mut at)).unwrap();
         let out = std::slice::from_raw_parts(at.cast::<u8>(), size as usize).to_vec();
         back.Unmap(0, None);
+        crate::test_d3d12_debug::assert_clean(&device, "native_rt::gpu_instances");
         Some(out)
     }
 }

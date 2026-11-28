@@ -402,7 +402,8 @@ fn linear_buffer(total: u64) -> Option<(ID3D12Resource, u64)> {
     let size = total.max(64 << 10).next_power_of_two();
     let host = crate::host::host()?;
     if size > SPARE_MOST {
-        return host.uav_buffer(total).map(|b| (b, 0));
+        // The detile compute shader writes 4-byte dwords (`words = bytes.div_ceil(4)`).
+        return host.uav_buffer(total.next_multiple_of(4)).map(|b| (b, 0));
     }
     let taken = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());

@@ -17,6 +17,7 @@ struct Rig {
     fence: ID3D12Fence,
     event: HANDLE,
     submitted: u64,
+    debug: Option<ID3D12InfoQueue>,
 }
 
 impl Drop for Rig {
@@ -38,10 +39,12 @@ impl Rig {
             if card {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             } else {
+                crate::test_d3d12_debug::enable();
                 let adapter = crate::host::warp_adapter().ok()?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             }
             let device = device?;
+            let debug = (!card).then(|| crate::test_d3d12_debug::messages(&device)).flatten();
             let queue: ID3D12CommandQueue = device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -64,6 +67,7 @@ impl Rig {
                 fence,
                 event,
                 submitted: 0,
+                debug,
             })
         }
     }
@@ -88,6 +92,7 @@ impl Rig {
             );
             let removed = self.device.GetDeviceRemovedReason();
             assert!(removed.is_ok(), "device lost: {removed:?}");
+            crate::test_d3d12_debug::assert_clean_queue(self.debug.as_ref(), "gpu_detile");
             self.allocator.Reset().unwrap();
             self.list.Reset(&self.allocator, None).unwrap();
         }
@@ -268,7 +273,7 @@ fn both(rig: &mut Rig, d: &Detiler, case: &Case, held: u32) -> bool {
         D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COMMON,
-        total,
+        total.next_multiple_of(4),
     );
     let gpu = Gpu {
         linear,

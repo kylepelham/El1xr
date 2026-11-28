@@ -251,6 +251,7 @@ fn a_job_signals_its_fence_from_the_thread_on_a_card() {
     host.wait_fence(fence);
     // SAFETY: a plain query.
     assert!(unsafe { host.fence.GetCompletedValue() } >= fence);
+    crate::test_d3d12_debug::assert_clean_queue(host.messages.as_ref(), "host_send_thread::fence");
 }
 
 /// (`VICTORY_CARD_RECORD_SEND`) A job records its card lists before it
@@ -359,5 +360,6 @@ fn a_card_list_recorded_on_the_thread_writes_the_same_bytes() {
         assert!(got == want.as_slice(), "recorded on the thread: {on_thread}");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        crate::test_d3d12_debug::assert_clean_queue(host.messages.as_ref(), "host_send_thread::card_rec");
     }
 }

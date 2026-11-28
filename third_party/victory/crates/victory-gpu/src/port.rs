@@ -386,6 +386,7 @@ mod tests {
             assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the stretch");
             assert_eq!(second.bias, 0);
             // The title's views may change under the heap.
+            crate::test_d3d12_debug::assert_clean(&device, "port::place_in");
             drop((placed, second));
             forget(base as usize, 8 * K);
             for view in views {

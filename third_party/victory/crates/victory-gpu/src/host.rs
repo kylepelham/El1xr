@@ -830,9 +830,17 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
-        if debug {
+        #[cfg(test)]
+        let test_debug = crate::test_d3d12_debug::wanted();
+        #[cfg(not(test))]
+        let test_debug = false;
+        let debug = test_debug
+            || (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some());
+        #[cfg(test)]
+        if test_debug {
+            crate::test_d3d12_debug::enable();
+        }
+        if debug && !test_debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
@@ -943,6 +951,10 @@ fn create() -> windows::core::Result<Host> {
 /// Whether the host device is the software adapter (WARP): diagnostics
 /// builds with `VICTORY_D3D12_WARP`.
 pub(crate) fn on_warp() -> bool {
+    #[cfg(test)]
+    if crate::test_d3d12_debug::wanted() {
+        return true;
+    }
     cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
 }
 
@@ -3561,10 +3573,12 @@ impl Host {
     fn new_warp() -> Option<Host> {
         // SAFETY: plain WARP D3D12 object creation for unit tests.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let adapter = warp_adapter().ok()?;
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             let device = device?;
+            let messages = crate::test_d3d12_debug::messages(&device);
             let queue: ID3D12CommandQueue = device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -3580,7 +3594,7 @@ impl Host {
                 submitted: Mutex::new(0),
                 submitted_fence: std::sync::atomic::AtomicU64::new(0),
                 event,
-                messages: None,
+                messages,
                 presenter: Mutex::new(None),
                 adapter: None,
             })
@@ -5135,6 +5149,10 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    #[cfg(test)]
+                    if crate::test_d3d12_debug::wanted() && m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        eprintln!("d3d12 debug layer (host): severity {} id {}: {text}", m.Severity.0, m.ID.0);
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }

@@ -1660,6 +1660,7 @@ pub(crate) mod tests {
         // SAFETY: plain DXGI queries and device creation on the software
         // adapter; a card is never opened.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
             let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
@@ -1691,6 +1692,8 @@ pub(crate) mod tests {
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
         assert!(probe.reserved_section_refused, "a reserved section is refused");
+        // ID 1089: intentional negative test passing a SEC_RESERVE section to OpenExistingHeapFromFileMapping.
+        crate::test_d3d12_debug::assert_clean_except(&device, "inplace::probe", &[1089]);
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that
@@ -1732,6 +1735,7 @@ pub(crate) mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+        crate::test_d3d12_debug::assert_clean(&device, "inplace::place_part");
     }
 
     /// (El1xr) `VICTORY_INPLACE_WINDOWS`: only a window with no side on
