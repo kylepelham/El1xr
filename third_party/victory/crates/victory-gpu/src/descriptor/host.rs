@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod away_grace;
 mod buffer_format;
 mod copy_first;
 mod flicker;
@@ -28,6 +29,7 @@ pub(crate) mod mirror_known;
 pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
+pub(crate) mod remade_safe;
 mod slot_wait;
 mod srgb_cast;
 pub(crate) mod view_ages;
@@ -431,6 +433,7 @@ pub(crate) fn requeue_show(heap: usize, index: u32) {
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
+    remade_safe::level_changed();
     RESHOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1317,6 +1320,11 @@ impl TextureQueue {
         self.marks.set(index, write);
     }
 
+    /// The frame slot `index` was written or found changed in, if queued.
+    fn written_at(&self, index: u32) -> Option<u64> {
+        self.slots.get(&index).map(|w| w.written)
+    }
+
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
@@ -2156,6 +2164,7 @@ impl HostHeap {
             std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()))
         };
         join_ranges(&mut ranges, 0);
+        heap_remap::memory_changed(&ranges);
         if ranges.is_empty() {
             return 0;
         }
@@ -2203,6 +2212,7 @@ impl HostHeap {
             std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()))
         };
         join_ranges(&mut ranges, 0);
+        heap_remap::memory_changed(&ranges);
         // `VICTORY_PAGE_SETTLE_REREAD`: staged textures under them read again once they settle.
         if crate::texture::settle_reread::on() {
             crate::texture::settle_reread::page_written(&ranges, crate::host::now_ms());
@@ -2509,6 +2519,9 @@ impl HostHeap {
         slot_wait::drain();
         self.stale_due();
         self.levels_due();
+        if remade_safe::on() {
+            return self.views_remade_safe();
+        }
         // The slots made again here are live slots of the heap the card
         // reads, and the making is the layer's own, at a moment the title
         // knows nothing of: a list already sent may be reading a slot while
@@ -2640,6 +2653,38 @@ impl HostHeap {
                         raw,
                         i < self.count && !self.sampler && self.tabled_lately(i, frame),
                     )
+                })
+            })
+            .collect()
+    }
+
+    /// (El1xr) [`HostHeap::slots_showing`] for `crate::resource::idle_sweep`: every slot
+    /// showing one of the host textures `raws`, as (index, raw, its kind).
+    pub(crate) fn slots_by_class(
+        &self,
+        raws: &std::collections::HashSet<usize>,
+        frame: u64,
+    ) -> Vec<(u32, usize, super::SlotClass)> {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                // (A lock to a slot: see `kept`.)
+                let raw = {
+                    let r = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    windows::core::Interface::as_raw(r.as_ref()?) as usize
+                };
+                raws.contains(&raw).then(|| {
+                    let i = i as u32;
+                    let title = i < self.count && !self.sampler;
+                    let class = if title && self.tabled_lately(i, frame) {
+                        super::SlotClass::Lately
+                    } else if title && tabled_out() && self.tabled_stamp(i) != 0 {
+                        super::SlotClass::Earlier
+                    } else {
+                        super::SlotClass::Never
+                    };
+                    (i, raw, class)
                 })
             })
             .collect()

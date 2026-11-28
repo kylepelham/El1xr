@@ -41,6 +41,10 @@ use super::super::View;
 
 mod commit;
 mod demand;
+mod follow;
+
+/// Title slots a dirty chunk covers: one 64 KiB page of 32-byte records.
+pub(crate) const CHUNK: u32 = 2048;
 
 /// Frames between looks at every title slot past the host heap.
 pub(crate) const RESCAN_EVERY: u64 = 300;
@@ -177,6 +181,15 @@ pub(crate) struct Packed {
     /// Title slot ranges to look at, and whether to make their views again
     /// even when the record is the same.
     dirty: Vec<(u32, u32, bool)>,
+    /// Title slot chunks ([`CHUNK`] slots) written since they were last
+    /// looked at, and where the look goes on: bounded however much the title
+    /// writes (Part R2: about 95 64 KiB pages of slots past the host heap a
+    /// frame, more than a frame's look reads).
+    chunks: Vec<bool>,
+    chunk_hand: usize,
+    /// (`follow`) The title memory each packed placed texture shows, to make
+    /// it again when that memory is mapped or written.
+    pub(crate) spans: follow::Spans,
     seeded: bool,
     last_rescan: u64,
     /// The frame of the last [`refresh`].
@@ -230,6 +243,8 @@ pub(crate) struct Counts {
     /// The longest ready pass, and passes skipped for commit.
     pub ready_max_us: u64,
     pub ready_waits: u64,
+    /// Packed views made again in place for a change of their memory.
+    pub in_place: u64,
 }
 
 impl Packed {
@@ -246,6 +261,9 @@ impl Packed {
             generation: 0,
             cursor: 0,
             dirty: Vec::new(),
+            chunks: Vec::new(),
+            chunk_hand: 0,
+            spans: follow::Spans::default(),
             seeded: false,
             last_rescan: 0,
             now: 0,
@@ -292,6 +310,48 @@ impl Packed {
         if self.table != 0 {
             put(self.table as *mut u32, self.entry_len, entry, value);
         }
+    }
+
+    /// Marks title slots `[lo, hi)` written.
+    pub(crate) fn mark(&mut self, lo: u32, hi: u32) {
+        if lo >= hi {
+            return;
+        }
+        let last = ((hi - 1) / CHUNK) as usize;
+        if self.chunks.len() <= last {
+            self.chunks.resize(last + 1, false);
+        }
+        for c in (lo / CHUNK) as usize..=last {
+            self.chunks[c] = true;
+        }
+    }
+
+    /// The next written chunk at or after the hand, unmarked: its slots.
+    pub(crate) fn next_chunk(&mut self) -> Option<(u32, u32)> {
+        let n = self.chunks.len();
+        for _ in 0..n {
+            let c = self.chunk_hand;
+            self.chunk_hand = (self.chunk_hand + 1) % n;
+            if std::mem::take(&mut self.chunks[c]) {
+                let lo = c as u32 * CHUNK;
+                return Some((lo, lo + CHUNK));
+            }
+        }
+        None
+    }
+
+    /// Chunks written and not looked at yet.
+    pub(crate) fn chunks_due(&self) -> usize {
+        self.chunks.iter().filter(|&&c| c).count()
+    }
+
+    /// Whether title slot `slot` shows the view of record `key` now (its
+    /// entry points at its packed slot).
+    pub(crate) fn shows(&self, slot: u32, key: [u32; 3]) -> bool {
+        self.map
+            .get(&slot)
+            .and_then(|&k| self.owner[k as usize])
+            .is_some_and(|o| o.stage == Stage::Shown && o.key == key)
     }
 
     /// Whether no packed slot can be given at `frame`.
@@ -533,6 +593,12 @@ static PENDING: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 /// The most dynamic slots taken at once since the last line, and ever.
 pub(crate) static PEAK_TAKEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Title memory `ranges` was mapped or written (`HostHeap::texture_slots_remapped`): packed
+/// textures over it are made again ([`follow`]).
+pub(super) fn memory_changed(ranges: &[(u64, u64)]) {
+    follow::memory_changed(ranges);
+}
+
 /// Title slots `[lo, hi)` were written (`heap_cap::made_past`, `note_writes`).
 pub(crate) fn dirty(lo: u32, hi: u32) {
     if lo < hi {
@@ -723,7 +789,9 @@ fn work(w: &'static Worker) {
 /// Does `op`: the descriptor written, nothing else of the heap's touched.
 fn run(op: Op) -> Done {
     // a texture whose host copy is not there: made only as the commit gate says
-    let texture = match &op.view {
+    // (a placed view's texture object is the one `make` resolves it to)
+    let resolved = op.view.as_ref().and_then(super::placed_texture);
+    let texture = match resolved.as_ref().or(op.view.as_ref()) {
         Some(View::Shader(resource, _)) => Some(*resource as crate::object::This)
             .filter(|&r| !crate::resource::host_copy_made(r)),
         _ => None,
@@ -953,22 +1021,25 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
         if packed.seeded {
             line(packed, frame, title);
         }
-        packed.dirty.push((packed.title_null, end, false));
+        let lo = packed.title_null;
+        packed.mark(lo, end);
         packed.seeded = true;
         packed.last_rescan = frame;
     }
     for (lo, hi) in std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner())) {
         let (lo, hi) = (lo.max(packed.title_null), hi.min(end));
-        if lo < hi {
-            packed.dirty.push((lo, hi, false));
-        }
+        packed.mark(lo, hi);
+    }
+    // packed textures whose memory was mapped or written: made again in place
+    for slot in follow::changed(packed) {
+        packed.dirty.push((slot, slot + 1, true));
     }
     if frame.is_multiple_of(8) {
         for slot in packed.failed(RETRY_BUDGET) {
             packed.dirty.push((slot, slot + 1, false));
         }
     }
-    if packed.dirty.is_empty() {
+    if packed.dirty.is_empty() && packed.chunks_due() == 0 {
         return;
     }
     let (mut read, mut makes) = (0u32, 0u32);
@@ -978,9 +1049,23 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
     if bytes.len() < 1 << 19 {
         bytes.resize(1 << 19, 0);
     }
-    while let Some((lo, hi, again)) = packed.dirty.pop() {
+    loop {
+        let Some((lo, hi, again)) = packed.dirty.pop().or_else(|| {
+            // the singles first (retries, memory changes), then written chunks
+            let (lo, hi) = packed.next_chunk()?;
+            Some((lo.max(packed.title_null), hi.min(end), false))
+        }) else {
+            break;
+        };
+        if lo >= hi {
+            continue;
+        }
         if read >= READ_BUDGET || makes >= MAKE_BUDGET {
-            packed.dirty.push((lo, hi, again));
+            if again || hi - lo < CHUNK {
+                packed.dirty.push((lo, hi, again));
+            } else {
+                packed.mark(lo, hi);
+            }
             break;
         }
         let n = (hi - lo)
@@ -1021,11 +1106,20 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
                 packed.put(entry, packed.unpacked(view.is_some()));
                 continue;
             }
+            // a view whose memory changed: its entry keeps pointing at its packed slot while
+            // the view is made again there (null meanwhile would read black)
+            let in_place = again && packed.shows(slot, key);
             let placed = packed.place(slot, view.as_ref().map(|_| key), again, frame);
-            if let Placed::Make { .. } = placed {
+            if let Placed::Make { at, generation } = placed {
                 makes += 1;
+                if let Some(view) = &view {
+                    packed.spans.note(view, at - packed.base, generation);
+                }
             }
-            apply(packed, host, entry, placed, view);
+            if in_place {
+                packed.counts.in_place += 1;
+            }
+            apply(packed, host, entry, placed, view, in_place);
         }
     }
 }
@@ -1033,7 +1127,14 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
 /// Does what [`Packed::place`] said for title slot entry `entry` (`view`
 /// its view): off the table first (shown again once made and readied), the
 /// make or null queued; an overflow left unpacked (flagged under `=5`).
-fn apply(packed: &Packed, host: &super::HostHeap, entry: u32, placed: Placed, view: Option<View>) {
+fn apply(
+    packed: &Packed,
+    host: &super::HostHeap,
+    entry: u32,
+    placed: Placed,
+    view: Option<View>,
+    in_place: bool,
+) {
     let (at, generation, view) = match placed {
         Placed::Make { at, generation } => (at, generation, view),
         Placed::Drop(at) => (at, 0, None),
@@ -1043,7 +1144,9 @@ fn apply(packed: &Packed, host: &super::HostHeap, entry: u32, placed: Placed, vi
         }
         Placed::Same | Placed::Nothing => return,
     };
-    packed.put(entry, packed.title_null);
+    if !in_place {
+        packed.put(entry, packed.title_null);
+    }
     send(Op {
         heap: host.heap.clone(),
         id: host.id,
@@ -1179,6 +1282,9 @@ fn line(packed: &mut Packed, frame: u64, title: u32) {
         unread = c.unread,
         looked = c.looked,
         backlog = packed.dirty.len(),
+        chunks_due = packed.chunks_due(),
+        in_place = c.in_place,
+        followed = packed.spans.len(),
         dynamic_peak = PEAK_TAKEN[0].swap(0, Relaxed),
         dynamic_peak_ever = PEAK_TAKEN[1].load(Relaxed),
         commit_mb,

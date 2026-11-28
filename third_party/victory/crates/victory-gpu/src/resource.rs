@@ -1347,6 +1347,8 @@ pub(crate) mod placed_inside;
 pub(crate) mod alias_compatible;
 #[cfg(windows)]
 pub(crate) mod find_facts;
+#[cfg(windows)]
+pub(crate) mod idle_sweep;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
@@ -1774,6 +1776,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        crate::idle_evict::made_again(this as usize);
         *made = Some((std::sync::Arc::new(host), twin));
         crate::readable_once::bump(this as usize);
         // Slots the title wrote with views of it while it had no host copy
@@ -2607,6 +2610,8 @@ pub(crate) fn let_go_idle() {
     }
     slot_evict(&all, video, idle_ms, IDLE_FRAMES);
     drop(all);
+    // (El1xr) VICTORY_IDLE_EVICT_S: copies only table slots show, on a thread of its own.
+    crate::idle_evict::start();
     if floor {
         crate::commitline::floor_report(&floor_went);
     }

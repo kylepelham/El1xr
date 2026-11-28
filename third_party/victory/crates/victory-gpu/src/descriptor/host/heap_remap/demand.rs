@@ -294,17 +294,20 @@ pub(super) fn step(
             continue;
         };
         match placed {
-            Placed::Make { .. } => {
+            Placed::Make { at, generation } => {
                 let view = packed
                     .map
                     .get(&slot)
                     .and_then(|&k| packed.owner[k as usize])
                     .and_then(|o| super::super::super::view_at(o.key[1], o.key[2]));
-                super::apply(packed, host, entry, placed, view);
+                if let Some(view) = &view {
+                    packed.spans.note(view, at - packed.base, generation);
+                }
+                super::apply(packed, host, entry, placed, view, false);
             }
             Placed::Drop(at) => {
                 // evicted, still live: asks again when read
-                super::apply(packed, host, entry, placed, None);
+                super::apply(packed, host, entry, placed, None, false);
                 packed.put(entry, packed.unpacked(true));
                 let _ = at;
             }
