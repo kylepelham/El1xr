@@ -86,9 +86,33 @@ fn a_slot_is_told_when_it_turns_bad_and_when_it_turns_good() {
 
 #[test]
 fn bake_result_memory_is_found_by_overlap() {
-    let r = [(0x1000u64, 0x100u64)];
-    assert!(overlaps(&r, 0x10f0, 0x20));
-    assert!(overlaps(&r, 0x0f00, 0x101));
-    assert!(!overlaps(&r, 0x1100, 0x10));
-    assert!(!overlaps(&r, 0x0f00, 0x100));
+    let r = [(0x1000u64, 0x100u64, 1usize, false)];
+    assert_eq!(overlaps(&r, 0x10f0, 0x20), Some(false));
+    assert_eq!(overlaps(&r, 0x0f00, 0x101), Some(false));
+    assert_eq!(overlaps(&r, 0x1100, 0x10), None);
+    assert_eq!(overlaps(&r, 0x0f00, 0x100), None);
+}
+
+/// Memory a released bake result held is told apart from a bake result still the title's
+/// (batch 5 part O: `in_bake_memory` could not say which), and from a target over it now.
+#[test]
+fn released_bake_memory_and_a_target_over_it_are_named() {
+    let r = [
+        (0x1000u64, 0x100u64, 1usize, true),
+        (0x1080, 0x100, 2, false),
+    ];
+    assert_eq!(overlaps(&r[..1], 0x1010, 0x10), Some(true));
+    assert_eq!(overlaps(&r, 0x1090, 0x10), Some(false), "one still the title's");
+    let mut t = ok(5);
+    t.note_bake(overlaps(&r[..1], 0x1010, 0x10));
+    t.over_target = Some(0x1000);
+    assert_eq!(reason(&t), Some("bake_alias"));
+    let text = tex_text(&t);
+    assert!(text.contains(" in_released_bake_memory over_target=0x1000"), "{text}");
+    let mut live = ok(5);
+    live.note_bake(overlaps(&r, 0x1090, 0x10));
+    assert!(tex_text(&live).ends_with(" in_bake_memory"));
+    let mut none = ok(5);
+    none.note_bake(None);
+    assert!(!none.in_bake);
 }

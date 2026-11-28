@@ -106,6 +106,22 @@ pub(crate) struct Tex {
     pub(crate) baked: Option<String>,
     /// Its memory lies in a bake result's memory, through another texture object.
     pub(crate) in_bake: bool,
+    /// That bake result was released by the title since (its memory given to others).
+    pub(crate) bake_released: bool,
+    /// The start of a texture the host writes (a target) whose memory holds part of it now.
+    pub(crate) over_target: Option<u64>,
+}
+
+impl Tex {
+    /// What [`in_result`] said of its memory; an earlier answer is kept.
+    pub(crate) fn note_bake(&mut self, found: Option<bool>) {
+        if let Some(released) = found
+            && !self.in_bake
+        {
+            self.in_bake = true;
+            self.bake_released = released;
+        }
+    }
 }
 
 /// Why a slot reads badly, the first reason found; None when it looks current.
@@ -168,7 +184,14 @@ pub(crate) fn tex_text(t: &Tex) -> String {
         s.push_str(&format!(" baked={b}"));
     }
     if t.in_bake {
-        s.push_str(" in_bake_memory");
+        s.push_str(if t.bake_released {
+            " in_released_bake_memory"
+        } else {
+            " in_bake_memory"
+        });
+    }
+    if let Some(at) = t.over_target {
+        s.push_str(&format!(" over_target={at:#x}"));
     }
     s
 }
@@ -317,9 +340,12 @@ pub(crate) fn unread(frame: u64) {
     }
 }
 
-/// Title memory of bake results (`crate::bake_check` results): (address, bytes), the newest few.
-fn results() -> std::sync::MutexGuard<'static, Vec<(u64, u64)>> {
-    static R: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// A bake result's title memory: address, bytes, its texture, whether the title released it.
+type Result = (u64, u64, usize, bool);
+
+/// Title memory of bake results (`crate::bake_check` results), the newest few.
+fn results() -> std::sync::MutexGuard<'static, Vec<Result>> {
+    static R: Mutex<Vec<Result>> = Mutex::new(Vec::new());
     R.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -327,32 +353,49 @@ fn results() -> std::sync::MutexGuard<'static, Vec<(u64, u64)>> {
 const RESULT_RANGES: usize = 1024;
 static NOTED: AtomicU64 = AtomicU64::new(0);
 
-/// A bake result lies in title memory `address`, `len` bytes.
-pub(crate) fn note_result(address: u64, len: u64) {
+/// Bake result `resource` lies in title memory `address`, `len` bytes.
+pub(crate) fn note_result(address: u64, len: u64, resource: usize) {
     if address == 0 || len == 0 {
         return;
     }
     let mut r = results();
-    if r.iter().any(|&(a, l)| a == address && l == len) {
+    if let Some(e) = r
+        .iter_mut()
+        .find(|e| e.0 == address && e.1 == len && e.2 == resource)
+    {
+        e.3 = false;
         return;
     }
     if r.len() >= RESULT_RANGES {
         r.drain(..RESULT_RANGES / 2);
     }
-    r.push((address, len));
+    r.push((address, len, resource, false));
     NOTED.fetch_add(1, Relaxed);
 }
 
-/// Whether `[address, address + len)` overlaps a bake result's memory.
-pub(crate) fn in_result(address: u64, len: u64) -> bool {
+/// The title released texture `resource`: a bake result's memory is noted as released.
+pub(crate) fn result_gone(resource: usize) {
+    if !on() {
+        return;
+    }
+    for e in results().iter_mut().filter(|e| e.2 == resource) {
+        e.3 = true;
+    }
+}
+
+/// Whether `[address, address + len)` overlaps a bake result's memory: `Some(released)`,
+/// false when one of them is still the title's.
+pub(crate) fn in_result(address: u64, len: u64) -> Option<bool> {
     overlaps(&results(), address, len)
 }
 
-fn overlaps(ranges: &[(u64, u64)], address: u64, len: u64) -> bool {
+fn overlaps(ranges: &[Result], address: u64, len: u64) -> Option<bool> {
     let end = address.saturating_add(len.max(1));
     ranges
         .iter()
-        .any(|&(a, l)| address < a.saturating_add(l) && a < end)
+        .filter(|e| address < e.0.saturating_add(e.1) && e.0 < end)
+        .map(|e| e.3)
+        .reduce(|a, b| a && b)
 }
 
 #[cfg(test)]

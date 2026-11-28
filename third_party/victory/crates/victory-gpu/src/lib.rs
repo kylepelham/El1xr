@@ -233,6 +233,8 @@ mod zero_out;
 #[cfg(windows)]
 mod face_watch;
 #[cfg(windows)]
+mod target_reuse;
+#[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
 mod memory;

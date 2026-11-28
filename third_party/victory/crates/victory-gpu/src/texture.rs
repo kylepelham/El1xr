@@ -930,6 +930,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+    crate::target_reuse::forget(resource);
+    crate::face_watch::result_gone(resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -974,6 +976,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    // `VICTORY_TARGET_REUSE_REREAD` (`crate::target_reuse`): memory a target held is read
+    // again from title memory.
+    let (at, len) = staging.memory();
+    if crate::target_reuse::reread(resource as usize, at as u64, len as u64) {
+        staging.forget();
+        staging.dirty.store(true, Relaxed);
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte

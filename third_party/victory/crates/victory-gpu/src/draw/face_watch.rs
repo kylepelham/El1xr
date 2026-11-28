@@ -53,7 +53,8 @@ impl State {
             Some(View::Placed(false, resource, _)) => {
                 if let Some((address, len, _)) = bake_pass::placed(heap, slot) {
                     t.zero = bake_zero::reads_zero(address, len);
-                    t.in_bake = crate::face_watch::in_result(address, len);
+                    t.note_bake(crate::face_watch::in_result(address, len));
+                    t.over_target = crate::resource::placed_inside::target_over(address, len);
                     crate::resource::placed_known(address, &resource)
                 } else {
                     None
@@ -71,7 +72,7 @@ impl State {
                 && let Some((at, desc)) = crate::resource::texture_memory(this)
                 && let Some(len) = crate::resource::texture_layout(&desc).map(|l| l.size)
             {
-                t.in_bake = crate::face_watch::in_result(at as u64, len);
+                t.note_bake(crate::face_watch::in_result(at as u64, len));
             }
         }
         t

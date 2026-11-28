@@ -781,7 +781,7 @@ pub(crate) fn written(list: usize, resource: usize, kind: &str, by: usize) {
                 && let Some((at, desc)) = crate::resource::texture_memory(resource as crate::object::This)
                 && let Some(layout) = crate::resource::texture_layout(&desc)
             {
-                crate::face_watch::note_result(at as u64, layout.size);
+                crate::face_watch::note_result(at as u64, layout.size, resource);
             }
             let mut set = result_set().write().unwrap_or_else(|e| e.into_inner());
             set.insert(resource);
