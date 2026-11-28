@@ -1627,6 +1627,68 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
     );
 }
 
+/// `VICTORY_VOLUMETRICS_WIDE=1`: the program above, in the untiled
+/// `CS_TransmissionVolumetrics`' container (`super::underwater::UNTILED`), on a 32-lane host
+/// without the paired form (the RTX 5090's `VICTORY_WAVE_PAIRS=0`), takes the wave-wide form
+/// with 32-lane waves before the approximate one; off, and in another container, the
+/// approximate form as before.
+#[test]
+fn the_untiled_volumetrics_take_the_wave_wide_form_before_an_approximate_one() {
+    let mut w = vec![
+        sop1(0x03, 7, LIT), // s_mov_b32 s7, 0x77
+        0x77,
+        vop1(0x01, 5, k(1)),    // v_mov_b32 v5, 1
+        vop2(0x16, 6, k(1), 0), // v_lshrrev_b32 v6, 1, v0
+        vop2(0x1A, 7, v(6), 5), // v_lshlrev_b32 v7, v6, v5
+        vopc(0xC4, 0, 0),       // v_cmp_gt_u32 vcc, s0, v0
+        sop1(0x24, 12, VCC),    // s_and_saveexec_b64 s[12:13], vcc
+        sopp(0x08, 20),         // s_cbranch_execz past the OR
+    ];
+    w.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    w.extend([
+        sop1(0x04, EXEC, 12), // s_mov_b64 exec, s[12:13]
+        vop1(0x01, 8, 7),     // v_mov_b32 v8, s7
+    ]);
+    w.extend(stores([8, 7, 6, 0]));
+    let native = native_with(&w, true, 64, 0);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut untiled = crate::dxbc::build(&[]);
+    untiled[4..20].copy_from_slice(&super::underwater::UNTILED);
+    let other = crate::dxbc::build(&[]);
+    let form = |bytes: &[u8], on: bool| {
+        let c = super::Container::parse(bytes).expect("container");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let pairs = super::TEST_PAIRS.replace(Some(false));
+        let switch = super::underwater::TEST_VOLUMETRICS_WIDE.replace(Some(on));
+        let r = super::emit_forms(&c, &native, &p, &st, &io, &res);
+        super::underwater::TEST_VOLUMETRICS_WIDE.set(switch);
+        super::TEST_PAIRS.set(pairs);
+        lower::TEST_HOST_WAVE.set(was);
+        r.expect("emit_forms")
+    };
+    let wide = {
+        let c = super::Container::parse(&untiled).expect("container");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let r = super::widen(&c, &native, &p, false, false);
+        lower::TEST_HOST_WAVE.set(was);
+        r.expect("the wave-wide form")
+    };
+    assert_eq!(wide.1, Some(32));
+    let (on, off, elsewhere) = (form(&untiled, true), form(&untiled, false), form(&other, true));
+    assert_eq!(on.1, Some(32));
+    assert!(on.0.dxil == wide.0.dxil, "on: the wave-wide form");
+    assert!(off.0.dxil != wide.0.dxil, "off: the wave-wide form anyway");
+    assert!(elsewhere.0.dxil == off.0.dxil, "another program: as off");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = on.0.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+}
+
 /// [`half_sum_program`] in the paired form: each half's tree over its 32 lanes, then the two
 /// halves' sums, the console's last addition.
 #[test]

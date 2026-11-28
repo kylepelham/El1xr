@@ -23,6 +23,14 @@
 //!
 //! Ported from readmet3xt-lab/foxhound PR #16 (head `9d1fba51`, JokerAttack), GPL-3.0; the
 //! PortalsOnly digest is from trustno1-coder/VIctory-NVIDIA #101.
+//!
+//! `VICTORY_VOLUMETRICS_WIDE=1` puts the untiled `CS_TransmissionVolumetrics`
+//! (`6871d6e4b3ac9a10`) on the same list ([`UNTILED`]). Without it the program is refused ("a
+//! lane mask holding lanes elsewhere read as data"); with `VICTORY_MASK_ELSEWHERE=1` it comes
+//! out with 64-lane waves, which the driver refuses (`E_INVALIDARG`, "wants wave lane count of
+//! 64"). Either way it is the one refused pipeline of every run: the title makes it at load.
+//! The wave-wide form gives it 32-lane waves (14 branches taken wave-wide), with or without
+//! `VICTORY_MASK_ELSEWHERE` or `VICTORY_LOOPS_WAVE`.
 
 /// The containers' digests (bytes 4..20 of the container).
 pub(super) const DIGESTS: [[u8; 16]; 2] = [
@@ -38,6 +46,11 @@ pub(super) const DIGESTS: [[u8; 16]; 2] = [
     ],
 ];
 
+/// The untiled `CS_TransmissionVolumetrics` (`6871d6e4b3ac9a10`), `VICTORY_VOLUMETRICS_WIDE=1`.
+pub(super) const UNTILED: [u8; 16] = [
+    0xc4, 0x0b, 0xd9, 0x53, 0x09, 0x6e, 0x88, 0x25, 0xce, 0x64, 0x50, 0xb5, 0x53, 0xf1, 0x23, 0x5c,
+];
+
 pub(super) fn on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_UNDERWATER_WIDE.get() {
@@ -47,17 +60,30 @@ pub(super) fn on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_UNDERWATER_WIDE").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether [`UNTILED`] is on the list (`VICTORY_VOLUMETRICS_WIDE=1`).
+pub(super) fn untiled_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_VOLUMETRICS_WIDE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VOLUMETRICS_WIDE").is_ok_and(|v| v.trim() == "1"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`on`], for its thread only.
     pub(super) static TEST_UNDERWATER_WIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+    /// A test's choice for [`untiled_on`], for its thread only.
+    pub(super) static TEST_VOLUMETRICS_WIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Whether the switch puts the program of `digest` with groups of `threads` threads on the
+/// Whether a switch puts the program of `digest` with groups of `threads` threads on the
 /// wave-wide list.
 pub(super) fn listed(threads: Option<u32>, digest: [u8; 16]) -> bool {
-    threads == Some(64) && on() && DIGESTS.contains(&digest)
+    threads == Some(64) && (on() && DIGESTS.contains(&digest) || untiled_on() && digest == UNTILED)
 }
 
 /// Whether a host-loop retry of the program of `digest` that gives waves of `wave` lanes on a
@@ -86,4 +112,22 @@ mod tests {
         assert!(retry_counts(DIGESTS[1], 64, 32));
         TEST_UNDERWATER_WIDE.set(was);
     }
+
+    #[test]
+    fn the_untiled_program_joins_the_list_only_with_its_own_switch() {
+        let (under, untiled) = (TEST_UNDERWATER_WIDE.replace(Some(true)), TEST_VOLUMETRICS_WIDE.replace(Some(false)));
+        assert!(!listed(Some(64), UNTILED), "not with VICTORY_UNDERWATER_WIDE alone");
+        TEST_UNDERWATER_WIDE.set(Some(false));
+        TEST_VOLUMETRICS_WIDE.set(Some(true));
+        assert!(listed(Some(64), UNTILED));
+        assert!(!listed(Some(128), UNTILED));
+        assert!(!listed(Some(64), DIGESTS[0]), "the other two stay with VICTORY_UNDERWATER_WIDE");
+        assert!(retry_counts(UNTILED, 64, 32));
+        TEST_UNDERWATER_WIDE.set(under);
+        TEST_VOLUMETRICS_WIDE.set(untiled);
+    }
 }
+
+#[cfg(all(test, windows))]
+#[path = "volumetrics_wide_tests.rs"]
+mod volumetrics_wide_tests;
