@@ -758,6 +758,7 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         crate::timeline::closed(std::ptr::from_ref(host) as usize);
+        crate::watch::look_skip::closed(std::ptr::from_ref(host) as usize);
         host.close();
     }
     S_OK
@@ -789,6 +790,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // Before `host_list` below: a list left open is not closed for it.
         if let Some(host) = list.host.as_ref() {
             crate::fresh_open::title_reset(host);
+            crate::watch::look_skip::forget(std::ptr::from_ref(host) as usize);
         }
     }
     #[cfg(windows)]

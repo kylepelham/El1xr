@@ -64,6 +64,8 @@ mod holes;
 pub(crate) mod ask_split;
 /// (worldstream) `VICTORY_ASK_END_FAST=1`: an end with nothing standing leaves the journal's lock alone.
 mod end_fast;
+/// (worldstream) `VICTORY_LOOK_SKIP=1`: a submission covered by this frame's last asking takes it again.
+pub(crate) mod look_skip;
 mod reservation;
 pub(crate) use reservation::line as reservation_line;
 
@@ -1989,6 +1991,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_once_end();
     ask_split::add_us(ask_split::END_US, ending);
     if reservation::enabled() {
+        if look_skip::take_again(ranges) {
+            return;
+        }
         reservation::ask(ranges);
         return;
     }
@@ -2560,6 +2565,9 @@ pub(crate) fn ask_once_end() {
         return;
     }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    if j.kept {
+        look_skip::ended(&j);
+    }
     if j.kept || reservation::enabled() {
         j.kept = false;
         KEPT.store(false, std::sync::atomic::Ordering::Release);

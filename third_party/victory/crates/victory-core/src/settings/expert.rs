@@ -219,6 +219,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_LIVE_TEXTURES_SKIP_GPU_WRITTEN", Apply::Live),
     ("VICTORY_LOADING_DRAIN", Apply::Live),
     ("VICTORY_LOOKUP_CACHE", Apply::Restart),
+    ("VICTORY_LOOK_SKIP", Apply::Live),
     ("VICTORY_MAPPED_BY_PAGE", Apply::Restart),
     ("VICTORY_MAPPED_BY_VIEWS", Apply::Live),
     ("VICTORY_MEET_POLLS", Apply::Retranslate),
