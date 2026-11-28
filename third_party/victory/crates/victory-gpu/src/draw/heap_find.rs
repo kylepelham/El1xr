@@ -27,7 +27,7 @@ fn entry_found(start: u64, len: u64, at: usize, v: u32, what: &str) -> String {
     };
     entry::found(start, len, at, slot, what);
     match entry::read_words(start + 4 * at as u64, 4).and_then(|w| w.first().copied()) {
-        Some(raw) if raw != v => format!(" raw {raw:#x} (bits 27-31 the shader drops)"),
+        Some(raw) if raw != v => format!(" raw {raw:#x} (flags in bits 24-31 the shader masks off)"),
         _ => String::new(),
     }
 }
@@ -136,6 +136,18 @@ impl State {
                 _ => {}
             }
         }
+        if let Some(p) = p
+            && crate::heap_find::entry::on()
+        {
+            for (label, start, len) in self.heap_bound_buffers(p, roots, &heap) {
+                if let Some((at, v, what)) = search_memory(start, len, &filter, &wanted) {
+                    hits.push(format!(
+                        "ref global {label} buffer {start:#x}+{len:#x} dword {at} = {v:#x} ({what}){}",
+                        entry_found(start, len, at, v, &what)
+                    ));
+                }
+            }
+        }
         for stage in p.iter().flat_map(|p| p.stages.iter()) {
             for u in stage.translated().used.iter() {
                 if u.root != RootType::Table || !matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
@@ -161,6 +173,60 @@ impl State {
                 }
             }
         }
+    }
+
+    /// (round 11, `VICTORY_HEAP_FIND_ENTRY=1`) The buffers a forward
+    /// material shader takes from the heap (`crate::heap_find::entry`):
+    /// for each heap byte offset in its `b0` dwords 8 and 9 first seen
+    /// this frame, the buffer views of the slots from it (label, start,
+    /// bytes).
+    fn heap_bound_buffers(
+        &self,
+        p: &HostPipeline,
+        roots: &[Root],
+        heap: &crate::descriptor::Heap,
+    ) -> Vec<(String, u64, u64)> {
+        use crate::heap_find::entry::{BASE_DWORDS, base_slots, first_base, read_words};
+        let frame = crate::frame::current();
+        let mut out = Vec::new();
+        for stage in &p.stages {
+            for u in stage.translated().used.iter() {
+                if u.kind != ResourceType::Cbv || u.lower_bound != 0 {
+                    continue;
+                }
+                let at = match (u.root, roots.get(usize::from(u.slot))) {
+                    (RootType::Table, Some(&Root::Table(table))) => {
+                        match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                            Some(View::Constant(a, _)) => a,
+                            _ => continue,
+                        }
+                    }
+                    (RootType::Descriptor, Some(&Root::View(a))) => a,
+                    _ => continue,
+                };
+                let Some(words) = read_words(at, 4 * (BASE_DWORDS[1] as u64 + 1)) else {
+                    continue;
+                };
+                for d in BASE_DWORDS {
+                    let base = words[d];
+                    if base == 0 || !first_base(frame, base) {
+                        continue;
+                    }
+                    for slot in base_slots(base, u32::MAX) {
+                        let handle = heap.start + u64::from(slot) * crate::heap_find::SLOT_BYTES;
+                        if heap.index(handle) != Some(slot) {
+                            break;
+                        }
+                        if let Some((start, len)) = crate::descriptor::view(handle).as_ref().and_then(buffer_memory) {
+                            let k = u64::from(slot) * crate::heap_find::SLOT_BYTES - u64::from(base);
+                            out.push((format!("b0 dword {d} base {base:#x} +{k} slot {slot}"), start, len));
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+        out
     }
 
     /// (round 10, `VICTORY_HEAP_FIND_ENTRY=1`) A bind whose buffer views

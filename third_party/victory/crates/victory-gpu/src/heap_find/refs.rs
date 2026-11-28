@@ -54,8 +54,8 @@ pub(crate) type Candidates = Arc<Vec<(u32, u32)>>;
 /// `bound` (an index or byte offset, from the heap's or a table's first
 /// slot, is never past the largest slot's byte offset), or one of `extra`
 /// (the found slots' handles, low half).
-/// (round 10, `low_bits`) A word whose bits under [`INDEX_BITS`] name a
-/// found slot is kept under those bits.
+/// (round 10, `low_bits`) A word whose bits under [`INDEX_BITS`] are an
+/// index no larger than the largest found slot is kept under those bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Filter {
     pub(crate) bound: u32,
@@ -63,11 +63,12 @@ pub(crate) struct Filter {
     pub(crate) low_bits: bool,
 }
 
-/// The bits of a word a translated shader keeps of a view index: it
-/// multiplies the index by 32 in 32-bit arithmetic (`index << 5`, then the
-/// heap's byte address over 32), so bits 27-31 never reach the slot and
-/// the title may keep flags there.
-pub(crate) const INDEX_BITS: u32 = 0x07ff_ffff;
+/// The bits of a material word that are its view index (round 11): the
+/// forward material shaders (`TL_PS_PBR_MATERIAL_EMISSIVE` 1b14318ca02eeada)
+/// read a texture's index from their 512-byte material record (+12, +48)
+/// and keep `word & 0xffffff` before `<< 5`, so bits 24-31 are flags. Round
+/// 10 kept 27 bits and missed a flag in bits 24-26.
+pub(crate) const INDEX_BITS: u32 = 0x00ff_ffff;
 
 impl Filter {
     fn plain(&self, word: u32) -> bool {
@@ -80,7 +81,8 @@ impl Filter {
             return Some(word);
         }
         let low = word & INDEX_BITS;
-        (self.low_bits && low != word && self.plain(low)).then_some(low)
+        let index = (super::SMALLEST..=self.bound / super::SLOT_BYTES as u32).contains(&low);
+        (self.low_bits && low != word && index).then_some(low)
     }
 
     /// A number for the buffer keys: buffers searched with another filter
@@ -371,6 +373,11 @@ mod tests {
         let words = [1.0f32.to_bits(), 0x8000_0000 | 94_434, 0xf800_0007];
         assert!(candidates(&bytes(&words), &plain).is_empty());
         assert_eq!(candidates(&bytes(&words), &low), vec![(94_434, 1)]);
+        // Round 11: a flag in bits 24-26 (the shader keeps 24 bits) is
+        // kept too; a flagged byte offset is not an index and is not.
+        let flagged = [0x0300_0000 | 94_434, 0x3f00_0000 | (94_434 * 32)];
+        assert!(candidates(&bytes(&flagged), &plain).is_empty());
+        assert_eq!(candidates(&bytes(&flagged), &low), vec![(94_434, 0)]);
         assert_ne!(plain.id(), low.id(), "searched again when the switch flips");
         let wanted: Vec<Wanted> = vec![(94_434, "slot 94434 as an index".into())];
         let c = candidates(&bytes(&words), &low);
