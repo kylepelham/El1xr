@@ -696,6 +696,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     crate::timeline::line(frames);
+    crate::title_waits::line(frames);
     crate::merge_runs::line(frames);
     readcopy::frame_line(frames);
     sweep_aside::line(frames);
@@ -4520,6 +4521,8 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::timeline::mark(0);
+        crate::title_threads::settle();
+        crate::title_waits::submission();
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4573,6 +4576,7 @@ impl Host {
             }
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::descriptor::host::remade_safe::point(flying);
         crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {

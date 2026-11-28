@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
 
@@ -20,6 +22,11 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
+    /// The key of these 32 bytes (as [`CacheKey::bytes`] gave them).
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        CacheKey(blake3::Hash::from_bytes(bytes))
+    }
+
     /// The key's 32 bytes (the pack's index, `crate::pack`).
     pub fn bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
@@ -30,10 +37,34 @@ impl CacheKey {
     }
 }
 
+/// (Vice-Tay 511a950) The conversions running, by key: a second miss for
+/// a key being converted waits for that conversion instead of converting
+/// it too (`VICTORY_SHARED_CONVERSIONS=1`).
+type Running = Mutex<HashMap<CacheKey, Weak<Mutex<()>>>>;
+
+/// Misses that waited for another thread's conversion of their key and
+/// took its result ([`shared_conversions`]).
+static SHARED: AtomicU64 = AtomicU64::new(0);
+
+/// Misses served by another thread's conversion of the same key since the
+/// start (`VICTORY_SHARED_CONVERSIONS=1`; 0 without it).
+pub fn shared_conversions() -> u64 {
+    SHARED.load(Ordering::Relaxed)
+}
+
+/// Whether concurrent misses for one key share one conversion
+/// (`VICTORY_SHARED_CONVERSIONS=1`; off unless set).
+fn sharing() -> bool {
+    std::env::var_os("VICTORY_SHARED_CONVERSIONS").is_some_and(|v| v == "1")
+}
+
 /// Content-addressed store under the user's cache directory.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    /// With `VICTORY_SHARED_CONVERSIONS=1`: the conversions running, shared
+    /// by the clones of this cache.
+    running: Option<Arc<Running>>,
 }
 
 impl Cache {
@@ -44,10 +75,32 @@ impl Cache {
 
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_sharing(root, sharing())
+    }
+
+    /// [`Cache::open`], with concurrent misses for one key sharing one
+    /// conversion or not.
+    fn open_sharing(root: impl Into<PathBuf>, share: bool) -> Result<Self> {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Cache { root })
+        Ok(Cache {
+            root,
+            running: share.then(Arc::default),
+        })
+    }
+
+    /// The lock of `key`'s conversion, made if none is running
+    /// (`VICTORY_SHARED_CONVERSIONS=1`).
+    fn conversion(running: &Running, key: CacheKey) -> Arc<Mutex<()>> {
+        let mut running = running.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conversion) = running.get(&key).and_then(Weak::upgrade) {
+            return conversion;
+        }
+        running.retain(|_, conversion| conversion.strong_count() != 0);
+        let conversion = Arc::new(Mutex::new(()));
+        running.insert(key, Arc::downgrade(&conversion));
+        conversion
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
@@ -67,6 +120,13 @@ impl Cache {
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+            return Ok(path);
+        }
+        let conversion = self.running.as_deref().map(|running| Self::conversion(running, key));
+        let _converting = conversion.as_deref().map(|c| c.lock().unwrap_or_else(|e| e.into_inner()));
+        if conversion.is_some() && path.is_file() {
+            // Converted by the thread this one waited for.
+            SHARED.fetch_add(1, Ordering::Relaxed);
             return Ok(path);
         }
         let output = converter
@@ -94,10 +154,14 @@ impl Cache {
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(e) = published {
             let _ = std::fs::remove_file(&tmp);
+            // (Vice-Tay 511a950) Another process published the key first (or
+            // a reader held the file open): its output is the same.
+            if self.running.is_none() || !path.is_file() {
+                return Err(e.into());
+            }
         }
-        published?;
         Ok(path)
     }
 }
@@ -155,6 +219,53 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    /// [`Upper`], slow enough that the threads of a test all miss.
+    struct SlowUpper(Upper);
+
+    impl Converter for SlowUpper {
+        fn id(&self) -> &'static str {
+            self.0.id()
+        }
+        fn version(&self) -> u32 {
+            self.0.version()
+        }
+        fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.0.convert(input)
+        }
+    }
+
+    /// `threads` threads miss on one key at once, sharing conversions; the
+    /// conversions run.
+    fn misses_at_once(threads: usize) -> usize {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open_sharing(tmp.path().join("cache"), true).unwrap();
+        let conv = SlowUpper(Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        });
+        let start = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let (cache, start, conv) = (&cache, &start, &conv);
+                scope.spawn(move || {
+                    start.wait();
+                    let path = cache.get_or_convert(conv, b"abc").unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"ABC");
+                });
+            }
+        });
+        conv.0.runs.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn concurrent_misses_for_one_key_share_a_conversion() {
+        let _one = one_at_a_time();
+        let shared = shared_conversions();
+        assert_eq!(misses_at_once(8), 1);
+        assert_eq!(shared_conversions() - shared, 7);
     }
 
     #[test]

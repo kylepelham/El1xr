@@ -638,6 +638,13 @@ pub(crate) fn skips_rt_skin(this: This, alpha_rays: bool) -> bool {
     })
 }
 
+/// Whether `this`'s dispatches are bound and declared but run no groups
+/// (`VICTORY_SHADOW_TRACE_IDLE`, `crate::shadow_idle`).
+#[cfg(windows)]
+pub(crate) fn shadow_idle(this: This) -> bool {
+    !this.is_null() && pipeline(this).shadow_idle
+}
+
 /// Whether `this` is a `CS_RayPrePass*`: `Some(true)` for the alpha one,
 /// `Some(false)` for the others (see [`for_rays`]).
 #[cfg(windows)]
@@ -943,6 +950,9 @@ struct Pipeline {
     /// [`ray_pre_pass`].
     #[cfg(windows)]
     pre_pass: Option<bool>,
+    /// [`shadow_idle`].
+    #[cfg(windows)]
+    shadow_idle: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -1295,6 +1305,10 @@ fn hand_out(
             .iter()
             .filter(|s| s.stage == "compute")
             .find_map(|s| pre_pass_of(&s.container)),
+        #[cfg(windows)]
+        shadow_idle: crate::shadow_idle::of(
+            shaders.iter().filter(|s| s.stage == "compute").map(|s| s.container.as_slice()),
+        ),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

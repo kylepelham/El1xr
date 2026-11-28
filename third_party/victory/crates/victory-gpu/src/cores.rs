@@ -6,6 +6,26 @@
 /// The system's processor sets of group 0: each one's id, its efficiency
 /// class (higher is faster) and its core (which two of them may share).
 pub(crate) fn cpu_sets() -> Vec<(u32, u8, u8)> {
+    cpu_records()
+        .iter()
+        .map(|c| (c.id, c.class, c.core))
+        .collect()
+}
+
+/// One processor set of group 0, as the system describes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CpuRecord {
+    pub id: u32,
+    pub class: u8,
+    pub core: u8,
+    /// Its logical processor number.
+    pub logical: u8,
+    /// Which last-level cache it shares (its die on a Ryzen of two).
+    pub cache: u8,
+}
+
+/// The system's processor sets of group 0 ([`CpuRecord`]).
+pub(crate) fn cpu_records() -> Vec<CpuRecord> {
     use windows_sys::Win32::System::SystemInformation::{
         GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
     };
@@ -43,7 +63,13 @@ pub(crate) fn cpu_sets() -> Vec<(u32, u8, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass, set.CoreIndex));
+            sets.push(CpuRecord {
+                id: set.Id,
+                class: set.EfficiencyClass,
+                core: set.CoreIndex,
+                logical: set.LogicalProcessorIndex,
+                cache: set.LastLevelCacheIndex,
+            });
         }
         at += info.Size as usize;
     }
@@ -244,14 +270,15 @@ fn settle() {
     let one = one_core(&sets).filter(|_| lane_core());
     let others: &[u32] = one.as_ref().map_or(&[], |o| &o.1);
     let null = std::ptr::null::<u32>();
-    // SAFETY: our own process and the system's own set ids (none: all).
-    unsafe {
+    // (critpath #88) `VICTORY_OWN_CPUS` owns the process's default sets while it is on.
+    if !crate::title_threads::own_active() {
         let at = if others.is_empty() {
             null
         } else {
             others.as_ptr()
         };
-        SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32);
+        // SAFETY: our own process and the system's own set ids (none: all).
+        unsafe { SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32) };
     }
     let helpers: Vec<u32> = match &one {
         Some((own, _)) => fast

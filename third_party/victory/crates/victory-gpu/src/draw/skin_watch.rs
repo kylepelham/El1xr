@@ -194,16 +194,24 @@ impl State {
     fn skin_watch_bound(&self) -> Option<String> {
         let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
         let depth = self.depth as This;
-        let host = crate::resource::host_copy(depth)
+        let (host, width, height) = crate::resource::host_copy(depth).map_or((0, 0, 0), |c| {
             // SAFETY: a live texture.
-            .map_or(0, |c| unsafe { c.texture.GetDesc() }.Format.0);
+            let d = unsafe { c.texture.GetDesc() };
+            (d.Format.0, d.Width, d.Height)
+        });
         let rects = match (self.topology == RECTANGLES, p.rects) {
             (false, _) => "no",
             (true, true) => "gs",
             (true, false) => "first_triangle",
         };
+        let pixel = p
+            .stages
+            .iter()
+            .find(|s| s.shader.stage == "pixel")
+            .map_or("-", |s| s.shader.hash.get(..8).unwrap_or(&s.shader.hash));
+        let [_, _, w, h] = self.viewport_rect();
         Some(format!(
-            "depth=f{host} twin={} {} rects={rects} targets={}",
+            "depth=f{host} {width}x{height} twin={} {} rects={rects} targets={} ps={pixel} view={w}x{h}",
             crate::resource::depth_and_unordered(depth),
             crate::skin_watch::depth_state(&p.state),
             self.targets.len(),
