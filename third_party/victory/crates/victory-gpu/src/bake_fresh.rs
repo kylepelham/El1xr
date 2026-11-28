@@ -87,7 +87,7 @@ impl Fresh {
         )
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Fresh::NotTexture => "not_texture",
             Fresh::Queued => "queued",
