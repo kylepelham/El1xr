@@ -2,11 +2,45 @@
 //! the emitter's state.
 
 use super::{
-    Attr, Bin, Cast, EXEC, Fields, Inst, LANE_MASK, Lower, NULL, Operand, Reg, V, Val, Why, flags,
-    pred,
+    Attr, Bin, Cast, EXEC, Exit, Fields, Inst, LANE_MASK, Lower, NULL, Operand, Reg, V, Val, Why,
+    flags, pred,
 };
 
 impl Lower<'_> {
+    /// Whether `inst` is the `s_andn2_wrexec` of the console compiler's waterfall loop
+    /// (`VICTORY_WREXEC_SCC=1`): one block that `s_cbranch_execnz` closes, running the lanes
+    /// whose VGPR equals its `v_readfirstlane` (so each pass drops at least the first lane: at
+    /// most 64 passes). It is left only once no lane remains, so the SCC it writes (EXEC != 0)
+    /// is false wherever a block after the loop reads it. Not when [`super::super::loop_limit`]
+    /// could cut it short (that exit leaves lanes behind), nor for a phi of the block taking it
+    /// (a later pass's). Source: Marvisak/VIctory PR #3016 (Anzymanz).
+    fn leaves_with_no_lane(&self, inst: &Inst) -> bool {
+        let b = self.cur_ir;
+        let block = &self.x.p.blocks[b];
+        let n = block.insts.len();
+        // The first lane's key: a compare of it with the VGPR it was read from.
+        let keyed = block.insts.iter().any(|rf| {
+            let (Some(&(Reg::V(_), v)), Some(&(Reg::S(_), k))) = (rf.reads.first(), rf.writes.first())
+            else {
+                return false;
+            };
+            rf.name() == "v_readfirstlane_b32"
+                && block.insts.iter().any(|c| {
+                    c.name().starts_with("v_cmpx_eq_") && [v, k].iter().all(|x| c.reads.iter().any(|r| r.1 == *x))
+                })
+        });
+        matches!(inst.name(), "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64")
+            && super::super::loop_limit() >= 64
+            && keyed
+            && n >= 2
+            && std::ptr::eq(&block.insts[n - 2], inst)
+            && block.insts[n - 1].name() == "s_cbranch_execnz"
+            && matches!(block.exit, Exit::Branch { taken, .. } if taken == b)
+            && inst
+                .write(Reg::Scc)
+                .is_some_and(|scc| block.phis.iter().all(|phi| !phi.args.contains(&scc)))
+    }
+
     pub(super) fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -19,6 +53,17 @@ impl Lower<'_> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.numeric_sop {
+            if let Some(scc) = scc
+                && super::isa_fixes::Fix::WrexecScc.on()
+                && self.leaves_with_no_lane(inst)
+            {
+                for &(_, v) in &inst.writes {
+                    self.vals.insert(v, Val::Missing(LANE_MASK));
+                }
+                let none = self.s.m.bool(false);
+                self.vals.insert(scc, Val::Bit(none));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(

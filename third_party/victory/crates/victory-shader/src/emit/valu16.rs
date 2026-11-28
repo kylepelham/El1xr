@@ -207,7 +207,9 @@ impl Lower<'_> {
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
             // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
+            let h = if let Some(h) = l.f16_by_mode(inst, f) {
+                h
+            } else if f16_nearest_on() {
                 l.f16_nearest(f)
             } else {
                 l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
