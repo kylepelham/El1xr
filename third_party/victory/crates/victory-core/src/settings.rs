@@ -16,6 +16,7 @@
 //! read through a [`Live`] cell, which re-reads its value after [`set`].
 
 mod expert;
+pub mod ray_tracing;
 pub mod schedule;
 mod table;
 
@@ -198,15 +199,17 @@ pub struct Loaded {
     pub overridden: Vec<String>,
     /// Lines of the file that were not used, and why.
     pub problems: Vec<String>,
+    /// What `VICTORY_RAY_TRACING=on` added ([`ray_tracing`]).
+    pub ray_tracing: Option<String>,
 }
 
 impl Loaded {
     /// The lines to log once logging is up; none when there was no file.
     pub fn lines(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.ray_tracing.iter().cloned().collect();
         let Some(path) = &self.path else {
-            return Vec::new();
+            return out;
         };
-        let mut out = Vec::new();
         if !self.applied.is_empty() || !self.overridden.is_empty() {
             out.push(format!(
                 "settings: {} values from {} ({}), {} set by the environment instead ({})",
@@ -227,9 +230,22 @@ impl Loaded {
 }
 
 /// Reads the settings file and puts its values into the environment for
-/// the settings the environment leaves unset. Call it first in `main`,
-/// before any thread starts. Without a file nothing changes.
+/// the settings the environment leaves unset, then what
+/// `VICTORY_RAY_TRACING=on` adds ([`ray_tracing`]). Call it first in `main`,
+/// before any thread starts. Without a file and that switch nothing changes.
 pub fn init() -> Loaded {
+    let mut loaded = read_file();
+    let value = std::env::var(ray_tracing::NAME).ok();
+    let added = ray_tracing::expansion(value.as_deref(), |name| std::env::var_os(name).is_some());
+    for (name, v) in &added {
+        // SAFETY: as in `read_file`: first in `main`, before any other thread.
+        unsafe { std::env::set_var(name, v) };
+    }
+    loaded.ray_tracing = ray_tracing::line(value.as_deref(), &added);
+    loaded
+}
+
+fn read_file() -> Loaded {
     started();
     let Some(path) = file_path() else {
         return Loaded::default();
@@ -257,6 +273,7 @@ pub fn init() -> Loaded {
         applied,
         overridden,
         problems,
+        ray_tracing: None,
     };
     store().file = file;
     loaded

@@ -55,8 +55,17 @@ def prewarm_overrides(
     return merged
 
 
-def launcher_extra(pipelines: bool, jobs: int) -> list[str]:
-    """The launcher switches that make it warm and stop before the title."""
+RAY_TRACING = "VICTORY_RAY_TRACING"
+
+
+def other_ray_tracing(overrides: dict[str, str]) -> dict[str, str]:
+    """The overrides of the other ray tracing variant `-PrecompileRayTracing` warms (on unless they have it on)."""
+    return {**overrides, RAY_TRACING: "off" if overrides.get(RAY_TRACING) == "on" else "on"}
+
+
+def launcher_extra(pipelines: bool, jobs: int, ray_tracing_both: bool = False) -> list[str]:
+    """The launcher switches that make it warm and stop before the title (`ray_tracing_both`: both ray tracing
+    variants)."""
     extra = ["-Precompile", "-NoGame"]
     if jobs > 0:
         extra += ["-WarmJobs", str(jobs)]
@@ -65,6 +74,8 @@ def launcher_extra(pipelines: bool, jobs: int) -> list[str]:
     extra.append("-WarmNoPipelines")
     if pipelines:
         extra.append("-WarmRecipes")
+    if ray_tracing_both:
+        extra.append("-PrecompileRayTracing")
     return extra
 
 

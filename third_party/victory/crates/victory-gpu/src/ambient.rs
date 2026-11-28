@@ -192,10 +192,32 @@ fn unpack(bits: u64) -> [f32; 2] {
     [f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32)]
 }
 
-/// Whether a stand-in is on (for the diffuse light or for reflections):
-/// set, and the title's rays find nothing.
-pub(crate) fn on() -> bool {
-    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+/// Whether the stand-in following `role` is on: set, and the title's rays
+/// find nothing there ([`rays_find`]).
+pub(crate) fn on(role: Role) -> bool {
+    (set() != Set::Off || specular().is_some())
+        && !(crate::pipeline::builder_runs()
+            && rays_find(
+                role,
+                victory_core::settings::ray_tracing::on(),
+                crate::rt_hit_only::reflections_walk(),
+                crate::rt_hit_only::probes_walk(),
+            ))
+}
+
+/// With the structure builder running: whether the rays `role`'s stand-in
+/// stands in for find something. Turned on by its own switches, the builder
+/// lets every ray walk (the whole stand-in steps aside, as before).
+/// `VICTORY_RAY_TRACING=on` lets only the listed traces walk
+/// (`VICTORY_RT_HIT_ONLY`): the reflection stand-ins step aside when the
+/// reflections walk, the diffuse one when the light probes do, so nothing
+/// is lit twice and nothing the rays still miss goes dark.
+fn rays_find(role: Role, ray_tracing: bool, reflections: bool, probes: bool) -> bool {
+    match role {
+        _ if !ray_tracing => true,
+        Role::Miss | Role::Reflect | Role::Knee => reflections,
+        Role::Resolve | Role::Radiance | Role::Air => probes,
+    }
 }
 
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]` (foxhound `9f8838b`; off by
@@ -930,7 +952,7 @@ static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// slow mean), the share of it, the constant. None while the diffuse stand-in is off or,
 /// for the estimate, before a frame's light has been kept.
 pub(crate) fn skin_light() -> Option<crate::skin_fill::Light<'static>> {
-    if !on() {
+    if !on(Role::Resolve) {
         return None;
     }
     let (level, constant) = match set() {
@@ -1198,6 +1220,25 @@ mod tests {
         check_live("VICTORY_AMBIENT_SETTLE", "100,2", settle, Some(Settle { ms: 250.0, jump: 3.0 }), Some(Settle { ms: 100.0, jump: 2.0 }));
         check_live("VICTORY_AMBIENT_SHADE", "0.5", shade, [1.0, 0.6], [0.5, 0.6]);
         check_live("VICTORY_AMBIENT_SPECULAR_ALPHA", "0", specular_alpha, true, false);
+    }
+
+    /// The builder on by its own switches: every stand-in steps aside. With
+    /// `VICTORY_RAY_TRACING=on` (reflections walk, probes miss): the
+    /// reflection stand-ins step aside, the diffuse one stays.
+    #[test]
+    fn stand_ins_step_aside_where_the_rays_find_something() {
+        let all = [Role::Resolve, Role::Radiance, Role::Air, Role::Miss, Role::Reflect, Role::Knee];
+        for role in all {
+            assert!(rays_find(role, false, false, false), "{role:?}");
+            assert!(rays_find(role, true, true, true), "{role:?}");
+            assert!(!rays_find(role, true, false, false), "{role:?}");
+        }
+        for role in [Role::Miss, Role::Reflect, Role::Knee] {
+            assert!(rays_find(role, true, true, false), "{role:?}");
+        }
+        for role in [Role::Resolve, Role::Radiance, Role::Air] {
+            assert!(!rays_find(role, true, true, false), "{role:?}");
+        }
     }
 
     #[test]

@@ -1340,7 +1340,7 @@ def is_warm(overrides: dict[str, str], pipelines: bool, diag: bool = False, prof
 def prewarm_command(
     game_dir: Path, overrides: dict[str, str], mute: bool, diag: bool, pipelines: bool, jobs: int,
     host_wave: int = dev_prewarm.DEFAULT_HOST_WAVE, view_limit: int = dev_prewarm.DEFAULT_VIEW_LIMIT,
-    profile: str = "release",
+    profile: str = "release", ray_tracing_both: bool = False,
 ) -> list[str]:
     # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
     # overrides, mute and skip-intro (not in the key, but kept identical).
@@ -1350,7 +1350,7 @@ def prewarm_command(
         overrides=dev_prewarm.prewarm_overrides(overrides, pipelines, host_wave, view_limit),
         mute=mute,
         skip_intro=True,
-        extra=dev_prewarm.launcher_extra(pipelines, jobs),
+        extra=dev_prewarm.launcher_extra(pipelines, jobs, ray_tracing_both),
         profile=profile,
     )
 
@@ -1363,7 +1363,8 @@ def cmd_prewarm(args: argparse.Namespace) -> int:
         except ValueError:
             return prewarm_work(args)
         sig = warm_signature(overrides, args.diag)
-        if is_warm(overrides, args.pipelines, args.diag):
+        both = not args.ray_tracing_both or is_warm(dev_prewarm.other_ray_tracing(overrides), args.pipelines, args.diag)
+        if both and is_warm(overrides, args.pipelines, args.diag):
             profile = "diag" if args.diag else "release"
             print(_dev_line("prewarm", True, {
                 "profile": profile, "skipped": "warm", "stamp": str(dev_warm.stamp_path(warm_dir(), sig)),
@@ -1389,7 +1390,8 @@ def prewarm_work(args: argparse.Namespace) -> int:
         print(f"DEV prewarm FAIL profile={profile} secs=0.0 shaders=0 hits=0 translated=0 refused=0 log={log_path}")
         return 1
     overrides, mute = apply_mute_default(overrides, args.unmute)
-    cmd = prewarm_command(game_dir, overrides, mute, args.diag, args.pipelines, args.jobs, args.host_wave, args.view_limit)
+    cmd = prewarm_command(game_dir, overrides, mute, args.diag, args.pipelines, args.jobs, args.host_wave, args.view_limit,
+                          ray_tracing_both=args.ray_tracing_both)
     gpu = acquire_gpu_lock("prewarm") if args.pipelines else contextlib.nullcontext()
     t0 = time.monotonic()
     with gpu:
@@ -1401,6 +1403,9 @@ def prewarm_work(args: argparse.Namespace) -> int:
     ok = ok and counts["shaders"] > 0 and (counts["recipes"] > 0 if args.pipelines else not device)
     if ok:
         dev_warm.write_stamp(warm_dir(), warm_signature(overrides, args.diag), args.pipelines, counts, overrides, "prewarm")
+        if args.ray_tracing_both:
+            other = dev_prewarm.other_ray_tracing(overrides)
+            dev_warm.write_stamp(warm_dir(), warm_signature(other, args.diag), args.pipelines, counts, other, "prewarm")
     fields = {
         "profile": profile,
         "secs": f"{secs:.1f}",
@@ -1597,6 +1602,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--unmute", action="store_true", help="As bench/capture --unmute (not in the key).")
     p_pre.add_argument("--jobs", type=int, default=0, help="Worker threads (default: every logical core).")
     p_pre.add_argument("--force", action="store_true", help="Run it even when a stamp says this variant is warm.")
+    p_pre.add_argument(
+        "--ray-tracing-both", action="store_true",
+        help="Also warm the other VICTORY_RAY_TRACING variant (launcher -PrecompileRayTracing), so the menu's Ray "
+        "tracing switch does not translate shaders at the next launch.",
+    )
     p_pre.add_argument(
         "--pipelines", action="store_true",
         help="Then make the host pipelines of the recipes runs wrote down (VICTORY_PIPELINE_RECIPES=1) into the "

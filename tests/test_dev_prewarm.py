@@ -53,6 +53,15 @@ def test_launcher_extra_warms_and_stops_before_the_title():
     assert dev_prewarm.launcher_extra(True, 8) == [
         "-Precompile", "-NoGame", "-WarmJobs", "8", "-WarmNoPipelines", "-WarmRecipes",
     ]
+    assert dev_prewarm.launcher_extra(False, 0, True) == [
+        "-Precompile", "-NoGame", "-WarmNoPipelines", "-PrecompileRayTracing",
+    ]
+
+
+def test_the_other_ray_tracing_variant_flips_the_one_setting():
+    assert dev_prewarm.other_ray_tracing({"VICTORY_MUTE": "1"}) == {"VICTORY_MUTE": "1", "VICTORY_RAY_TRACING": "on"}
+    assert dev_prewarm.other_ray_tracing({"VICTORY_RAY_TRACING": "on"}) == {"VICTORY_RAY_TRACING": "off"}
+    assert dev_prewarm.other_ray_tracing({"VICTORY_RAY_TRACING": "off"}) == {"VICTORY_RAY_TRACING": "on"}
 
 
 def test_parse_summary_reads_the_warm_lines():
