@@ -371,6 +371,41 @@ fn duplicates_in(book: &Book) -> [usize; 4] {
 mod tests {
     use super::*;
 
+    /// (portscout, c #20) Offline count of a run's recipes file: how many
+    /// graphics pipelines `VICTORY_PSO_CANON` would key as one with another.
+    /// `VICTORY_RECIPES_FILE=<pipeline-recipes.bin> cargo test -p victory-gpu
+    /// --lib recipes_file_duplicates -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn recipes_file_duplicates() {
+        let path = std::env::var("VICTORY_RECIPES_FILE").expect("VICTORY_RECIPES_FILE");
+        let book = Book::decode(&std::fs::read(path).expect("read")).expect("a recipes file");
+        let [graphics, leftovers, same, unreadable] = duplicates_in(&book);
+        let mut by_stages: HashMap<Vec<(u8, [u8; 32])>, HashSet<String>> = HashMap::new();
+        let mut depth_off: HashMap<Vec<(u8, [u8; 32])>, HashSet<String>> = HashMap::new();
+        for r in &book.recipes {
+            let Some(g) = r.graphics.as_deref().and_then(GraphicsState::decode) else {
+                continue;
+            };
+            let mut g = g;
+            super::super::pso_canon::canonical(&mut g);
+            by_stages.entry(r.stages.clone()).or_default().insert(g.describe());
+            if !g.depth.DepthEnable.as_bool() {
+                g.depth.DepthFunc = GraphicsState::default().depth.DepthFunc;
+                g.depth.DepthWriteMask = GraphicsState::default().depth.DepthWriteMask;
+            }
+            depth_off.entry(r.stages.clone()).or_default().insert(g.describe());
+        }
+        let canon: usize = by_stages.values().map(HashSet::len).sum();
+        let deeper: usize = depth_off.values().map(HashSet::len).sum();
+        println!(
+            "recipes={} graphics={graphics} with_leftovers={leftovers} same_pipeline_other_key={same} unreadable={unreadable} \
+             stage_sets={} canonical_states={canon} canonical_plus_depth_off={deeper}",
+            book.recipes.len(),
+            by_stages.len(),
+        );
+    }
+
     #[test]
     fn a_book_of_plain_states_has_no_duplicates() {
         assert_eq!(duplicates(&book().encode()), Some([1, 0, 0, 0]));
