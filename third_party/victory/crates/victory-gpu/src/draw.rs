@@ -633,7 +633,7 @@ pub(crate) struct State {
     alpha_rays: bool,
     /// The host top levels of the glass dispatch being made
     /// (`crate::rt_bind::dispatch`), for its root SRVs.
-    glass_tlas: Option<[u64; 2]>,
+    glass_tlas: Option<crate::rt_bind::Bound>,
 }
 
 impl Drop for State {
@@ -1897,6 +1897,10 @@ impl State {
         if kind == victory_shader::emit::USER_GLASS_NATIVE {
             return u32::from(self.glass_tlas.is_some());
         }
+        if kind == victory_shader::emit::USER_SHADOW_BASE_FIRST || kind == victory_shader::emit::USER_SHADOW_BASE_SECOND {
+            let second = usize::from(kind == victory_shader::emit::USER_SHADOW_BASE_SECOND);
+            return self.glass_tlas.map_or(0, |b| b.bases[second]);
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2338,7 +2342,7 @@ impl State {
                         // when it was not, and then the shader takes the
                         // title's walk.
                         let near = usize::from(slot == victory_shader::emit::SLOT_TLAS_NEAR);
-                        let at = self.glass_tlas.map_or(0, |m| m[near]);
+                        let at = self.glass_tlas.map_or(0, |b| b.host[near]);
                         self.bind_resource(list, compute, param, RootResource::Srv(at));
                         continue;
                     }

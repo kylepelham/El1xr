@@ -2550,6 +2550,15 @@ impl<'a> Lower<'a> {
                         0,
                         0,
                     )),
+                    // The shadow splice's candidate top levels (`shadow_patch::BASES`).
+                    None if n == super::shadow_patch::BASES[0] || n == super::shadow_patch::BASES[1] => {
+                        let second = u32::from(n == super::shadow_patch::BASES[1]);
+                        Val::I32(self.host_word(
+                            RootType::Other(super::shader::USER_SHADOW_BASE_FIRST + second),
+                            0,
+                            0,
+                        ))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),

@@ -27,7 +27,13 @@
 //! shadow splice knows (`victory_shader::emit::shadow_structures`): the host
 //! top levels of their two structure views (t355, t356 for the distant
 //! traces; the one view, in both, for Checkerboard), for `SLOT_TLAS` and
-//! `SLOT_TLAS_NEAR` (counted as `shadow_*`, one count a view looked up).
+//! `SLOT_TLAS_NEAR` (counted as `shadow_*`, one count a view looked up). The
+//! TraceShadowRays variants pick their top level per wave from the resource
+//! heap (t357 or t353): the host binds the candidates it built (one is
+//! enough) and gives the shader their title addresses >> 8 ([`Bound::bases`]);
+//! a wave whose pick matches neither takes the title's walk. Each variant's
+//! candidates are logged (`native rt bind: shadow variant`, first few) and
+//! counted (`shadow_variant_*`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +88,47 @@ enum Found {
 /// Counts since the last summary: [glass `t355`, glass `t354`, other
 /// VBuffer, other traces, shadow traces] × [host, no host, no view].
 static COUNTS: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
+/// Per-wave shadow variant dispatches since the last summary, by how many of
+/// their two candidates have a host top level: [none, one, both].
+static VARIANTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// What a matched dispatch binds: the host top levels for `SLOT_TLAS` and
+/// `SLOT_TLAS_NEAR` (0: none), and for a shadow trace that picks per wave the
+/// title addresses >> 8 (low 32 bits) of the candidates with a host top level
+/// (0 for one without), for `USER_SHADOW_BASE_FIRST`/`_SECOND`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bound {
+    pub host: [u64; 2],
+    pub bases: [u32; 2],
+}
+
+/// The bases of a per-wave variant: a candidate's address >> 8 where the host
+/// built its top level.
+fn bases(titles: [Option<u64>; 2], host: [u64; 2]) -> [u32; 2] {
+    std::array::from_fn(|k| match titles[k] {
+        Some(at) if host[k] != 0 => (at >> 8) as u32,
+        _ => 0,
+    })
+}
+
+/// The first few distinct candidate sets of the per-wave variants, logged.
+fn log_variant(hash: &str, registers: [Option<u32>; 2], titles: [Option<u64>; 2], host: [u64; 2]) {
+    static SEEN: Mutex<Vec<(&'static str, [Option<u64>; 2])>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (victory_shader::emit::shadow_binding(hash).map_or("", |b| b.hash), titles);
+    if seen.len() >= 16 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let t = |k: usize| format!("t{}", registers[k].unwrap_or(0));
+    let at = |k: usize| titles[k].map_or("none".to_owned(), |a| format!("{a:#x}"));
+    tracing::info!(
+        variant = hash,
+        first = format_args!("{} {} host={}", t(0), at(0), host[0] != 0),
+        second = format_args!("{} {} host={}", t(1), at(1), host[1] != 0),
+        "native rt bind: shadow variant candidates (a wave whose picked top level matches neither takes the title's walk)"
+    );
+}
 
 /// The first title addresses that found no host top level (a few, for the
 /// log: whether they are near what was built tells a wrong key from a
@@ -115,13 +162,14 @@ fn classify(address: Option<u64>, host: impl Fn(u64) -> Option<u64>) -> Found {
 /// the first descriptor of the table bound at compute root parameter `slot`.
 /// For the glass trace with both structures matched: their host top levels
 /// (`t355`, `t354`), for root SRVs (`SLOT_TLAS`, `SLOT_TLAS_NEAR`); for a
-/// known shadow trace with its structure matched: its host top level in both;
-/// `None` otherwise, when the dispatch takes the title's own walk.
+/// known shadow trace with its structures matched: their host top levels (a
+/// per-wave variant: those matched, one is enough, and their bases); `None`
+/// otherwise, when the dispatch takes the title's own walk.
 pub(crate) fn dispatch(
     this: This,
     alpha: bool,
     table: impl Fn(u8) -> Option<u64>,
-) -> Option<[u64; 2]> {
+) -> Option<Bound> {
     if !on() {
         return None;
     }
@@ -135,9 +183,10 @@ pub(crate) fn dispatch(
         Walks::Glass => &[(Some(GLASS_FAR), 0, 0), (Some(GLASS_NEAR), 1, 1)],
         Walks::VBuffer => &[(None, 2, 3)],
         Walks::Trace => &[(None, 3, 3)],
-        Walks::Shadow([a, b]) if a == b => &[(a, 4, 2)],
-        Walks::Shadow([a, b]) => &[(a, 4, 0), (b, 4, 1)],
+        Walks::Shadow(b) if b.registers[0] == b.registers[1] => &[(b.registers[0], 4, 2)],
+        Walks::Shadow(b) => &[(b.registers[0], 4, 0), (b.registers[1], 4, 1)],
     };
+    let mut titles = [None; 2];
     for &(register, row, to) in walks {
         let address = find_structure(&views, register, view);
         let host = address.and_then(crate::native_rt::top_level);
@@ -156,15 +205,25 @@ pub(crate) fn dispatch(
             }
         }
         match to {
-            0 | 1 => matched[usize::from(to)] = host.unwrap_or(0),
+            0 | 1 => {
+                matched[usize::from(to)] = host.unwrap_or(0);
+                titles[usize::from(to)] = address;
+            }
             2 => matched = [host.unwrap_or(0); 2],
             _ => {}
         }
         COUNTS[row][found as usize].fetch_add(1, Ordering::Relaxed);
     }
     summary();
+    let bound = |host| Bound { host, bases: [0; 2] };
     match kind {
-        Walks::Glass | Walks::Shadow(_) => both(matched),
+        Walks::Shadow(b) if b.per_wave => {
+            let built = matched.iter().filter(|&&m| m != 0).count();
+            VARIANTS[built].fetch_add(1, Ordering::Relaxed);
+            log_variant(b.hash, b.registers, titles, matched);
+            (built > 0).then(|| Bound { host: matched, bases: bases(titles, matched) })
+        }
+        Walks::Glass | Walks::Shadow(_) => both(matched).map(bound),
         Walks::VBuffer | Walks::Trace => None,
     }
 }
@@ -202,6 +261,9 @@ fn summary() {
         shadow_host = shadow[0],
         shadow_fallback = shadow[1] + shadow[2],
         shadow_no_view = shadow[2],
+        shadow_variant_none = VARIANTS[0].swap(0, Ordering::Relaxed),
+        shadow_variant_one = VARIANTS[1].swap(0, Ordering::Relaxed),
+        shadow_variant_both = VARIANTS[2].swap(0, Ordering::Relaxed),
         tops_kept = crate::native_rt::tops_kept(),
         "native rt bind: trace dispatches in the last 5 s (host: a host top level is there; fallback: the title's program)"
     );
@@ -292,5 +354,13 @@ mod tests {
     #[test]
     fn off_by_default() {
         assert!(!on());
+    }
+
+    #[test]
+    fn a_per_wave_variant_gives_the_bases_of_the_top_levels_built() {
+        let titles = [Some(0x12_3456_7800), Some(0x9a_bcde_f000)];
+        assert_eq!(bases(titles, [0x5000, 0x6000]), [0x1234_5678, 0x9abc_def0]);
+        assert_eq!(bases(titles, [0, 0x6000]), [0, 0x9abc_def0]);
+        assert_eq!(bases([None, Some(0x9a_bcde_f000)], [0x5000, 0x6000])[0], 0);
     }
 }

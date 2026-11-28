@@ -114,6 +114,12 @@ pub const USER_THREAD_LIMIT: u32 = 0x105;
 /// ([`SLOT_TLAS`], [`SLOT_TLAS_NEAR`]), else 0. Asked for by the spliced
 /// glass trace (`VICTORY_NATIVE_GLASS=1`, `glass_splice::SELECTOR`).
 pub const USER_GLASS_NATIVE: u32 = 0x106;
+/// `RootType::Other` codes of the user-data dwords the host sets for a shadow trace that picks
+/// its top level per wave (`shadow_patch`, `ttmp13`/`ttmp14` read on entry): the title address
+/// >> 8 (low 32 bits) of its first and second candidate structure view, 0 where the view names
+/// no top level the host built.
+pub const USER_SHADOW_BASE_FIRST: u32 = 0x107;
+pub const USER_SHADOW_BASE_SECOND: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

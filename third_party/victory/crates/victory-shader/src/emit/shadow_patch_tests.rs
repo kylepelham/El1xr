@@ -10,6 +10,12 @@ fn stand_in(trace: &Trace, bytes: usize) -> NativeProgram {
         code[walk.skip - 4..walk.skip].copy_from_slice(&walk.cmp.to_le_bytes());
         let skip = sopp(S_CBRANCH_SCC1, walk.skip, walk.past);
         code[walk.skip..walk.skip + 4].copy_from_slice(&skip.to_le_bytes());
+        for out in walk.outs {
+            if let Out::Primitive { at, .. } = *out {
+                let title = v_mov(29, 0xc1); // v_mov_b32 v29, -1
+                code[at..at + 4].copy_from_slice(&title.to_le_bytes());
+            }
+        }
     }
     NativeProgram {
         stage: HwStage::Cs,
@@ -39,14 +45,38 @@ fn another_program_is_left_as_it_is() {
 
 /// Every row is consistent: a SOPC comparison, the set-up between the skip and the loop's
 /// head, the arm going on at the merge or after it; a walk whose results take exec ends with
-/// [`Out::Exec`] and has the indices it needs from the first top level; the host finds each
-/// trace's top levels by its hash.
+/// [`Out::Exec`] and has the indices it needs from the first top level; a trace that picks its
+/// top level per wave has two candidate views and every walk names the picked one, copies the
+/// title's prefix from past the walk and has the alpha test's word after where it goes on; the
+/// host finds each trace's binding by its hash.
 #[test]
 fn the_tables_agree() {
     for t in TRACES {
         assert!(!t.walks.is_empty(), "{}", t.hash);
-        assert_eq!(shadow_structures(t.hash), Some(t.structures));
+        assert_eq!(
+            shadow_binding(t.hash),
+            Some(ShadowBinding {
+                hash: t.hash,
+                registers: t.structures,
+                per_wave: t.per_wave
+            })
+        );
+        if t.per_wave {
+            assert!(t.structures.iter().all(Option::is_some), "{}", t.hash);
+            assert_ne!(t.structures[0], t.structures[1], "{}", t.hash);
+        }
         for w in t.walks {
+            assert_eq!(w.choose.is_some(), t.per_wave, "{}", t.hash);
+            for out in w.outs {
+                match *out {
+                    Out::Prefix { from, to, execz } => {
+                        assert!(w.past <= from && from < to && to < w.resume, "{}", t.hash);
+                        assert!(execz > w.resume, "{}", t.hash);
+                    }
+                    Out::Primitive { at, .. } => assert!(at > w.resume, "{}", t.hash),
+                    _ => {}
+                }
+            }
             assert!(
                 w.skip < w.head && w.head < w.past && w.past <= w.resume,
                 "{}: {w:?}",
@@ -69,12 +99,74 @@ fn the_tables_agree() {
             }
         }
     }
-    assert_eq!(
-        shadow_structures("a1b20bc47e3c9597"),
-        Some([Some(355), Some(356)])
-    );
-    assert_eq!(shadow_structures("559d9f0184e15fe3"), Some([None, None]));
-    assert_eq!(shadow_structures("6d7fe7745ab9c6d8"), None);
+    let registers = |hash| shadow_binding(hash).map(|b| b.registers);
+    assert_eq!(registers("a1b20bc47e3c9597"), Some([Some(355), Some(356)]));
+    assert_eq!(registers("559d9f0184e15fe3"), Some([None, None]));
+    assert_eq!(registers("6d7fe7745ab9c6d8"), None);
+    let quarter = shadow_binding("0e64f14fae060d04").expect("Quarter");
+    assert_eq!(quarter.registers, [Some(357), Some(353)]);
+    assert!(quarter.per_wave);
+    assert!(!shadow_binding("a1b20bc47e3c9597").unwrap().per_wave);
+}
+
+/// A per-wave walk's region: with the selector set, the picked base against the host's first
+/// candidate (`ttmp13`) and second (`ttmp14`), each to its arm, else (and with the selector
+/// clear) the title's comparison and skip; the first arm's markers on the first top level
+/// (`ttmp[0:3]`, `ttmp[4:7]`), the second's on the second (`ttmp[8:11]`, `ttmp[12:15]`); each
+/// arm runs the title's prefix to its `s_cbranch_execz`, clears the alpha test's mask and goes
+/// on after the reads; the alpha test's -1 becomes the arm's primitive index.
+#[test]
+fn a_per_wave_walk_picks_its_arm_by_the_base() {
+    let bytes = 0x8800;
+    let mut native = stand_in(&QUARTER, bytes);
+    apply(&QUARTER, &mut native);
+    let walk = &QUARTER.walks[0];
+    let insts = crate::gfx10::decode(&native.code).expect("decodes");
+    let text = |offset: usize| {
+        insts
+            .iter()
+            .find(|i| i.offset == offset)
+            .map(|i| i.text(false))
+            .unwrap_or_default()
+    };
+    let region = 0x8800;
+    assert_eq!(text(walk.skip), format!("s_branch label_{region:04X}"));
+    assert_eq!(text(region), "s_cmp_lg_u32 ttmp15, 0");
+    assert_eq!(text(region + 4), format!("s_cbranch_scc0 label_{:04X}", region + 24));
+    assert_eq!(text(region + 8), "s_cmp_eq_u32 s12, ttmp13");
+    assert_eq!(text(region + 16), "s_cmp_eq_u32 s12, ttmp14");
+    assert_eq!(text(region + 24), "s_cmp_eq_u32 s90, 0");
+    assert_eq!(text(region + 28), format!("s_cbranch_scc1 label_{:04X}", walk.past));
+    assert_eq!(text(region + 32), format!("s_branch label_{:04X}", walk.skip + 4));
+    let target = |offset: usize| {
+        let t = text(offset);
+        usize::from_str_radix(t.rsplit("label_").next().unwrap(), 16).unwrap()
+    };
+    let (first, second) = (target(region + 12), target(region + 20));
+    assert_eq!(first, region + 36);
+    let arm = |from: usize, to: usize| -> Vec<String> {
+        insts
+            .iter()
+            .filter(|i| i.offset >= from && i.offset < to)
+            .map(|i| i.text(false))
+            .collect()
+    };
+    let next = target(QUARTER.walks[1].skip);
+    for (from, to, pairs) in [
+        (first, second, ["ttmp[0:3]", "ttmp[4:7]"]),
+        (second, next, ["ttmp[8:11]", "ttmp[12:15]"]),
+    ] {
+        let t = arm(from, to);
+        let markers: Vec<&String> = t.iter().filter(|x| x.starts_with("image_bvh64")).collect();
+        assert_eq!(markers.len(), 2, "{t:?}");
+        assert!(markers[0].contains(pairs[0]) && markers[1].contains(pairs[1]), "{markers:?}");
+        assert!(t.iter().any(|x| x == "s_cbranch_execz label_8448"), "{t:?}");
+        assert!(t.iter().any(|x| x == "s_mov_b32 s8, 0"), "{t:?}");
+        assert_eq!(t.last().unwrap(), &format!("s_branch label_{:04X}", walk.resume));
+    }
+    let primitive = 64 + RAY_DWORDS + HIT_DWORDS + 1;
+    assert_eq!(text(0x7504), format!("v_mov_b32 v29, v{primitive}"));
+    assert_eq!(text(0x78b4), format!("v_mov_b32 v29, v{primitive}"));
 }
 
 /// The splice on code of the known layout: the skip becomes a branch to the region; the
@@ -240,16 +332,33 @@ fn the_shadow_traces_spliced_translate_and_validate() {
             .walks
             .iter()
             .map(|w| {
-                1 + usize::from(
+                let arms = if w.choose.is_some() { 2 } else { 1 };
+                arms * (1 + usize::from(
                     w.outs
                         .iter()
                         .any(|o| matches!(o, Out::Contribution(_) | Out::Geometry(_))),
-                )
+                ))
             })
             .sum();
         assert_eq!(markers, want, "{}", trace.hash);
         let io = crate::io::raise(&p, &native).expect("io");
-        let shader = super::super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+        let shader = super::super::emit(&c, &native, &p, &st, &io, &res);
+        if trace.per_wave {
+            // The title's own walk reads its structure's descriptor, loaded from the resource
+            // heap at an offset a per-wave record names, as numbers (the picked base): the
+            // translator refuses that, spliced or not, until such a load reads title memory.
+            let unspliced = translate_unspliced(&c);
+            for got in [shader.map(|_| ()), unspliced] {
+                assert!(
+                    matches!(got, Err(crate::ShaderError::Unsupported { what, .. })
+                        if what == "a descriptor read only as data"),
+                    "{}: {got:?}",
+                    trace.hash
+                );
+            }
+            continue;
+        }
+        let shader = shader.expect("emit");
         let first = u32::from_le_bytes(shader.dxil[32..36].try_into().unwrap()) as usize;
         let features = u64::from_le_bytes(shader.dxil[first + 8..first + 16].try_into().unwrap());
         assert_ne!(features & 0x10_0000, 0, "{}: RaytracingTier1_1", trace.hash);
@@ -261,6 +370,13 @@ fn the_shadow_traces_spliced_translate_and_validate() {
             "{}",
             trace.hash
         );
+        for base in [
+            super::super::shader::USER_SHADOW_BASE_FIRST,
+            super::super::shader::USER_SHADOW_BASE_SECOND,
+        ] {
+            let asks = shader.user_data.iter().any(|u| u.root == RootType::Other(base));
+            assert_eq!(asks, trace.per_wave, "{}: {base:#x}", trace.hash);
+        }
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -268,6 +384,21 @@ fn the_shadow_traces_spliced_translate_and_validate() {
             v.validate(&mut copy).expect("DXIL validation failed");
         }
     }
+}
+
+/// `c`'s compute program translated as the title wrote it.
+fn translate_unspliced(c: &crate::dxbc::Container) -> Result<(), crate::ShaderError> {
+    let part = super::super::program_part(c).expect("a program part");
+    let native = crate::native_programs(part.data)
+        .expect("native programs")
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .expect("a compute program");
+    let p = crate::spill::build(&native).expect("spill::build");
+    let st = crate::structure::structure(&p).expect("structure");
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = crate::io::raise(&p, &native).expect("io");
+    super::super::emit(c, &native, &p, &st, &io, &res).map(|_| ())
 }
 
 /// One thread of a card test: whether it is one of the walk's lanes, the ray's origin,
@@ -286,6 +417,16 @@ struct Lane {
 /// the arm, exec back from the walk's saved SGPR where its results took it, then the four
 /// `stores` operand codes stored at 16 bytes a thread.
 fn arm_program(walk: &Walk, preset: &[u8], stores: [u32; 4]) -> NativeProgram {
+    let mut w = prologue(walk, preset);
+    arm(&mut w, walk, 80, walk.structure, &[], 0);
+    if let Some(Out::Exec { saved, .. }) = walk.outs.last() {
+        w.push(s_mov(EXEC_LO, *saved));
+    }
+    program(w, stores)
+}
+
+/// [`arm_program`]'s code before the arm.
+fn prologue(walk: &Walk, preset: &[u8]) -> Vec<u32> {
     let mut w = vec![
         0xbe85_0380, // s_mov_b32 s5, 0
         0xf408_0202,
@@ -317,10 +458,11 @@ fn arm_program(walk: &Walk, preset: &[u8], stores: [u32; 4]) -> NativeProgram {
     for &r in preset {
         w.push(v_mov(r, 0x87)); // 7
     }
-    arm(&mut w, walk, 80);
-    if let Some(Out::Exec { saved, .. }) = walk.outs.last() {
-        w.push(s_mov(EXEC_LO, *saved));
-    }
+    w
+}
+
+/// [`arm_program`]'s program: `w`, then the four `stores` stored at 16 bytes a thread.
+fn program(mut w: Vec<u32>, stores: [u32; 4]) -> NativeProgram {
     w.push(0x3428_0084); // v_lshlrev_b32 v20, 4, v0
     for (k, src) in stores.into_iter().enumerate() {
         w.push(v_mov(70 + k as u8, src));
@@ -370,12 +512,14 @@ fn arm_program(walk: &Walk, preset: &[u8], stores: [u32; 4]) -> NativeProgram {
 
 /// Runs `native` on the card with `scenes` at the two top levels' root SRVs (the first at
 /// [`super::super::shader::SLOT_TLAS`], the second at `SLOT_TLAS_NEAR`), one thread a lane
-/// (threads past them repeat the last); each thread's four stored dwords.
+/// (threads past them repeat the last), the user-data dwords of `words` (root kind, dword
+/// within it, value; the others 0); each thread's four stored dwords.
 fn run_on_card(
     host: &super::super::host::Host,
     native: &NativeProgram,
     mut scenes: [Option<super::super::host_tlas::Scene>; 2],
     lanes: &[Lane],
+    words: &[(RootType, u32, u32)],
 ) -> Vec<[u32; 4]> {
     use super::super::host::{Dispatch, Root, Stride, View};
     use super::super::shader::{SLOT_TLAS, SLOT_TLAS_NEAR};
@@ -418,10 +562,13 @@ fn run_on_card(
     srvs.sort_unstable();
     srvs.dedup();
     let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
-    let mut roots = vec![(
-        0,
-        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
-    )];
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        if let Some(&(.., value)) = words.iter().find(|w| (w.0, w.1) == (u.root, u.dword)) {
+            constants[u.index as usize] = value;
+        }
+    }
+    let mut roots = vec![(0, Root::Constants(constants))];
     for (k, slot) in srvs.iter().enumerate() {
         let which = if *slot == SLOT_TLAS {
             0
@@ -535,7 +682,7 @@ fn the_checkerboard_arm_finds_occluders_on_the_card() {
     ];
     // Outside the mask and nearer; in it.
     let scene = triangles(&[([0.0, 0.0, -2.0], 0x01, 0), ([0.0; 3], 0x40, 0)], 1);
-    let got = run_on_card(&host, &native, [Some(scene), None], &lanes);
+    let got = run_on_card(&host, &native, [Some(scene), None], &lanes, &[]);
     let f = f32::to_bits;
     let want = [
         [1, f(5.0), 0, 0],
@@ -583,6 +730,7 @@ fn the_distant_walks_hand_over_their_results_on_the_card() {
         &native,
         [Some(triangles(&instances, 3)), None],
         &lanes,
+        &[],
     );
     // Lanes 0 and 3 hit (and the threads past the lanes, as lane 3); lane 2 misses.
     let hit_lanes: u32 = !0b0110;
@@ -603,6 +751,7 @@ fn the_distant_walks_hand_over_their_results_on_the_card() {
         &native,
         [None, Some(triangles(&instances, 1))],
         &lanes,
+        &[],
     );
     let f = f32::to_bits;
     for (t, want) in [[1, f(5.0)], [7, f(100.0)], [7, f(100.0)], [1, f(5.0)]]
@@ -615,5 +764,78 @@ fn the_distant_walks_hand_over_their_results_on_the_card() {
             "far walk, thread {t}: got {:x?}",
             got[t]
         );
+    }
+}
+
+/// A per-wave walk spliced into a program of the title's shape and run on the card: the picked
+/// base (`s30`, from root constant 0) against the host's candidates. Equal to the first: the
+/// first top level's hit (t 5); to the second: the second's (t 7); to neither, or with the
+/// selector clear: the title's walk (`v50` 1, `v17` and `v15` as before). The walk's set-up
+/// (`v51` 3) runs on every path a walk lane takes; a lane outside the walk keeps its values,
+/// and on the title's path skips the set-up too (the title's skip, split per lane).
+#[test]
+fn a_per_wave_walk_takes_the_picked_top_level_on_the_card() {
+    use super::super::shader::{USER_GLASS_NATIVE, USER_SHADOW_BASE_FIRST, USER_SHADOW_BASE_SECOND};
+    let Some(host) = card() else { return };
+    let _one = super::super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let model = &CHECKERBOARD.walks[0];
+    let mut w = prologue(model, &[17]);
+    w.push(v_mov(50, ZERO));
+    w.push(s_mov(30, 0)); // s_mov_b32 s30, s0
+    let skip = 4 * (w.len() + 1);
+    let head = skip + 8;
+    let past = head + 4;
+    let walk = Walk {
+        cmp: s_cmp_eq(model.lanes, 0x80),
+        skip,
+        past,
+        head,
+        resume: past,
+        structure: 0,
+        choose: Some(30),
+        ..*model
+    };
+    w.push(walk.cmp);
+    w.push(sopp(S_CBRANCH_SCC1, skip, past));
+    w.push(v_mov(51, 0x83)); // the set-up: 3
+    w.push(v_mov(50, ONE)); // the title's walk
+    assert_eq!(4 * w.len(), past);
+    let mut native = program(w, [v(17), v(15), v(50), v(51)]);
+    native.vgprs = 80;
+    let trace = Trace {
+        walks: Box::leak(Box::new([walk])),
+        per_wave: true,
+        ..CHECKERBOARD
+    };
+    apply(&trace, &mut native);
+    let lane = |walks| Lane {
+        walks,
+        origin: [-0.5, -0.5, 0.0],
+        dz: 1.0,
+        extent: 100.0,
+    };
+    let lanes = [lane(true), lane(false)];
+    let (a, b) = (0x00ab_cd01, 0x00ab_cd02);
+    let scene = |z| Some(triangles(&[([0.0, 0.0, z], 0xff, 0)], 1));
+    let f = f32::to_bits;
+    for (picked, selector, want) in [
+        (a, 1, [1, f(5.0), 0, 3]),
+        (b, 1, [1, f(7.0), 0, 3]),
+        (0x00ab_cd03, 1, [7, f(100.0), 1, 3]),
+        (a, 0, [7, f(100.0), 1, 3]),
+    ] {
+        let words = [
+            (RootType::Constants, 0, picked),
+            (RootType::Other(USER_GLASS_NATIVE), 0, selector),
+            (RootType::Other(USER_SHADOW_BASE_FIRST), 0, a),
+            (RootType::Other(USER_SHADOW_BASE_SECOND), 0, b),
+        ];
+        let got = run_on_card(&host, &native, [scene(0.0), scene(2.0)], &lanes, &words);
+        assert_eq!(got[0], want, "picked {picked:#x}, selector {selector}: got {:x?}", got[0]);
+        // On the title's path the lane takes the title's skip, split per lane.
+        let outside = [7, f(100.0), 0, if want[2] == 1 { 0 } else { 3 }];
+        assert_eq!(got[1], outside, "outside the walk: got {:x?}", got[1]);
     }
 }

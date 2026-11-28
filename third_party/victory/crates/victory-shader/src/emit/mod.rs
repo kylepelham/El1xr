@@ -152,14 +152,14 @@ pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
 pub use shadow_splice::native_shadow;
-pub use shadow_patch::shadow_structures;
+pub use shadow_patch::{ShadowBinding, shadow_binding};
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS, SLOT_TLAS_NEAR, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_GLASS_NATIVE, USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_title_view_limit, set_view_heap_limit,
+    USER_GLASS_NATIVE, USER_SHADOW_BASE_FIRST, USER_SHADOW_BASE_SECOND, USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_title_view_limit, set_view_heap_limit,
     title_view_limit, view_heap_limit, REMAP_BASE, REMAP_LEN, SLOT_REMAP, set_title_remap_len,
     title_remap_len, FULL_REMAP, set_title_remap_full, title_remap_full, FAULT_DWORDS, FAULT_FLAG,
     set_title_fault_slot, title_fault_slot,

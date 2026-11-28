@@ -654,9 +654,9 @@ pub(crate) fn ray_pre_pass(this: This) -> Option<bool> {
 pub(crate) enum Walks {
     /// The glass trace ([`GLASS_TRACE`]).
     Glass,
-    /// A shadow trace the shadow splice knows, with the registers of its two top levels' views
-    /// (`victory_shader::emit::shadow_structures`).
-    Shadow([Option<u32>; 2]),
+    /// A shadow trace the shadow splice knows, and how it is bound
+    /// (`victory_shader::emit::shadow_binding`).
+    Shadow(victory_shader::emit::ShadowBinding),
     /// Another `CS_RaytraceVBuffer*`.
     VBuffer,
     /// Another BVH trace (`RayOnly::Trace`).
@@ -674,10 +674,10 @@ pub(crate) fn ray_views(this: This) -> Option<(Walks, Vec<(u8, u32, u32)>)> {
     }
     let p = pipeline(this);
     let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
-    let shadow = victory_shader::emit::shadow_structures(&shader.hash);
+    let shadow = victory_shader::emit::shadow_binding(&shader.hash);
     let walks = match (p.rt_only, shadow) {
         _ if shader.hash.starts_with(GLASS_TRACE) => Walks::Glass,
-        (_, Some(registers)) => Walks::Shadow(registers),
+        (_, Some(binding)) => Walks::Shadow(binding),
         (RayOnly::VBuffer, None) => Walks::VBuffer,
         (RayOnly::Trace, None) => Walks::Trace,
         _ => return None,
