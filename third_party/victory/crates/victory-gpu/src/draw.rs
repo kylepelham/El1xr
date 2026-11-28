@@ -3293,8 +3293,22 @@ impl State {
             Some((_, bytes, _)) if bytes >= (1 << 30) => usize::MAX,
             _ => 4096,
         };
+        // (`VICTORY_BAKE_SPREAD`, `VICTORY_BAKE_LOAD_SPREAD` while loading) A bake pass hands all
+        // but the bake's own textures to the prepare threads and checks its time before each slot.
+        let world = crate::load_rate::in_world();
+        let spread_mode = crate::bake_spread::mode_now(world);
+        let spread = crate::bake_spread::spreads(
+            spread_mode,
+            PASS_BUDGET.get().is_some_and(|(_, _, now)| now),
+            bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
+            crate::texture::prepare::threads(),
+        );
+        // While loading, the frame's cap: a pass with none left looks at the bake's own slots alone.
+        let load_left = (spread && !world).then(|| crate::bake_spread::load_left(frame, spread_mode));
         let only = bake_pass::ONLY.get();
-        let (mut due, census) = host.texture_slots_due(frame, if only { 0 } else { slot_limit });
+        let none_left = load_left.is_some_and(|left| left.is_zero());
+        let (mut due, census) =
+            host.texture_slots_due(frame, if only || none_left { 0 } else { slot_limit });
         // (`VICTORY_BAKE_INPUTS`) A bake draw's own textures go first, outside the budgets, in a
         // pass whose uploads must be there now.
         let pinned = if PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
@@ -3314,16 +3328,6 @@ impl State {
             }
             None => 0,
         };
-        // (`VICTORY_BAKE_SPREAD`) In the world, a bake pass hands all but the bake's own textures
-        // to the prepare threads and checks its time before each slot.
-        let spread_mode = crate::bake_spread::mode();
-        let spread = crate::bake_spread::spreads(
-            spread_mode,
-            PASS_BUDGET.get().is_some_and(|(_, _, now)| now),
-            bake_pass::PINNED.with_borrow(|mine| !mine.is_empty()),
-            crate::load_rate::in_world(),
-            crate::texture::prepare::threads(),
-        );
         // (`VICTORY_MATERIAL_TEXTURE_DEMAND`) Character material textures next, within the budgets.
         if !only && crate::material_demand::on() {
             let wanted = host.texture_slots_pick(&crate::material_demand::take());
@@ -3482,7 +3486,8 @@ impl State {
             }
             let took = ahead.elapsed();
             crate::bake_spread::add(crate::bake_spread::C::AheadUs, took.as_micros() as u64);
-            budget = crate::bake_spread::budget_left(spread_mode, budget, took);
+            let capped = load_left.map_or(budget, |left| budget.min(left));
+            budget = crate::bake_spread::budget_left(spread_mode, capped, took);
         } else if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
             let ahead = std::time::Instant::now();
             crate::bake_ahead::host_copies(heap, &due, budget, PASS_BUDGET.get().map_or(0, |b| b.1));
@@ -3841,6 +3846,9 @@ impl State {
             add(C::Pinned, pinned as u64);
             add(C::Handed, handed);
             add(C::Us, entered.elapsed().as_micros() as u64);
+            if load_left.is_some() {
+                crate::bake_spread::load_took(frame, entered.elapsed().as_micros() as u64);
+            }
         }
         // Where this pass's time went, for the frame line (`HEAP_TEXTURE_PARTS`).
         let [made, made_us] = crate::resource::made_here();
