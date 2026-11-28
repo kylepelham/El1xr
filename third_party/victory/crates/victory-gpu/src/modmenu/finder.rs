@@ -304,13 +304,18 @@ pub fn parse_skip(v: &str) -> Vec<u64> {
 }
 
 pub fn tp_set(v: &str) {
-    let mut tp = lock(&TP);
-    *tp = (v == "run").then(|| {
+    *lock(&TP) = (v == "run").then(|| {
         let skip = std::env::var("VICTORY_MOD_MENU_TP_SKIP")
             .map_or_else(|_| Vec::new(), |v| parse_skip(&v));
         TpFind::new(candidates::TELEPORT, &skip)
     });
-    ACTIVE.store(tp.is_some() || lock(&GET).is_some(), Relaxed);
+    refresh();
+}
+
+/// One lock at a time: the menu thread and the game thread both set and tick the finders.
+fn refresh() {
+    let on = lock(&TP).is_some();
+    ACTIVE.store(on || lock(&GET).is_some(), Relaxed);
 }
 
 pub fn tp_get() -> String {
@@ -320,10 +325,9 @@ pub fn tp_get() -> String {
 }
 
 pub fn get_set(v: &str) {
-    let mut get = lock(&GET);
-    *get =
+    *lock(&GET) =
         (v == "run").then(|| GetSweep::new(candidates::ENTITY_GETTERS, candidates::PLAYER_GETTERS));
-    ACTIVE.store(get.is_some() || lock(&TP).is_some(), Relaxed);
+    refresh();
 }
 
 pub fn get_get() -> String {
