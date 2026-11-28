@@ -21,9 +21,9 @@
 //!   and the texture queue makes no new ones (`crate::resource::room`), as when the card is
 //!   full.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use victory_core::settings::Live;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 /// Committed upload buffers alive (`crate::host::Host::upload_buffer` outside the blocks) and
@@ -33,35 +33,22 @@ static UPLOAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Times the cap trimmed the pools, blocks let go by it, and times the floor was found pressed.
 static ACTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-fn mb_switch(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
+/// A size in MB as bytes; unset, unparsed or 0: 0 (off).
+fn mb_bits(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |mb| mb.saturating_mul(1 << 20))
 }
 
-/// `VICTORY_UPLOAD_CAP_MB` in bytes, if set.
+static CAP: Live = Live::new("VICTORY_UPLOAD_CAP_MB", mb_bits);
+static FLOOR: Live = Live::new("VICTORY_COMMIT_FLOOR_MB", mb_bits);
+
+/// `VICTORY_UPLOAD_CAP_MB` in bytes, if set (live).
 fn upload_cap() -> Option<u64> {
-    static CAP: OnceLock<Option<u64>> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        let cap = mb_switch("VICTORY_UPLOAD_CAP_MB").map(|mb| mb << 20);
-        if let Some(cap) = cap {
-            tracing::info!(cap_mb = cap >> 20, "upload memory past the cap keeps no empty block and no pooled staging buffer (VICTORY_UPLOAD_CAP_MB)");
-        }
-        cap
-    })
+    Some(CAP.get()).filter(|&v| v > 0)
 }
 
-/// `VICTORY_COMMIT_FLOOR_MB` in bytes, if set.
+/// `VICTORY_COMMIT_FLOOR_MB` in bytes, if set (live).
 fn commit_floor() -> Option<u64> {
-    static FLOOR: OnceLock<Option<u64>> = OnceLock::new();
-    *FLOOR.get_or_init(|| {
-        let floor = mb_switch("VICTORY_COMMIT_FLOOR_MB").map(|mb| mb << 20);
-        if let Some(floor) = floor {
-            tracing::info!(floor_mb = floor >> 20, "under this much free commit textures go sooner and the texture queue waits (VICTORY_COMMIT_FLOOR_MB)");
-        }
-        floor
-    })
+    Some(FLOOR.get()).filter(|&v| v > 0)
 }
 
 /// Counts a committed upload buffer of `bytes` while it lives.
@@ -255,6 +242,17 @@ mod tests {
         assert!(!under(0, None));
         assert!(!under(4 << 30, Some(4 << 30)));
         assert!(under((4 << 30) - 1, Some(4 << 30)));
+    }
+
+    /// Both switches are live: a launch can A/B them, and off is 0.
+    #[test]
+    fn the_switches_are_live_and_off_by_default() {
+        use victory_core::settings::check_live;
+        assert_eq!(mb_bits(None), 0);
+        assert_eq!(mb_bits(Some(" 512 ")), 512 << 20);
+        assert_eq!(mb_bits(Some("x")), 0);
+        check_live("VICTORY_UPLOAD_CAP_MB", "1024", upload_cap, None, Some(1 << 30));
+        check_live("VICTORY_COMMIT_FLOOR_MB", "4096", commit_floor, None, Some(4 << 30));
     }
 
     /// The system's commit is read, its limit above what is charged.
