@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod away_grace;
 mod buffer_format;
 mod copy_first;
 mod flicker;
@@ -1315,6 +1316,11 @@ impl TextureQueue {
             },
         );
         self.marks.set(index, write);
+    }
+
+    /// The frame slot `index` was written or found changed in, if queued.
+    fn written_at(&self, index: u32) -> Option<u64> {
+        self.slots.get(&index).map(|w| w.written)
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload

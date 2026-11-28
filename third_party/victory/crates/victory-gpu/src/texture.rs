@@ -29,6 +29,7 @@ mod gpu_detile;
 mod hash_behind;
 mod inside_copy;
 mod mapped_holes;
+mod partial_grown;
 #[cfg(all(test, windows))]
 mod inside_copy_tests;
 pub(crate) mod prepare;
@@ -115,6 +116,8 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// What its partly mapped reads know of its mapping (`VICTORY_PARTIAL_GROWN`).
+    grown: partial_grown::Grown,
     /// The texture was found changed without a write the guard saw
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
@@ -1734,6 +1737,7 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        let asked_before = last.asked;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
         {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
@@ -1851,9 +1855,21 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // `VICTORY_PARTIAL_GROWN=1`: read again soon when more of it is mapped.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            let grown = partial_grown::on();
+            let memory = self.memory;
+            if partial_grown::holds(last.partial, frame, grown, &mut last.grown, || {
+                mapped_bytes(memory, size)
+            }) {
+                if last.grown.waiting() {
+                    last.asked = asked_before;
+                }
                 return 0;
+            }
+            if grown {
+                let early = last.partial.is_some_and(|at| frame < at + partial_grown::WINDOW);
+                partial_grown::read(&mut last.grown, mapped_bytes(memory, size), early);
             }
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
