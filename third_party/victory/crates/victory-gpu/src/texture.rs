@@ -838,6 +838,9 @@ pub(crate) fn host_written_sub(resource: This, sub: Option<u32>) {
         };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
+            if crate::bake_reuse::on() {
+                crate::bake_reuse::card_wrote(at as u64, bytes);
+            }
             HOST_WRITTEN_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -891,6 +894,9 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// card in the other texture, where no shader that reads this view finds
 /// them.
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    if crate::bake_reuse::on() {
+        crate::bake_reuse::placed(address, desc);
+    }
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
@@ -952,7 +958,13 @@ pub(crate) fn forget(resource: usize) {
     HOST_WRITTEN_AT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, d| d.5 != resource);
+        .retain(|at, d| {
+            // `VICTORY_BAKE_REUSE_WATCH`: the memory of a released card-written texture.
+            if d.5 == resource && crate::bake_reuse::on() {
+                crate::bake_reuse::released(*at, d.0, [d.1, d.2, d.3, d.4], resource);
+            }
+            d.5 != resource
+        });
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
@@ -1182,6 +1194,11 @@ impl PreludeUpload {
             if let Some((_, baked)) = in_host_written(at as u64, len as u64, self.resource) {
                 crate::bake_check::written(0, baked, "alias_upload", self.resource);
             }
+        }
+        // `VICTORY_BAKE_REUSE_WATCH`: title memory over a released bake result's texels.
+        if crate::bake_reuse::on() {
+            let (at, len) = self.staging.memory();
+            crate::bake_reuse::title_upload(at as u64, len as u64, self.resource);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
