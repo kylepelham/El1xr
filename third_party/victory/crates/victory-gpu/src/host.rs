@@ -1037,6 +1037,8 @@ pub(crate) struct HostList {
     ahead_chunks: Mutex<Vec<(ID3D12Resource, bool)>>,
     /// Left open for the title's next reset (`crate::fresh_open`).
     pub(crate) left_open: std::sync::atomic::AtomicU8,
+    /// Its prelude was reset with it and is open and empty (`run_wait`).
+    prelude_open: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Its title commands, for device-removed data and the hang watch.
@@ -2815,8 +2817,9 @@ enum Step {
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only. The flag: it reads no texture
+    /// check's result either (`run_wait`, `VICTORY_HOST_ALONE`).
+    Host(Box<dyn Fn() + Send>, bool),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date and uploads it on the
@@ -3466,7 +3469,7 @@ fn blocked_by_walk(written: &[(usize, usize)], runs: &[&HostList], count: bool) 
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -3751,6 +3754,7 @@ impl Host {
                 card_constants: Default::default(),
                 ahead_chunks: Mutex::default(),
                 left_open: crate::fresh_open::mark(),
+                prelude_open: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 ops,
                 #[cfg(feature = "diagnostics")]
@@ -4670,7 +4674,7 @@ impl Host {
                     }
                     firsts.push(lists.len());
                     let _laps = run_split::prelude();
-                    if let Some(prelude) = list.prelude(&uploads) {
+                    if let Some(prelude) = run_wait::prelude(|| list.prelude(&uploads)) {
                         lists.push(Some(prelude));
                     }
                     lists.push(list.list.cast().ok());
@@ -5232,6 +5236,7 @@ impl HostList {
             }
             crate::gpucost::begin_as(&self.list, crate::gpucost::TITLE, self.ops.id());
         }
+        run_wait::reset_ahead(self);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::ResetNs,
@@ -5653,8 +5658,7 @@ impl HostList {
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
+            run_wait::open(self, allocator, list).and_then(|()| {
                 crate::gpucost::begin(list, crate::gpucost::PRELUDE_TWINS);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
@@ -5663,19 +5667,21 @@ impl HostList {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 crate::gpucost::at(list, crate::gpucost::PRELUDE_UPLOADS);
-                for (upload, _) in uploads {
-                    upload.record(self, list);
-                }
+                run_wait::uploads(uploads.len(), || {
+                    for (upload, _) in uploads {
+                        upload.record(self, list);
+                    }
+                });
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
                 if let Some(budget) = budget {
                     crate::gpucost::at(list, crate::gpucost::PRELUDE_AHEAD);
                     let mut chunks = self.ahead_chunks.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::indirect::record_ahead(list, budget, &mut chunks, &ahead);
+                    run_wait::ahead(|| crate::indirect::record_ahead(list, budget, &mut chunks, &ahead));
                 }
                 crate::gpucost::end(list);
-                list.Close()
+                run_wait::close(list)
             })
         };
         if let Err(e) = recorded {
@@ -6191,7 +6197,7 @@ impl HostList {
                 for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
-            })));
+            }), true));
         }
         Some(*gpu)
     }
@@ -6353,7 +6359,15 @@ impl HostList {
         // (Neptune) Title memory or a buffer changes at this place in the list: a table made
         // ready before it is made ready again after it (`crate::draw`).
         self.changes.fetch_add(1, Ordering::Relaxed);
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.deferred().copies.push(Step::Host(Box::new(work), false));
+    }
+
+    /// As [`HostList::defer_host`], for work that reads no texture check's
+    /// result either: with `VICTORY_HOST_ALONE=1` it does not wait for the
+    /// checks pending before it (`run_wait`).
+    pub(crate) fn defer_host_alone(&self, work: impl Fn() + Send + 'static) {
+        self.changes.fetch_add(1, Ordering::Relaxed);
+        self.deferred().copies.push(Step::Host(Box::new(work), true));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -6422,17 +6436,19 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work, _) => {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
-                    } else if !batch.pending_textures.is_empty() || batch.early.started() {
+                        work();
+                    } else {
                         // Host callbacks can use a refresh result, including the
-                        // mip mask that maps a reserved texture for this upload.
-                        batch.flush_textures();
+                        // mip mask that maps a reserved texture for this upload
+                        // (not those recorded alone, `run_wait`).
+                        let pending = !batch.pending_textures.is_empty() || batch.early.started();
+                        run_wait::host_step(step, pending, || batch.flush_textures(), work);
                     }
-                    work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -8000,6 +8016,7 @@ impl Meter {
             step_reads::line(frames);
             crate::port_order::line(frames);
             run_split::line(frames);
+            run_wait::line(frames);
             let copies = CARD_COPIES.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!(
                 "title buffer copies run on the card per frame: {copies:.1} (they read memory shaders write; VICTORY_CARD_COPIES=0: on the CPU, after every flight has landed)"
@@ -9198,6 +9215,8 @@ mod one_pass;
 mod step_reads;
 #[path = "host_run_split.rs"]
 mod run_split;
+#[path = "host_run_wait.rs"]
+mod run_wait;
 use step_reads::blocked_by;
 
 #[cfg(test)]
