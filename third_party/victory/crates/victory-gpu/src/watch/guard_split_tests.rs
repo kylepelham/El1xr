@@ -7,12 +7,16 @@ use super::super::{
 use super::{NOTE_ONCE_FORCED, PUBLISH_TRY_FORCED, note_written};
 
 /// Reserved address space of our own: page numbers no other test notes.
+/// Their stamps and 4 KiB entries start cleared: a test that noted the same
+/// addresses before they were freed and given to us leaves its own (in 4
+/// full suites at once with 16 threads each, 26 of 100 failed here, #78).
 fn reserve(pages: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
     // SAFETY: a fresh reservation, never committed, freed by `release`.
     let at = unsafe { VirtualAlloc(std::ptr::null(), pages * PAGE, MEM_RESERVE, PAGE_NOACCESS) }
         as usize;
     assert_ne!(at, 0);
+    clear_stamps(at, pages * PAGE);
     at
 }
 

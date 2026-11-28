@@ -2897,7 +2897,7 @@ fn merge_due_leaves_out_only_merges_that_do_nothing() {
     // No write pending: nothing to merge.
     assert!(!agree(&shadow, "nothing pending"));
     let _ = shadow.update(block.addr(), LEN);
-    shadow.writing(block.addr(), LEN);
+    writing_in_submission(h, &shadow, block.addr(), LEN);
     assert!(shadow.writes_pending());
     let _ = agree(&shadow, "pending, title quiet");
     // The title writes a page under the pending writes: never left out.
@@ -2948,7 +2948,7 @@ fn warm_fill_brings_in_what_update_would() {
         let _ = plain.update(block.addr(), LEN);
         assert!(held(&warmed) == held(&plain), "carded={carded}: after a write, the copies differ");
         // Shader writes pending: left alone.
-        warmed.writing(block.addr(), LEN);
+        writing_in_submission(h, &warmed, block.addr(), LEN);
         assert_eq!(warm::fill(&warmed, block.addr(), LEN), None);
         warmed.copy_back_done(&[(block.addr(), block.addr() + LEN)]);
     }
