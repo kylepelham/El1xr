@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="430" viewBox="0 0 900 430" role="img" aria-labelledby="title desc">
-  <title id="title">Batch 4: launch time, black frames and black faces before and after its kept switches, RTX 5090, 4K</title>
-  <desc id="desc">Before and after bars from batch 4 runs; each pair ran on one build. Launch to the first world frame: 32 to 33 seconds with the loading switches off, 27 to 28 seconds with them on, two runs each, back to back. Black frames that reached the screen in the first 90 seconds: 152 with the last-frame hold off, 31 with it on, one quiet run each. Diner snapshots with a black face per run: 0 to 3 in three runs without bake inputs, 0 in two runs with them (24 snapshots).</desc>
+  <title id="title">Batch 5: launch time, diner flashes and the world-entry frame before and after its kept switches, RTX 5090, 4K</title>
+  <desc id="desc">Before and after bars from batch 5 runs; each pair ran on one build. Launch to the first world frame: 26.2 to 26.7 seconds with the loading bundle off, 23.1 to 24.6 seconds with it on, two quiet back-to-back pairs. One-frame dark flashes of the diner background per run: 12 to 19 without TABLE_NULL_ONCE, 0 with it. The first world frame took 781 to 1048 milliseconds without HEAP_WARM and 614 to 702 milliseconds with it, two pairs.</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -17,51 +17,49 @@
   </style>
   <defs>
     <linearGradient id="cardbg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#120a24"/><stop offset="1" stop-color="#1b0f33"/></linearGradient>
-    <radialGradient id="glow" cx=".85" cy="1.05" r=".75"><stop offset="0" stop-color="#ff3d8b" stop-opacity=".22"/><stop offset=".5" stop-color="#9b5cff" stop-opacity=".08"/><stop offset="1" stop-color="#9b5cff" stop-opacity="0"/></radialGradient>
     <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <linearGradient id="sunsetv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd36e"/><stop offset=".35" stop-color="#ff8a3d"/><stop offset=".7" stop-color="#ff3d8b"/><stop offset="1" stop-color="#9b5cff"/></linearGradient>
     <clipPath id="cardclip"><rect width="900" height="430" rx="18"/></clipPath>
   </defs>
   <g clip-path="url(#cardclip)">
     <rect width="900" height="430" fill="url(#cardbg)"/>
-    <rect width="900" height="430" fill="url(#glow)"/>
     <path d="M0 430L0 420L12 420L12 410L14 410L14 420L25 420L25 426L60 426L60 424L95 424L95 425L124 425L124 414L155 414L155 419L163 419L163 409L165 409L165 419L173 419L173 400L199 400L199 414L232 414L232 416L248 416L248 412L263 412L263 402L265 402L265 412L280 412L280 418L300 418L300 418L333 418L333 422L368 422L368 423L394 423L394 420L430 420L430 404L447 404L447 424L455 424L455 414L457 414L457 424L466 424L466 423L478 423L478 413L480 413L480 423L493 423L493 393L519 393L519 403L529 403L529 393L531 393L531 403L542 403L542 418L570 418L570 422L607 422L607 420L636 420L636 394L654 394L654 384L656 384L656 394L674 394L674 397L704 397L704 424L733 424L733 409L763 409L763 417L779 417L779 414L807 414L807 412L825 412L825 402L827 402L827 412L845 412L845 419L878 419L878 418L897 418L897 415L904 415L904 405L906 405L906 415L900 415L900 430Z" fill="#9b5cff" fill-opacity=".07"/>
     <rect width="900" height="4" fill="url(#sunset)"/>
   </g>
   <rect x=".5" y=".5" width="899" height="429" rx="18" fill="none" stroke="#2c2048"/>
-  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Batch 4, 27 Nov 2026</text>
-  <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">Fewer black frames, faster in</text>
+  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Batch 5, 28 Nov 2026</text>
+  <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">Faster in, fewer flashes</text>
   <text class="s up" x="36" y="118" font-size="12" font-weight="700" fill="#f6eefe">Launch to first world frame</text>
-  <text class="s" x="864" y="118" font-size="12.5" text-anchor="end" fill="#a99bc6">loading switches off / on, 2 runs each</text>
+  <text class="s" x="864" y="118" font-size="12.5" text-anchor="end" fill="#a99bc6">loading bundle off / on, 2 quiet pairs</text>
   <text class="s" x="222" y="139" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="173" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
-  <rect class="grow t1" x="236" y="126" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t1" x="236" y="126" width="543" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="142" font-size="20" font-style="italic" fill="#ddd3ee">32-33 s</text>
-  <rect class="grow t2" x="236" y="156" width="475" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t2" x="236" y="156" width="458" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="723" y="178" font-size="28" font-style="italic" fill="#ffd36e">27-28 s</text>
-  <text class="s up" x="36" y="218" font-size="12" font-weight="700" fill="#f6eefe">Black frames shown, first 90 s</text>
-  <text class="s" x="864" y="218" font-size="12.5" text-anchor="end" fill="#a99bc6">last-frame hold off / on, quiet</text>
+  <rect class="grow t1" x="236" y="126" width="480" height="18" fill="#3b2d58" opacity=".55"/>
+  <rect class="grow t1" x="236" y="126" width="471" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="728" y="142" font-size="20" font-style="italic" fill="#ddd3ee">26.2-26.7 s</text>
+  <rect class="grow t2" x="236" y="156" width="442" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t2" x="236" y="156" width="415" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="690" y="178" font-size="28" font-style="italic" fill="#ffd36e">23.1-24.6 s</text>
+  <text class="s up" x="36" y="218" font-size="12" font-weight="700" fill="#f6eefe">Diner dark flashes per run</text>
+  <text class="s" x="864" y="218" font-size="12.5" text-anchor="end" fill="#a99bc6">TABLE_NULL_ONCE off / on</text>
   <text class="s" x="222" y="239" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="273" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
-  <rect class="grow t3" x="236" y="226" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t3" x="236" y="226" width="560" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="242" font-size="20" font-style="italic" fill="#ddd3ee">152</text>
-  <rect class="grow t4" x="236" y="256" width="114" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t4" x="236" y="256" width="114" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="362" y="278" font-size="28" font-style="italic" fill="#ffd36e">31</text>
-  <text class="s up" x="36" y="318" font-size="12" font-weight="700" fill="#f6eefe">Black-face diner snaps per run</text>
-  <text class="s" x="864" y="318" font-size="12.5" text-anchor="end" fill="#a99bc6">bake inputs off (3 runs) / on (2 runs)</text>
+  <rect class="grow t3" x="236" y="226" width="480" height="18" fill="#3b2d58" opacity=".55"/>
+  <rect class="grow t3" x="236" y="226" width="303" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="728" y="242" font-size="20" font-style="italic" fill="#ddd3ee">12-19</text>
+  <rect class="grow t4" x="236" y="256" width="3" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t4" x="236" y="256" width="3" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="251" y="278" font-size="28" font-style="italic" fill="#ffd36e">0</text>
+  <text class="s up" x="36" y="318" font-size="12" font-weight="700" fill="#f6eefe">World-entry frame</text>
+  <text class="s" x="864" y="318" font-size="12.5" text-anchor="end" fill="#a99bc6">HEAP_WARM off / on, 2 pairs</text>
   <text class="s" x="222" y="339" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="373" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
-  <rect class="grow t5" x="236" y="326" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t5" x="236" y="326" width="0" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="342" font-size="20" font-style="italic" fill="#ddd3ee">0-3</text>
-  <rect class="grow t6" x="236" y="356" width="3" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t6" x="236" y="356" width="3" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="251" y="378" font-size="28" font-style="italic" fill="#ffd36e">0</text>
+  <rect class="grow t5" x="236" y="326" width="480" height="18" fill="#3b2d58" opacity=".55"/>
+  <rect class="grow t5" x="236" y="326" width="358" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="728" y="342" font-size="20" font-style="italic" fill="#ddd3ee">781-1048 ms</text>
+  <rect class="grow t6" x="236" y="356" width="322" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t6" x="236" y="356" width="281" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="570" y="378" font-size="28" font-style="italic" fill="#ffd36e">614-702 ms</text>
   <rect x="36" y="194" width="828" height="1" fill="#2c2048"/>
   <rect x="36" y="294" width="828" height="1" fill="#2c2048"/>
-  <text class="s" x="36" y="408" font-size="13" fill="#a99bc6">RTX 5090, 4K, batch 4. Each before/after pair ran on one build. Less is better. Pale end of a bar: spread between runs.</text>
+  <text class="s" x="36" y="408" font-size="13" fill="#a99bc6">RTX 5090, 4K, batch 5. Each before/after pair ran on one build. Less is better. Pale end of a bar: spread between runs.</text>
 </svg>
