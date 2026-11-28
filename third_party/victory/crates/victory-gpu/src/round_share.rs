@@ -30,6 +30,17 @@
 //! value is there, so when a wait is passed what is behind it is stamped
 //! again ([`raise`], from `queue.rs`). The rounds the preparing asks for
 //! after its own heap writes and settles (`Rounds::wrote`) are not shared.
+//!
+//! (critpath, #88) `VICTORY_HEAP_ROUND_AHEAD=1` (Live, off by default; acts with
+//! `VICTORY_HEAP_ROUND_SHARE=1`): the title's `ExecuteCommandLists` (and a wait passed, for the
+//! parts behind it) also asks the round, right after stamping, when a list uses heaps
+//! ([`ask_ahead`]). With `VICTORY_ASYNC_SUBMIT=1` the submission then sits queued while the one
+//! before it is prepared, and its round runs meanwhile: when it enters `Host::submit` the round
+//! is done or under way, where before it was asked only then and waited for at the end of its
+//! preparing (sync_heaps 0.35-0.9 ms a frame settled, 1.8-7.8 ms while streaming, part S/T; the
+//! pass itself 1.0-1.6 ms a frame over 24 rounds). The ticket asked is the stamp or later, so
+//! its round begins after the title wrote the records; a heap write of ours after it raises the
+//! floor past it, and the submission asks a round of its own, as before.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,6 +97,32 @@ const LANDING_ON: usize = 4;
 const RAISED: usize = 5;
 const BEHIND: usize = 6;
 
+static AHEAD: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_HEAP_ROUND_AHEAD");
+
+/// Since the last line: rounds asked ahead ([`ask_ahead`]).
+static AHEAD_ASKED: AtomicU64 = AtomicU64::new(0);
+
+/// (`VICTORY_HEAP_ROUND_AHEAD`) Lists that use heaps were stamped (or raised) just now: their
+/// round is asked now, not when their submission is prepared.
+fn ask_ahead(uses_heaps: bool) {
+    if uses_heaps && AHEAD.get_bool() {
+        ask_now();
+    }
+}
+
+fn ask_now() {
+    if crate::descriptor::sync_heaps_start() != 0 {
+        AHEAD_ASKED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Rounds asked ahead since the last call, per frame over `frames`.
+pub(crate) fn ahead_take(frames: f64) -> f64 {
+    let n = AHEAD_ASKED.swap(0, Ordering::Relaxed) as f64;
+    if frames > 0.0 { n / frames } else { 0.0 }
+}
+
 /// The stamp of a list given to a queue now (0: no worker; never shared).
 pub(crate) fn stamp_now() -> u64 {
     crate::descriptor::heap_sync_next()
@@ -97,10 +134,15 @@ pub(crate) fn stamp_lists(lists: &[crate::object::This]) {
         return;
     }
     let stamp = stamp_now();
+    let mut uses_heaps = false;
     for &l in lists {
         if let Some(host) = crate::list::host_list(l) {
             host.heap_stamp.store(stamp, Ordering::Release);
+            uses_heaps |= host.uses_heaps.load(Ordering::Relaxed);
         }
+    }
+    if stamp != 0 {
+        ask_ahead(uses_heaps);
     }
 }
 
@@ -117,13 +159,17 @@ pub(crate) fn raise_lists<'a>(
     lists: impl IntoIterator<Item = &'a crate::host::HostList>,
     now: u64,
 ) {
-    let mut any = false;
+    let (mut any, mut uses_heaps) = (false, false);
     for l in lists {
         raise(&l.heap_stamp, now);
         any = true;
+        uses_heaps |= l.uses_heaps.load(Ordering::Relaxed);
     }
     if any {
         STATS[BEHIND].fetch_add(1, Ordering::Relaxed);
+        if now != 0 {
+            ask_ahead(uses_heaps);
+        }
     }
 }
 
@@ -325,6 +371,28 @@ mod tests {
     /// prepared.
     #[test]
     fn no_submission_runs_on_records_older_than_it_needs() {
+        let (shared, asked_own) = model(false);
+        assert!(shared > 0 && asked_own > 0, "shared {shared}, asked {asked_own}");
+    }
+
+    /// (`VICTORY_HEAP_ROUND_AHEAD`) The title asks the round when it gives the lists (and when
+    /// it meets a wait): no submission runs on older records, and more find theirs had already.
+    #[test]
+    fn rounds_asked_ahead_keep_every_submission_on_its_records() {
+        let (shared_ahead, own_ahead) = model(true);
+        let (shared, own) = model(false);
+        assert!(shared_ahead > 0, "shared {shared_ahead}, asked {own_ahead}");
+        assert!(
+            shared_ahead * (shared + own) > shared * (shared_ahead + own_ahead),
+            "ahead: {shared_ahead} shared of {}, before: {shared} of {}",
+            shared_ahead + own_ahead,
+            shared + own,
+        );
+    }
+
+    /// The model below; `ahead`: the title asks a round right after each stamp and raise.
+    /// Submissions that shared a round, and that asked one of their own.
+    fn model(ahead: bool) -> (u64, u64) {
         struct Sub {
             stamp: u64,
             /// The records' version it must see at least.
@@ -374,6 +442,9 @@ mod tests {
                             must_see: version,
                             behind_wait: random(4) == 0,
                         });
+                        if ahead {
+                            asked += 1;
+                        }
                     }
                     // It writes records for those behind the wait and meets
                     // it: their stamps rise (`queue::raise_behind`).
@@ -385,6 +456,9 @@ mod tests {
                             raise(&stamp, asked + 1);
                             s.stamp = stamp.into_inner();
                             s.behind_wait = false;
+                        }
+                        if ahead {
+                            asked += 1;
                         }
                     }
                     // Shaders' writes land in a heap; the floor rises after.
@@ -439,7 +513,24 @@ mod tests {
                 }
             }
         }
-        assert!(shared > 0 && asked_own > 0, "shared {shared}, asked {asked_own}");
+        (shared, asked_own)
+    }
+
+    /// (`VICTORY_HEAP_ROUND_AHEAD`) A round asked right after the stamp is the lists' round:
+    /// their submission shares it, done or under way, and asks none of its own.
+    #[test]
+    fn a_round_asked_ahead_is_had_by_the_stamped_submission() {
+        let stamp = stamp_now();
+        if stamp == 0 {
+            return; // no worker thread
+        }
+        let before = AHEAD_ASKED.load(Ordering::Relaxed);
+        ask_now();
+        assert!(AHEAD_ASKED.load(Ordering::Relaxed) > before);
+        let (wait_for, decision) = crate::descriptor::sync_heaps_share(stamp);
+        assert_ne!(decision, Decision::Ask, "the round asked ahead was not had");
+        assert!(wait_for >= stamp);
+        crate::descriptor::sync_heaps_wait(wait_for);
     }
 
     /// A stamp taken before a round began is not met by that round, even
