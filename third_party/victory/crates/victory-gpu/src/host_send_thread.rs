@@ -34,6 +34,12 @@
 //! line, `LAZY_GPU`): callers of [`wait_idle`] may hold any of them. It takes
 //! the card clock's lock in `card_sent`, which nobody holds while waiting.
 //!
+//! With `VICTORY_CARD_RECORD_SEND=1` a job also carries its plan's two card
+//! lists unrecorded (`super::card_rec`): the thread records them first, then
+//! sends (rule 2 keeps every other user of the queue behind both). A
+//! recording that fails sends nothing of the job and signals its fence (rule
+//! 4).
+//!
 //! After Kemerd/VIctory-NVIDIA-RT `host/send_thread.rs` (step 5a of its
 //! `-Fast` set, as applied in TheUnrealZaka/VIctoryUnified-DLSS `aeeb2f72`).
 
@@ -47,6 +53,7 @@ use std::time::Instant;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandList;
 
 use super::Host;
+use super::card_rec::Pending;
 
 static ON: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_SEND_THREAD");
 
@@ -59,7 +66,8 @@ pub(super) fn on() -> bool {
 pub(super) trait Work: Send + 'static {
     /// The fence value it signals (to check the order jobs come in).
     fn fence(&self) -> u64;
-    /// Sends and signals; `Err` when the signal failed.
+    /// Sends and signals; `Err` with the run's failure when the signal (or
+    /// what comes before it) failed.
     fn run(&mut self) -> Result<(), String>;
     /// After a panic in `run`: signals what it reserved if `run` did not.
     fn rescue(&mut self);
@@ -189,9 +197,7 @@ impl<W: Work> Sender<W> {
             let began = Instant::now();
             let failure = match std::panic::catch_unwind(AssertUnwindSafe(|| job.run())) {
                 Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(format!(
-                    "a submission sent ahead could not be followed by a signal ({e})"
-                )),
+                Ok(Err(e)) => Some(e),
                 Err(_) => {
                     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| job.rescue()));
                     Some("the thread that sends submissions panicked".to_string())
@@ -221,14 +227,33 @@ fn in_order(last: &mut u64, fence: u64) -> bool {
     ok
 }
 
-/// One submission's tail: its closed lists, the compare sent in a call of
-/// its own, and the fence value signalled behind them.
+/// One submission's tail: its card lists to record (`VICTORY_CARD_RECORD_SEND`),
+/// its closed lists, the compare sent in a call of its own, and the fence
+/// value signalled behind them.
 pub(super) struct Job {
     host: &'static Host,
+    card: Option<Pending>,
     lists: Vec<Option<ID3D12CommandList>>,
     apart: Option<ID3D12CommandList>,
     fence: u64,
     signalled: bool,
+}
+
+/// A job's steps in order: `record` (the card's lists), then `send` (lists,
+/// compare, signal). A recording that fails sends nothing; `signal` alone
+/// completes the fence value and the recording's failure is given back.
+fn steps(
+    record: impl FnOnce() -> Result<(), String>,
+    send: impl FnOnce() -> Result<(), String>,
+    signal: impl FnOnce(),
+) -> Result<(), String> {
+    match record() {
+        Ok(()) => send(),
+        Err(e) => {
+            signal();
+            Err(e)
+        }
+    }
 }
 
 // SAFETY: closed lists of free-threaded D3D12 objects; nothing records into
@@ -243,15 +268,29 @@ impl Work for Job {
     /// The calls `Host::submit` makes inline, in the same order.
     fn run(&mut self) -> Result<(), String> {
         let host = self.host;
-        // SAFETY: closed lists; the fence is ours.
-        let signalled = unsafe {
-            host.queue.ExecuteCommandLists(&self.lists);
-            crate::compare_apart::send(&host.queue, &self.apart);
-            host.queue.Signal(&host.fence, self.fence)
-        };
-        self.signalled = true;
-        host.card_sent();
-        signalled.map_err(|e| e.to_string())
+        let (fence, card) = (self.fence, self.card.take());
+        let signalled = Cell::new(false);
+        let ran = steps(
+            || card.as_ref().map_or(Ok(()), Pending::record),
+            || {
+                // SAFETY: closed lists (the card's recorded just now); the fence is ours.
+                let sent = unsafe {
+                    host.queue.ExecuteCommandLists(&self.lists);
+                    crate::compare_apart::send(&host.queue, &self.apart);
+                    host.queue.Signal(&host.fence, fence)
+                };
+                signalled.set(true);
+                host.card_sent();
+                sent.map_err(|e| format!("a submission sent ahead could not be followed by a signal ({e})"))
+            },
+            || {
+                // SAFETY: our queue and fence; the value was reserved for this job.
+                let _ = unsafe { host.queue.Signal(&host.fence, fence) };
+                signalled.set(true);
+            },
+        );
+        self.signalled |= signalled.get();
+        ran
     }
 
     fn rescue(&mut self) {
@@ -276,6 +315,7 @@ pub(super) fn send_ahead(
     host: &Host,
     lists: &mut Vec<Option<ID3D12CommandList>>,
     apart: &mut Option<ID3D12CommandList>,
+    card: &mut Option<Pending>,
     fence: u64,
     note: impl FnOnce(),
 ) -> bool {
@@ -288,19 +328,40 @@ pub(super) fn send_ahead(
     note();
     let job = Job {
         host,
+        card: card.take(),
         lists: std::mem::take(lists),
         apart: apart.take(),
         fence,
         signalled: false,
     };
-    if let Err(mut job) = SEND.hand_over(job) {
-        if let Err(what) = job.run() {
-            Job::failed(&format!(
-                "a submission sent ahead could not be followed by a signal ({what})"
-            ));
+    let carded = job.card.is_some();
+    match SEND.hand_over(job) {
+        Ok(()) => {
+            if carded {
+                Pending::counted(false);
+            }
+        }
+        Err(mut job) => {
+            if carded {
+                Pending::counted(true);
+            }
+            if let Err(what) = job.run() {
+                Job::failed(&what);
+            }
         }
     }
     true
+}
+
+/// A submission the thread did not take: its card lists, if left to record,
+/// are recorded here, before its lists go to the queue.
+pub(super) fn record_here(card: &mut Option<Pending>) {
+    if let Some(card) = card.take() {
+        Pending::counted(true);
+        if let Err(what) = card.record() {
+            super::fail(format_args!("{what}"));
+        }
+    }
 }
 
 /// Returns once the thread has sent everything handed over so far; at once
