@@ -17,6 +17,12 @@
 //! zeros as a committed one does, and every list that names it is sent after
 //! the zeros were written. One send is in flight at a time (one allocator);
 //! a block every piece of which is back still goes unzeroed.
+//!
+//! The buffer of zeros is written with zeros once, from the CPU through an
+//! upload buffer, before the first send: a committed buffer only "almost
+//! always" starts as zeros (the memory manager may hand a process memory it
+//! freed itself back without clearing it). WARP did under commit pressure,
+//! and the zeroer then copied a freed buffer's old bytes over the pieces.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -47,7 +53,9 @@ pub(super) struct Zeroer {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     zeros: ID3D12Resource,
-    /// The fence value of the last send.
+    /// The buffer the zeros are first copied from, until that copy has run.
+    first: Option<ID3D12Resource>,
+    /// The fence value of the last send (1: the first copy of zeros).
     sent: u64,
 }
 // SAFETY: D3D12 objects are free-threaded; the list is recorded by the
@@ -68,29 +76,42 @@ impl Zeroer {
             crate::alloc_count::track(&allocator);
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+            let buffer = |kind: D3D12_HEAP_TYPE, state| -> windows::core::Result<ID3D12Resource> {
+                let mut made: Option<ID3D12Resource> = None;
+                device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: kind,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &super::buffers::buffer_desc(ZEROS, D3D12_RESOURCE_FLAG_NONE),
+                    state,
+                    None,
+                    &mut made,
+                )?;
+                made.ok_or_else(windows::core::Error::empty)
+            };
+            let zeros = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)?;
+            // Not taken to start as zeros (see the top): written from the CPU.
+            let first = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut data = std::ptr::null_mut();
+            first.Map(0, None, Some(&mut data))?;
+            std::ptr::write_bytes(data.cast::<u8>(), 0, ZEROS as usize);
+            first.Unmap(0, None);
+            list.CopyBufferRegion(&zeros, 0, &first, 0, ZEROS);
             list.Close()?;
-            // A committed buffer starts as zeros, and nothing writes this one.
-            let mut zeros: Option<ID3D12Resource> = None;
-            device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &super::buffers::buffer_desc(ZEROS, D3D12_RESOURCE_FLAG_NONE),
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut zeros,
-            )?;
-            let zeros = zeros.ok_or_else(windows::core::Error::empty)?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+            queue.Signal(&fence, 1)?;
             crate::host::name(&queue, || "card block reuse (zeros)".into());
             Ok(Zeroer {
                 queue,
                 allocator,
                 list,
-                fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                fence,
                 zeros,
-                sent: 0,
+                first: Some(first),
+                sent: 1,
             })
         }
     }
@@ -106,6 +127,7 @@ impl Zeroer {
         // SAFETY: the last send has run (the caller saw its fence value), so
         // the allocator may be reset; the buffers live until the list has run
         // (the blocks stay while their pieces are out of the free lists).
+        self.first = None;
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
@@ -341,6 +363,9 @@ mod tests {
             }
             let device = device.unwrap();
             let mut z = Zeroer::new(&device).unwrap();
+            while z.completed() < z.sent {
+                std::thread::yield_now();
+            }
             let heap = {
                 let mut heap: Option<ID3D12Heap> = None;
                 device
@@ -452,6 +477,96 @@ mod tests {
             assert_eq!(again, value + 1);
             while z.completed() < again {
                 std::thread::yield_now();
+            }
+        }
+    }
+
+    /// On the software adapter: the buffer of zeros holds zeros even where
+    /// the memory it is made in held other bytes just before. A committed
+    /// buffer only "almost always" starts as zeros (the memory manager may
+    /// hand a process back memory it freed itself without clearing it): WARP
+    /// did, and the zeroer then wrote a test's old bytes over pieces (byte
+    /// 65540 = 1, byte 81920 = 90 in loaded gate runs).
+    #[test]
+    fn the_buffer_of_zeros_is_zeros_over_memory_used_before() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        // SAFETY: plain object creation and copies on a device of our own;
+        // every mapping is of a live buffer of ours, of its size.
+        unsafe {
+            let Ok(adapter) = crate::host::warp_adapter() else {
+                eprintln!("no WARP adapter: skipped");
+                return;
+            };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                eprintln!("no WARP device: skipped");
+                return;
+            }
+            let device = device.unwrap();
+            let buffer = |kind: D3D12_HEAP_TYPE, state| {
+                let mut made: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: kind,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &super::super::buffers::buffer_desc(ZEROS, D3D12_RESOURCE_FLAG_NONE),
+                        state,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+                made.unwrap()
+            };
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let next = std::cell::Cell::new(0);
+            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)
+                    .unwrap();
+                record(&list);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                next.set(next.get() + 1);
+                queue.Signal(&fence, next.get()).unwrap();
+                while fence.GetCompletedValue() < next.get() {
+                    std::thread::yield_now();
+                }
+                allocator.Reset().unwrap();
+            };
+            let up = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut data = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut data)).unwrap();
+            std::ptr::write_bytes(data.cast::<u8>(), 0xCD, ZEROS as usize);
+            let back = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let mut read = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut read)).unwrap();
+            let bytes = std::slice::from_raw_parts(read.cast::<u8>(), ZEROS as usize);
+            for round in 0..8 {
+                // Buffers of the same size filled with other bytes and let go.
+                for _ in 0..4 {
+                    let used = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+                    run(&|list| list.CopyBufferRegion(&used, 0, &up, 0, ZEROS));
+                }
+                let z = Zeroer::new(&device).unwrap();
+                while z.completed() < z.sent {
+                    std::thread::yield_now();
+                }
+                run(&|list| list.CopyBufferRegion(&back, 0, &z.zeros, 0, ZEROS));
+                if let Some(at) = bytes.iter().position(|&b| b != 0) {
+                    panic!("round {round}: byte {at} of the buffer of zeros is {}", bytes[at]);
+                }
             }
         }
     }
