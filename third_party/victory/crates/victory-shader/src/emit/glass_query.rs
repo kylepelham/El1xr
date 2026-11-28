@@ -1,8 +1,9 @@
-//! The glass splice's ray query (`VICTORY_NATIVE_GLASS`, [`super::super::glass_splice`]):
-//! an `image_bvh64_intersect_ray` whose descriptor operand is a trap
-//! temporary is not a node test but a marker the splice put in the console
-//! program. It traces the instruction's ray (origin, direction, extent as
-//! the maximum distance) with an inline ray query on the host top level at
+//! The splices' ray query (`VICTORY_NATIVE_GLASS`, [`super::super::glass_splice`];
+//! `VICTORY_NATIVE_SHADOW`, [`super::super::shadow_patch`]): an `image_bvh64_intersect_ray`
+//! whose descriptor operand is a trap temporary is not a node test but a marker the splice put
+//! in the console program. It traces the instruction's ray (origin, direction, extent as the
+//! maximum distance; the instance mask in the node pointer's place, 0xff for glass, the
+//! title's shadow-caster mask for shadows) with an inline ray query on the host top level at
 //! root SRV [`SLOT_TLAS`] or [`SLOT_TLAS_NEAR`], opaque geometry only, and
 //! writes four dwords of the committed hit:
 //!
@@ -25,8 +26,6 @@ use super::{Inst, Lower, Reg, V, pred};
 /// the title's own test per candidate, not yet spliced), so no candidate
 /// ever comes back to the shader and one `Proceed` ends the walk.
 pub(in crate::emit) const CULL_NON_OPAQUE: u32 = 0x80;
-/// The instance mask: every instance.
-const MASK: u32 = 0xff;
 /// The distance a miss reports (the title's own miss value in `v36`).
 const MISS_T: f32 = -1.0;
 
@@ -39,6 +38,7 @@ impl<'a> Lower<'a> {
         dst: u8,
         guard: Option<V>,
         marker: Marker,
+        mask: V,
         origin: [V; 3],
         direction: [V; 3],
         extent: V,
@@ -52,7 +52,7 @@ impl<'a> Lower<'a> {
         let gate = self.begin_guarded(guard);
         let c = self.cur;
         let rq = self.s.ray_query(c, CULL_NON_OPAQUE);
-        let (flags, mask) = (self.s.m.i32(0), self.s.m.i32(MASK));
+        let flags = self.s.m.i32(0);
         let tmin = self.s.m.f32(0);
         self.s
             .trace_ray_inline(c, rq, slot, flags, mask, origin, tmin, direction, extent);

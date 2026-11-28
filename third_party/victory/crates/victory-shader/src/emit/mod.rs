@@ -87,7 +87,9 @@ mod bitcode;
 mod container;
 pub mod glass_record;
 pub(crate) mod glass_splice;
+pub(crate) mod shadow_splice;
 mod glass_patch;
+mod shadow_patch;
 mod hit_only;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
@@ -99,6 +101,8 @@ mod intersect_tests;
 mod glass_splice_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+pub mod host_tlas;
 mod idiom;
 mod link;
 mod null_view_size;
@@ -147,6 +151,8 @@ pub use lower::set_host_max_wave;
 pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
+pub use shadow_splice::native_shadow;
+pub use shadow_patch::SHADOW_TRACES;
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;
@@ -428,6 +434,9 @@ fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// Returns whether the program changed.
 pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
     if glass_splice::native_glass() && glass_patch::rewrite(&c.digest, native) {
+        return true;
+    }
+    if shadow_splice::native_shadow() && shadow_patch::rewrite(&c.digest, native) {
         return true;
     }
     lower::host_max_wave() == 32

@@ -117,6 +117,9 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if victory_shader::emit::native_glass() {
         h.update(b"VICTORY_NATIVE_GLASS=1");
     }
+    if victory_shader::emit::native_shadow() {
+        h.update(b"VICTORY_NATIVE_SHADOW=1");
+    }
     if let Some(key) = victory_shader::emit::miss_sky_key() {
         h.update(key.as_bytes());
     }
