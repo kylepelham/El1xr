@@ -145,6 +145,7 @@ fn summary(
     for &(k, n) in counts {
         s.counts[k as usize] = n;
     }
+    s.programs.sort_unstable();
     s
 }
 
@@ -156,8 +157,46 @@ fn the_diff_names_missing_extra_fewer_and_dropped_pipelines() {
     let after = summary(11, &[(1, 10, 0), (2, 40, 0), (3, 8, 0)], &[], &[]);
     assert_eq!(
         programs_diff(&before, &dark, Some(&after), &name),
-        "programs missing=2[*p1 x10; p4 x1] extra=1[p5 x3] fewer=1[p2 40->10] dropped=1[p3 x2]"
+        "programs missing=2[*p1 x10 (not issued); p4 x1 (not issued)] (not issued 2, dropped 0) extra=1[p5 x3] fewer=1[p2 40->10] dropped=1[p3 x2 (unclassified)]"
     );
+}
+
+#[test]
+fn a_missing_program_says_whether_it_was_dropped_and_why() {
+    let name = |p: usize| format!("p{p}");
+    let before = summary(9, &[(1, 10, 0), (2, 4, 0), (3, 1, 0)], &[], &[]);
+    let mut dark = summary(10, &[(1, 0, 10), (3, 0, 1)], &[], &[]);
+    dark.why = vec![(1, "ray-only pass left out"), (3, "MissingHostPipeline")];
+    assert_eq!(
+        programs_diff(&before, &dark, None, &name),
+        "programs missing=3[p1 x10 (dropped x10: ray-only pass left out); p2 x4 (not issued); p3 x1 (dropped x1: MissingHostPipeline)] (not issued 1, dropped 2) extra=0[] fewer=0[] dropped=2[p1 x10 (ray-only pass left out); p3 x1 (MissingHostPipeline)]"
+    );
+}
+
+#[test]
+fn watched_programs_are_listed_with_their_runs_drops_and_paths() {
+    let name = |p: usize| match p {
+        1 => "[compute aa CS_MainBlur_446b3af2_Wrapped]".to_owned(),
+        2 => "[compute bb CS_Composite_12345678_Wrapped]".to_owned(),
+        p => format!("[compute {p}]"),
+    };
+    let parts: Vec<String> = WATCHED_NAMES.iter().map(|&n| n.to_owned()).collect();
+    let mut before = summary(9, &[(1, 1, 0), (2, 1, 0), (3, 5, 0)], &[], &[]);
+    before.paths = vec![(1, Path::Clamped as u8), (2, Path::Clamped as u8)];
+    let mut dark = summary(10, &[(1, 0, 1), (3, 5, 0)], &[], &[]);
+    dark.why = vec![(1, "MissingHostPipeline")];
+    let mut after = summary(11, &[(1, 1, 0), (2, 1, 0)], &[], &[]);
+    after.paths = vec![(1, Path::Raw as u8 | Path::Clamped as u8), (2, Path::Clamped as u8)];
+    assert_eq!(
+        watched(&before, &dark, Some(&after), &name, &parts),
+        "watched=2[[compute aa CS_MainBlur_446b3af2_Wrapped] ran 0/1/1 dropped 1/0/0 (MissingHostPipeline) paths -/clamped/raw+clamped; [compute bb CS_Composite_12345678_Wrapped] ran 0/1/1 dropped 0/0/0 paths -/clamped/clamped]"
+    );
+    assert_eq!(
+        watched(&before, &dark, None, &name, &parts[..1]),
+        "watched=0[]"
+    );
+    assert_eq!(path_names(0), "-");
+    assert_eq!(path_names(Path::Ahead as u8 | Path::Zeroed as u8), "ahead+zeroed");
 }
 
 #[test]
@@ -213,7 +252,15 @@ fn the_switch_is_live_and_frames_are_summed_at_the_present() {
     victory_core::settings::set("VICTORY_FLICKER_CATCH", "1").unwrap();
     ran(0x7123_4560);
     ran(0x7123_4560);
-    dropped(0x7123_4568);
+    dropped(0x7123_4568, "");
+    path(0x7123_4560, Path::Clamped);
+    path(0x7123_4560, Path::Raw);
+    // An indirect execution dropped with the drop reasons off: its pipeline
+    // and reason, not "no pipeline".
+    crate::drop_why::pipeline(0x7123_4578);
+    crate::drop_why::set("ray-only pass left out");
+    crate::drop_why::indirect_dropped();
+    crate::drop_why::count("indirect");
     count(Kind::Zeroed);
     descriptor(1);
     settled(6);
@@ -224,6 +271,10 @@ fn the_switch_is_live_and_frames_are_summed_at_the_present() {
     let s = summary_of(7_000_001).unwrap();
     assert!(s.programs.contains(&(0x7123_4560, 2, 0)));
     assert!(s.programs.contains(&(0x7123_4568, 0, 1)));
+    assert!(s.programs.contains(&(0x7123_4578, 0, 1)));
+    assert_eq!(s.why_of(0x7123_4568), "unclassified");
+    assert_eq!(s.why_of(0x7123_4578), "ray-only pass left out");
+    assert_eq!(s.paths_of(0x7123_4560), Path::Raw as u8 | Path::Clamped as u8);
     assert!(s.counts[Kind::Ran as usize] >= 2);
     assert!(s.counts[Kind::Dropped as usize] >= 1);
     assert!(s.counts[Kind::Zeroed as usize] >= 1);
