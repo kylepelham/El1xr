@@ -177,7 +177,7 @@ pub(super) fn drain() {
 
 /// Makes slot `index` of the host heap at `host` again from `key`, if that
 /// heap is still registered and the slot still shows `key`.
-fn remake(host: usize, index: u32, key: u64) -> bool {
+pub(super) fn remake(host: usize, index: u32, key: u64) -> bool {
     let heaps = super::super::SHADER_HEAPS
         .read()
         .unwrap_or_else(|e| e.into_inner());
