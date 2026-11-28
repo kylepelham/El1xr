@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub(crate) mod detect;
 pub(crate) mod periodic;
+pub(crate) mod shadow_tiles;
 #[cfg(windows)]
 pub(crate) mod pass;
 
@@ -451,8 +452,7 @@ pub(crate) fn frame_done(frame: u64) {
     why.sort_unstable();
     let mut paths: Vec<_> = taken.paths.into_iter().collect();
     paths.sort_unstable();
-    let mut ring = RINGED.lock().unwrap_or_else(|e| e.into_inner());
-    ring.push_back(Summary {
+    let summary = Summary {
         frame,
         counts,
         settled,
@@ -462,7 +462,10 @@ pub(crate) fn frame_done(frame: u64) {
         why,
         paths,
         periodic,
-    });
+    };
+    shadow_tiles::frame(&summary);
+    let mut ring = RINGED.lock().unwrap_or_else(|e| e.into_inner());
+    ring.push_back(summary);
     while ring.len() > RING {
         ring.pop_front();
     }
