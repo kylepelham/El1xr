@@ -136,6 +136,7 @@ fn present_later() -> bool {
         return false;
     };
     job();
+    crate::present_own::TURNS.ran();
     // What the title gave its queues meanwhile, into their lines.
     let next = {
         let mut later = lock(&LATER.0);
@@ -615,6 +616,10 @@ pub(crate) fn release_held(all: bool) {
                     }
                     Held::Run(lists, order) => {
                         let _hitch = crate::hitch::span(crate::hitch::Phase::Submit);
+                        crate::flicker_catch::count(crate::flicker_catch::Kind::SentRuns);
+                        if all {
+                            crate::flicker_catch::count(crate::flicker_catch::Kind::ForcedRuns);
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -1185,7 +1190,7 @@ extern "system" fn present(
     };
     #[cfg(windows)]
     if async_present() {
-        {
+        let ticket = {
             // One present at a time waits its turn: the title is not let more than a
             // frame ahead of what has been sent.
             let _turn = crate::hitch::span(crate::hitch::Phase::PresentTurn);
@@ -1194,30 +1199,53 @@ extern "system" fn present(
                 later = LATER.1.wait(later).unwrap_or_else(|e| e.into_inner());
             }
             later.pending = true;
-            later.job = Some(Box::new(move || present_now(named)));
-        }
+            let asked = std::time::Instant::now();
+            later.job = Some(Box::new(move || present_now(named, Some(asked))));
+            crate::present_own::TURNS.ask()
+        };
         wake_releaser();
+        // (texflicker #96) `VICTORY_PRESENT_OWN_FRAME=2`: the title records nothing of the
+        // next frame before this present has run.
+        if crate::present_own::title_waits(crate::present_own::level()) {
+            let _turn = crate::hitch::span(crate::hitch::Phase::PresentTurn);
+            let waited = std::time::Instant::now();
+            crate::present_own::TURNS.wait(ticket);
+            crate::present_own::title_waited(waited.elapsed().as_micros() as u64);
+        }
         return S_OK;
     }
-    present_now(named);
+    present_now(named, None);
     S_OK
 }
 
 /// The first plane's first resource and a second plane's, as the title named them.
 type Named = Option<(usize, Option<usize>)>;
 
-/// [`present`], when its turn has come.
-fn present_now(named: Named) {
+/// [`present`], when its turn has come (`asked`: when the title called it, if
+/// it waited its turn).
+fn present_now(named: Named, asked: Option<std::time::Instant>) {
     let _hitch = crate::hitch::span(crate::hitch::Phase::Present);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(windows)]
+    if crate::flicker_catch::on() {
+        use crate::flicker_catch::{Kind, count_n};
+        if let Some(asked) = asked {
+            count_n(Kind::PresentLagMs, asked.elapsed().as_millis() as u64);
+        }
+        count_n(Kind::KeptAside, lock(&LATER.0).next.len() as u64);
+    }
+    #[cfg(not(windows))]
+    let _ = asked;
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
     if crate::host::late() && !crate::host::late_free_present() {
+        let settling = std::time::Instant::now();
         crate::host::settle_for_present();
         release_held(false);
         crate::host::settle_for_present();
+        crate::present_own::presented(crate::present_own::level(), settling.elapsed().as_micros() as u64);
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
