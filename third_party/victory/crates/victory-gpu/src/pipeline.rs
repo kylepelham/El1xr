@@ -376,6 +376,14 @@ impl Shader {
                         program_name(&self.container).unwrap_or("?"),
                         e,
                     ),
+                    #[cfg(windows)]
+                    Err(e) if pieces::refused_instead(&self.container) => tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        name = program_name(&self.container).unwrap_or("?"),
+                        error = %e,
+                        "shader from pieces does not translate; its pipelines are refused at creation and the title makes its own"
+                    ),
                     Err(e) => self.log_refused(e),
                 }
                 #[cfg(windows)]

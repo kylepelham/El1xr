@@ -389,7 +389,10 @@ extern "system" fn unknown_pipeline(
                 crate::pieces_log::pieces_outcome(calls, Ok(()));
                 return answer;
             }
-            Err(why) => crate::pieces_log::pieces_outcome(calls, Err(why)),
+            Err(why) => {
+                crate::pieces_dump::refused(desc, why);
+                crate::pieces_log::pieces_outcome(calls, Err(why));
+            }
         }
     }
     if calls <= 4 || calls.is_power_of_two() {
