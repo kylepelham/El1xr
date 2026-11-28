@@ -1366,6 +1366,7 @@ pub(crate) mod find_facts;
 pub(crate) mod idle_sweep;
 #[cfg(windows)]
 pub(crate) mod card_kept;
+mod first_mip_array;
 #[cfg(all(test, windows))]
 mod class_depth_tests;
 
@@ -3828,14 +3829,11 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
 }
 
 /// The first mip a placed texture's view shows: of views of one 2D texture
-/// (the others show whole textures).
+/// (and with `VICTORY_PLACED_FIRST_MIP_ARRAY=1`, 1-slice `TEXTURE2DARRAY`
+/// views; the others show whole textures).
 #[cfg(windows)]
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
-    const TEXTURE_2D_VIEW: u32 = 4;
-    match *view {
-        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
-        _ => 0,
-    }
+    first_mip_array::first_mip(view)
 }
 
 /// `VICTORY_PLACED_LOOSE_KEY=1`: what keys a placed texture ([`texture_at`])
