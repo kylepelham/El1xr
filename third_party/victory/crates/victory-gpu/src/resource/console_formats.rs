@@ -11,8 +11,8 @@
 //! (the host makes its texels, the title never fills it itself), the host copy is made in a
 //! stand-in that holds every value the console's format does, through the same path as the
 //! other target stand-ins ([`super::target_format`]): views, render target and clear formats
-//! and pipelines name the stand-in. The pipelines' host formats are in their library names,
-//! so they are made again, not taken from the cache.
+//! and pipelines name the stand-in. With the switch off the host could not make pipelines
+//! drawing into these formats at all, so no cached pipeline names the console format.
 //! - 116, 117: R16G16B16A16_FLOAT (10): 11-bit mantissas over the 7e3/6e4 ranges, alpha too.
 //! - 189: R16G16B16A16_SNORM (13): signed colour clamped to [-1, 1] as the console does.
 //! - 190: R8G8_UNORM (49): every 4-bit level exact.
