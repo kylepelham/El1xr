@@ -95,6 +95,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_NATIVE_RT_BIND", "Counts ray trace dispatches that native structures could serve."),
     ("VICTORY_NATIVE_SHADOW", "Shadow traces use native ray queries instead of the software walk."),
     ("VICTORY_NORM_NEAREST", "Normalized buffer values load as the nearest float, as on the console."),
+    ("VICTORY_PAGE_ASK", "Write faults ask about their one page, not the whole region."),
     ("VICTORY_PARALLEL_REFRESH", "Runs a submission's texture checks in parallel on helper threads."),
     ("VICTORY_PIPELINE_PIECES", "Builds graphics pipelines the game assembles from separate pieces."),
     ("VICTORY_PIPELINE_PIECES_DIAG", "Logs calls that build pipelines from pieces, without building them."),

@@ -69,6 +69,7 @@ pub(crate) fn guard_split_log(frames: f64) {
 pub(crate) mod empty_notice;
 pub(crate) mod alias_skip;
 mod claim_narrow;
+mod page_ask;
 mod hole_marks;
 mod holes;
 pub(crate) mod ask_split;
@@ -5813,16 +5814,10 @@ pub(crate) fn transition_clean_guards_run_to_noaccess(
     out
 }
 
-/// Whether `at` is committed read-write memory now.
+/// Whether `at` is committed read-write memory now (`VICTORY_PAGE_ASK`:
+/// asked about its one page, `page_ask.rs`).
 fn writable(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    page_ask::writable(at)
 }
 
 #[cfg(test)]

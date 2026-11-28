@@ -39,6 +39,7 @@ pub(crate) fn line(frames: f64) {
     hot::line(frames);
     quiet::line(frames);
     super::look_skip::line(frames);
+    super::page_ask::line(frames);
     if stats() && frames > 0.0 {
         let _journal = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         let [calls, pages, regions] = STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
