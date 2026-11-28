@@ -19,7 +19,7 @@
 //! a pointer, a 32-byte description and a state.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The DLL whose `ffxDispatch` is taken when `VICTORY_UPSCALE` is enabled.
 pub const LOADER: &str = "amd_fidelityfx_loader_xbox.dll";
@@ -205,7 +205,7 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 note_camera(d);
             }
             #[cfg(windows)]
-            let live = live_mode();
+            let live = off_guard(live_mode(), d.upscale);
             // (None: the hook is only observing for `VICTORY_CAMERA_CAPTURE`.)
             #[cfg(windows)]
             if live.is_some() && live != Some(victory_gpu::upscale_live::Live::Native) {
@@ -495,6 +495,130 @@ pub fn query_address() -> usize {
     query as *const () as usize
 }
 
+// --- `ffxCreateContext`, watched with `ffxDispatch` ---
+//
+// The title creates its FSR 4 context with `maxUpscaleSize` = its output.
+// Its shipping DLL only has the 1920x1080 Quality tables, so at any other
+// output it refuses (`FSR_API_DEBUG_ERROR: Shipping FSR4 configuration
+// mismatch`, the title's own message) and there is no context. That is
+// harmless while the upscale is ours, but a live `VICTORY_UPSCALE=off`
+// passes the dispatch to that DLL, which has nothing to upscale with. The
+// call is passed on as it is; only its answer is noted.
+
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`.
+const CREATE_UPSCALE: u64 = 0x0001_0000;
+/// The only output the title's shipping FSR 4 DLL makes a context for.
+pub const SHIPPING_UPSCALE: (u32, u32) = (1920, 1080);
+
+/// `ffxCreateContextDescUpscale`.
+#[repr(C)]
+struct CreateUpscale {
+    header: Header,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+    message: *const c_void,
+}
+
+type Create = extern "system" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
+
+static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+/// The last upscale context the title asked for: 0 none yet, else its
+/// `maxUpscaleSize` (width low, height high) with [`REFUSED`] set when its
+/// DLL refused it.
+static CONTEXT: AtomicU64 = AtomicU64::new(0);
+const REFUSED: u64 = 1 << 63;
+
+/// The title's own `ffxCreateContext`.
+pub fn set_real_create(address: usize) {
+    REAL_CREATE.store(address, Ordering::Relaxed);
+}
+
+/// What the title's import of `ffxCreateContext` is bound to, with `ffxDispatch`.
+pub fn create_address() -> usize {
+    create as *const () as usize
+}
+
+/// The `maxUpscaleSize` of the upscale context description in `desc`'s chain.
+///
+/// # Safety
+/// `desc` is null or a chain of descriptions laid out as their types say.
+unsafe fn upscale_create_size(mut desc: *const Header) -> Option<(u32, u32)> {
+    for _ in 0..32 {
+        // SAFETY: the caller's promise.
+        let header = unsafe { desc.as_ref() }?;
+        if header.kind == CREATE_UPSCALE {
+            // SAFETY: an upscale context description, by its type.
+            let [w, h] = unsafe { (*desc.cast::<CreateUpscale>()).max_upscale };
+            return Some((w, h));
+        }
+        desc = header.next;
+    }
+    None
+}
+
+extern "system" fn create(context: *mut *mut c_void, desc: *mut Header, alloc: *const c_void) -> u32 {
+    let code = match REAL_CREATE.load(Ordering::Relaxed) {
+        0 => ERROR,
+        // SAFETY: the title's own `ffxCreateContext`, with its own arguments.
+        c => unsafe { std::mem::transmute::<usize, Create>(c)(context, desc, alloc) },
+    };
+    // SAFETY: the title's description chain.
+    if let Some((w, h)) = unsafe { upscale_create_size(desc) } {
+        let refused = code != 0;
+        CONTEXT.store(u64::from(w) | u64::from(h) << 32 | if refused { REFUSED } else { 0 }, Ordering::Relaxed);
+        if refused {
+            tracing::info!(
+                code,
+                max_upscale = ?(w, h),
+                shipping = ?SHIPPING_UPSCALE,
+                "FidelityFX: the title's FSR 4 made no context for this output (its DLL has the 1920x1080 tables only); the upscale is ours, Upscaler off live stretches with VICTORY_UPSCALE_OFF_STRETCH=1"
+            );
+        } else {
+            tracing::info!(max_upscale = ?(w, h), "FidelityFX: the title's FSR 4 context made");
+        }
+    }
+    code
+}
+
+/// Whether the title's last upscale context was refused (none yet: no).
+pub fn context_refused() -> bool {
+    CONTEXT.load(Ordering::Relaxed) & REFUSED != 0
+}
+
+/// `VICTORY_UPSCALE_OFF_STRETCH=1`.
+fn off_stretch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPSCALE_OFF_STRETCH").is_some_and(|v| v == "1"))
+}
+
+/// Whether an upscale the title's DLL is asked for (`native`) must be ours
+/// instead: with the switch on, when its context was refused.
+pub fn native_needs_stand_in(native: bool, refused: bool, switch: bool) -> bool {
+    native && refused && switch
+}
+
+/// The upscale to record for a dispatch to `upscale`: a live Off (the
+/// title's DLL) becomes a stretch when that DLL has no context.
+#[cfg(windows)]
+fn off_guard(
+    live: Option<victory_gpu::upscale_live::Live>,
+    upscale: [u32; 2],
+) -> Option<victory_gpu::upscale_live::Live> {
+    use victory_gpu::upscale_live::Live;
+    if !native_needs_stand_in(live == Some(Live::Native), context_refused(), off_stretch()) {
+        return live;
+    }
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    TOLD.call_once(|| {
+        tracing::warn!(
+            upscale = ?upscale,
+            "FidelityFX: Upscaler off live, but the title's FSR 4 has no context at this output: stretched until the next start (Off then renders at the resolution)"
+        );
+    });
+    Some(Live::Stretch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +716,53 @@ mod tests {
         set_real_dispatch(fake_real as *const () as usize);
         assert_eq!(dispatch(std::ptr::null_mut(), &other), 42);
         REAL.store(before, Ordering::Relaxed);
+    }
+
+    /// The upscale context description as `ffx_upscale.h` lays it out, found
+    /// in a chain; the title's answer is passed back and a refusal noted.
+    #[test]
+    fn a_refused_upscale_context_is_noted_and_its_answer_kept() {
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(CreateUpscale, flags), 0x10);
+        assert_eq!(offset_of!(CreateUpscale, max_render), 0x14);
+        assert_eq!(offset_of!(CreateUpscale, max_upscale), 0x1c);
+        assert_eq!(offset_of!(CreateUpscale, message), 0x28);
+        extern "system" fn shipping(_: *mut *mut c_void, desc: *mut Header, _: *const c_void) -> u32 {
+            // SAFETY: the test's chain.
+            match unsafe { upscale_create_size(desc) } {
+                Some(SHIPPING_UPSCALE) | None => 0,
+                Some(_) => 6,
+            }
+        }
+        let backend = Header { kind: 0x2, next: std::ptr::null() };
+        let mut up = CreateUpscale {
+            header: Header { kind: CREATE_UPSCALE, next: &backend },
+            flags: 0,
+            max_render: [1706, 960],
+            max_upscale: [2560, 1440],
+            message: std::ptr::null(),
+        };
+        let other = Header { kind: 0x2, next: std::ptr::null() };
+        set_real_create(shipping as *const () as usize);
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        let (desc, plain) = (&mut up.header as *mut Header, &other as *const Header as *mut Header);
+        assert_eq!(create(&mut ctx, plain, std::ptr::null()), 0);
+        assert!(!context_refused(), "not an upscale context");
+        assert_eq!(create(&mut ctx, desc, std::ptr::null()), 6);
+        assert!(context_refused());
+        // SAFETY: `desc` points at `up`, alive for the test.
+        let size = |w, h| unsafe { (*desc.cast::<CreateUpscale>()).max_upscale = [w, h] };
+        size(1920, 1080);
+        assert_eq!(create(&mut ctx, desc, std::ptr::null()), 0);
+        assert!(!context_refused(), "a later context the DLL made");
+        size(3840, 2160);
+        assert_eq!(create(&mut ctx, desc, std::ptr::null()), 6);
+        assert!(context_refused());
+        // Only a live Off with no context and the switch on is stretched.
+        assert!(native_needs_stand_in(true, true, true));
+        assert!(!native_needs_stand_in(true, true, false));
+        assert!(!native_needs_stand_in(true, false, true));
+        assert!(!native_needs_stand_in(false, true, true));
     }
 
     #[test]

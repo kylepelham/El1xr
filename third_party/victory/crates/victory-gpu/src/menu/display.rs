@@ -28,9 +28,40 @@ pub fn primary_display_size() -> Option<(u32, u32)> {
     None
 }
 
-/// The line under `name`'s row for the values `get` gives (`None`: the
-/// row's help).
+/// Display rows in plain words, short enough for the row: the registry's help (the full text,
+/// shown under the list for the selected row) is written for the people tuning them.
+const PLAIN: &[(&str, &str)] = &[
+    ("VICTORY_UPSCALE_QUALITY", "With Stretch or DLSS: the share of the resolution rendered, then upscaled"),
+    ("VICTORY_FRAME_GEN", "Adds generated frames between the rendered ones: AMD FSR or NVIDIA DLSS"),
+    ("VICTORY_DLSS_PRESET", "Which DLSS model: K is the newest, Default lets DLSS choose"),
+    ("VICTORY_PRESENT_SMOOTH_READY", "Pacing follows when frames were ready; 2 from the first world frame"),
+    ("VICTORY_LOAD_END", "World: the loading frame rate ends when the world first shows"),
+    ("VICTORY_HOLD_LAST_FRAME", "A black frame shows the last good one instead (hides one-frame flashes)"),
+    ("VICTORY_AMBIENT_ONCE", "The ambient light counts one bounce, so it does not feed on itself"),
+    ("VICTORY_NATIVE_DEFAULT", "With no Resolution chosen, use this monitor's instead of 3840x2160"),
+    ("VICTORY_DLSS_QUALITY", "The DLSS mode on its own; Quality above sets it for you"),
+    ("VICTORY_FFX_SCALE", "FidelityFX render scale, 0.5 to 1.0; Quality above sets it for you"),
+    ("VICTORY_UPSCALER", "The title's upscaler: its own, or FidelityFX (needed for DLSS)"),
+    ("VICTORY_DLSS_REACTIVE", "Gives DLSS the title's reactive mask, when the title has one"),
+];
+
+/// `name`'s line in plain words, if the Display tab has one for it.
+pub fn plain(name: &str) -> Option<&'static str> {
+    PLAIN.iter().find(|(n, _)| *n == name).map(|&(_, line)| line)
+}
+
+/// The line under `name`'s row for the values `get` gives: what the next
+/// start renders, else its plain words ([`plain`]); `None`: the row's help.
 pub fn detail(
+    name: &str,
+    get: impl Fn(&str) -> Option<String>,
+    native: impl Fn() -> Option<(u32, u32)>,
+) -> Option<String> {
+    sized(name, get, native).or_else(|| plain(name).map(str::to_string))
+}
+
+/// The resolution rows' line (and Ray tracing's).
+fn sized(
     name: &str,
     get: impl Fn(&str) -> Option<String>,
     native: impl Fn() -> Option<(u32, u32)>,
@@ -185,7 +216,8 @@ mod tests {
             detail("VICTORY_UPSCALE", &v, MONITOR).unwrap(),
             "Upscaler off: renders 2560x1440, the target"
         );
-        assert_eq!(detail("VICTORY_FFX_SCALE", &v, MONITOR), None);
+        assert_eq!(detail("VICTORY_FFX_SCALE", &v, MONITOR).as_deref(), plain("VICTORY_FFX_SCALE"));
+        assert_eq!(detail("VICTORY_OVERLAY", &v, MONITOR), None);
     }
 
     #[test]
@@ -202,7 +234,7 @@ mod tests {
         );
         let v = with(&[("VICTORY_UPSCALE", "dlss")]);
         assert_eq!(detail("VICTORY_UPSCALE", &v, MONITOR), None);
-        assert_eq!(detail("VICTORY_UPSCALE_QUALITY", &v, MONITOR), None);
+        assert_eq!(detail("VICTORY_UPSCALE_QUALITY", &v, MONITOR).as_deref(), plain("VICTORY_UPSCALE_QUALITY"));
         assert_eq!(
             detail("VICTORY_RESOLUTION", &v, MONITOR).unwrap(),
             "Not chosen: the title's 3840x2160; a choice is kept for the next start"
