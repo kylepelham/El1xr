@@ -19,6 +19,7 @@ mod heap_find;
 mod exposure_watch;
 #[cfg(windows)]
 mod flicker_region;
+mod pixel_watch;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -638,6 +639,8 @@ pub(crate) struct State {
     /// The host top levels of the glass dispatch being made
     /// (`crate::rt_bind::dispatch`), for its root SRVs.
     glass_tlas: Option<crate::rt_bind::Bound>,
+    /// (`VICTORY_PIXEL_WATCH`) Per-list batched 1x1 texel samples.
+    pixel_watch: pixel_watch::ListState,
 }
 
 impl Drop for State {
@@ -1336,6 +1339,7 @@ impl State {
             tables_gone,
             alpha_rays,
             glass_tlas,
+            pixel_watch,
             root_bindings,
         } = self;
         *pipeline = new_pipeline as usize;
@@ -1412,6 +1416,7 @@ impl State {
         *tables_gone = false;
         *alpha_rays = false;
         *glass_tlas = None;
+        pixel_watch.reset();
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1615,6 +1620,9 @@ impl State {
         });
         if cache_on && self.bound_targets == Some(key) {
             return;
+        }
+        if crate::pixel_watch::on() {
+            self.pixel_watch_targets_changing(list);
         }
         self.targets_ready = None;
         self.targets.clear();
@@ -2182,6 +2190,9 @@ impl State {
         #[cfg(windows)]
         if crate::flicker_catch::region::on() {
             self.flicker_region(p, compute);
+        }
+        if crate::pixel_watch::on() {
+            self.pixel_watch_before_bind(list, compute);
         }
         // Textures picked by index, before anything asks for them.
         {
@@ -4055,6 +4066,9 @@ impl State {
         if ran && crate::tile_args_watch::on() {
             self.tile_args_producer(list);
         }
+        if ran && crate::pixel_watch::on() {
+            self.pixel_watch_dispatch(list);
+        }
         crate::consumer_gate::after(role, ran);
     }
 
@@ -4553,6 +4567,9 @@ impl State {
                 }
                 Err(_) => false,
             };
+        if ran && crate::pixel_watch::on() {
+            self.pixel_watch_draw(list);
+        }
         if crate::bake_replay::mode() > 0 {
             self.bake_replay_drawn(ran, bake_replay::Again::Mesh(x));
         }
@@ -5336,6 +5353,9 @@ impl State {
         if crate::skin_watch::on() {
             self.skin_watch_plain(false, ran);
         }
+        if ran && crate::pixel_watch::on() {
+            self.pixel_watch_draw(list);
+        }
         if crate::bake_replay::mode() > 0 {
             let again = bake_replay::Again::Draw(vertices, instances, first, first_instance);
             self.bake_replay_drawn(ran && !rects, again);
@@ -5465,6 +5485,9 @@ impl State {
         if crate::skin_watch::on() {
             self.skin_watch_plain(false, ran);
         }
+        if ran && crate::pixel_watch::on() {
+            self.pixel_watch_draw(list);
+        }
         if crate::bake_replay::mode() > 0 {
             let again = bake_replay::Again::Indexed(indices, instances, first, base, first_instance);
             self.bake_replay_drawn(ran, again);
@@ -5509,6 +5532,13 @@ impl State {
         }
         if ran && kind == 2 && crate::tile_args_watch::on() {
             self.tile_args_producer(list);
+        }
+        if ran && crate::pixel_watch::on() {
+            if kind == 2 {
+                self.pixel_watch_dispatch(list);
+            } else if matches!(kind, 0 | 1 | 10) {
+                self.pixel_watch_draw(list);
+            }
         }
         if ran
             && kind == 2

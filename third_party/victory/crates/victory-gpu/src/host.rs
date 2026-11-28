@@ -8668,6 +8668,7 @@ impl Host {
             let watched = crate::popwatch::take(&self.device, list, texture);
             let audited = crate::present_audit::take(&self.device, list, texture, index, frame);
             let caught = crate::flicker_catch::pass::take(&self.device, list, texture, frame);
+            let pixel_watched = crate::pixel_watch::gpu::present_take(&self.device, list, texture, frame);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
@@ -8716,6 +8717,9 @@ impl Host {
             }
             if let Some(caught) = caught {
                 crate::flicker_catch::pass::sent(caught, flown);
+            }
+            if let Some(taken) = pixel_watched {
+                crate::pixel_watch::gpu::present_sent(taken, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             crate::report::sent(report, slot.map_or(0, |i| p.ahead[i].1));

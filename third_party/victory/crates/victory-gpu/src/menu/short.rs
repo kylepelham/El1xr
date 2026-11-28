@@ -138,6 +138,8 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_PARALLEL_REFRESH", "Runs a submission's texture checks in parallel on helper threads."),
     ("VICTORY_PIPELINE_PIECES", "Builds graphics pipelines the game assembles from separate pieces."),
     ("VICTORY_PIPELINE_PIECES_DIAG", "Logs calls that build pipelines from pieces, without building them."),
+    ("VICTORY_PIXEL_WATCH", "Logs 1x1 texel changes at a screen pixel across all targets and passes."),
+    ("VICTORY_PIXEL_WATCH_FRAMES", "Frame or second window limiting when the pixel watch samples."),
     ("VICTORY_PLACED_FIRST_MIP_ARRAY", "Uses first mip on 1-slice 2D array views so tails do not evict neighbours."),
     ("VICTORY_PLAN_SNAPSHOT", "Plans stale copy refreshes from a snapshot, without holding the lock."),
     ("VICTORY_PLAN_SPLIT", "Holds a copy's lock only for the first part of refresh planning."),

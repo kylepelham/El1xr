@@ -268,6 +268,7 @@ mod target_reuse;
 #[cfg(windows)]
 mod skin_watch;
 #[cfg(windows)]
+mod pixel_watch;
 mod tile_args_watch;
 #[cfg(windows)]
 mod material_demand;

@@ -454,6 +454,9 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
+    if crate::pixel_watch::on() {
+        list.state.lock().unwrap_or_else(|e| e.into_inner()).pixel_watch_close(current);
+    }
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -759,6 +762,9 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        if crate::pixel_watch::on() {
+            with_state(this, |list, state| state.pixel_watch_close(list));
+        }
         crate::timeline::closed(std::ptr::from_ref(host) as usize);
         crate::watch::look_skip::closed(std::ptr::from_ref(host) as usize);
         host.close();
@@ -2509,6 +2515,9 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(fresh) = fresh_list() else {
             return;
         };
+        if crate::pixel_watch::on() {
+            list.state.lock().unwrap_or_else(|e| e.into_inner()).pixel_watch_close(current);
+        }
         current.close();
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
