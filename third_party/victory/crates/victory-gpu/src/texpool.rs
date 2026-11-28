@@ -700,14 +700,21 @@ fn time_lines(now: u64) {
     }
 }
 
-/// Drops blocks a pool let go of, outside its lock, timed.
-fn let_go<B>(which: Which, freed: Vec<B>) {
+/// Drops blocks a pool let go of, outside its lock, timed. (texflicker)
+/// The staging pool's with `VICTORY_PREPARE_FENCED=1`: on `victory-reaper`
+/// once the submissions begun before have finished
+/// (`crate::texture::prepare_fenced`), not by the thread taking a piece.
+fn let_go<B: 'static>(which: Which, freed: Vec<B>) {
     if freed.is_empty() {
         return;
     }
     let began = std::time::Instant::now();
     let n = freed.len() as u64;
-    drop(freed);
+    if matches!(which, Which::Staging) && crate::texture::prepare_fenced::on() {
+        crate::texture::prepare_fenced::let_go(freed, n as usize, true);
+    } else {
+        drop(freed);
+    }
     time(which, T_FREED, n);
     time(which, T_FREE_US, us(began));
 }
@@ -747,7 +754,7 @@ fn make_into<B: Clone>(
 /// took 222 us each in the game against 6 on a quiet card). One thread
 /// makes a pool's block at a time; another that needs one meanwhile gets
 /// `None` and makes a committed allocation of its own, as without the pool.
-fn take_from<B: Clone>(
+fn take_from<B: Clone + 'static>(
     pool: &'static Mutex<Pool<B>>,
     which: Which,
     len: u64,
