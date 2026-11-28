@@ -4,9 +4,9 @@
 //!
 //! Pinned on 1.0.2.1 (see `AnyXboxX-coord/modmenu/STATE.md`): [`NATIVE_HEALTH`] resolves the
 //! entity and reads its health through the title's health accessor (`+0x2ba4e0`: for peds
-//! `(1 - damage) * 1000`, rounded so a living ped never reads 0); [`NATIVE_MAX_HEALTH`] reads the
-//! other output of the same accessor (1000 for peds). The entity health setters found offline skip
-//! peds, so the ped setter, armour and wanted are found by the pair finder: each candidate setter
+//! `(1 - damage) * max`, rounded so a living ped never reads 0); [`NATIVE_MAX_HEALTH`] reads the
+//! other output of the same accessor (batch 5 part T read 130 / 130 for the player). The entity
+//! health setters found offline skip peds, so the ped setter, armour and wanted are found by the pair finder: each candidate setter
 //! is called with [`VALUE`] and the getters that read it back afterwards name the pair.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -21,7 +21,7 @@ pub const NATIVE_HEALTH: u64 = 0x158c_3f08_7dc9_7878;
 pub const NATIVE_MAX_HEALTH: u64 = 0x92e8_f3c3_ea28_a89f;
 /// Reads a level from the wanted manager by key (slot 0); a wanted getter candidate.
 pub const NATIVE_WANTED_BY_KEY: u64 = 0xb649_eb46_5f68_c63d;
-/// What the ped pass sets: below the caps (ped health 1000; armour 100 in GTA V) and unusual.
+/// What the ped pass sets: below the caps (player health 130 in part T; armour 100 in GTA V) and unusual.
 pub const VALUE: i32 = 73;
 /// What the player pass sets: a wanted level (0..=6).
 pub const WANTED_VALUE: i32 = 2;

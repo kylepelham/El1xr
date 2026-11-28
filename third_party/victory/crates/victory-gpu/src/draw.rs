@@ -2124,6 +2124,7 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let _whole = BindLap::start(0);
         let _hitch = crate::hitch::span(crate::hitch::Phase::Bind);
+        crate::title_waits::bind();
         let l = &list.list;
         if crate::bake_watch::on() {
             let stages = p.stages.iter().map(|s| s.shader.hash.as_str());
@@ -4048,6 +4049,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         note_defrag(p, Some(u64::from(x) * u64::from(y) * u64::from(z)));
         match group_base(p) {
+            // (`VICTORY_SHADOW_TRACE_IDLE`) Bound and declared, run with no groups.
+            _ if crate::pipeline::shadow_idle(self.pipeline as This) => crate::shadow_idle::idled(),
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
                 // SAFETY: an open list with everything set; the parameter
@@ -5025,13 +5028,13 @@ impl State {
                         {
                             Some(shown) => host.make_at(index, &shown),
                             // (`VICTORY_LIST_VIEWS`) Made once in this recording, then copied.
+                            // (`VICTORY_TABLE_VIEW_CACHE`) Made once, copied across lists.
                             None => {
-                                let listed = crate::descriptor::host::list_views()
-                                    && host.make_listed(
-                                        self.recording,
-                                        crate::descriptor::record_at(table + u64::from(k) * 32),
-                                        index,
-                                    );
+                                let record = crate::descriptor::record_at(table + u64::from(k) * 32);
+                                let listed = (crate::descriptor::host::view_cache::on()
+                                    && host.make_cached(record, index))
+                                    || crate::descriptor::host::list_views()
+                                        && host.make_listed(self.recording, record, index);
                                 if !listed {
                                     host.make_at(index, &view);
                                 }
@@ -5535,6 +5538,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // (`VICTORY_SHADOW_TRACE_IDLE`) Bound and declared, run with no groups.
+        let idle = kind == DISPATCH && crate::pipeline::shadow_idle(self.pipeline as This);
+        if idle {
+            crate::shadow_idle::idled();
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -5657,18 +5665,20 @@ impl State {
                     false,
                 )
             });
-            // SAFETY: an open list with everything set; the list keeps the host copy
-            // alive, and the signature is cached.
-            unsafe {
-                list.list.ExecuteIndirect(
-                    signature,
-                    1,
-                    &args.buffer,
-                    args.offset(arguments),
-                    None::<&ID3D12Resource>,
-                    0,
-                )
-            };
+            if !idle {
+                // SAFETY: an open list with everything set; the list keeps the host copy
+                // alive, and the signature is cached.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        1,
+                        &args.buffer,
+                        args.offset(arguments),
+                        None::<&ID3D12Resource>,
+                        0,
+                    )
+                };
+            }
             #[cfg(feature = "diagnostics")]
             self.check_rtv_formats(Some(p), "ExecuteIndirect");
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -5797,18 +5807,20 @@ impl State {
                     || crate::pipeline::shaders_of(self.pipeline as This),
                 );
             }
-            // SAFETY: an open list with everything set; the list keeps the host copies
-            // alive, and the signature is cached.
-            unsafe {
-                list.list.ExecuteIndirect(
-                    signature,
-                    max.max(1),
-                    &args.buffer,
-                    args.offset(arguments),
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-                )
-            };
+            if !idle {
+                // SAFETY: an open list with everything set; the list keeps the host copies
+                // alive, and the signature is cached.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        max.max(1),
+                        &args.buffer,
+                        args.offset(arguments),
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                };
+            }
             if kind == MESH {
                 self.mesh_scissor(list, false);
             }
@@ -6081,22 +6093,24 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            if let Some((base, signature)) = parts {
-                crate::indirect::execute_parts(&list.list, base, signature, (&bounded, 0));
-            } else {
-                list.list.ExecuteIndirect(
-                    signature,
-                    max,
-                    &bounded,
-                    at,
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-                )
-            }
-        };
+        if !idle {
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe {
+                if let Some((base, signature)) = parts {
+                    crate::indirect::execute_parts(&list.list, base, signature, (&bounded, 0));
+                } else {
+                    list.list.ExecuteIndirect(
+                        signature,
+                        max,
+                        &bounded,
+                        at,
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                }
+            };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

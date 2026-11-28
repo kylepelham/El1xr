@@ -3951,16 +3951,19 @@ impl<'a> Lower<'a> {
         let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
         let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
         let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+        // (`VICTORY_DIV_INF_ZERO`) Zero and infinity operands before a NaN quotient.
+        let zero_first = super::div_zero::on();
         let make_inf = {
             let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-            self.s.m.bin(c, Bin::Or, t, q_nan)
+            if zero_first { t } else { self.s.m.bin(c, Bin::Or, t, q_nan) }
         };
         let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
         let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
         let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
         let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
         let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-        let r = self.s.m.select(c, make_zero, sign, signed_q);
+        let r = if zero_first { self.s.m.select(c, q_nan, signed_inf, signed_q) } else { signed_q };
+        let r = self.s.m.select(c, make_zero, sign, r);
         let r = self.s.m.select(c, make_inf, signed_inf, r);
         let r = self.s.m.select(c, invalid, kneg_qnan, r);
         let r = self.s.m.select(c, d_nan, d_qnan, r);
