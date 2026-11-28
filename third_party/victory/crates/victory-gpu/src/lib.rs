@@ -241,6 +241,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shader_pack;
 #[cfg(windows)]
+mod shader_prefetch;
+#[cfg(windows)]
 mod wave_more;
 mod zero_out;
 mod zero_fill;

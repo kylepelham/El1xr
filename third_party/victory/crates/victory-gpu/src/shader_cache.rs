@@ -27,6 +27,9 @@ pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
+            if let Some(cache) = CACHE.get() {
+                crate::shader_prefetch::opened(cache);
+            }
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
@@ -476,6 +479,7 @@ pub(crate) fn cached(
         ran: AtomicBool::new(false),
     };
     let key = victory_pipeline::CacheKey::new(&converter, &input);
+    crate::shader_prefetch::noted(key.bytes());
     // `VICTORY_SHADER_PACK=1`: the pack first; what the loose files serve
     // (or a translation stores there) goes into it (`crate::shader_pack`).
     let pack = crate::shader_pack::pack(cache);

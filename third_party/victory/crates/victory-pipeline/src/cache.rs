@@ -22,6 +22,11 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
+    /// The key of these 32 bytes (as [`CacheKey::bytes`] gave them).
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        CacheKey(blake3::Hash::from_bytes(bytes))
+    }
+
     /// The key's 32 bytes (the pack's index, `crate::pack`).
     pub fn bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()

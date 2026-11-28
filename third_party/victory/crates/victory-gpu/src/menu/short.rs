@@ -125,6 +125,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_SEND_THREAD", "Sends submissions to the card from a separate thread."),
     ("VICTORY_SETTLE_ROOM", "Allows more lists and changed runs in flight before settling."),
     ("VICTORY_SHADER_PACK", "Reads translated shaders from one pack file, not a million loose files."),
+    ("VICTORY_SHADER_PREFETCH", "Threads that read the last boot's shaders ahead from the disk cache."),
     ("VICTORY_SHADOW_RASTER_TILES", "Sends sun shadow tiles to the shadow maps when rays always miss."),
     ("VICTORY_SHADOW_TILE_WATCH", "Logs sun-shadow tile programs that changed path between frames."),
     ("VICTORY_SHARED_CONVERSIONS", "A shader two threads miss at once is translated once and shared."),
