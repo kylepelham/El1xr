@@ -75,6 +75,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_GUARD_NOTE_ONCE", "Notes a guard check's written pages under one lock, not one per page."),
     ("VICTORY_GUARD_PUBLISH_TRY", "Leaves a busy block for the next guard walk instead of spinning."),
     ("VICTORY_GUARD_STAMP_FRESH", "Stamps closed pages fresh at each guard check to avoid stale copies."),
+    ("VICTORY_HALF_VIEWS_OFF", "Sends 16-bit buffer views back through floats: 1 all, loads only loads."),
     ("VICTORY_HANG_WATCH", "Logs in-flight work when the card stalls this many seconds."),
     ("VICTORY_HEAP_CAP", "Title views past the card's 1M heap: null (1-2), packed (3-5)."),
     ("VICTORY_HEAP_VIEW_ADDRESS", "Shaders that read a heap view's address as numbers get it from the host."),

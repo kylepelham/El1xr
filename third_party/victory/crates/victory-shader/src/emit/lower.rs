@@ -81,7 +81,7 @@ mod half_meet;
 pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_meets};
 
 #[path = "halves.rs"]
-mod halves;
+pub(super) mod halves;
 
 /// Infinities held at ±65504 by the NaN scrub, colours held to the HDR range
 /// (`VICTORY_NAN_SCRUB_INF=1`, `VICTORY_HDR_CLAMP`).

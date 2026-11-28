@@ -2050,6 +2050,16 @@ fn half_places_are_the_descriptors_the_program_loads() {
     fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     fixed.push(S_ENDPGM);
     assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    // `VICTORY_HALF_VIEWS_OFF=1`: the d16 accesses take the float path, no
+    // view named; `=loads` keeps the d16 views.
+    use super::lower::halves::{HalfViewsOff, TEST_HALF_VIEWS_OFF};
+    TEST_HALF_VIEWS_OFF.set(Some(HalfViewsOff::All));
+    let off = lowered(&fixed);
+    assert!(off.half_views.is_empty());
+    TEST_HALF_VIEWS_OFF.set(Some(HalfViewsOff::Loads));
+    assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    TEST_HALF_VIEWS_OFF.set(None);
+    assert_ne!(off.dxil, lowered(&fixed).dxil);
     // The load's offset in s20, from the first lane's thread index
     // (`v_readfirstlane_b32 s20, v0`): picked at run time. The pick may land
     // on the store's place too, so no place of that table is named: the d16
@@ -2170,6 +2180,15 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
     let as_halves = lowered(&[&load[..], &[half]].concat());
     assert_eq!(as_halves.half_views, [(1, 0)]);
+    // `VICTORY_HALF_VIEWS_OFF=1` or `=loads`: a float load, as before, no view.
+    use super::lower::halves::{HalfViewsOff, TEST_HALF_VIEWS_OFF};
+    for off in [HalfViewsOff::All, HalfViewsOff::Loads] {
+        TEST_HALF_VIEWS_OFF.set(Some(off));
+        let floats = lowered(&[&load[..], &[half]].concat());
+        TEST_HALF_VIEWS_OFF.set(None);
+        assert!(floats.half_views.is_empty(), "{off:?}");
+        assert_ne!(floats.dxil, as_halves.dxil, "{off:?}");
+    }
     let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
     assert!(as_float.half_views.is_empty());
     // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.

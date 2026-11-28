@@ -129,6 +129,15 @@ fn build(wave_wide: bool, wave_pairs: bool, wave_pairs_vt: bool, strict: bool) -
     if victory_shader::emit::mask_elsewhere() {
         h.update(b"VICTORY_MASK_ELSEWHERE=1");
     }
+    match victory_shader::emit::half_views_off() {
+        victory_shader::emit::HalfViewsOff::No => {}
+        victory_shader::emit::HalfViewsOff::All => {
+            h.update(b"VICTORY_HALF_VIEWS_OFF=1");
+        }
+        victory_shader::emit::HalfViewsOff::Loads => {
+            h.update(b"VICTORY_HALF_VIEWS_OFF=loads");
+        }
+    }
     if victory_shader::emit::div_inf_zero() {
         h.update(b"VICTORY_DIV_INF_ZERO=1");
     }
