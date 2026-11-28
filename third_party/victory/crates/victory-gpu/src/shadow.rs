@@ -34,8 +34,12 @@ mod placement;
 mod pending;
 #[path = "shadow_plan_split.rs"]
 pub(crate) mod plan_split;
+#[path = "shadow_copied_shared.rs"]
+pub(crate) mod copied_shared;
 #[path = "shadow_refresh_stamp.rs"]
 pub(crate) mod refresh_stamp;
+#[path = "shadow_merge_due.rs"]
+pub(crate) mod merge_due;
 #[path = "shadow_wide_wake.rs"]
 pub(crate) mod wide_wake;
 pub use lazy::LazyAccessHold;
@@ -742,7 +746,7 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never), paired with an uncopied bitmask.
-    copied: Mutex<CopiedPages>,
+    copied: copied_shared::CopiedLock,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -787,6 +791,9 @@ pub(crate) struct Shadow {
     window: bool,
     /// Whether a shader write to this transient or rebar window was logged.
     written_said: std::sync::atomic::AtomicBool,
+    /// Whether a list's shaders were said to write the copy (`gpu_writes`), ever:
+    /// `crate::port_cbv::written_level`.
+    shaders_wrote: AtomicBool,
     /// (Neptune) `VICTORY_WINDOW_REBAR=1`: a window whose one copy is `buffer`, in a GPU upload heap
     /// (card memory the CPU maps write-combined) that `data` maps. No CPU twin, no card twin, no
     /// card: refreshes write the title's pages into it and shaders read it. The CPU must never
@@ -5027,6 +5034,16 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Whether this is a window of title memory outside buffers, not a title buffer's copy.
+    pub(crate) fn window(&self) -> bool {
+        self.window
+    }
+
+    /// Whether a list's shaders were ever said to write the copy.
+    pub(crate) fn shaders_wrote(&self) -> bool {
+        self.shaders_wrote.load(Ordering::Relaxed)
+    }
+
     /// The title memory the copy is of: its start and length.
     pub(crate) fn span(&self) -> (u64, u64) {
         (self.start, self.len)
@@ -5101,7 +5118,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(CopiedPages::with_base(pages, (start / PAGE as u64) as usize)),
+            copied: copied_shared::CopiedLock::new(CopiedPages::with_base(pages, (start / PAGE as u64) as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
@@ -5119,6 +5136,7 @@ impl Shadow {
             card: None,
             window: false,
             written_said: std::sync::atomic::AtomicBool::new(false),
+            shaders_wrote: AtomicBool::new(false),
             rebar: false,
             place: None,
             lazy_state: (0..pages).map(|_| AtomicU8::new(LAZY_EAGER)).collect(),
@@ -5183,7 +5201,7 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         let base = start / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let copied = self.copied.look();
         if from >= to || copied.all_uncopied() {
             return false;
         }
@@ -5218,6 +5236,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if !self.shaders_wrote.load(Ordering::Relaxed) {
+            self.shaders_wrote.store(true, Ordering::Relaxed);
+        }
         // (Neptune) Every declaration, before the cases below that return: the sanitizer must see
         // them all (`VICTORY_CLAMP_AFTER_WRITER`).
         if crate::indirect::after_writer() {
@@ -5832,7 +5853,7 @@ impl Shadow {
                 }
             }
         }
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let copied = self.copied.look();
         busy.into_iter()
             .any(|(a, e)| match crate::watch::asked(a, e) {
                 Some((_, written)) => stale_pages_in(base, &copied.at, a, e, &written)
@@ -5949,7 +5970,7 @@ impl Shadow {
         let mut page_buf = MergePage::take();
         for (a, e) in busy {
             if watched == 1 {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let copied = self.copied.look();
                 let clean = crate::watch::nothing_new(a, e, base, &copied.at);
                 drop(copied);
                 if clean {
@@ -5967,7 +5988,7 @@ impl Shadow {
                 return true;
             };
             let stale: Vec<(usize, u64)> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let copied = self.copied.look();
                 stale_pages_in(base, &copied.at, a, e, &written)
                     .into_iter()
                     .filter(|&p| {
@@ -6297,7 +6318,7 @@ impl Shadow {
             let skip = crate::cold_skip::on();
             let asking = crate::refresh_prof::start();
             if w == 1 {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let copied = self.copied.look();
                 let clean = if skip {
                     crate::watch::nothing_new_cold(
                         from,

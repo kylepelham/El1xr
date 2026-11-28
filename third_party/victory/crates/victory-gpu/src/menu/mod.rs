@@ -398,9 +398,9 @@ mod tests {
             "host.rs only starts the menu"
         );
         assert!(!include_str!("../pacing.rs").contains("menu"));
-        assert!(
-            !include_str!("../screenshot.rs").contains("menu"),
-            "screenshots leave the menu out"
-        );
+        // F12 screenshots leave the menu out; only a selftest ask carries its bitmap.
+        for s in [include_str!("../screenshot.rs"), include_str!("../menu_shot.rs")] {
+            assert!(!s.contains("crate::menu::"), "screenshots do not reach into the menu");
+        }
     }
 }

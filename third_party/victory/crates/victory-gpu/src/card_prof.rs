@@ -108,6 +108,7 @@ pub(crate) fn log(frames: f64) {
         for a in &STATS {
             a.store(0, Ordering::Relaxed);
         }
+        crate::shadow::merge_due::take();
         return;
     }
     if frames <= 0.0 {
@@ -147,6 +148,13 @@ pub(crate) fn log(frames: f64) {
         ms(P::StaleMerge),
         per(P::StaleCalls),
         per(P::StaleCopies),
+    );
+    let (asked, left_out) = crate::shadow::merge_due::take();
+    tracing::info!(
+        "stale_flights copies asked first per frame (VICTORY_STALE_QUICK={}): {:.1} asked, {:.1} left out with nothing to merge",
+        u8::from(crate::shadow::merge_due::on()),
+        asked as f64 / frames,
+        left_out as f64 / frames,
     );
 }
 

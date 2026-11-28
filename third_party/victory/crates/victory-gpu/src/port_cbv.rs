@@ -153,6 +153,58 @@ pub(crate) fn table_use(
 /// viewed directly in host copies, their bytes.
 static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// (feedcard, #88; ported from MAXAWER/victory-merged-amd `8aa43c301a`, GPL-3.0)
+/// `VICTORY_PORT_CBV_WRITTEN` (Live; 0, off, by default; needs `VICTORY_PORT_CBV=1`): a table's
+/// constant buffer in the host copy of a small title buffer that shaders write is a raw view of
+/// that copy, read by the card when the draw runs, instead of bytes copied out of title memory on
+/// the CPU when the submission is prepared. 1: the constant's bytes are refreshed from title memory
+/// first (a refresh leaves out ranges flights still write); 2: no refresh.
+///
+/// Why: the CPU copy reads title memory, so it must wait for the flights that write the buffer to
+/// land and be copied back. Upstream (AMD) measured about four such waits a frame, 22-30 ms of a
+/// 57 ms frame, for five buffers of 0x190-0x340 bytes the title's shaders fill, and 20 to 23 fps
+/// at level 2. Their level 1 flickered trees (40-43% of picture changes): the refresh laid what
+/// title memory held (a frame old) over what the shaders had just written on the card. Ours skips
+/// ranges with flights out, so 1 may be clean here; 2 is upstream's.
+///
+/// What it assumes: the shaders that fill the constants write this host copy (the same lookup
+/// finds it for their views), and the title's CPU does not write those bytes between (at 2).
+/// Not in the cache key: the shaders already read constants raw with the port.
+static WRITTEN: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_PORT_CBV_WRITTEN", |v| match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    });
+
+/// Title buffers up to this size that shaders write are read in their host copy (upstream's
+/// buffers were 0x190-0x340 bytes; a large host copy is rewritten under flights in the air).
+pub(crate) const SMALL_WRITTEN: u64 = 64 << 10;
+
+/// [`WRITTEN`] with the port on: 0, 1 or 2.
+pub(crate) fn written_level() -> u64 {
+    if on() { WRITTEN.get() } else { 0 }
+}
+
+/// Whether a table's constant buffer in a host copy is read in that copy at [`written_level`]:
+/// a copy, not title memory in place nor a window, that shaders write, of at most
+/// [`SMALL_WRITTEN`] bytes.
+pub(crate) fn written_fits(in_place: bool, window: bool, shaders_wrote: bool, len: u64) -> bool {
+    !in_place && !window && shaders_wrote && len <= SMALL_WRITTEN
+}
+
+/// Since the last line: tables' constant buffers read in the host copy of a buffer shaders write,
+/// and those copied all the same (the view could not be made).
+static WRITTEN_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn from_written() {
+    WRITTEN_STATS[0].fetch_add(1, Relaxed);
+}
+
+pub(crate) fn not_from_written() {
+    WRITTEN_STATS[1].fetch_add(1, Relaxed);
+}
+
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
     STATS[0].fetch_add(1, Relaxed);
@@ -191,6 +243,14 @@ pub(crate) fn log(frames: f64) {
         .iter()
         .map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9))
         .collect();
+    let [read, not] = WRITTEN_STATS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames.max(1e-9));
+    let level = written_level();
+    if level > 0 {
+        tracing::info!(
+            "renderer port 5 per frame (VICTORY_PORT_CBV_WRITTEN={level}): {read:.0} tables' constant buffers read in the host copy \
+             of a small buffer shaders write, {not:.0} of those copied all the same"
+        );
+    }
     if copy_order_on() {
         let [done, left] = ORDERED.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames.max(1e-9));
         tracing::info!(
@@ -226,6 +286,27 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_small_shader_written_copies_are_read_in_place_of_a_copy() {
+        assert!(written_fits(false, false, true, 0x340));
+        assert!(written_fits(false, false, true, SMALL_WRITTEN));
+        assert!(!written_fits(false, false, true, SMALL_WRITTEN + 1), "large");
+        assert!(!written_fits(false, false, false, 0x340), "never written by shaders");
+        assert!(!written_fits(true, false, true, 0x340), "in place: read where it is already");
+        assert!(!written_fits(false, true, true, 0x340), "a window, not a buffer's copy");
+    }
+
+    #[test]
+    fn the_written_level_parses_and_is_live() {
+        if std::env::var_os("VICTORY_PORT_CBV_WRITTEN").is_some() {
+            return;
+        }
+        for (v, want) in [("2", 2), ("1", 1), ("0", 0), ("", 0)] {
+            victory_core::settings::set("VICTORY_PORT_CBV_WRITTEN", v).unwrap();
+            assert_eq!(WRITTEN.get(), want, "{v:?}");
+        }
+    }
 
     #[test]
     fn a_viewed_copy_is_known_by_its_bit() {

@@ -2855,3 +2855,49 @@ fn lazy_copyback_mapped_view_steady_state_refresh_lockfree() {
     assert!(!has_lazy_mapped_view_pages());
     assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
 }
+
+/// (entryhitch) `VICTORY_STALE_QUICK`: `merge_due` says no only where
+/// `merge_under_writes` returns `false` and leaves the copy as it was, and
+/// says yes for a page the title wrote under pending shader writes.
+#[test]
+fn merge_due_leaves_out_only_merges_that_do_nothing() {
+    let Some(h) = host() else {
+        return;
+    };
+    const LEN: usize = 4 * PAGE;
+    let block = VirtualBlock::new(LEN, true);
+    // SAFETY: our own fresh allocation.
+    unsafe { std::ptr::write_bytes(block.ptr, 0x11, LEN) };
+    let shadow = make_test_shadow(h, block.addr() as u64, LEN as u64, false).expect("shadow");
+    let held = || {
+        // SAFETY: the copy's CPU mapping, `LEN` bytes.
+        unsafe { std::slice::from_raw_parts(shadow.data, LEN) }.to_vec()
+    };
+    let agree = |shadow: &Shadow, label: &str| {
+        let before = held();
+        let due = shadow.merge_due(block.addr(), LEN);
+        let mut runs_left = 1024;
+        let settle = shadow.merge_under_writes(block.addr(), LEN, &mut runs_left);
+        if !due {
+            assert!(!settle, "{label}: left out, yet the merge asks for a settle");
+            assert_eq!(runs_left, 1024, "{label}: left out, yet the merge sent runs");
+            assert!(before == held(), "{label}: left out, yet the merge changed the copy");
+        }
+        due
+    };
+    // No write pending: nothing to merge.
+    assert!(!agree(&shadow, "nothing pending"));
+    let _ = shadow.update(block.addr(), LEN);
+    shadow.writing(block.addr(), LEN);
+    assert!(shadow.writes_pending());
+    let _ = agree(&shadow, "pending, title quiet");
+    // The title writes a page under the pending writes: never left out.
+    // SAFETY: inside our allocation.
+    unsafe { block.ptr.add(PAGE + 8).write(0x77) };
+    assert!(
+        shadow.merge_due(block.addr(), LEN),
+        "a page the title wrote under pending writes is left out"
+    );
+    shadow.copy_back_done(&[(block.addr(), block.addr() + LEN)]);
+    assert!(!agree(&shadow, "landed"));
+}

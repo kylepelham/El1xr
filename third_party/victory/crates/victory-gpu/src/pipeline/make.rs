@@ -37,6 +37,7 @@ mod compute_wait;
 #[cfg(windows)]
 mod rescue;
 mod head_map;
+mod scene_said;
 mod screen_wait;
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -492,11 +493,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+    let first_use = !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed);
+    if first_use {
         super::library::note_used(&p.key);
         super::eager::first_use(origin(p), p.made.get().is_some());
     }
     let head_map = head_map::first(p);
+    let scene_first = scene_said::first(p, first_use);
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
         screen_wait::front(p);
@@ -511,6 +514,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if let Some(first) = head_map {
         head_map::said(p, first);
+    }
+    if let Some(first) = scene_first {
+        scene_said::said(p, first);
     }
     p.made.get()?.as_ref()
 }

@@ -159,6 +159,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_GPU_COST_SLOW_MS", Apply::Live),
     ("VICTORY_GPU_TIMING", Apply::Restart),
     ("VICTORY_GROUP_SYNC", Apply::Retranslate),
+    ("VICTORY_GROUP_SYNC_FULL", Apply::Retranslate),
     ("VICTORY_GUARD_ASK", Apply::Restart),
     ("VICTORY_GUARD_HOLES", Apply::Restart),
     ("VICTORY_GUARD_OPEN_AHEAD", Apply::Restart),
@@ -172,6 +173,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HEAP_FIND_WINDOW", Apply::Live),
     ("VICTORY_HEAP_NOTICES", Apply::Restart),
     ("VICTORY_HEAP_RECHECK", Apply::Restart),
+    ("VICTORY_HEAP_RECHECK_MIPS", Apply::Restart),
     ("VICTORY_HEAP_RESCAN_SLICES", Apply::Restart),
     // Not live: list stamps and the round floor are kept only while on; turned on mid-run it
     // would trust a stale floor and skip a heap round a submission needs (stale descriptors).
@@ -207,6 +209,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_KEYS", Apply::Restart),
     ("VICTORY_LAND_ASIDE", Apply::Restart),
     ("VICTORY_LANE_CORE", Apply::Restart),
+    ("VICTORY_LANE_MASK_WIDE", Apply::Retranslate),
     // Not live: how submissions are prepared against flights in the air (late copies, merges
     // under writes); flights prepared under one stage would be settled under another.
     ("VICTORY_LATE_WAIT", Apply::Restart),
@@ -329,6 +332,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_RT_MISS_SKY", Apply::Retranslate),
     ("VICTORY_RT_RESOLVE", Apply::Restart),
     ("VICTORY_RT_TRACE", Apply::Restart),
+    ("VICTORY_SAMPLER_CLAMP", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE_OUT", Apply::Restart),
     ("VICTORY_SAMPLE_PROFILE_SECONDS", Apply::Restart),
@@ -368,6 +372,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_STACKS", Apply::Restart),
     ("VICTORY_STAGED_ASK_ALL", Apply::Live),
     ("VICTORY_STAGE_POOL_MB", Apply::Restart),
+    ("VICTORY_STALE_QUICK", Apply::Live),
     ("VICTORY_STALE_TEXTURES", Apply::Restart),
     ("VICTORY_STALE_WIDE_MIN", Apply::Live),
     ("VICTORY_STEP_INDEX", Apply::Restart),
@@ -410,6 +415,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_TRAIL", Apply::Restart),
     ("VICTORY_TRANSLATE_ONLY", Apply::Restart),
     ("VICTORY_TRAP_LOG", Apply::Restart),
+    ("VICTORY_UNDERWATER_WIDE", Apply::Retranslate),
     ("VICTORY_UNIFORM_STRICT", Apply::Retranslate),
     ("VICTORY_UNIFORM_STRICT_ALL", Apply::Retranslate),
     ("VICTORY_UNWATCHED_FRAMES", Apply::Restart),
