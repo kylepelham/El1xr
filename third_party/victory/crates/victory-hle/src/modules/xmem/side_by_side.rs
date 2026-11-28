@@ -228,6 +228,7 @@ pub(super) fn change_many(
     }
     let mut ops = Vec::new();
     for (at, len, slice) in maps {
+        super::unmap_later::settle(at, len);
         let hole = physical.holes.remove(&at);
         let inside: Vec<usize> = physical.holes.range(at + 1..at + len).map(|(&at, _)| at).collect();
         for at in inside {
