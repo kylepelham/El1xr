@@ -9,6 +9,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_ALIAS_SKIP", "Skips alias copies whose source and target are unchanged since last copy."),
     ("VICTORY_ALLOC", "Memory allocator: system uses the process heap instead of mimalloc."),
     ("VICTORY_AMBIENT_SPECULAR_ALPHA", "Glass and foam keep the game's own sky reflection."),
+    ("VICTORY_ASK_ASIDE", "Asks which memory the title wrote on a thread of its own, beside the walk."),
     ("VICTORY_ASK_QUIET", "Checks quiet memory blocks for writes once a frame, busy ones every time."),
     ("VICTORY_ASK_QUIET_EVERY", "Most submissions a quiet range may go unchecked when skipping is on."),
     ("VICTORY_ASK_QUIET_SKIP", "Answers clean write-watch ranges from the journal, skipping the kernel."),
