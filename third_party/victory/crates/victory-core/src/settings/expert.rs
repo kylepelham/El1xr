@@ -249,6 +249,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_PIPELINE_EAGER", Apply::Restart),
     ("VICTORY_PIPELINE_GATE_S", Apply::Restart),
     ("VICTORY_PIPELINE_RECIPES", Apply::Restart),
+    ("VICTORY_PIPELINE_RESCUE", Apply::Restart),
     ("VICTORY_PIPELINE_WAIT_MS", Apply::Live),
     ("VICTORY_PIPELINE_WAIT_SHARED", Apply::Restart),
     ("VICTORY_PIPELINE_WORKERS", Apply::Restart),

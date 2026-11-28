@@ -34,6 +34,8 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 mod compute_wait;
+#[cfg(windows)]
+mod rescue;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -61,6 +63,12 @@ pub(crate) struct Pending {
     /// (bootfast) Queued at creation by `VICTORY_PIPELINE_EAGER`
     /// ([`super::eager`]); set under [`QUEUE`]'s lock.
     eager: AtomicBool,
+    /// `VICTORY_PIPELINE_RESCUE` ([`rescue`]): a thread has claimed its
+    /// making, that thread's handle while it makes it, and whether it was
+    /// made again after that thread ended.
+    building: AtomicBool,
+    maker: Mutex<usize>,
+    rescued: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -278,6 +286,9 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             eager: AtomicBool::new(false),
+            building: AtomicBool::new(false),
+            maker: Mutex::new(0),
+            rescued: AtomicBool::new(false),
         }
     }
 
@@ -306,6 +317,14 @@ impl Pending {
 
     fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         let _ = self.begun.set(Instant::now());
+        #[cfg(windows)]
+        if rescue::on() {
+            rescue::make_with(self, build);
+            let (lock, done) = &self.completion;
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            done.notify_all();
+            return;
+        }
         self.made.get_or_init(|| {
             // A failed translation must complete this queue entry and wake its waiters.
             match catch_unwind(AssertUnwindSafe(build)) {
