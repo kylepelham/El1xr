@@ -63,6 +63,8 @@ mod bake_inputs;
 #[cfg(windows)]
 mod bake_publish;
 #[cfg(windows)]
+mod bake_replay;
+#[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
 mod bake_why;
@@ -73,6 +75,8 @@ mod dred;
 #[cfg(windows)]
 mod alloc_count;
 #[cfg(windows)]
+mod consumer_gate;
+#[cfg(windows)]
 mod hang_watch;
 #[cfg(windows)]
 mod raw_watch;
@@ -80,6 +84,10 @@ mod raw_watch;
 mod drop_why;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pieces_diag;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pieces_log;
+#[cfg(windows)]
+mod read_there;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -145,6 +153,8 @@ mod present_audit;
 mod hold_frame;
 mod flicker_catch;
 #[cfg(windows)]
+mod hdr_scrub;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;
@@ -202,6 +212,7 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod wave_more;
+mod zero_out;
 #[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]

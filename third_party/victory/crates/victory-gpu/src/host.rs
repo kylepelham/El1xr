@@ -4061,6 +4061,7 @@ impl Host {
                     }
                     crate::gpucost::end(list);
                     list.Close()?;
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -4713,7 +4714,7 @@ impl Host {
                 *f += 1;
             }
         }
-        let apart = crate::compare_apart::split(
+        let mut apart = crate::compare_apart::split(
             card.as_ref().and_then(|c| c.check.clone()),
             &mut lists,
             crate::compare_apart::on(),
@@ -4737,22 +4738,34 @@ impl Host {
             let mut t_lists = crate::prep_cut::now();
             let signalled = {
                 let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
-                // SAFETY: closed lists; the fence is ours.
-                let signalled = unsafe {
-                    self.queue.ExecuteCommandLists(&lists);
-                    crate::prep_cut::lap(crate::prep_cut::F::ExecLists, &mut t_lists);
-                    crate::compare_apart::send(&self.queue, &apart);
-                    self.queue.Signal(&self.fence, *submitted)
+                let fence = *submitted;
+                // (`VICTORY_SEND_THREAD`) Noted as submitted before the thread signals it.
+                let note = || {
+                    self.submitted_fence.store(fence, Ordering::Release);
+                    back.iter().for_each(|(shadow, _)| shadow.note_write_fence(fence));
                 };
-                self.card_sent();
-                if signalled.is_ok() {
-                    self.submitted_fence.store(*submitted, Ordering::Release);
-                    crate::dred::sent(*submitted, this_submission, runs);
-                    for (shadow, _) in &back {
-                        shadow.note_write_fence(*submitted);
+                if send_thread::send_ahead(self, &mut lists, &mut apart, fence, note) {
+                    crate::dred::sent(fence, this_submission, runs);
+                    Ok(())
+                } else {
+                    send_thread::wait_idle();
+                    // SAFETY: closed lists; the fence is ours.
+                    let signalled = unsafe {
+                        self.queue.ExecuteCommandLists(&lists);
+                        crate::prep_cut::lap(crate::prep_cut::F::ExecLists, &mut t_lists);
+                        crate::compare_apart::send(&self.queue, &apart);
+                        self.queue.Signal(&self.fence, *submitted)
+                    };
+                    self.card_sent();
+                    if signalled.is_ok() {
+                        self.submitted_fence.store(*submitted, Ordering::Release);
+                        crate::dred::sent(*submitted, this_submission, runs);
+                        for (shadow, _) in &back {
+                            shadow.note_write_fence(*submitted);
+                        }
                     }
+                    signalled
                 }
-                signalled
             };
             drop(card_order);
             if let Err(e) = signalled {
@@ -4813,6 +4826,7 @@ impl Host {
             unsafe {
                 let waited = {
                     let _lazy_gpu = crate::shadow::lazy_submit_gpu_guard();
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(group);
                     if i + 1 == groups.len() {
                         crate::compare_apart::send(&self.queue, &apart);
@@ -6176,6 +6190,7 @@ impl HostList {
                     .fetch_add(u64::from(words.add(6).read_volatile()), Ordering::Relaxed);
                 // And its records over the budget (`VICTORY_INDIRECT_REST`).
                 crate::indirect::rest::take(words, crate::indirect::budget::log2().unwrap_or(27));
+                crate::indirect::wide::take(words);
                 for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
@@ -7884,6 +7899,7 @@ impl Meter {
         crate::indirect::budget::line(frames);
         crate::indirect::rest::line(frames);
         crate::indirect::raw_check::line(frames);
+        crate::indirect::wide::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
@@ -8400,6 +8416,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            send_thread::wait_idle();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9219,6 +9236,8 @@ mod sweep_aside;
 mod flush;
 #[path = "host_flush_beside.rs"]
 mod beside;
+#[path = "host_send_thread.rs"]
+pub(crate) mod send_thread;
 #[path = "host_one_pass.rs"]
 mod one_pass;
 #[path = "host_step_reads.rs"]

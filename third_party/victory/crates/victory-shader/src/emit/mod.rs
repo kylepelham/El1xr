@@ -98,6 +98,7 @@ mod intersect_tests;
 pub mod host;
 mod idiom;
 mod link;
+mod null_view_size;
 mod loops_wave;
 mod lower;
 pub mod meet;
@@ -423,6 +424,17 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// Runs `f` as on a host whose widest wave has `lanes` lanes, on this
+/// thread only (tests outside this module that translate for both kinds of
+/// host).
+#[cfg(test)]
+pub(crate) fn with_test_host_wave<R>(lanes: u32, f: impl FnOnce() -> R) -> R {
+    let was = lower::TEST_HOST_WAVE.replace(Some(lanes));
+    let r = f();
+    lower::TEST_HOST_WAVE.set(was);
+    r
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -2624,6 +2636,35 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    /// The colour a pixel program writes: with `VICTORY_NAN_SCRUB_INF=1` the scrub holds an
+    /// infinity at 65504 (another program than the scrub to 0), and with `VICTORY_HDR_CLAMP=1`
+    /// it is held to the HDR range (`lower::hdr_hold`). Off, the translation is the one
+    /// before both switches.
+    #[test]
+    fn bright_colours_are_held_when_asked() {
+        use lower::hdr_hold::{HDR_MAX, TEST_HDR_CLAMP, TEST_SCRUB_INF};
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let translated = |inf: bool, clamp: bool| {
+            let was = (TEST_SCRUB_INF.replace(Some(inf)), TEST_HDR_CLAMP.replace(Some(clamp)));
+            let shader = pixel(&words, PERSP_CENTER);
+            TEST_SCRUB_INF.set(was.0);
+            TEST_HDR_CLAMP.set(was.1);
+            let shader = shader.expect("the pixel program translates");
+            validate(&shader);
+            shader.dxil
+        };
+        let plain = translated(false, false);
+        let held_inf = translated(true, false);
+        assert_ne!(held_inf, plain, "the infinity hold changed nothing");
+        let clamped = translated(false, true);
+        assert!(clamped.len() > plain.len(), "the clamp added nothing");
+        let both = translated(true, true);
+        assert!(both != clamped && both != held_inf);
+        assert_eq!(translated(false, false), plain);
+        assert_eq!(HDR_MAX, 65024.0);
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
@@ -2968,6 +3009,7 @@ mod barycentric_tests {
         ];
         let io = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![VsOutput {
                 usage: Usage::Generic,
                 row: 1,
@@ -3215,6 +3257,7 @@ mod barycentric_tests {
         };
         let io = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![output(1, 0), output(2, 1)],
         };
         let osg1 = [
@@ -3250,6 +3293,7 @@ mod barycentric_tests {
         });
         let vs = StageIo::Vs {
             inputs: vec![],
+            fetch: vec![],
             outputs: vec![],
         };
         let digests = [

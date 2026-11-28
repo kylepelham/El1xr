@@ -2081,6 +2081,10 @@ impl State {
             self.draw_dump(list, p, compute);
         }
         #[cfg(windows)]
+        if !compute && crate::heap_find::follows() {
+            self.heap_find_follow(p);
+        }
+        #[cfg(windows)]
         if crate::heap_find::recording() {
             self.heap_find(list, p, compute);
         }
@@ -2150,7 +2154,7 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return prepare_failed!(self, DynamicDescriptorTable);
             }
-            if stage.shader.ambient.is_some() {
+            if stage.shader.ambient.is_some() || stage.shader.hdr.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -2854,6 +2858,15 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // `VICTORY_BAKE_REPLAY=1|2`: incomplete bakes whose inputs arrived drawn again; a bake
+        // draw is noted when drawn.
+        if crate::bake_replay::mode() > 0 {
+            if !p.is_bake {
+                Self::bake_replay_run();
+            } else if !compute {
+                bake_replay::BAKE.set(Some(false));
+            }
+        }
         // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
         if !compute && crate::material_demand::on() {
             self.material_textures(p);
@@ -3771,6 +3784,21 @@ impl State {
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // `VICTORY_CONSUMER_GATE`: a consumer whose producer was dropped is
+        // held; a producer that is not run holds its consumers.
+        let role = crate::consumer_gate::role(self.pipeline as This);
+        if crate::consumer_gate::holds(role) {
+            crate::drop_why::set("consumer of a dropped producer held (VICTORY_CONSUMER_GATE)");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count_of("dispatch", self.pipeline);
+            return;
+        }
+        let issued = crate::consumer_gate::issued_count();
+        self.dispatch_run(list, x, y, z);
+        crate::consumer_gate::after(role, crate::consumer_gate::issued_count() != issued);
+    }
+
+    fn dispatch_run(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
         #[cfg(feature = "diagnostics")]
@@ -3836,6 +3864,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.zero_out(list, p) {
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
@@ -3874,6 +3905,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.hdr_scrub(list, p);
+        crate::consumer_gate::issued();
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on(role)
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
@@ -4256,6 +4289,9 @@ impl State {
                 }
                 Err(_) => false,
             };
+        if crate::bake_replay::mode() > 0 {
+            self.bake_replay_drawn(ran, bake_replay::Again::Mesh(x));
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("mesh", self.pipeline);
@@ -4968,6 +5004,10 @@ impl State {
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
         }
+        if crate::bake_replay::mode() > 0 {
+            let again = bake_replay::Again::Draw(vertices, instances, first, first_instance);
+            self.bake_replay_drawn(ran && !rects, again);
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("draw", self.pipeline);
@@ -5088,6 +5128,10 @@ impl State {
         if crate::bake_check::on() {
             self.bake_check_drawn(list, ran);
         }
+        if crate::bake_replay::mode() > 0 {
+            let again = bake_replay::Again::Indexed(indices, instances, first, base, first_instance);
+            self.bake_replay_drawn(ran, again);
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("indexed", self.pipeline);
@@ -5111,7 +5155,19 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
+        let role = crate::consumer_gate::role(self.pipeline as This);
+        if crate::consumer_gate::holds(role) {
+            crate::drop_why::set("consumer of a dropped producer held (VICTORY_CONSUMER_GATE)");
+            return false;
+        }
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if ran
+            && kind == 2
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.hdr_scrub(list, p);
+        }
+        crate::consumer_gate::after(role, ran);
         // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
         // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran
@@ -5273,6 +5329,9 @@ impl State {
                 p.compute, p.mesh, self.topology
             ));
             return false;
+        }
+        if kind == DISPATCH && self.zero_out(list, p) {
+            return true;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some((args, max)) = crate::shadow::find_any(arguments, len)
@@ -5838,8 +5897,11 @@ mod bake_pass;
 mod bake_check;
 mod bake_fresh;
 mod bake_publish;
+mod bake_replay;
 mod material_pass;
 mod skin_views;
+mod zero_views;
+mod hdr_views;
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made

@@ -1235,6 +1235,8 @@ impl Host {
                     // In the order of the queue: the sends of title bytes so
                     // far are ahead of this fetch, every later one behind it.
                     let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    // Sends handed to the thread that sends (`VICTORY_SEND_THREAD`) are counted in `order`.
+                    super::send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&lists);
                     let after = *order;
                     drop(order);

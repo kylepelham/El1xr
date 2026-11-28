@@ -25,11 +25,14 @@
 pub const NAME: &str = "VICTORY_RAY_TRACING";
 
 /// What `on` adds: the builder with its fixes (batch 5 part F arm R3: no
-/// quarantine, the title gets its read-backs) and hits for the glass and
-/// opaque reflections' trace only.
+/// quarantine, the title gets its read-backs), hits for the glass and
+/// opaque reflections' trace only, and room on the card for the windows the
+/// builder writes, so their writes are compared there and not snapshotted on
+/// the CPU (part F: 9.7 GB snapshotted a frame, 0.75 fps).
 pub const ON: &[(&str, &str)] = &[
     ("VICTORY_BVH_BUILDER", "1"),
     ("VICTORY_BVH_BUILDER_EARLY", "1"),
+    ("VICTORY_BVH_CARD_WINDOWS_MB", "8192"),
     ("VICTORY_BVH_HOOK", "1"),
     ("VICTORY_BVH_PREMAP", "1"),
     ("VICTORY_DISPATCHX_MASK", "1"),
@@ -101,7 +104,7 @@ mod tests {
         assert_eq!(added.len(), ON.len() - 2);
         assert!(added.iter().all(|(n, _)| *n != "VICTORY_BVH_PREMAP" && *n != "VICTORY_RT_HIT_ONLY"));
         let line = line(Some("on"), &added).unwrap();
-        assert!(line.contains("added 5 (VICTORY_BVH_BUILDER=1 "), "{line}");
+        assert!(line.contains("added 6 (VICTORY_BVH_BUILDER=1 "), "{line}");
         assert!(line.ends_with("2 kept as set (VICTORY_BVH_PREMAP VICTORY_RT_HIT_ONLY)"), "{line}");
     }
 

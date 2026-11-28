@@ -25,6 +25,7 @@
 mod console_insn;
 mod crash;
 pub mod frame_rate;
+pub mod no_watchdog;
 pub mod prepare;
 pub mod resolution;
 pub mod resolve;
