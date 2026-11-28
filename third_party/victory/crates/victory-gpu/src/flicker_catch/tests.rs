@@ -284,6 +284,38 @@ fn the_switch_is_live_and_frames_are_summed_at_the_present() {
     assert!(s.targets.contains(&(0x7123_4570, 1)));
     assert_ne!(s.ambient & 1 << 18, 0);
     assert_ne!(s.periodic & 1 << periodic::Task::TexturesGone as u32, 0);
+
+    // (round 15) Cut where the title presents: what is recorded after its
+    // present call and before the present runs is the next frame's; the
+    // present's own counts stay with it. In the same test: the frames are
+    // one global state.
+    assert!(victory_core::settings::check_live(
+        "VICTORY_FLICKER_CATCH_TITLE_CUT",
+        "1",
+        title_cut,
+        false,
+        true
+    ));
+    victory_core::settings::set("VICTORY_FLICKER_CATCH", "1").unwrap();
+    victory_core::settings::set("VICTORY_FLICKER_CATCH_TITLE_CUT", "1").unwrap();
+    ran(0x7123_4580);
+    target(0x7123_4590);
+    title_presents();
+    ran(0x7123_4588);
+    count_n(Kind::KeptAside, 7);
+    frame_done(7_000_002);
+    title_presents();
+    frame_done(7_000_003);
+    victory_core::settings::set("VICTORY_FLICKER_CATCH_TITLE_CUT", "").unwrap();
+    victory_core::settings::set("VICTORY_FLICKER_CATCH", "").unwrap();
+    let first = summary_of(7_000_002).unwrap();
+    assert!(first.programs.contains(&(0x7123_4580, 1, 0)));
+    assert_eq!(first.of(0x7123_4588), (0, 0), "recorded after the title's present call");
+    assert!(first.targets.contains(&(0x7123_4590, 1)));
+    assert!(first.counts[Kind::KeptAside as usize] >= 7, "the present's own count");
+    let second = summary_of(7_000_003).unwrap();
+    assert!(second.programs.contains(&(0x7123_4588, 1, 0)));
+    assert_eq!(second.of(0x7123_4580), (0, 0));
 }
 
 #[test]

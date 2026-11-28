@@ -185,6 +185,27 @@ impl Rig {
         }
     }
 
+    /// Clears `rect` of `texture` (in [`READ`]) to `colour`.
+    fn paint(&mut self, texture: &ID3D12Resource, rect: RECT, colour: [f32; 4]) {
+        // SAFETY: our device, heap and list; a live texture.
+        unsafe {
+            let target = self.targets.GetCPUDescriptorHandleForHeapStart();
+            self.device.CreateRenderTargetView(texture, None, target);
+            self.list.ResourceBarrier(&[transition(
+                texture,
+                READ,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            self.list.ClearRenderTargetView(target, &colour, Some(&[rect]));
+            self.list.ResourceBarrier(&[transition(
+                texture,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                READ,
+            )]);
+            self.run();
+        }
+    }
+
     /// The texels of `back` (a copy destination) at (0, 0) and at the far
     /// corner, as RGBA bytes.
     fn shown(&mut self, back: &ID3D12Resource) -> [[u8; 4]; 2] {
@@ -326,6 +347,94 @@ fn a_black_present_shows_the_last_good_frame() {
     // A present went by without the pass: what was kept is not shown.
     hold.stale = true;
     assert_eq!(rig.present(&mut hold, &black, &back), [BLACK, BLACK], "the kept frame is forgotten");
-    // Held 3, lit 2, black shown 3.
-    assert_eq!(hold.counts(), [3, 2, 3]);
+    // Held 3, lit 2, black shown 3, no dark frame held.
+    assert_eq!(hold.counts(), [3, 2, 3, 0]);
+}
+
+#[test]
+fn the_dark_switch_is_off_unless_a_number_and_at_most_8() {
+    assert_eq!(parse_dark(None), 0);
+    assert_eq!(parse_dark(Some("x")), 0);
+    assert_eq!(parse_dark(Some("1")), 1);
+    assert_eq!(parse_dark(Some(" 3 ")), 3);
+    assert_eq!(parse_dark(Some("99")), DARK_MOST);
+}
+
+#[test]
+fn the_dark_switch_is_live() {
+    victory_core::settings::check_live("VICTORY_HOLD_DARK_FRAME", "2", dark_most, 0, 2);
+}
+
+#[test]
+fn only_srgb_and_float_views_are_read_as_linear_light() {
+    assert!(linear_light(DXGI_FORMAT_R16G16B16A16_FLOAT));
+    assert!(linear_light(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB));
+    assert!(linear_light(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB));
+    assert!(!linear_light(DXGI_FORMAT_R8G8B8A8_UNORM));
+    assert!(!linear_light(DXGI_FORMAT_R10G10B10A2_UNORM));
+}
+
+const GREY: [u8; 4] = [64, 64, 64, 255];
+const DIM: [u8; 4] = [13, 13, 13, 255];
+
+/// On the software adapter, `VICTORY_HOLD_DARK_FRAME=1`: a frame drawn at
+/// the raised black level (13/255) with a small bright patch (the title's
+/// subtitles, under one texel in 50) shows the last good frame once, and
+/// the second in a row is shown and kept (a real fade comes one frame
+/// late); a frame with 1 in 40 texels bright is not dark; a black frame
+/// still follows the black rule; with the switch off a dark frame is shown.
+#[test]
+fn a_dark_present_shows_the_last_good_frame_once() {
+    let Some(mut rig) = Rig::new() else {
+        eprintln!("no WARP device: skipped");
+        return;
+    };
+    let mut hold = Hold::new(&rig.device, 4).expect("the pass");
+    hold.dark = 1;
+    let back = rig.texture(false, None);
+    let whole = RECT { left: 0, top: 0, right: W as i32, bottom: H as i32 };
+    let lit = rig.texture(true, Some((whole, [0.25, 0.25, 0.25, 1.0])));
+    let dim = 13.0 / 255.0;
+    // 960 texels: a 6x3 patch (18, under 960 / 50) is a subtitle; a 8x3
+    // patch (24, one in 40) is not dark.
+    let dark = |rig: &mut Rig, wide: i32| {
+        let t = rig.texture(true, Some((whole, [dim, dim, dim, 1.0])));
+        // The patch over the raised black: drawn as a second texture's
+        // clear would lose the first, so clear twice on one texture.
+        let patch = RECT { left: 0, top: 0, right: wide, bottom: 3 };
+        rig.paint(&t, patch, [1.0, 1.0, 1.0, 1.0]);
+        t
+    };
+    let subtitle = dark(&mut rig, 6);
+    let wider = dark(&mut rig, 8);
+    let black = rig.texture(true, None);
+
+    assert_eq!(rig.present(&mut hold, &lit, &back), [GREY, GREY]);
+    assert_eq!(rig.present(&mut hold, &subtitle, &back), [GREY, GREY], "a dark frame is held");
+    assert_eq!(
+        rig.present(&mut hold, &subtitle, &back),
+        [[255, 255, 255, 255], DIM],
+        "the second dark frame in a row is shown"
+    );
+    assert_eq!(
+        rig.present(&mut hold, &black, &back),
+        [[255, 255, 255, 255], DIM],
+        "and kept: a black frame after it shows it"
+    );
+    assert_eq!(rig.present(&mut hold, &lit, &back), [GREY, GREY]);
+    assert_eq!(
+        rig.present(&mut hold, &wider, &back),
+        [[255, 255, 255, 255], DIM],
+        "one texel in 40 bright is not dark"
+    );
+    assert_eq!(rig.present(&mut hold, &lit, &back), [GREY, GREY]);
+    hold.dark = 0;
+    assert_eq!(
+        rig.present(&mut hold, &subtitle, &back),
+        [[255, 255, 255, 255], DIM],
+        "with the switch off a dark frame is shown"
+    );
+    // Held 2 (1 dark, 1 black), kept 6 (lit x3, dark shown x1, wider, dark
+    // with the switch off), black shown 0, dark held 1.
+    assert_eq!(hold.counts(), [2, 6, 0, 1]);
 }

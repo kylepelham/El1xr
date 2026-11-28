@@ -71,6 +71,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_HEAP_CAP", "View indices past the card's heap read a null slot instead of ours."),
     ("VICTORY_HEAP_WARM", "Prepares view heap buffers on the loading screen for a faster first frame."),
     ("VICTORY_HELPER_PRIORITY", "Priority of the helper threads a frame waits on, from -2 to 2."),
+    ("VICTORY_HOLD_DARK_FRAME", "A frame drawn black under subtitles shows the last good frame once."),
     ("VICTORY_HOST_ALONE", "Host steps that need no texture check stop waiting for pending ones."),
     ("VICTORY_JOINED_APART", "Returns changed ranges as they are when already in order and apart."),
     ("VICTORY_LDS_UNIFORM_STRICT", "Stricter check before treating a shared-memory read as wave-uniform."),

@@ -34,6 +34,19 @@
 //! depth-of-field passes by default, `VICTORY_FLICKER_CATCH_WATCH=<name
 //! part>,..` for others) are listed in every line with their runs, drops
 //! and indirect paths in the dark frame, the one before and the one after.
+//!
+//! Round 15 (#96): `VICTORY_FLICKER_CATCH_TITLE_CUT=1` (live) cuts frames
+//! where the title asks for its present instead of where the present runs
+//! ([`title_presents`]). With the present a job of its own
+//! (`VICTORY_ASYNC_SUBMIT`) the title records its next frame before this
+//! one's present has run (`kept_aside` up to 35 lists), so a frame's
+//! programs counted at the present are partly the next frame's: part R2's
+//! black-under-subtitles frames read `ran=437` and 4 render targets
+//! against 6,695 and 64 the frame before, without saying whether the title
+//! drew nothing or its frame was counted in the one before. Cut where the
+//! title presents, a frame holds what the title recorded for it. The
+//! present's own counts (`kept_aside`, `present_lag_ms`) stay with the
+//! present that counted them.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -218,6 +231,90 @@ pub(crate) enum Path {
 const PATH_NAMES: [&str; 5] = ["raw", "clamped", "ahead", "sanitized", "zeroed"];
 
 static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
+
+impl Frame {
+    /// Adds `other`'s draws, binds, reasons and paths to this frame's.
+    fn add(&mut self, other: Frame) {
+        for (p, (r, d)) in other.programs {
+            let n = self.programs.entry(p).or_default();
+            n.0 += r;
+            n.1 += d;
+        }
+        for (t, n) in other.targets {
+            *self.targets.entry(t).or_default() += n;
+        }
+        self.why.extend(other.why);
+        for (p, bits) in other.paths {
+            *self.paths.entry(p).or_default() |= bits;
+        }
+    }
+}
+
+/// Whether frames are cut where the title presents
+/// (`VICTORY_FLICKER_CATCH_TITLE_CUT=1`).
+fn title_cut() -> bool {
+    static ON: victory_core::settings::Live =
+        victory_core::settings::Live::flag("VICTORY_FLICKER_CATCH_TITLE_CUT");
+    ON.get_bool()
+}
+
+/// The counts a present makes itself: they stay with the present that
+/// counted them, not with the title's frame.
+const PRESENT_SIDE: [Kind; 2] = [Kind::KeptAside, Kind::PresentLagMs];
+
+/// What the title recorded up to its present call, waiting for that
+/// present to run ([`frame_done`]): counts, settles, the stand-in's roles
+/// and the per-pipeline frame.
+struct Staged {
+    counts: [u32; KINDS],
+    settled: u32,
+    ambient: u32,
+    frame: Frame,
+}
+
+static STAGED: Mutex<Option<Staged>> = Mutex::new(None);
+
+/// The title asks for a present (with [`title_cut`]): what it recorded
+/// since its last one is that frame's, whenever the present runs. A frame
+/// staged and not yet presented (a present that did not run) takes this
+/// one's too.
+pub(crate) fn title_presents() {
+    if !on() || !title_cut() {
+        return;
+    }
+    let mut counts = [0u32; KINDS];
+    for (i, c) in NOW.iter().enumerate() {
+        if !PRESENT_SIDE.iter().any(|&k| k as usize == i) {
+            counts[i] = c.swap(0, Relaxed);
+        }
+    }
+    let settled = SETTLED.swap(0, Relaxed);
+    let ambient = AMBIENT.swap(0, Relaxed);
+    let frame = FRAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    let mut staged = STAGED.lock().unwrap_or_else(|e| e.into_inner());
+    match staged.as_mut() {
+        Some(s) => {
+            for (a, b) in s.counts.iter_mut().zip(counts) {
+                *a = a.saturating_add(b);
+            }
+            s.settled |= settled;
+            s.ambient |= ambient;
+            s.frame.add(frame);
+        }
+        None => {
+            *staged = Some(Staged {
+                counts,
+                settled,
+                ambient,
+                frame,
+            });
+        }
+    }
+}
 
 /// Counts `kind` in this frame.
 pub(crate) fn count(kind: Kind) {
@@ -431,15 +528,28 @@ static NAMED_AS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 /// Frame `frame` is presented: what was counted since the last present is
 /// its summary.
 pub(crate) fn frame_done(frame: u64) {
-    let counts = NOW.each_ref().map(|c| c.swap(0, Relaxed));
-    let settled = SETTLED.swap(0, Relaxed);
-    let ambient = AMBIENT.swap(0, Relaxed);
+    let staged = STAGED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let (counts, settled, ambient, taken) = match staged {
+        // Cut where the title presented: the present's own counts join it.
+        Some(mut s) => {
+            for k in PRESENT_SIDE {
+                s.counts[k as usize] =
+                    s.counts[k as usize].saturating_add(NOW[k as usize].swap(0, Relaxed));
+            }
+            (s.counts, s.settled, s.ambient, s.frame)
+        }
+        None => (
+            NOW.each_ref().map(|c| c.swap(0, Relaxed)),
+            SETTLED.swap(0, Relaxed),
+            AMBIENT.swap(0, Relaxed),
+            FRAME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default(),
+        ),
+    };
     let periodic = periodic::take();
-    let taken = FRAME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default();
     let mut programs: Vec<_> = taken
         .programs
         .into_iter()
