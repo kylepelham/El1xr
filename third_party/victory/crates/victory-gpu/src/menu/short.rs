@@ -68,7 +68,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_GUARD_PUBLISH_TRY", "Leaves a busy block for the next guard walk instead of spinning."),
     ("VICTORY_GUARD_STAMP_FRESH", "Stamps closed pages fresh at each guard check to avoid stale copies."),
     ("VICTORY_HANG_WATCH", "Logs in-flight work when the card stalls this many seconds."),
-    ("VICTORY_HEAP_CAP", "View indices past the card's heap read a null slot instead of ours."),
+    ("VICTORY_HEAP_CAP", "Title views past the card's 1M heap: null (1-2), packed (3-5)."),
     ("VICTORY_HEAP_WARM", "Prepares view heap buffers on the loading screen for a faster first frame."),
     ("VICTORY_HELPER_PRIORITY", "Priority of the helper threads a frame waits on, from -2 to 2."),
     ("VICTORY_HOLD_DARK_FRAME", "A frame drawn black under subtitles shows the last good frame once."),

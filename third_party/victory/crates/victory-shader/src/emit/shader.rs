@@ -70,6 +70,12 @@ pub const REMAP_LEN: u32 = SLOT_STRIDES_COUNT - REMAP_BASE - 1;
 /// ([`title_remap_full`]): dword `i` the host slot of title view slot `i`; indices at or past
 /// the last read the last, a null slot.
 pub const FULL_REMAP: u32 = 1 << 21;
+/// (heapcap, `VICTORY_HEAP_CAP=5`) A whole-heap table entry with this bit set asks for a fault
+/// note: the shader still reads the host slot in the other bits, and writes the title slot to
+/// the fault buffer ([`title_fault_slot`]).
+pub const FAULT_FLAG: u32 = 1 << 31;
+/// (heapcap) Dwords of the fault buffer: title slot `k` is noted at dword `1 + k % (n - 1)`.
+pub const FAULT_DWORDS: u32 = 1 << 17;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -204,6 +210,32 @@ static TITLE_REMAP_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 thread_local! {
     /// For a test's thread alone: [`title_remap_full`].
     pub(crate) static TITLE_REMAP_FULL_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// (heapcap, `VICTORY_HEAP_CAP=5`) The host view slot of the fault buffer's raw UAV (0: no
+/// faults): a whole-heap table entry with [`FAULT_FLAG`] makes the shader note its title slot
+/// there. A note not asked for goes past the buffer's end, where the store is dropped: no
+/// branch, one store issued per view index.
+static TITLE_FAULT_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`title_fault_slot`].
+    pub(crate) static TITLE_FAULT_SLOT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`TITLE_FAULT_SLOT`].
+pub fn set_title_fault_slot(slot: u32) {
+    TITLE_FAULT_SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`TITLE_FAULT_SLOT`].
+pub fn title_fault_slot() -> u32 {
+    #[cfg(test)]
+    if let Some(slot) = TITLE_FAULT_SLOT_HERE.get() {
+        return slot;
+    }
+    TITLE_FAULT_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// See [`TITLE_REMAP_FULL`].
