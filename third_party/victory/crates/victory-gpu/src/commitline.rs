@@ -97,7 +97,7 @@ fn under(free: u64, floor: Option<u64>) -> bool {
 }
 
 /// The system's free commit (bytes), asked at most every 100 ms.
-fn free_commit() -> u64 {
+pub(crate) fn free_commit() -> u64 {
     static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let tenth = crate::host::now_ms() / 100 + 1;
     if LAST[0].load(Relaxed) == tenth {
@@ -188,7 +188,7 @@ pub(crate) fn floor_report(went: &[(usize, u64, u64)]) {
     );
 }
 
-fn memory_status() -> windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
+pub(crate) fn memory_status() -> windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -241,6 +241,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
     } else {
         0
     };
+    crate::poolslack::tick();
     let mb = |v: u64| v >> 20;
     let (charged, limit, peak) = system_commit();
     let m = memory_status();
@@ -276,7 +277,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
          title virtual allocations {} MB (views of title pages {} MB, mapped, outside private); \
          the rest {} MB (driver, heaps: pipeline library file {} MB, translated shaders {} MB, containers {} MB, command allocators {}); \
          blocks MB/held by pieces MB/still cuttable MB: {}; \
-         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} sweeps, host copies let go {} ({} MB)), staging sweeps at 2 s {}",
+         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} sweeps, host copies let go {} ({} MB)), staging sweeps at 2 s {}; {}",
         mb(charged),
         mb(limit),
         mb(peak),
@@ -318,6 +319,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
         ACTED[3].load(Relaxed),
         mb(ACTED[4].load(Relaxed)),
         ACTED[5].load(Relaxed),
+        crate::poolslack::summary(),
     );
 }
 

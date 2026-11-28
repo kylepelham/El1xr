@@ -251,7 +251,7 @@ impl State {
 }
 
 /// A committed read-back buffer of `bytes`.
-fn read_back_buffer(device: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
+pub(super) fn read_back_buffer(device: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
