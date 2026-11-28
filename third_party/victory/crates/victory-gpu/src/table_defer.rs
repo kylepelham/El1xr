@@ -10,6 +10,13 @@
 //! (all threads) making fresh tables, much of it making host copies and
 //! staging buffers of textures read for the first time.
 //!
+//! (texflicker, #96) A texture the texture pass uploaded is let go of its
+//! staging buffer after (`crate::draw`), so it reads as never staged here
+//! though its host copy holds it: its slot was left null for a frame, the
+//! diner's far layer dark every ~2 s. `VICTORY_PREPARE_PRUNE_SAFE` (live):
+//! such a texture is read as it is, its upload recorded now as before
+//! (`crate::texture::prepare::prune_safe`).
+//!
 //! Never for a draw of the title's decoration bake (what it reads must be
 //! there now: shortened bakes left faces black), for dispatches, for views
 //! other than shader resource views of textures the title fills, without
@@ -27,8 +34,10 @@ thread_local! {
 }
 
 /// Since the last line: table slots left null for a texture being made
-/// ready, and of them the textures handed out now.
-static STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// ready, of them the textures handed out now, and of them the slots whose
+/// texture's host copy held an upload already; slots not left null for that
+/// (`VICTORY_PREPARE_PRUNE_SAFE`).
+static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The switch (`VICTORY_TABLE_DEFER`; on unless `0`).
 pub(crate) fn on() -> bool {
@@ -76,6 +85,9 @@ struct Texture {
     host_copy_made: bool,
     /// Its staging buffer holds the mips the view shows: uploaded before.
     staged: bool,
+    /// Its host copy holds an upload of the mips the view shows (one the
+    /// texture pass let the staging buffer of go after).
+    filled: bool,
     host_refused: bool,
     room: bool,
 }
@@ -84,6 +96,12 @@ struct Texture {
 /// never staged, and a host copy made or room on the card to make one.
 fn candidate(t: Texture) -> bool {
     t.read && t.title_fills && !t.staged && !t.host_refused && (t.host_copy_made || t.room)
+}
+
+/// Whether a candidate's slot is read as it is, not left null: its host
+/// copy is filled and `VICTORY_PREPARE_PRUNE_SAFE` is on.
+fn reads_filled(t: Texture, safe: u64) -> bool {
+    safe != 0 && t.filled
 }
 
 /// What a table handed out, by resource and first mip: found again with
@@ -140,16 +158,24 @@ pub(crate) fn wait(
         },
         _ => return false,
     };
-    let made = crate::resource::host_copy_made(resource);
+    let uploaded = crate::resource::host_copy_uploaded_from(resource);
+    let made = uploaded.is_some();
     let t = Texture {
         read,
         title_fills: crate::resource::title_fills(resource),
         host_copy_made: made,
         staged: made && crate::resource::staged_first(resource) <= first,
+        filled: uploaded.is_some_and(|f| f <= first),
         host_refused: crate::resource::host_refused(resource),
         room: crate::resource::room_lately(),
     };
     if !candidate(t) {
+        return false;
+    }
+    if reads_filled(t, crate::texture::prepare::prune_safe()) {
+        STATS[3].fetch_add(1, Relaxed);
+        crate::flicker_catch::count(crate::flicker_catch::Kind::TableKeptFilled);
+        line();
         return false;
     }
     let key = (resource as usize, first);
@@ -186,6 +212,11 @@ pub(crate) fn wait(
     };
     if waits {
         STATS[0].fetch_add(1, Relaxed);
+        crate::flicker_catch::count(crate::flicker_catch::Kind::TableNulled);
+        if t.filled {
+            STATS[2].fetch_add(1, Relaxed);
+            crate::flicker_catch::count(crate::flicker_catch::Kind::TableNulledFilled);
+        }
         line();
     }
     waits
@@ -212,10 +243,12 @@ fn line() {
     {
         return;
     }
-    let [null, handed] = [0, 1].map(|i| STATS[i].swap(0, Relaxed));
+    let [null, handed, null_filled, kept_filled] = [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed));
     tracing::info!(
         null,
         handed,
+        null_filled,
+        kept_filled,
         "table slots left null while their texture's first upload is made ready on the prepare threads (VICTORY_TABLE_DEFER=0: made on the recording thread)"
     );
 }
@@ -252,6 +285,7 @@ mod tests {
             staged: false,
             host_refused: false,
             room: true,
+            filled: false,
         };
         assert!(candidate(t));
         assert!(!candidate(Texture { read: false, ..t }));
@@ -262,6 +296,27 @@ mod tests {
         let made = Texture { host_copy_made: true, room: false, ..t };
         assert!(candidate(made));
         assert!(!candidate(Texture { staged: true, ..made }));
+    }
+
+    /// (texflicker, #96) A texture whose host copy holds its upload (the
+    /// texture pass let its staging buffer go) is still a candidate, as
+    /// before; with `VICTORY_PREPARE_PRUNE_SAFE` its slot is read as it is.
+    #[test]
+    fn a_filled_host_copy_is_read_as_it_is_only_when_safe() {
+        let filled = Texture {
+            read: true,
+            title_fills: true,
+            host_copy_made: true,
+            staged: false,
+            host_refused: false,
+            room: true,
+            filled: true,
+        };
+        assert!(candidate(filled));
+        assert!(!reads_filled(filled, 0));
+        assert!(reads_filled(filled, 1));
+        assert!(reads_filled(filled, 2));
+        assert!(!reads_filled(Texture { filled: false, ..filled }, 1));
     }
 
     /// A slot is never left null for good: once handed out, a texture with
