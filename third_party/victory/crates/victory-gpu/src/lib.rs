@@ -160,6 +160,8 @@ mod primitive;
 mod heap_pass;
 pub mod query;
 pub mod queue;
+/// (mandy 6e80eb8648) `VICTORY_ALIAS_LATER=1`: page-mapping copies mapped behind the title's call.
+pub mod alias_later;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

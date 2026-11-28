@@ -80,6 +80,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | [flipflapov/victory_upifork](https://github.com/flipflapov/victory_upifork) (edsuuu, d'après edsuuu/VI-BR-PORT `10ac68f9d2`) | GPL-3.0 | | Programmes de cuisson de décorations reconnus par leur nom (`e5c58d3480`, `PS_BakeDecorations_*`/`PS_DecorationBlend_*`), porté à la main (`VICTORY_BAKE_BY_NAME=1`, `victory-gpu/src/bake_name.rs`) |
 | [snaxky915-dotcom/VIctory-Belobug-NVIDIA](https://github.com/snaxky915-dotcom/VIctory-Belobug-NVIDIA) (snaxky915) | GPL-3.0 | | Étages de géométrie des cuissons (`03ab74a2ee` : sommets `089d6271be6650ef`, maillage `d4111a6e6ea49d91`), porté à la main (`VICTORY_BAKE_BY_NAME=2`) |
 | [TheSmurphilicious/victorious-foxwoodhound-lite](https://github.com/TheSmurphilicious/victorious-foxwoodhound-lite) (santa-smurph) | GPL-3.0 | | Copies hôtes d'une cuisson faites au-delà de la ligne de place de la carte (`1e59516195`, `VICTORY_BAKE_ROOM`), idée portée à la main pour les textures propres d'une cuisson (`VICTORY_BAKE_ROOM=1`, `victory-gpu/src/bake_fresh.rs`) |
+| [ProjectLeonida/mandy](https://github.com/ProjectLeonida/mandy) (NotRexed ; d'après aki-gta6/aki-runtime) | GPL-3.0 | | Copies de mappages de pages (`CopyPageMappingsBatchX`) : pages cherchées dans l'appel du titre, mappées derrière lui par un fil à nous, la file de la queue attendant ce lot (`6e80eb8648`, `VICTORY_ALIAS_LATER=1`) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 

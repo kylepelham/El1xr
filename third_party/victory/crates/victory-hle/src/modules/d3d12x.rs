@@ -20,6 +20,7 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     victory_gpu::resource::use_constant_page_mapper(super::xmem::map_alias_constant);
+    victory_gpu::alias_later::use_later_page_mapper(super::xmem::map_aliases_later);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
