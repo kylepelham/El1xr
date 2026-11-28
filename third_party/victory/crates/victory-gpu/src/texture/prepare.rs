@@ -48,6 +48,36 @@ pub(crate) fn threads() -> usize {
     })
 }
 
+/// (texflicker, #96) `VICTORY_PREPARE_PRUNE_SAFE` (live; 0 unless set): 1:
+/// a table never leaves a slot null for a texture whose host copy holds an
+/// upload already (`crate::table_defer`), and what was made ready is let go
+/// two seconds after it was last taken, not after it was made ([`prune`]);
+/// 2: the first alone.
+///
+/// The diner's background went dark for one frame every ~2.06 s (b5 part N:
+/// 20 dark frames in 75 s, none with no prepare threads; [`prune`] ran in the
+/// frame before 15 times of 20). The texture pass lets go of a texture's
+/// staging buffer once it recorded its upload (`crate::draw`, "Uploaded"),
+/// so the texture reads as never staged; a table that reads it next asked
+/// the prepare threads ([`held`]) and found the entry another slot's take
+/// had left in the queue: it took that, and nothing was null. Two seconds
+/// after that entry was made the prune let it go though tables took it every
+/// frame; the next table that read the texture handed it out anew and left
+/// its slot null for a frame, the texture's host copy full all along (the
+/// far layer's textures, many at once); the entry made then was let go two
+/// seconds later, and so on.
+pub(crate) fn prune_safe() -> u64 {
+    static LEVEL: victory_core::settings::Live =
+        victory_core::settings::Live::new("VICTORY_PREPARE_PRUNE_SAFE", prune_safe_level);
+    LEVEL.get()
+}
+
+fn prune_safe_level(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(0, |n| n.min(2))
+}
+
 /// A texture handed out: the title resource (kept alive until the thread is
 /// done with it), the first mip the view that asked for it shows, and its
 /// bytes as counted against the budget.
@@ -137,12 +167,15 @@ impl Queue {
     /// `by_table`: a take with no slot served (a draw's table) retires the
     /// entry it took at once (`crate::texture::take_by_table`): the table of
     /// staging buffers holds it from now on, and the pass finds it there.
+    /// `now` (`VICTORY_PREPARE_PRUNE_SAFE=1`): the entry taken counts its two
+    /// seconds before the prune from now if it stays.
     fn take(
         &mut self,
         key: usize,
         first: u32,
         serving: Option<u32>,
         by_table: bool,
+        now: Option<u64>,
     ) -> Option<(Option<Arc<Staging>>, Vec<Ready>)> {
         let all = self.ready.get_mut(&key)?;
         let best = all
@@ -152,6 +185,9 @@ impl Queue {
             .max_by_key(|(_, r)| r.first)
             .map(|(i, _)| i)?;
         let staging = all[best].staging.clone();
+        if let Some(now) = now {
+            all[best].at = now;
+        }
         // The slot served now waits for none of them any more.
         let mut served = 0;
         let mut table_slots = Vec::new();
@@ -307,17 +343,23 @@ pub(crate) enum Held {
 }
 
 pub(crate) fn held(resource: This, first: u32) -> Held {
-    let q = queue();
-    if (0..=first).any(|f| q.pending.contains_key(&(resource as usize, f))) {
-        Held::Pending
-    } else if q
-        .ready
-        .get(&(resource as usize))
-        .is_some_and(|all| all.iter().any(|r| r.first <= first))
-    {
-        Held::Ready
-    } else {
-        Held::Nothing
+    queue().held(resource as usize, first)
+}
+
+impl Queue {
+    /// [`held`]'s look in the queue.
+    fn held(&self, resource: usize, first: u32) -> Held {
+        if (0..=first).any(|f| self.pending.contains_key(&(resource, f))) {
+            Held::Pending
+        } else if self
+            .ready
+            .get(&resource)
+            .is_some_and(|all| all.iter().any(|r| r.first <= first))
+        {
+            Held::Ready
+        } else {
+            Held::Nothing
+        }
     }
 }
 
@@ -597,6 +639,7 @@ pub(crate) fn take_ready(resource: This, first: u32, on_demand: bool) -> Option<
         first,
         SERVING.get(),
         crate::texture::take_by_table::on(),
+        (prune_safe() == 1).then(crate::host::moment),
     )?;
     drop(gone);
     let staging = staging?;
@@ -678,40 +721,102 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// Lets go of what was made ready two seconds and two frames ago and not
-/// taken (its slot was written again, or is no longer due). Called by the
+/// taken (its slot was written again, or is no longer due); with
+/// `VICTORY_PREPARE_PRUNE_SAFE=1`, taken last that long ago. Called by the
 /// pass before it looks at the slots.
 pub(crate) fn prune() {
     if threads() == 0 {
         return;
     }
-    let mut gone = Vec::new();
-    {
+    let logs = crate::flicker_catch::on() || prune_safe() != 0;
+    let (gone, risky) = {
         let mut q = queue();
         if q.ready.is_empty() {
             return;
         }
+        // Under the queue's lock: a texture the title releases leaves the
+        // queue first (`forget`), so the ones named here are alive.
+        q.stale(
+            |at| crate::host::long_ago(at, 2000, 2),
+            |resource, first| logs && filled_unstaged(resource, first),
+        )
+    };
+    STATS[8].fetch_add(gone.len() as u64, Relaxed);
+    if !gone.is_empty() {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::PrepPruned);
+        if logs {
+            tracing::info!("{}", prune_line(&gone, risky));
+        }
+    }
+    drop(gone);
+}
+
+/// Whether title texture `resource`'s host copy holds an upload from mip
+/// `first` on while it has no staging buffer that serves from there: the
+/// next table that reads it would leave its slot null to hand it out anew
+/// (without `VICTORY_PREPARE_PRUNE_SAFE`).
+fn filled_unstaged(resource: usize, first: u32) -> bool {
+    let resource = resource as This;
+    crate::resource::staged_first(resource) > first
+        && crate::resource::host_copy_uploaded_from(resource).is_some_and(|f| f <= first)
+}
+
+impl Queue {
+    /// [`prune`]'s look: takes out what `old` says was made ready (or, with
+    /// `VICTORY_PREPARE_PRUNE_SAFE=1`, taken) long enough ago, and how many
+    /// of those `risky` names (by resource and first mip).
+    fn stale(
+        &mut self,
+        old: impl Fn(u64) -> bool,
+        risky: impl Fn(usize, u32) -> bool,
+    ) -> (Vec<Ready>, usize) {
         let mut stale = Vec::new();
-        for all in q.ready.values_mut() {
+        let mut risks = 0;
+        for (&resource, all) in self.ready.iter_mut() {
             let mut i = 0;
             while i < all.len() {
-                if crate::host::long_ago(all[i].at, 2000, 2) {
-                    stale.push(all.swap_remove(i));
+                if old(all[i].at) {
+                    let ready = all.swap_remove(i);
+                    risks += usize::from(risky(resource, ready.first));
+                    stale.push(ready);
                 } else {
                     i += 1;
                 }
             }
         }
-        q.ready.retain(|_, all| !all.is_empty());
+        self.ready.retain(|_, all| !all.is_empty());
         for ready in &stale {
-            q.gone(ready);
+            self.gone(ready);
         }
-        gone.extend(stale);
+        (stale, risks)
     }
-    STATS[8].fetch_add(gone.len() as u64, Relaxed);
-    if !gone.is_empty() {
-        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::PrepPruned);
-    }
-    drop(gone);
+}
+
+/// The `prepare prune:` line: what one prune let go, and how much of it was
+/// still referenced (a staging buffer the table of staging buffers or a
+/// list held too: it stays alive, only the queue's entry goes).
+fn prune_line(gone: &[Ready], risky: usize) -> String {
+    let staged: Vec<&Arc<Staging>> = gone.iter().filter_map(|r| r.staging.as_ref()).collect();
+    let referenced = staged.iter().filter(|s| Arc::strong_count(s) > 1).count();
+    let bytes: u64 = staged.iter().map(|s| s.bytes).sum();
+    let freed: u64 = staged
+        .iter()
+        .filter(|s| Arc::strong_count(s) == 1)
+        .map(|s| s.bytes)
+        .sum();
+    let waited = gone.iter().filter(|r| !r.slots.is_empty()).count();
+    let slots: usize = gone.iter().map(|r| r.slots.len()).sum();
+    format!(
+        "prepare prune: {} entries let go ({} with a staging buffer, {} KiB; {} KiB freed), \
+         still referenced={referenced} (staging held by the table or a list), with slots waiting={waited} ({slots} slots), \
+         host copy filled and unstaged={risky} (a table reading one next leaves its slot null unless VICTORY_PREPARE_PRUNE_SAFE); \
+         VICTORY_PREPARE_PRUNE_SAFE={}",
+        gone.len(),
+        staged.len(),
+        bytes >> 10,
+        freed >> 10,
+        prune_safe()
+    )
 }
 
 /// For the frame line: textures handed out and not done, made ready and not
@@ -847,7 +952,7 @@ mod tests {
     fn a_table_take_keeps_the_entry_with_the_switch_off() {
         let mut q = Queue::default();
         ready(&mut q, 9, 0, 100, &[7]);
-        let (_, gone) = q.take(9, 0, None, false).unwrap();
+        let (_, gone) = q.take(9, 0, None, false, None).unwrap();
         assert!(gone.is_empty());
         assert_eq!(q.outstanding, 100);
         assert!(q.ready_slots.contains_key(&7));
@@ -860,7 +965,7 @@ mod tests {
         let mut q = Queue::default();
         ready(&mut q, 9, 0, 100, &[7]);
         ready(&mut q, 9, 2, 30, &[8]);
-        let (_, gone) = q.take(9, 1, None, true).unwrap();
+        let (_, gone) = q.take(9, 1, None, true, None).unwrap();
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].first, 0);
         assert_eq!(q.outstanding, 30);
@@ -875,12 +980,12 @@ mod tests {
         for by_table in [false, true] {
             let mut q = Queue::default();
             ready(&mut q, 9, 0, 100, &[7, 8]);
-            let (_, gone) = q.take(9, 0, Some(7), by_table).unwrap();
+            let (_, gone) = q.take(9, 0, Some(7), by_table, None).unwrap();
             assert!(gone.is_empty());
             assert_eq!(q.outstanding, 100);
             assert!(!q.ready_slots.contains_key(&7));
             assert!(q.ready_slots.contains_key(&8));
-            let (_, gone) = q.take(9, 0, Some(8), by_table).unwrap();
+            let (_, gone) = q.take(9, 0, Some(8), by_table, None).unwrap();
             assert_eq!(gone.len(), 1);
             assert_eq!(q.outstanding, 0);
             assert!(q.ready.is_empty());
@@ -891,10 +996,77 @@ mod tests {
     #[test]
     fn no_take_without_a_ready_entry_that_serves() {
         let mut q = Queue::default();
-        assert!(q.take(9, 0, None, true).is_none());
+        assert!(q.take(9, 0, None, true, None).is_none());
         ready(&mut q, 9, 3, 10, &[1]);
-        assert!(q.take(9, 2, None, true).is_none());
+        assert!(q.take(9, 2, None, true, None).is_none());
         assert_eq!(q.outstanding, 10);
+    }
+
+    /// (texflicker, #96) The cycle behind the diner's dark frames: the pass
+    /// handed a texture out for heap slot 7, and tables read it every frame
+    /// as slot 8 (the pass let go of its staging buffer after its upload, so
+    /// every table asks the queue). Each take serves no slot of the entry,
+    /// which stays. Without the switch the prune let it go two seconds after
+    /// it was made, taken or not, and the next table found nothing held
+    /// (`crate::table_defer` then left its slot null and handed it out anew);
+    /// with it, an entry taken within the two seconds stays.
+    #[test]
+    fn an_entry_tables_take_every_frame_survives_the_prune_only_when_safe() {
+        const TWO_SECONDS: u64 = 25;
+        for safe in [false, true] {
+            let mut q = Queue::default();
+            q.outstanding += 100;
+            q.hint(&[7]);
+            q.ready.entry(9).or_default().push(Ready {
+                staging: None,
+                first: 0,
+                bytes: 100,
+                at: 10,
+                slots: vec![7],
+            });
+            for now in 11..=40 {
+                let (_, gone) = q.take(9, 0, Some(8), true, safe.then_some(now)).unwrap();
+                assert!(gone.is_empty());
+            }
+            let (gone, _) = q.stale(|at| 40 - at >= TWO_SECONDS, |_, _| false);
+            if safe {
+                assert!(gone.is_empty());
+                assert_eq!(q.held(9, 0), Held::Ready);
+                assert_eq!(q.outstanding, 100);
+            } else {
+                assert_eq!(gone.len(), 1);
+                assert_eq!(q.held(9, 0), Held::Nothing);
+                assert_eq!(q.outstanding, 0);
+                assert!(q.ready_slots.is_empty());
+            }
+            // Not taken for two seconds: let go either way.
+            let (gone, _) = q.stale(|at| 80 - at >= TWO_SECONDS, |_, _| false);
+            assert_eq!(gone.len(), usize::from(safe));
+            assert!(q.ready.is_empty());
+        }
+    }
+
+    /// The prune counts what it let go whose texture's host copy is filled
+    /// and unstaged (as its look says), by resource and first mip.
+    #[test]
+    fn the_prune_counts_the_risky_entries() {
+        let mut q = Queue::default();
+        ready(&mut q, 9, 0, 10, &[1]);
+        ready(&mut q, 9, 2, 10, &[2]);
+        ready(&mut q, 5, 0, 10, &[]);
+        let (gone, risky) = q.stale(|_| true, |resource, first| resource == 9 && first == 2);
+        assert_eq!((gone.len(), risky), (3, 1));
+        assert!(prune_line(&gone, risky).starts_with("prepare prune: 3 entries let go"));
+        assert_eq!(q.outstanding, 0);
+    }
+
+    #[test]
+    fn prune_safe_is_live_and_off_unless_set() {
+        assert_eq!(super::prune_safe_level(None), 0);
+        assert_eq!(super::prune_safe_level(Some("1")), 1);
+        assert_eq!(super::prune_safe_level(Some("7")), 2);
+        assert_eq!(super::prune_safe_level(Some("x")), 0);
+        victory_core::settings::check_live("VICTORY_PREPARE_PRUNE_SAFE", "1", super::prune_safe, 0, 1);
     }
 
     /// An urgent look (a table's texture) ignores the frame's bytes and is

@@ -69,7 +69,7 @@ impl State {
     /// `p`: the host pipeline (`None` for a dropped draw: no buffer views
     /// are known then).
     fn heap_find_refs(&self, p: Option<&HostPipeline>, roots: &[Root], hits: &mut Vec<String>) {
-        use crate::heap_find::{MOST_SCAN, near, search, search_memory, slots_in, wanted};
+        use crate::heap_find::{MOST_SCAN, filter, near, search, search_memory, slots_in, wanted};
         let Some(heap) = self
             .heaps
             .iter()
@@ -95,9 +95,7 @@ impl State {
             hits.push(format!("table{root} at slot {t} reaches found slot {s} at +{}", s - t));
         }
         let wanted = wanted(heap.start, &slots, &tables);
-        let key = tables.iter().fold(0u64, |k, &(r, t)| {
-            k.rotate_left(7) ^ (u64::from(r) << 32 | u64::from(t))
-        });
+        let filter = filter(heap.start, &slots);
         for (i, r) in roots.iter().enumerate() {
             match r {
                 Root::Constants(c) => {
@@ -106,7 +104,7 @@ impl State {
                     }
                 }
                 &Root::View(a) => {
-                    if let Some((at, v, what)) = search_memory(a, MOST_SCAN, key, &wanted) {
+                    if let Some((at, v, what)) = search_memory(a, MOST_SCAN, &filter, &wanted) {
                         hits.push(format!("ref root{i} view at {a:#x} dword {at} = {v:#x} ({what})"));
                     }
                 }
@@ -126,7 +124,7 @@ impl State {
                 else {
                     continue;
                 };
-                if let Some((at, v, what)) = search_memory(start, len, key, &wanted) {
+                if let Some((at, v, what)) = search_memory(start, len, &filter, &wanted) {
                     hits.push(format!(
                         "ref {} {:?} s{}+{} buffer {start:#x}+{len:#x} dword {at} = {v:#x} ({what})",
                         stage.shader.stage, u.kind, u.slot, u.table_offset_dwords
@@ -136,12 +134,16 @@ impl State {
         }
     }
 
-    /// (round 8) Whether the bind is a draw of the scene colour or a UI
-    /// in the frames after a Bink write, not into the target followed.
-    fn heap_find_scene_or_ui(&self, compute: bool, spans: &[(u64, u64)]) -> bool {
+    /// (round 9) Whether the bind is searched in the frames after a Bink
+    /// write: a dispatch, or a draw whose rt0 is not the target followed
+    /// and not tiny (`crate::heap_find::searched_target`).
+    fn heap_find_searched(&self, compute: bool, spans: &[(u64, u64)]) -> bool {
         use crate::resource::find_facts::{object_size, object_span};
-        if compute || !crate::heap_find::after_write() {
+        if !crate::heap_find::after_write() {
             return false;
+        }
+        if compute {
+            return true;
         }
         let Some(&rt0) = self.targets.first() else {
             return false;
@@ -151,7 +153,7 @@ impl State {
             return false;
         };
         !crate::heap_find::meets(spans, start, len)
-            && object_size(rt0).is_some_and(|(w, h)| crate::heap_find::scene_or_ui(w, h))
+            && object_size(rt0).is_some_and(|(w, h)| crate::heap_find::searched_target(w, h))
     }
 
     /// (round 8, `VICTORY_HEAP_FIND_REFS`) A draw or dispatch that was not
@@ -171,6 +173,7 @@ impl State {
         } else {
             &self.graphics
         };
+        crate::heap_find::refs_dropped();
         let mut hits = Vec::new();
         self.heap_find_refs(None, roots, &mut hits);
         if hits.is_empty() {
@@ -261,11 +264,13 @@ impl State {
                 ));
             }
         }
-        if crate::heap_find::refs()
-            && (crate::heap_find::refs_all() || self.heap_find_scene_or_ui(compute, &spans))
-        {
-            crate::heap_find::refs_bind();
-            self.heap_find_refs(Some(p), roots, &mut hits);
+        if crate::heap_find::refs() {
+            if crate::heap_find::refs_all() || self.heap_find_searched(compute, &spans) {
+                crate::heap_find::refs_bind();
+                self.heap_find_refs(Some(p), roots, &mut hits);
+            } else if crate::heap_find::after_write() {
+                crate::heap_find::refs_passed_over();
+            }
         }
         if hits.is_empty() {
             return;
