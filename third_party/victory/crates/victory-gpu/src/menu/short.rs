@@ -24,6 +24,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BAKE_REPLAY", "Redraws an incomplete face or skin bake once all its textures are current."),
     ("VICTORY_BAKE_ROOM", "Lets a bake's own texture go on the card past the room limit."),
     ("VICTORY_BAKE_SPREAD", "Bake passes make only their own textures; the rest go to helper threads."),
+    ("VICTORY_BAKE_SPREAD_FRAME", "A frame's spread bake passes share one time cap in the world."),
     ("VICTORY_BAKE_STAGE_ALL", "While loading, bake passes prepare all their textures on helper threads."),
     ("VICTORY_BAKE_WAIT_MS", "How long a bake waits for its textures to be mapped, in ms."),
     ("VICTORY_BAKE_WATCH", "Logs per-frame counts of bake draws and related events."),
