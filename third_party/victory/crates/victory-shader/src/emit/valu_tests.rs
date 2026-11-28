@@ -2050,6 +2050,16 @@ fn half_places_are_the_descriptors_the_program_loads() {
     fixed.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     fixed.push(S_ENDPGM);
     assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    // `VICTORY_HALF_VIEWS_OFF=1`: the d16 accesses take the float path, no
+    // view named; `=loads` keeps the d16 views.
+    use super::lower::halves::{HalfViewsOff, TEST_HALF_VIEWS_OFF};
+    TEST_HALF_VIEWS_OFF.set(Some(HalfViewsOff::All));
+    let off = lowered(&fixed);
+    assert!(off.half_views.is_empty());
+    TEST_HALF_VIEWS_OFF.set(Some(HalfViewsOff::Loads));
+    assert_eq!(lowered(&fixed).half_views, [(1, 8), (1, 16)]);
+    TEST_HALF_VIEWS_OFF.set(None);
+    assert_ne!(off.dxil, lowered(&fixed).dxil);
     // The load's offset in s20, from the first lane's thread index
     // (`v_readfirstlane_b32 s20, v0`): picked at run time. The pick may land
     // on the store's place too, so no place of that table is named: the d16
@@ -2170,6 +2180,15 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
     let as_halves = lowered(&[&load[..], &[half]].concat());
     assert_eq!(as_halves.half_views, [(1, 0)]);
+    // `VICTORY_HALF_VIEWS_OFF=1` or `=loads`: a float load, as before, no view.
+    use super::lower::halves::{HalfViewsOff, TEST_HALF_VIEWS_OFF};
+    for off in [HalfViewsOff::All, HalfViewsOff::Loads] {
+        TEST_HALF_VIEWS_OFF.set(Some(off));
+        let floats = lowered(&[&load[..], &[half]].concat());
+        TEST_HALF_VIEWS_OFF.set(None);
+        assert!(floats.half_views.is_empty(), "{off:?}");
+        assert_ne!(floats.dxil, as_halves.dxil, "{off:?}");
+    }
     let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
     assert!(as_float.half_views.is_empty());
     // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.
@@ -3010,6 +3029,31 @@ fn normalized_buffer_fields_load_the_nearest_float() {
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             let want = normalized_reference(a, bits, signed);
             assert_eq!(got, want, "{backend}: format {format} code {a:#x} = {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+/// `VICTORY_F16_ROUND_MODE=1`: `v_cvt_f16_f32` rounds as MODE's 16/64-bit field says.
+/// 1 + 3/4 of an f16 step is 0x3C01 to nearest, 0x3C00 toward zero; after
+/// `s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3` (as the title sets it) toward zero, on
+/// every host, where the host's own conversion rounds to nearest (WARP) or toward zero
+/// (NVIDIA) whatever the mode.
+#[test]
+fn f16_results_round_as_the_mode_says() {
+    // v_cvt_f16_f32 v0, v1 (v0 = 0 on entry: the high half stays 0).
+    let cvt = vop1(0x0A, 0, vgpr(1));
+    // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), lit(value)
+    let setreg = |value: u32| [0xBA80_0881u32, value];
+    let x = 1.0f32 + 0.75 / 1024.0;
+    let cases = [[x.to_bits(), 0, 0, 0]];
+    super::lower::f16_round::FORCED.set(true);
+    let nearest = build_valu_cs(&[cvt]);
+    let zero = build_valu_cs(&[&setreg(3)[..], &[cvt]].concat());
+    let back = build_valu_cs(&[&setreg(3)[..], &setreg(0)[..], &[cvt]].concat());
+    super::lower::f16_round::FORCED.set(false);
+    for (name, shader, want) in [("nearest", &nearest, 0x3C01), ("zero", &zero, 0x3C00), ("back", &back, 0x3C01)] {
+        run_cases(shader, &cases, |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {name}");
         });
     }
 }

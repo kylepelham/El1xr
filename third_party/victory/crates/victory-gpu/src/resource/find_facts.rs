@@ -41,6 +41,23 @@ pub(crate) fn object_size(this: This) -> Option<(u64, u64)> {
     })
 }
 
+/// (`VICTORY_FLICKER_CATCH_REGION`) Title resource `this`'s memory,
+/// width, height, format and dimension.
+pub(crate) fn object_brief(this: This) -> Option<(u64, u64, u32, u32, u32)> {
+    (!this.is_null()).then(|| {
+        let r = resource(this);
+        let d = &r.desc;
+        (r.data() as u64, d.width, d.height, d.format, d.dimension)
+    })
+}
+
+/// (`VICTORY_FLICKER_CATCH_REGION`) The width, height, format and
+/// dimension in resource description `words`.
+pub(crate) fn words_brief(words: &[u32; 14]) -> (u64, u32, u32, u32) {
+    let d = desc_of(words);
+    (d.width, d.height, d.format, d.dimension)
+}
+
 /// The width of title resource `this`.
 pub(crate) fn object_width(this: This) -> Option<u64> {
     (!this.is_null()).then(|| resource(this).desc.width)

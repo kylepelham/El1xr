@@ -1160,7 +1160,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
-            crate::texture::host_written(dst);
+            crate::texture::host_written_in(dst, None, std::ptr::from_ref(list) as usize);
             if crate::bake_check::on() {
                 crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
             }
@@ -1370,7 +1370,11 @@ extern "system" fn copy_texture_region(
         if !same {
             crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         }
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written_in(
+            dst.resource,
+            (dst.kind != FOOTPRINT).then_some(dst.footprint.offset as u32),
+            std::ptr::from_ref(list) as usize,
+        );
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst.resource as usize, "copy", src.resource as usize);
         }
@@ -1553,7 +1557,7 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written_in(dst, Some(dst_sub), std::ptr::from_ref(list) as usize);
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
         }

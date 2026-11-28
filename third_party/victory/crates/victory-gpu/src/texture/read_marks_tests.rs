@@ -94,6 +94,123 @@ fn a_texture_the_host_wrote_is_marked_and_not_uploaded() {
     release(t);
 }
 
+/// (`VICTORY_CARD_MIPS_TRACK`, live) A texture the card wrote one mip of
+/// is still uploaded from title memory with the switch on (its other mip),
+/// not with it off; one the card wrote whole is not, either way. (The
+/// switch's live test too: one test sets it, so no other races it.)
+#[test]
+fn a_texture_the_card_wrote_one_mip_of_is_uploaded_with_the_switch() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    if std::env::var_os("VICTORY_CARD_MIPS_TRACK").is_some() {
+        return;
+    }
+    victory_core::settings::check_live(
+        "VICTORY_CARD_MIPS_TRACK",
+        "1",
+        super::card_mips::on,
+        false,
+        true,
+    );
+    let mut words = RGBA8_64;
+    words[7] = 1 | 2 << 16;
+    let i = ID3D12Resource::IID;
+    let iid = guid(i.data1, i.data2, i.data3, i.data4);
+    let mut t = std::ptr::null();
+    let made = crate::resource::create_at_address(
+        std::ptr::null(),
+        title_memory(1 << 16),
+        words.as_ptr().cast(),
+        0,
+        std::ptr::null(),
+        &iid,
+        &mut t,
+    );
+    assert_eq!(made, S_OK);
+    let texture = crate::resource::host_resource(t).unwrap();
+    assert_eq!(super::subresources(texture), 2);
+    super::host_written_sub(t, Some(1));
+    let read = |on: &str| {
+        victory_core::settings::set("VICTORY_CARD_MIPS_TRACK", on).unwrap();
+        let list = host.new_list().unwrap();
+        super::upload(&list, t, texture);
+        let read = !list.first_use(t as usize);
+        list.close();
+        victory_core::settings::set("VICTORY_CARD_MIPS_TRACK", "").unwrap();
+        read
+    };
+    assert!(!read(""), "off: the card's for good, as before");
+    assert!(read("1"), "on: mip 0 is the title's");
+    super::host_written(t);
+    assert!(!read("1"), "a whole write: the card's");
+    release(t);
+}
+
+/// (`VICTORY_PRELUDE_OWN_COPY`, live) The upload of a texture's title memory
+/// that a list records ahead of its own first copy into one mip (as
+/// `list.rs`'s copy over title memory does) is not left out by the recheck
+/// with the switch on, so the mip the copy does not write gets title memory;
+/// one another list wrote after the read still is; with the switch off both
+/// are, as before. (The switch's live test too: one test sets it.)
+#[test]
+fn a_lists_own_copy_does_not_leave_its_upload_out_with_the_switch() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    if std::env::var_os("VICTORY_PRELUDE_OWN_COPY").is_some() {
+        return;
+    }
+    victory_core::settings::check_live(
+        "VICTORY_PRELUDE_OWN_COPY",
+        "1",
+        super::own_copy::on,
+        false,
+        true,
+    );
+    let left_out = |on: &str, other: bool| {
+        let mut words = RGBA8_64;
+        words[7] = 1 | 2 << 16;
+        let i = ID3D12Resource::IID;
+        let iid = guid(i.data1, i.data2, i.data3, i.data4);
+        let mut t = std::ptr::null();
+        let made = crate::resource::create_at_address(
+            std::ptr::null(),
+            title_memory(1 << 16),
+            words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut t,
+        );
+        assert_eq!(made, S_OK);
+        let texture = crate::resource::host_resource(t).unwrap();
+        victory_core::settings::set("VICTORY_PRELUDE_OWN_COPY", on).unwrap();
+        let list = host.new_list().unwrap();
+        super::upload(&list, t, texture);
+        let id = std::ptr::from_ref(&list) as usize;
+        super::host_written_in(t, Some(0), id);
+        if other {
+            super::host_written_in(t, Some(0), id ^ 0x10);
+        }
+        let uploads = list.deferred_textures();
+        assert_eq!(uploads.len(), 1, "the upload ahead of the copy");
+        let out = uploads[0].left_out_for_host_write();
+        assert_eq!(
+            uploads[0].copy.uploaded_from.load(std::sync::atomic::Ordering::Acquire),
+            u32::MAX,
+            "never filled before: left out, the other mip stays empty"
+        );
+        list.close();
+        victory_core::settings::set("VICTORY_PRELUDE_OWN_COPY", "").unwrap();
+        release(t);
+        out
+    };
+    assert!(left_out("", false), "off: the list's own copy leaves it out, as before");
+    assert!(!left_out("1", false), "on: the list's own copy does not");
+    assert!(left_out("1", true), "on: another list's write still does");
+}
+
 /// A placed texture's kept "no target at its memory" answer does not hide
 /// a render target made there later, nor one gone after it.
 #[test]
