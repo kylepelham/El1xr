@@ -287,6 +287,14 @@ pub fn warm(threads: usize) -> std::io::Result<Warmed> {
     let bytes = std::fs::read(dir.join(FILE))?;
     let book = Book::decode(&bytes)
         .ok_or_else(|| std::io::Error::other("the recipes file does not read"))?;
+    let [graphics, leftovers, duplicates, _] = duplicates_in(&book);
+    tracing::info!(
+        graphics,
+        with_leftovers = leftovers,
+        same_pipeline_other_key = duplicates,
+        canonical = super::pso_canon::on(),
+        "pipeline keys of the recipes: ignored state and duplicate keys (VICTORY_PSO_CANON)"
+    );
     let before = [super::library::MADE.load(Relaxed), super::library::LOADED.load(Relaxed)];
     let next = AtomicUsize::new(0);
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -341,9 +349,34 @@ pub fn warm(threads: usize) -> std::io::Result<Warmed> {
     })
 }
 
+/// (bootfast) Of the graphics recipes in a recipes file's `bytes`: how
+/// many, how many hold ignored state off its defaults, how many are the
+/// same pipeline as an earlier recipe under another key, and how many
+/// states did not read (`pso_canon::recipe_duplicates`; `None`: not a
+/// recipes file). `warm` logs them.
+#[cfg(test)]
+fn duplicates(bytes: &[u8]) -> Option<[usize; 4]> {
+    Some(duplicates_in(&Book::decode(bytes)?))
+}
+
+fn duplicates_in(book: &Book) -> [usize; 4] {
+    super::pso_canon::recipe_duplicates(
+        book.recipes
+            .iter()
+            .filter_map(|r| r.graphics.as_deref().map(|g| (&r.stages[..], g))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_book_of_plain_states_has_no_duplicates() {
+        assert_eq!(duplicates(&book().encode()), Some([1, 0, 0, 0]));
+        assert_eq!(duplicates(b"VPRECIP0"), None);
+    }
+
 
     fn book() -> Book {
         let mut b = Book::default();

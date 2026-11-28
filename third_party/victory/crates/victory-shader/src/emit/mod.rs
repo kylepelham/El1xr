@@ -113,7 +113,9 @@ mod ray_query_warp_tests;
 mod rect;
 mod sampler;
 mod shader;
+mod sync_full;
 mod threading;
+mod underwater;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -194,7 +196,16 @@ pub fn loop_limit() -> u32 {
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
+///
+/// A program `VICTORY_GROUP_SYNC_FULL` names takes `2` unless the switch is `0`
+/// ([`sync_full`]).
 pub fn group_sync() -> u8 {
+    let mode = group_sync_setting();
+    if mode != 0 && sync_full::here() { 2 } else { mode }
+}
+
+/// `VICTORY_GROUP_SYNC`'s value ([`group_sync`]).
+fn group_sync_setting() -> u8 {
     #[cfg(test)]
     if let Some(mode) = TEST_GROUP_SYNC.get() {
         return mode;
@@ -448,6 +459,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    sync_full::with_container(c, || emit_listed(c, native, p, st, io, res))
+}
+
+/// [`emit`] inside the program's [`sync_full`] scope.
+fn emit_listed(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     let r = emit_any(c, native, p, st, io, res);
     if r.is_ok() && !permutes_outside_sections(p) {
         return r;
@@ -509,7 +532,8 @@ fn permutes_outside_sections(p: &ir::Program) -> bool {
     })
 }
 
-/// [`emit`] of `p` as it is.
+/// [`emit`] of `p` as it is; with `VICTORY_LANE_MASK_WIDE=1`, split per lane once more where
+/// the branches it takes wave-wide keep every form from the host ([`crate::lane_split`]).
 fn emit_any(
     c: &Container,
     native: &NativeProgram,
@@ -518,6 +542,34 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let first = emit_any_once(c, native, p, st, io, res);
+    crate::lane_split::again(first, st.wide.len(), lower::host_max_wave(), || {
+        let per_lane = || {
+            let st = structure::structure(p)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            emit_any_once(c, native, p, &st, io, &res)
+        };
+        // (killed lanes leaving at the kill, as the callers try next: `translate --list` builds
+        // that structure outside this call)
+        match per_lane() {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+                structure::without_live_quads(per_lane)
+            }
+            other => other,
+        }
+    })
+    .map(|(shader, _)| shader)
+}
+
+/// [`emit_any`] in the structure `st` gives, with the wave size the result requires of the host.
+fn emit_any_once(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // A program `with_wave_pairs_vt` names: the paired form with Vice-Tay #208's rules first,
     // the other forms as before if it refuses the program.
     if WAVE_PAIRS_VT_HERE.get()
@@ -531,7 +583,7 @@ fn emit_any(
         match tried {
             Ok((shader, Some(32))) => {
                 WAVE_PAIRS_VT_TOOK.set(Some(Ok(())));
-                return Ok(shader);
+                return Ok((shader, Some(32)));
             }
             Ok(_) => WAVE_PAIRS_VT_TOOK.set(Some(Err("a wave size other than 32"))),
             Err(ShaderError::Unsupported { what, .. }) => WAVE_PAIRS_VT_TOOK.set(Some(Err(what))),
@@ -560,11 +612,11 @@ fn emit_any(
                 Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
             }
         }
-        if let Ok((shader, _)) = again {
+        if let Ok(shader) = again {
             return Ok(shader);
         }
     }
-    r.map(|(shader, _)| shader)
+    r
 }
 
 /// Whether console wave64 compute programs may take the paired form ([`paired`]):
@@ -799,7 +851,12 @@ fn emit_forms(
         // One logical wave per group, with a wave32 PSO on RTX. The particle
         // light-atlas shaders that reset the card are not in this list.
         // Explicit policy wins.
-        let scene_kernel = is_scene_kernel(&native.io, c.digest);
+        let threads = match &native.io {
+            crate::native::StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+            _ => None,
+        };
+        let scene_kernel =
+            is_scene_kernel(&native.io, c.digest) || underwater::listed(threads, c.digest);
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
@@ -1325,7 +1382,7 @@ fn emit_program(
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let first = emit_program_plain(c, native, p, st, io, res);
-    loops_wave::again(first, native, p, st, |st, res| {
+    loops_wave::again(first, native, p, st, c.digest, |st, res| {
         emit_program_plain(c, native, p, st, io, res)
     })
 }

@@ -55,7 +55,7 @@ impl Work for Fake {
         self.signalled = true;
         match self.outcome {
             Outcome::PanicAfterSignal => panic!("after the signal"),
-            Outcome::Error(tag) => Err(tag.to_string()),
+            Outcome::Error(tag) => Err(format!("a submission sent ahead could not be followed by a signal ({tag})")),
             _ => Ok(()),
         }
     }
@@ -240,7 +240,7 @@ fn a_job_signals_its_fence_from_the_thread_on_a_card() {
     // SAFETY: the card runs what follows only once the gate opens.
     unsafe { host.queue.Wait(&gate, 1).unwrap() };
     let fence = 1u64 << 41;
-    let job = Job { host, lists: vec![list.list.cast().ok()], apart: None, fence, signalled: false };
+    let job = Job { host, card: None, lists: vec![list.list.cast().ok()], apart: None, fence, signalled: false };
     assert!(s.hand_over(job).is_ok());
     s.wait_idle();
     // SAFETY: plain queries and our gate.
@@ -251,4 +251,112 @@ fn a_job_signals_its_fence_from_the_thread_on_a_card() {
     host.wait_fence(fence);
     // SAFETY: a plain query.
     assert!(unsafe { host.fence.GetCompletedValue() } >= fence);
+}
+
+/// (`VICTORY_CARD_RECORD_SEND`) A job records its card lists before it
+/// sends; a recording that fails sends nothing, signals alone and gives its
+/// failure back as it is.
+#[test]
+fn a_job_records_before_it_sends_and_a_failed_recording_only_signals() {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let note = |what: &'static str| seen.borrow_mut().push(what);
+    let ran = steps(
+        || {
+            note("record");
+            Ok(())
+        },
+        || {
+            note("lists, signal");
+            Ok(())
+        },
+        || note("signal alone"),
+    );
+    assert_eq!(ran, Ok(()));
+    assert_eq!(seen.take(), ["record", "lists, signal"]);
+    let ran = steps(
+        || {
+            note("record");
+            Err("could-not-record-tag".to_string())
+        },
+        || {
+            note("lists, signal");
+            Ok(())
+        },
+        || note("signal alone"),
+    );
+    assert_eq!(ran, Err("could-not-record-tag".to_string()));
+    assert_eq!(seen.take(), ["record", "signal alone"]);
+    let ran = steps(|| Ok(()), || Err("signal-refused".to_string()), || note("signal alone"));
+    assert_eq!(ran, Err("signal-refused".to_string()));
+    assert!(seen.take().is_empty(), "a failed send is not signalled again");
+}
+
+#[test]
+fn the_card_record_switch_is_live_and_off_by_default() {
+    use super::super::card_rec;
+    if std::env::var_os("VICTORY_CARD_RECORD_SEND").is_some() {
+        return;
+    }
+    assert!(!card_rec::on(), "off by default");
+    victory_core::settings::set("VICTORY_CARD_RECORD_SEND", "1").unwrap();
+    let now = card_rec::on();
+    victory_core::settings::set("VICTORY_CARD_RECORD_SEND", "").unwrap();
+    assert!(now, "a change takes effect while running");
+    assert!(!card_rec::on());
+}
+
+/// On a card (WARP), `VICTORY_CARD_RECORD_SEND`: a sync list put among the
+/// job's lists unrecorded is recorded by the thread before it sends, and the
+/// card writes the same bytes as when the submitting thread records it first
+/// (`record_here`): the bytes each upload copies, nothing else.
+#[test]
+fn a_card_list_recorded_on_the_thread_writes_the_same_bytes() {
+    use super::super::card_rec::SyncRec;
+    use windows::core::Interface;
+    const BYTES: usize = 64 << 10;
+    let Some(host) = Host::new_warp() else { return };
+    let host: &'static Host = Box::leak(Box::new(host));
+    let s: &'static Sender<Job> = Box::leak(Box::new(Sender::new("victory-send-test-rec")));
+    let Ok(work) = host.make_card_work() else { return };
+    let Some((src, src_data)) = host.shared_buffer(BYTES as u64) else { return };
+    // SAFETY: the mapping of `src`, `BYTES` long; nothing on the card uses it yet.
+    let src_bytes = unsafe { std::slice::from_raw_parts_mut(src_data, BYTES) };
+    for (i, b) in src_bytes.iter_mut().enumerate() {
+        *b = (i * 7 + 3) as u8;
+    }
+    let parts = [(0x100usize, 0x2300usize, 0x40u64), (0x8000, 0x8004, 0x10), (0xfff0, 0x10000, 0x0)];
+    let mut want = vec![0u8; BYTES];
+    for &(a, b, at) in &parts {
+        want[a..b].copy_from_slice(&src_bytes[at as usize..at as usize + (b - a)]);
+    }
+    for (k, on_thread) in [false, true].into_iter().enumerate() {
+        let Some((dst, dst_data)) = host.shared_buffer(BYTES as u64) else { return };
+        // SAFETY: the mapping of `dst`, `BYTES` long; nothing on the card uses it yet.
+        unsafe { std::ptr::write_bytes(dst_data, 0, BYTES) };
+        let rec = SyncRec {
+            items: Vec::new(),
+            uploads: vec![(dst.clone(), parts.iter().map(|&(a, b, at)| (a, b, src.clone(), at)).collect())],
+            patch: None,
+            root: work.root.clone(),
+            pso: work.pso.clone(),
+            differs: work.differs.0.clone(),
+            join: false,
+        };
+        let Some(prelude) = host.make_prelude() else { return };
+        let mut card = Some(Pending { sync: Some((rec, prelude.clone())), check: None });
+        if !on_thread {
+            record_here(&mut card);
+        }
+        assert_eq!(card.is_some(), on_thread);
+        let fence = (1u64 << 42) + k as u64;
+        let job = Job { host, card, lists: vec![prelude.1.cast().ok()], apart: None, fence, signalled: false };
+        assert!(s.hand_over(job).is_ok());
+        s.wait_idle();
+        host.wait_fence(fence);
+        // SAFETY: the card is done with `dst` (its fence completed).
+        let got = unsafe { std::slice::from_raw_parts(dst_data, BYTES) };
+        assert!(got == want.as_slice(), "recorded on the thread: {on_thread}");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }

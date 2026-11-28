@@ -1,11 +1,12 @@
 //! (El1xr) The menu's window: a layered, topmost tool window over the game window's client area,
 //! on a thread of its own. Hidden while the menu is closed; open, it takes the mouse over the
-//! panel, and the keys and the pad are polled every 30 ms.
+//! panel, and the keys and the pad are polled every 30 ms. It shows only while a window of the
+//! game's process is in front, selftest or not.
 
 use std::cell::RefCell;
 use std::sync::Once;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -24,6 +25,8 @@ use crate::pixels::Bitmap;
 
 const TICK: usize = 1;
 const TICK_MS: u32 = 30;
+/// How long a selftest picture waits for a presented frame before it is skipped.
+const SHOT_WAIT: Duration = Duration::from_secs(5);
 
 const VK_ESCAPE: i32 = 0x1B;
 const VK_RETURN: i32 = 0x0D;
@@ -134,24 +137,48 @@ impl Ctx {
                 keys.extend(KEYS.iter().filter(|(vk, _)| down(*vk)).map(|&(_, k)| k));
             }
         }
-        let mut testing = false;
         if let Some(test) = self.selftest.as_mut() {
             let t = test.tick(now, &mut self.driver, self.spec.blocked.load(Relaxed), front);
             keys.extend(t.keys);
-            testing = t.active;
+            let mut shots = Vec::new();
             for out in t.out {
                 match out {
                     Out::Log(line) => tracing::info!("{line}"),
                     Out::Warn(line) => tracing::warn!("{line}"),
-                    Out::Grab(name) => grab_to(self.game, &name),
+                    Out::Grab(name) => shots.push(name),
                 }
+            }
+            for name in shots {
+                self.shoot(name);
+            }
+            if let Some(name) = crate::menu_shot::lapsed(SHOT_WAIT) {
+                tracing::warn!("menu selftest: {name} skipped: no frame went through the read-back present in {} s", SHOT_WAIT.as_secs());
             }
         }
         let pad = PAD_DOWN.load(Relaxed) | self.spec.pressed.swap(0, Relaxed);
         let wheel = self.spec.wheel.swap(0, Relaxed);
         self.dirty |= self.driver.tick(now, &keys, pad, wheel);
         self.spec.blocked.store(self.driver.blocked(), Relaxed);
-        self.show(front || testing);
+        self.show(front);
+    }
+
+    /// Asks the present for its next frame with the menu, drawn as it is now, laid over it
+    /// ([`crate::menu_shot`]): the game's own pixels only, whatever window is in front.
+    fn shoot(&mut self, name: String) {
+        let mut menu = None;
+        if self.driver.menu.open {
+            let (w, h) = client(self.game).map_or((1920, 1080), |(w, h, _)| (w, h));
+            let l = self.driver.layout(w, h);
+            menu = Painter::for_layout(None, &l)
+                .and_then(|p| p.paint(&l, &self.driver.menu, &*self.driver.model, None))
+                .map(|bm| (bm, (w as usize, h as usize)));
+            if menu.is_none() {
+                tracing::warn!("menu selftest: {name}: the menu could not be drawn, the picture has the game only");
+            }
+        }
+        if let Some(old) = crate::menu_shot::ask(name, menu) {
+            tracing::warn!("menu selftest: {old} skipped: no frame was presented before the next picture");
+        }
     }
 
     /// Draws and places the window when the menu is open and in front, hides it otherwise.
@@ -276,85 +303,6 @@ unsafe fn present(window: HWND, bm: &Bitmap, at: POINT) {
         }
         DeleteDC(dc);
         ReleaseDC(std::ptr::null_mut(), screen);
-    }
-}
-
-/// Runs `f` with this thread per-monitor DPI aware: screen and window coordinates in pixels,
-/// whatever the process's own awareness.
-fn in_pixels<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: the thread's awareness, set back after.
-    unsafe {
-        let old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let out = f();
-        if !old.is_null() {
-            SetThreadDpiAwarenessContext(old);
-        }
-        out
-    }
-}
-
-/// The screen over the game window's client area as it is seen (the game with the layered
-/// windows over it), as RGB rows in pixels.
-fn grab(game: HWND) -> Option<(usize, usize, Vec<u8>)> {
-    in_pixels(|| {
-        let (w, h, at) = client(game)?;
-        // SAFETY: a screen DC copied into a bitmap of ours, read back as 32-bit top-down rows, all
-        // freed before returning.
-        unsafe {
-            let screen = GetDC(std::ptr::null_mut());
-            let dc = CreateCompatibleDC(screen);
-            let bitmap = CreateCompatibleBitmap(screen, w, h);
-            let old = SelectObject(dc, bitmap);
-            let copied = BitBlt(dc, 0, 0, w, h, screen, at.x, at.y, SRCCOPY | CAPTUREBLT) != 0;
-            SelectObject(dc, old);
-            let mut info = std::mem::zeroed::<BITMAPINFO>();
-            info.bmiHeader = BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                ..std::mem::zeroed()
-            };
-            let mut bgra = vec![0u8; w as usize * h as usize * 4];
-            let rows = if copied {
-                GetDIBits(dc, bitmap, 0, h as u32, bgra.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS)
-            } else {
-                0
-            };
-            DeleteObject(bitmap);
-            DeleteDC(dc);
-            ReleaseDC(std::ptr::null_mut(), screen);
-            (rows == h).then(|| {
-                let rgb = bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
-                (w as usize, h as usize, rgb)
-            })
-        }
-    })
-}
-
-/// Grabs the screen over the game window and writes it as `name` into `VICTORY_SNAP_DIR`
-/// (default `snaps`), off this thread.
-fn grab_to(game: HWND, name: &str) {
-    let Some((w, h, rgb)) = grab(game) else {
-        tracing::warn!("menu selftest: {name}: the screen over the game window could not be grabbed");
-        return;
-    };
-    let dir = std::env::var_os("VICTORY_SNAP_DIR")
-        .map_or_else(|| std::path::PathBuf::from("snaps"), std::path::PathBuf::from);
-    let path = dir.join(name);
-    let spawned = std::thread::Builder::new()
-        .name("victory-menu-grab".into())
-        .spawn(move || {
-            let png = crate::screenshot::encode_png(w as u32, h as u32, &rgb);
-            match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, png)) {
-                Ok(()) => tracing::info!("menu selftest: wrote {} ({w}x{h}, screen over the game window)", path.display()),
-                Err(e) => tracing::warn!("menu selftest: {} not written: {e}", path.display()),
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "menu selftest: grab writer not started");
     }
 }
 
@@ -592,40 +540,6 @@ mod tests {
         assert_eq!(awareness, DPI_AWARENESS_PER_MONITOR_AWARE);
         assert!(dpi >= 96, "{dpi}");
         assert!(same);
-        assert_eq!(in_pixels(|| 7), 7);
-    }
-
-    /// The grab sees layered windows (the menu) over what is under them, at their place on the
-    /// screen. Shows a small window for a moment, so it runs only on request.
-    #[test]
-    #[ignore = "shows a window on the real screen and grabs it"]
-    fn grab_sees_a_layered_window_on_screen() {
-        // SAFETY: a layered window of this test, destroyed at the end.
-        unsafe {
-            let class = wide("STATIC");
-            let w = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, class.as_ptr(), class.as_ptr(),
-                WS_POPUP, 0, 0, 64, 64, std::ptr::null_mut(), std::ptr::null_mut(), GetModuleHandleW(std::ptr::null()),
-                std::ptr::null(),
-            );
-            assert!(!w.is_null());
-            let mut bm = Bitmap::new(64, 64);
-            for y in 0..64 {
-                for x in 0..64 {
-                    bm.over(x, y, [250, 20, 200], 255);
-                }
-            }
-            present(w, &bm, POINT { x: 40, y: 40 });
-            SetWindowPos(w, HWND_TOPMOST, 40, 40, 64, 64, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let (gw, gh, rgb) = grab(GetDesktopWindow()).expect("grab");
-            DestroyWindow(w);
-            assert!(gw > 104 && gh > 104);
-            // Night light or a colour profile may shift the colour a little.
-            let at = (72 * gw + 72) * 3;
-            let near = rgb[at..at + 3].iter().zip([250u8, 20, 200]).all(|(&a, b)| a.abs_diff(b) <= 40);
-            assert!(near, "{:?}", &rgb[at..at + 3]);
-        }
     }
 
     #[test]

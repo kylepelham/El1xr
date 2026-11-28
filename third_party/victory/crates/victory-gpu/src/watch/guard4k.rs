@@ -30,8 +30,9 @@ static OPEN: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
     [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
 
 /// Since the last line: pages opened alone, blocks closed noted at their pages alone, blocks
-/// closed and written whole too, pages that could not be made read-only again.
-static COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// closed and written whole too, pages that could not be made read-only again; with
+/// [`keep_for`], pages left open and noted written, kept pages closed by a probe.
+static COUNTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 fn count(what: usize, n: u64) {
     COUNTS[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -42,16 +43,23 @@ pub(super) fn line(frames: f64) {
     if !on() || frames <= 0.0 {
         return;
     }
-    let [opened, alone, whole, failed] =
-        [0, 1, 2, 3].map(|i| COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let [opened, alone, whole, failed, kept, probed] =
+        [0, 1, 2, 3, 4, 5].map(|i| COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "4 KiB guards per frame (VICTORY_GUARD_4K=1): {opened:.0} pages opened alone; checks noted {alone:.0} blocks \
-         at their 4 KiB pages alone and {whole:.0} written whole too; {failed:.1} pages not made read-only again"
+         at their 4 KiB pages alone and {whole:.0} written whole too; {failed:.1} pages not made read-only again; \
+         {kept:.0} pages left open and noted written, {probed:.0} of them closed to see (VICTORY_GUARD_4K_KEEP={})",
+        keep_for()
     );
 }
 
 const SUBS: u64 = (1 << (BLOCK / KERNEL_PAGE)) - 1;
 const ONLY: u64 = 1 << 62;
+/// With [`keep_for`]: bits 16-31 the pages the last check closed (written in the interval before
+/// it), bits 32-47 the pages it left open, bits 48-55 how many checks in a row left pages open.
+const PREV: u32 = 16;
+const KEPT: u32 = 32;
+const AGE: u32 = 48;
 
 /// `VICTORY_GUARD_4K=1`, with the shared guards and 4 KiB stamps it needs.
 pub(super) fn on() -> bool {
@@ -146,6 +154,9 @@ pub(super) enum Closed {
     Pages { only: bool },
     /// A page could not be made read-only again: the block stays not clean, written whole.
     Failed,
+    /// ([`keep_for`]) As `Pages { only: true }`, but pages written in two intervals in a row are
+    /// left open and noted written: the block stays not clean, so the next check notes them again.
+    Kept,
 }
 
 /// The guard's check of `block` (protected, not clean, its claim held): its open pages made
@@ -155,6 +166,11 @@ pub(super) fn close(block: usize, now: &mut dyn FnMut() -> u64) -> Closed {
         return Closed::None;
     };
     let cell = &part.0[block % super::PART];
+    let most = keep_for();
+    if most > 0 {
+        return close_keeping(cell, block, most, now);
+    }
+    // (Kept pages of a switch turned off since are in `pages` too: closed here with the rest.)
     let taken = cell.swap(0, AcqRel);
     let pages = taken & SUBS;
     if pages == 0 {
@@ -182,6 +198,106 @@ pub(super) fn close(block: usize, now: &mut dyn FnMut() -> u64) -> Closed {
         }
     }
     let only = taken & ONLY != 0;
+    count(if only { 1 } else { 2 }, 1);
+    Closed::Pages { only }
+}
+
+/// (feedcard, #88) `VICTORY_GUARD_4K_KEEP=N` (Live; 0, off, by default): a 4 KiB page written in
+/// two check intervals in a row is left open by the check, and noted written at every check after,
+/// for up to `N` checks; then a probe closes it, and it faults again if still written.
+///
+/// Why: b5g's FLUSH_PROF split put the 4 KiB guards at 533 `VirtualProtect` closes, 4.9 ms a
+/// frame, and the faults that open them again at 474 opens (1.3 ms, plus the exceptions on the
+/// title's own threads): the same pages, written every frame (constants, per-frame data), closed
+/// and opened again every frame. A kept page costs its 4 KiB copy at each refresh instead (well
+/// under a microsecond against about 9 us a close and as much again for the fault).
+///
+/// A write is not missed: a kept page stays noted open, its block is not made clean (so its piece's
+/// next refresh asks, and the walk checks it again), and every check notes it written at its own
+/// asking, after which the copy is taken; a write after the check is noted by the next one. Only a
+/// block whose sole reason not to be clean is its open pages ([`ONLY`]) keeps any; otherwise all
+/// are closed and the block counts written whole, as before. Anything that makes the block
+/// read-only whole again forgets the kept pages with the rest ([`ready`]). Not in the cache key: no
+/// shader or pipeline output.
+static KEEP: victory_core::settings::Live =
+    victory_core::settings::Live::new("VICTORY_GUARD_4K_KEEP", |v| {
+        v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(255)
+    });
+
+pub(super) fn keep_for() -> u64 {
+    #[cfg(test)]
+    if let Some(forced) = KEEP_FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    KEEP.get()
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEEP_FORCED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Which open pages a check keeps open and which it closes: `(keep, close)`. `pages` open now,
+/// `kept` left open by the last check, `prev` closed by it, `age` checks in a row that kept any.
+fn keep_split(pages: u64, kept: u64, prev: u64, age: u64, only: bool, most: u64) -> (u64, u64) {
+    if !only || age + 1 >= most {
+        return (0, pages);
+    }
+    let keep = (kept | (pages & prev)) & pages;
+    (keep, pages & !keep)
+}
+
+/// [`close`] with [`keep_for`] at `most`.
+fn close_keeping(
+    cell: &std::sync::atomic::AtomicU64,
+    block: usize,
+    most: u64,
+    now: &mut dyn FnMut() -> u64,
+) -> Closed {
+    // The claim is held, so no fault changes the cell meanwhile; `not_clean` may take [`ONLY`].
+    let (pages, keep, close, only, probed) = loop {
+        let taken = cell.load(Acquire);
+        let pages = taken & SUBS;
+        if pages == 0 {
+            return Closed::None;
+        }
+        let kept = (taken >> KEPT) & SUBS;
+        let (prev, age, only) = ((taken >> PREV) & SUBS, (taken >> AGE) & 0xff, taken & ONLY != 0);
+        let (keep, close) = keep_split(pages, kept, prev, age, only, most);
+        let new = if keep != 0 {
+            keep | (close << PREV) | (keep << KEPT) | ((age + 1) << AGE) | ONLY
+        } else {
+            close << PREV
+        };
+        if cell.compare_exchange(taken, new, AcqRel, Acquire).is_ok() {
+            break (pages, keep, close, only, kept & close);
+        }
+    };
+    let base = block * BLOCK;
+    for (run, end) in close_runs(close, keep == 0 && join()) {
+        let (from, len) = (base + run * KERNEL_PAGE, (end - run) * KERNEL_PAGE);
+        let t = crate::refresh_prof::start();
+        let done = protect_run(from, len, windows_sys::Win32::System::Memory::PAGE_READONLY);
+        crate::refresh_prof::add(crate::refresh_prof::P::Protect4kCalls, 1);
+        crate::refresh_prof::finish(crate::refresh_prof::P::Protect4kUs, t);
+        if !done {
+            cell.fetch_or(close, AcqRel);
+            count(3, 1);
+            return Closed::Failed;
+        }
+    }
+    let asked = now();
+    for k in 0..BLOCK / KERNEL_PAGE {
+        if pages & (1 << k) != 0 {
+            super::found_set(base + k * KERNEL_PAGE, asked);
+        }
+    }
+    count(4, u64::from(keep.count_ones()));
+    count(5, u64::from(probed.count_ones()));
+    if keep != 0 {
+        count(1, 1);
+        return Closed::Kept;
+    }
     count(if only { 1 } else { 2 }, 1);
     Closed::Pages { only }
 }
@@ -253,6 +369,7 @@ fn protect_run(at: usize, len: usize, flags: u32) -> bool {
 /// The open pages of `block` (bits) and whether [`ONLY`] is set, for tests.
 #[cfg(test)]
 pub(super) fn open_of(block: usize) -> (u64, bool) {
+    // (The kept-page state above the open bits is not part of the answer.)
     part_of(&OPEN, block, false).map_or((0, false), |p| {
         let v = p.0[block % super::PART].load(Acquire);
         (v & SUBS, v & ONLY != 0)
@@ -265,7 +382,7 @@ mod tests {
         BLOCK, KERNEL_PAGE, PAGE, VIEWS, clean_set, guard_shared, install, title_memory_remapped,
         written_in,
     };
-    use super::{FORCED, JOIN_FORCED, close_runs, open_of};
+    use super::{FORCED, JOIN_FORCED, KEEP_FORCED, close_runs, keep_split, open_of};
 
     /// A fresh view of a pagefile section, `bytes` long, taken for title memory.
     fn view(bytes: usize) -> (usize, usize) {
@@ -466,6 +583,119 @@ mod tests {
         JOIN_FORCED.with(|f| f.set(None));
         FORCED.with(|f| f.set(false));
         assert_eq!(seen[0], seen[1], "the same with the switch as without");
+    }
+
+    #[test]
+    fn a_page_is_kept_after_two_intervals_in_a_row_and_probed_after_the_most() {
+        // Opened for the first time: closed.
+        assert_eq!(keep_split(1 << 3, 0, 0, 0, true, 4), (0, 1 << 3));
+        // Written again in the next interval: kept; a page new this interval is closed.
+        assert_eq!(keep_split(1 << 3 | 1 << 5, 0, 1 << 3, 0, true, 4), (1 << 3, 1 << 5));
+        // Kept pages stay kept until the age reaches the most, then all close.
+        assert_eq!(keep_split(1 << 3, 1 << 3, 0, 2, true, 4), (1 << 3, 0));
+        assert_eq!(keep_split(1 << 3, 1 << 3, 0, 3, true, 4), (0, 1 << 3));
+        // Something else made the block not clean: nothing kept.
+        assert_eq!(keep_split(1 << 3, 1 << 3, 1 << 3, 0, false, 4), (0, 1 << 3));
+        // At most 1: every check is a probe, as without the switch.
+        assert_eq!(keep_split(1 << 3, 0, 1 << 3, 0, true, 1), (0, 1 << 3));
+    }
+
+    #[test]
+    fn a_kept_page_is_noted_at_every_check_until_the_probe_closes_it() {
+        const SIZE: usize = 2 * BLOCK;
+        FORCED.with(|f| f.set(true));
+        KEEP_FORCED.with(|f| f.set(Some(3)));
+        install();
+        let (section, at) = view(SIZE);
+        let (first, last) = (at / BLOCK, (at + SIZE) / BLOCK);
+        let b = first + 1;
+        let page = at + BLOCK + 3 * KERNEL_PAGE;
+        check(first, last);
+        check(first, last);
+        // First interval: opened by the fault, closed by the check.
+        // SAFETY: the view, guarded: the handler opens the 4 KiB pages written.
+        unsafe { poke(page) };
+        assert_eq!(check(first, last), Vec::<usize>::new());
+        assert!(!super::super::writable(page), "closed after one interval");
+        // Second interval in a row: kept open, noted, and the block not written whole.
+        // SAFETY: as above.
+        unsafe { poke(page) };
+        let before = stamp(b);
+        assert_eq!(check(first, last), Vec::<usize>::new(), "not written whole");
+        assert!(stamp(b) > before, "noted written");
+        assert!(super::super::writable(page), "left open");
+        assert_eq!(open_of(b), (1 << 3, true), "still noted open");
+        // Written with no fault: the next check notes it again all the same.
+        // SAFETY: open, a plain write.
+        unsafe { poke(page) };
+        let before = stamp(b);
+        assert_eq!(check(first, last), Vec::<usize>::new());
+        assert!(stamp(b) > before, "a kept page is noted at every check");
+        // The third check in a row that would keep it is the probe: closed again.
+        let before = stamp(b);
+        check(first, last);
+        assert!(stamp(b) > before);
+        assert!(!super::super::writable(page), "the probe closes it");
+        // And the next write faults and is seen.
+        // SAFETY: the view, guarded.
+        unsafe { poke(page) };
+        assert_eq!(open_of(b), (1 << 3, true));
+        // Kept again (closed by the probe, written again), then made not clean another way:
+        // closed and written whole, as without the switch.
+        check(first, last);
+        // SAFETY: open (kept), a plain write.
+        unsafe { poke(page) };
+        clean_set(b, false);
+        assert_eq!(check(first, last), vec![b], "written whole");
+        assert!(!super::super::writable(page), "closed with the rest");
+        KEEP_FORCED.with(|f| f.set(None));
+        FORCED.with(|f| f.set(false));
+        drop_view(section, at, SIZE);
+    }
+
+    /// (#88) Sizes `VICTORY_GUARD_4K_KEEP`: 64 guarded blocks with the same five pages each
+    /// written every round (faults on the title's side) and checked (closes on ours), without
+    /// and with the switch. Ignored; `--ignored --nocapture`, release for real numbers.
+    #[test]
+    #[ignore]
+    fn bench_keep_pages_written_every_round() {
+        const BLOCKS: usize = 64;
+        const ROUNDS: usize = 200;
+        FORCED.with(|f| f.set(true));
+        install();
+        for most in [0u64, 8, 0, 8] {
+            KEEP_FORCED.with(|f| f.set(Some(most)));
+            let size = (BLOCKS + 1) * BLOCK;
+            let (section, at) = view(size);
+            let base = at.div_ceil(BLOCK) * BLOCK;
+            let (first, last) = (at / BLOCK, (at + size) / BLOCK);
+            check(first, last);
+            check(first, last);
+            let (mut writing, mut checking) = (0u128, 0u128);
+            for _ in 0..ROUNDS {
+                let t = std::time::Instant::now();
+                for b in 0..BLOCKS {
+                    for k in [1, 2, 5, 9, 15] {
+                        // SAFETY: the view; guarded pages fault and are opened by the handler.
+                        unsafe { poke(base + b * BLOCK + k * KERNEL_PAGE) };
+                    }
+                }
+                writing += t.elapsed().as_nanos();
+                let t = std::time::Instant::now();
+                check(first, last);
+                checking += t.elapsed().as_nanos();
+            }
+            let pages = (BLOCKS * 5 * ROUNDS) as f64;
+            println!(
+                "GUARD_4K_KEEP={most}: writes {:.2} us a page (faults), checks {:.2} us a page, {:.2} ms a round",
+                writing as f64 / 1e3 / pages,
+                checking as f64 / 1e3 / pages,
+                (writing + checking) as f64 / 1e6 / ROUNDS as f64
+            );
+            drop_view(section, at, size);
+        }
+        KEEP_FORCED.with(|f| f.set(None));
+        FORCED.with(|f| f.set(false));
     }
 
     /// (#88) Sizes the switch: `blocks` guarded blocks with five open pages in four runs each,

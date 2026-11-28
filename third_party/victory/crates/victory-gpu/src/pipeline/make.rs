@@ -37,6 +37,7 @@ mod compute_wait;
 #[cfg(windows)]
 mod rescue;
 mod head_map;
+mod scene_said;
 mod screen_wait;
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -265,19 +266,18 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, mut graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(
-            graphics
-                .as_ref()
-                .map(|g| g.describe())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
+        // (bootfast) `VICTORY_PSO_CANON=1`: of its canonical form.
+        let state = graphics
+            .as_deref_mut()
+            .map(|g| super::pso_canon::state(g, &key))
+            .unwrap_or_default();
+        key.update(state.as_bytes());
         let left_out = left_out(&shaders);
         let head_map = head_map::is_head_map(shaders.iter().map(|s| (s.stage, s.hash.as_str())));
         let scene_input = left_out.is_none()
@@ -492,11 +492,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+    let first_use = !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed);
+    if first_use {
         super::library::note_used(&p.key);
         super::eager::first_use(origin(p), p.made.get().is_some());
     }
     let head_map = head_map::first(p);
+    let scene_first = scene_said::first(p, first_use);
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
         screen_wait::front(p);
@@ -511,6 +513,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if let Some(first) = head_map {
         head_map::said(p, first);
+    }
+    if let Some(first) = scene_first {
+        scene_said::said(p, first);
     }
     p.made.get()?.as_ref()
 }
@@ -1119,6 +1124,7 @@ fn drained() {
             "host pipelines all made"
         );
         super::eager::log();
+        super::pso_canon::log();
     }
     save_library_async();
 }

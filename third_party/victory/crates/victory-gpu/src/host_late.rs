@@ -70,6 +70,11 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     lap.mark(P::StaleWalk);
     if late_exact() {
+        // (entryhitch) `VICTORY_STALE_QUICK`: only the copies whose merge can do anything.
+        if crate::shadow::merge_due::on() {
+            crate::shadow::merge_due::keep_due(&mut spans);
+            lap.mark(P::StaleWalk);
+        }
         crate::card_prof::add(P::StaleCopies, spans.len() as u64);
         crate::prep_cut::add(crate::prep_cut::F::StaleCopies, spans.len() as u64);
         // The title's bytes are put in beside the flights' writes; a
