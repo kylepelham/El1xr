@@ -13,7 +13,7 @@
 use std::mem::offset_of;
 
 #[cfg(windows)]
-mod uav_clear;
+pub(crate) mod uav_clear;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
