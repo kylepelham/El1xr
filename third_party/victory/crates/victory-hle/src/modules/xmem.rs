@@ -38,6 +38,8 @@ pub use alias_later::map_aliases_later;
 mod probe;
 mod section_mb;
 mod side_by_side;
+/// `VICTORY_UNMAP_LATER=1`: a call's pure unmaps done by a thread of their own.
+mod unmap_later;
 
 const MIB: usize = 1 << 20;
 
@@ -1122,7 +1124,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // After the page-mapping copies behind the title's calls that map there.
     victory_gpu::alias_later::wait_touching(&[(address as u64, n.saturating_mul(PAGE) as u64)]);
     let _call = Call::begin();
-    let mut physical = physical();
+    let mut physical = physical_timed();
     let pages = (!pages.is_null()).then(|| {
         // SAFETY: the title passes `n` page numbers.
         unsafe { std::slice::from_raw_parts(pages, n) }
@@ -1197,10 +1199,11 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
         }
         return done;
     }
-    unmap(physical, base, n * PAGE);
     let Some(pages) = pages else {
+        unmap_later::unmap_only(physical, base, n * PAGE);
         return true;
     };
+    unmap(physical, base, n * PAGE);
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -1259,7 +1262,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         victory_gpu::alias_later::wait_touching(&at);
     }
     let _call = Call::begin();
-    let mut physical = physical();
+    let mut physical = physical_timed();
     if !scatter_runs() && side_by_side::threads() > 1 {
         return side_by_side::scatter(&mut physical, addresses, want).into();
     }
@@ -1369,6 +1372,9 @@ fn map_scattered(physical: &mut Physical, base: usize, want: &[Option<usize>]) -
             }
             continue;
         }
+        for k in (lo..hi).filter(|&k| want[k].is_none()) {
+            unmap_later::hand_on(physical, base + k * PAGE, PAGE);
+        }
         unmap(physical, start, len);
         let mut k = lo;
         while k < hi {
@@ -1432,7 +1438,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     victory_gpu::priority::stream_thread();
     let _making = probe::Making::begin(probe::Kind::Copy);
     let _call = Call::begin();
-    let mut physical = physical();
+    let mut physical = physical_timed();
     WORK[4].fetch_add((len / PAGE) as u64, std::sync::atomic::Ordering::Relaxed);
     // (Neptune) As in `map_pages`: what is asked for is there already.
     let mode = remap_same();
@@ -1498,6 +1504,10 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         };
         let done = side_by_side::change(&mut physical, to, len, maps, again);
         return done && (from == 0 || slices.len() == len / PAGE);
+    }
+    if from == 0 {
+        unmap_later::unmap_only(&mut physical, to, len);
+        return true;
     }
     unmap(&mut physical, to, len);
     // (Neptune) One view for each run of pages that follow one another in their section, as
@@ -1577,7 +1587,7 @@ pub fn map_alias_constant(to: u64, from: u64, len: u64) -> bool {
     }
     let _making = probe::Making::begin(probe::Kind::Constant);
     let _call = Call::begin();
-    let mut physical = physical();
+    let mut physical = physical_timed();
     WORK[4].fetch_add(pages as u64, Relaxed);
     let Some(source) = physical
         .views
@@ -1764,6 +1774,18 @@ fn work_line() {
         s[4] as f64 / secs,
         w[11] as f64 / 1e3 / secs,
     );
+    let c = [0, 1, 2, 3, 4].map(|i| CALL_SPLIT[i].swap(0, Relaxed));
+    tracing::info!(
+        "title memory remap calls split, a second over {secs:.0} s: the longest call {:.2} ms, {:.1} calls of 1 ms or more; {:.1} ms waiting for the page table, {:.1} ms for the remapping lock (reads in place), {:.1} ms telling the GPU side; {:.0} calls, {:.1} us a call; {}",
+        c[0] as f64 / 1e3,
+        c[1] as f64 / secs,
+        c[2] as f64 / 1e3 / secs,
+        c[3] as f64 / 1e3 / secs,
+        c[4] as f64 / 1e3 / secs,
+        w[5] as f64 / secs,
+        if w[5] == 0 { 0.0 } else { w[6] as f64 / w[5] as f64 },
+        unmap_later::line(secs),
+    );
     if let Some(line) = probe::line(secs) {
         tracing::info!("{line}");
     }
@@ -1792,10 +1814,35 @@ impl Call {
 impl Drop for Call {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let us = self.0.elapsed().as_micros() as u64;
         WORK[5].fetch_add(1, Relaxed);
-        WORK[6].fetch_add(self.0.elapsed().as_micros() as u64, Relaxed);
+        WORK[6].fetch_add(us, Relaxed);
+        CALL_SPLIT[0].fetch_max(us, Relaxed);
+        if us >= 1000 {
+            CALL_SPLIT[1].fetch_add(1, Relaxed);
+        }
         work_line();
     }
+}
+
+/// Where a title call's time goes, since the last line ([`work_line`]): [the longest call
+/// (µs), calls of 1 ms or more, µs waiting for the page table's lock, µs waiting for the
+/// remapping lock (reads of title memory in place under way), µs telling the GPU side].
+static CALL_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`physical`] for a call of the title, the wait counted.
+fn physical_timed() -> MutexGuard<'static, Physical> {
+    let asked = std::time::Instant::now();
+    let held = physical();
+    CALL_SPLIT[2].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    held
+}
+
+/// Runs `tell` (the GPU side told of a change), its time counted.
+fn told_gpu(tell: impl FnOnce()) {
+    let began = std::time::Instant::now();
+    tell();
+    CALL_SPLIT[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// The remapping lock (`victory_gpu::title_memory_remapping_range`) for a
@@ -1805,7 +1852,10 @@ impl Drop for Call {
 #[track_caller]
 fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
     let (lo, hi) = touched(physical, base, len);
-    victory_gpu::title_memory_remapping_range(lo, (hi - lo).max(1))
+    let asked = std::time::Instant::now();
+    let held = victory_gpu::title_memory_remapping_range(lo, (hi - lo).max(1));
+    CALL_SPLIT[3].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    held
 }
 
 /// The addresses a change of `[base, base + len)` touches: those, and the
@@ -1901,6 +1951,8 @@ fn map_view(
     fresh: bool,
 ) -> Result<(), Option<std::io::Error>> {
     let made = std::time::Instant::now();
+    // A view handed on there (`VICTORY_UNMAP_LATER`) is gone first.
+    unmap_later::settle(base, len);
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     // SAFETY: maps the section directly when `[base, base + len)` is already
@@ -1990,16 +2042,18 @@ fn noted(
     slice.section.mark_touched(slice.index, n);
     #[cfg(feature = "diagnostics")]
     let books = std::time::Instant::now();
-    // New contents, read-write: the GPU side's copies no longer guard it
-    // (what `unmap` maps again too: its protection is the view's, anew).
-    victory_gpu::title_memory_remapped(base, len);
-    // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(
-        base,
-        len,
-        slice.section.handle as usize,
-        (slice.index * PAGE) as u64,
-    );
+    told_gpu(|| {
+        // New contents, read-write: the GPU side's copies no longer guard it
+        // (what `unmap` maps again too: its protection is the view's, anew).
+        victory_gpu::title_memory_remapped(base, len);
+        // What the range shows now, for the GPU side's in-place census.
+        victory_gpu::title_memory_view(
+            base,
+            len,
+            slice.section.handle as usize,
+            (slice.index * PAGE) as u64,
+        );
+    });
     if fresh {
         for k in 0..n {
             let shown = physical.shown.entry(slice.key(k)).or_default();
@@ -2105,7 +2159,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         victory_gpu::titlemem::title_range_free(at);
         // Only the unmapped intersection is invalidated here; surviving tails
         // are invalidated in `map_again` when their views are mapped anew.
-        victory_gpu::title_memory_remapped(at + lo, hi - lo);
+        told_gpu(|| victory_gpu::title_memory_remapped(at + lo, hi - lo));
         if at < base || at + size > end {
             SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2373,6 +2427,64 @@ mod tests {
         THREADS.with(|t| t.set(None));
     }
 
+    /// With `VICTORY_UNMAP_LATER=1` (lean on, then off), the tests of maps,
+    /// unmaps, copies and scatters hold as they do with every unmap done in
+    /// the call: the same views, holes, bytes and failures.
+    #[test]
+    fn maps_and_unmaps_with_unmaps_handed_on_are_what_they_were() {
+        unmap_later::FORCE.with(|f| f.set(Some(true)));
+        for lean in [true, false] {
+            FORCE.with(|f| f.set([Some(lean), None]));
+            physical_pages_map_alias_and_unmap();
+            a_scatter_of_many_pages_maps_each_address();
+            mapping_no_pages_changes_nothing();
+            writes_cross_runs_and_allocations();
+            pages_know_where_they_are_shown();
+            pages_say_where_they_are_mapped();
+            a_page_committed_through_one_view_is_committed_in_another();
+            a_view_of_pages_committed_already_is_readable_and_writable();
+            a_scatter_unmaps_a_run_once_and_keeps_pages_independent();
+            map_alias_constant_unmaps_once_and_never_coalesces_placeholders();
+            many_pages_and_a_copy_of_them_side_by_side();
+        }
+        lean_maps_keep_what_pages_hold();
+        a_page_page_by_page_scatter_round_trip();
+        FORCE.with(|f| f.set([None; 2]));
+        unmap_later::FORCE.with(|f| f.set(None));
+    }
+
+    /// Scatters of single pages over a reservation, page 0 unmapping half of
+    /// them, then other pages mapped over the unmapped ones: bytes kept.
+    fn a_page_page_by_page_scatter_round_trip() {
+        let pages = allocate_whole(16);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 16 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        let to: Vec<*mut c_void> = (0..16).map(at).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 16, pages.as_ptr()), 1);
+        for k in 0..16 {
+            // SAFETY: mapped read-write.
+            unsafe { at(k).cast::<u64>().write(k as u64) };
+        }
+        let none: Vec<usize> = (0..16).map(|k| if k % 2 == 0 { 0 } else { pages[k] }).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 16, none.as_ptr()), 1);
+        assert!((0..16).step_by(2).all(|k| shows_nothing(&physical(), at(k) as usize, PAGE)));
+        // The even addresses get the even pages back, one up.
+        let back: Vec<usize> = (0..16).map(|k| if k % 2 == 0 { pages[(k + 2) % 16] } else { pages[k] }).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 16, back.as_ptr()), 1);
+        // SAFETY: mapped read-write.
+        assert!((0..16).all(|k| unsafe { at(k).cast::<u64>().read() } == if k % 2 == 0 { ((k + 2) % 16) as u64 } else { k as u64 }));
+        assert_eq!(XMemMapPhysicalPages(a, 16, std::ptr::null()), a);
+        assert!((0..16).all(|k| query(at(k)).host.State == MEM_RESERVE));
+        assert_eq!(XMemFreePhysicalPages(16, pages.as_ptr()), 1);
+    }
+
+    /// The same, every unmap in the call.
+    #[test]
+    fn a_page_by_page_scatter_round_trip() {
+        a_page_page_by_page_scatter_round_trip();
+    }
+
     /// 96 pages in 2 runs mapped at once, then 3 other runs over the views
     /// (a map must lie in one placeholder, as ever), copied page-mapping-wise
     /// into another range (a view per run), half unmapped by a copy from 0,
@@ -2591,6 +2703,10 @@ mod tests {
     }
 
     pub(super) fn query(address: *const c_void) -> BasicInformation {
+        // Views handed on (`VICTORY_UNMAP_LATER`) are unmapped first.
+        if unmap_later::on() {
+            unmap_later::drain();
+        }
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
         // SAFETY: a pseudo handle needs no closing.
