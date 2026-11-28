@@ -167,12 +167,7 @@ fn entry_for(view: Option<&View>, create_shadow: bool) -> [u32; 4] {
             crate::memory::premap_range(at, len);
         }
     }
-    [
-        at as u32,
-        (at >> 32) as u32,
-        len.min(u64::from(u32::MAX)) as u32,
-        stride,
-    ]
+    entry(view)
 }
 
 /// Writes title slot `index`'s entry (non-creating: upgrades immediately if its shadow exists).
