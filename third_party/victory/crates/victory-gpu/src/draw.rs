@@ -12,6 +12,7 @@
 mod mesh_launch;
 #[cfg(windows)]
 mod camera_tap;
+mod draw_dump;
 mod root_gather;
 mod root_slots;
 mod table_plan;
@@ -2067,6 +2068,9 @@ impl State {
         }
         if crate::camera::on() {
             self.camera_tap(list, p, compute);
+        }
+        if crate::draw_dump::recording() {
+            self.draw_dump(list, p, compute);
         }
         // Textures picked by index, before anything asks for them.
         {

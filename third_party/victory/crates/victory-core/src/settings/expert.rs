@@ -97,6 +97,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_DLSS_MV_SIGN", Apply::Restart),
     ("VICTORY_DLSS_SDK", Apply::Restart),
     ("VICTORY_DRAW_CENSUS", Apply::Restart),
+    ("VICTORY_DRAW_DUMP", Apply::Live),
+    ("VICTORY_DRAW_DUMP_EVERY_MS", Apply::Live),
     ("VICTORY_DSP_CONVOLVE", Apply::Restart),
     ("VICTORY_DSP_GAIN", Apply::Restart),
     ("VICTORY_DSTORAGE_ONE_LOOK", Apply::Restart),

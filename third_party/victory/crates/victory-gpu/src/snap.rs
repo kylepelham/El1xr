@@ -96,6 +96,11 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Seconds since the first present (what snaps are named by); none before it.
+pub(crate) fn seconds() -> Option<f64> {
+    lock(&STATE).start.map(|start| start.elapsed().as_secs_f64())
+}
+
 /// A snap recorded into a present's list, to be written once that list has run.
 pub(crate) struct Pending {
     buffer: Buffer,

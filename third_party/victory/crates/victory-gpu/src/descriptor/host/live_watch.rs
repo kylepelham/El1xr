@@ -193,16 +193,18 @@ static SLOTS: Mutex<Option<HashMap<u32, Slot>>> = Mutex::new(None);
 static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const MOST_LINES: u32 = 400;
 
-/// Share of zero bytes in `[at, at + len)` (up to 4 MiB of it), read
-/// through the kernel (pages not there count as zeros).
-fn zero_share(at: u64, len: u64) -> f64 {
+/// Share of zero bytes in `[at, at + len)` (up to 4 MiB of it) and the
+/// mean byte, read through the kernel (pages not there count as zeros).
+/// The mean tells a black video plane from a lit one, which zeros do not:
+/// black is luma 16 and chroma 128 in video range.
+fn byte_stats(at: u64, len: u64) -> (f64, f64) {
     const CHUNK: usize = 64 << 10;
     let len = len.min(4 << 20) as usize;
     if len == 0 {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let mut read = vec![0u8; CHUNK];
-    let (mut from, mut zeros) = (0usize, 0usize);
+    let (mut from, mut zeros, mut sum) = (0usize, 0usize, 0u64);
     while from < len {
         let bytes = CHUNK.min(len - from);
         read[..bytes].fill(0);
@@ -212,10 +214,19 @@ fn zero_share(at: u64, len: u64) -> f64 {
             bytes,
             false,
         );
-        zeros += read[..bytes].iter().filter(|&&b| b == 0).count();
+        let (z, s) = tally(&read[..bytes]);
+        zeros += z;
+        sum += s;
         from += bytes;
     }
-    zeros as f64 / len as f64
+    (zeros as f64 / len as f64, sum as f64 / len as f64)
+}
+
+/// Zero bytes and the sum of the bytes of `bytes`.
+fn tally(bytes: &[u8]) -> (usize, u64) {
+    bytes
+        .iter()
+        .fold((0, 0), |(z, s), &b| (z + usize::from(b == 0), s + u64::from(b)))
 }
 
 /// With the diagnostic: a look in `frame` found slot `index` (`seen`)
@@ -255,6 +266,7 @@ pub(crate) fn changed(index: u32, seen: &Recheck, frame: u64, card: Option<CardW
     }
     let [width, height, format, levels] = shape.unwrap_or([0; 4]);
     let span = frame.saturating_sub(first).max(1);
+    let (zeros, mean) = byte_stats(seen.at.0, seen.at.1);
     tracing::warn!(
         slot = index,
         address = format_args!("{:#x}", seen.at.0),
@@ -271,7 +283,8 @@ pub(crate) fn changed(index: u32, seen: &Recheck, frame: u64, card: Option<CardW
         left_alone = lefts,
         per_100_frames = format_args!("{:.1}", changes as f64 * 100.0 / span as f64),
         card_wrote = card.map_or_else(|| "none".to_string(), |c| c.to_string()),
-        zero_share = format_args!("{:.3}", zero_share(seen.at.0, seen.at.1)),
+        zero_share = format_args!("{zeros:.3}"),
+        mean_byte = format_args!("{mean:.1}"),
         frame,
         "live textures: a texture picked by index changed after its upload (card_wrote: the card writes that memory, so title memory lacks what it drew)"
     );
@@ -407,6 +420,16 @@ mod tests {
         // The same range again changes nothing.
         note_written(0x7_0000_0000, 0x2_0000);
         assert!(buffer_written(0x7_0000_0000, 1));
+    }
+
+    #[test]
+    fn bytes_are_tallied() {
+        assert_eq!(tally(&[0, 16, 128, 0]), (2, 144));
+        assert_eq!(tally(&[]), (0, 0));
+        let plane = vec![16u8; 4096];
+        let (zeros, mean) = byte_stats(plane.as_ptr() as u64, plane.len() as u64);
+        assert_eq!(zeros, 0.0);
+        assert_eq!(mean, 16.0);
     }
 
     #[test]
