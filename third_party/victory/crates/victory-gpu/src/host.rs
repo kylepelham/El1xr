@@ -4690,11 +4690,13 @@ impl Host {
             |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
                 for (list, textures) in pending.drain(..) {
                     let mut uploads = Vec::new();
+                    let claims = run_split::claims();
                     for upload in textures {
                         if let Some(first_upload) = upload.finish_refresh() {
                             uploads.push((upload, first_upload));
                         }
                     }
+                    drop(claims);
                     firsts.push(lists.len());
                     let _laps = run_split::prelude();
                     if let Some(prelude) = run_wait::prelude(|| list.prelude(&uploads)) {
@@ -5750,7 +5752,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| run_split::made(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
