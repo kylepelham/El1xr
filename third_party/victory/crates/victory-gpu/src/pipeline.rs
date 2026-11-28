@@ -671,7 +671,7 @@ pub(crate) enum Walks {
 }
 
 /// For a program that walks the ray-tracing structures (`RayOnly::Trace`,
-/// `RayOnly::VBuffer`, a known shadow trace): which ([`Walks`]), and the buffer views it reads
+/// `RayOnly::VBuffer`, a known shadow trace or one the automatic splice changed): which ([`Walks`]), and the buffer views it reads
 /// from tables as (root parameter, dword in the table, register) (`crate::rt_bind`).
 /// `None` for any other program.
 #[cfg(windows)]
@@ -681,7 +681,7 @@ pub(crate) fn ray_views(this: This) -> Option<(Walks, Vec<(u8, u32, u32)>)> {
     }
     let p = pipeline(this);
     let shader = p.shaders.iter().find(|s| s.stage == "compute")?;
-    let shadow = victory_shader::emit::shadow_binding(&shader.hash);
+    let shadow = victory_shader::emit::shadow_binding(&shader.hash).or(p.auto_shadow);
     let walks = match (p.rt_only, shadow) {
         _ if shader.hash.starts_with(GLASS_TRACE) => Walks::Glass,
         (_, Some(binding)) => Walks::Shadow(binding),
@@ -953,6 +953,10 @@ struct Pipeline {
     /// [`shadow_idle`].
     #[cfg(windows)]
     shadow_idle: bool,
+    /// How a shadow walk the automatic splice changed is bound
+    /// (`victory_shader::emit::shadow_auto_binding`, [`ray_views`]).
+    #[cfg(windows)]
+    auto_shadow: Option<victory_shader::emit::ShadowBinding>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -1309,6 +1313,11 @@ fn hand_out(
         shadow_idle: crate::shadow_idle::of(
             shaders.iter().filter(|s| s.stage == "compute").map(|s| s.container.as_slice()),
         ),
+        #[cfg(windows)]
+        auto_shadow: shaders
+            .iter()
+            .filter(|s| s.stage == "compute")
+            .find_map(|s| victory_shader::emit::shadow_auto_binding(&s.container)),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
