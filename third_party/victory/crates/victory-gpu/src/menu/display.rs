@@ -1,7 +1,7 @@
 //! (El1xr) The Display tab's resolution rows: the primary monitor's size for
 //! `VICTORY_RESOLUTION=native`, and the line under Resolution, Upscaler and
 //! Quality saying what the next start renders at
-//! (`victory_core::render_plan`).
+//! (`victory_core::render_plan`); Ray tracing's line in plain words.
 
 use victory_core::render_plan::{self, TITLE_OUTPUT};
 
@@ -35,6 +35,9 @@ pub fn detail(
     get: impl Fn(&str) -> Option<String>,
     native: impl Fn() -> Option<(u32, u32)>,
 ) -> Option<String> {
+    if name == victory_core::settings::ray_tracing::NAME {
+        return Some(ray_tracing_line(get(name).as_deref()).to_string());
+    }
     if !matches!(
         name,
         "VICTORY_RESOLUTION" | "VICTORY_UPSCALE" | "VICTORY_UPSCALE_QUALITY"
@@ -96,6 +99,15 @@ pub fn detail(
         &upscale,
         quality.as_deref().filter(|q| !q.is_empty()),
     ))
+}
+
+/// Ray tracing's line for its value.
+fn ray_tracing_line(value: Option<&str>) -> &'static str {
+    if victory_core::settings::ray_tracing::is_on(value) {
+        "On: glass, puddles and car paint reflect the scene through ray tracing; costs frame rate"
+    } else {
+        "Off: reflections come from the ambient stand-in; On traces glass, puddles and car paint"
+    }
 }
 
 /// The value an unset `name` stands for: Resolution's output size, and Quality's mode while an
@@ -217,6 +229,15 @@ mod tests {
         assert_eq!(effective("VICTORY_RESOLUTION", &chosen, MONITOR), None);
         assert_eq!(effective("VICTORY_UPSCALE_QUALITY", with(&[("VICTORY_UPSCALE", "off")]), MONITOR), None);
         assert_eq!(effective("VICTORY_OVERLAY", with(&[]), MONITOR), None);
+    }
+
+    #[test]
+    fn ray_tracing_reads_in_plain_words() {
+        let off = detail("VICTORY_RAY_TRACING", with(&[]), MONITOR).unwrap();
+        assert!(off.starts_with("Off: "), "{off}");
+        let on = detail("VICTORY_RAY_TRACING", with(&[("VICTORY_RAY_TRACING", "on")]), MONITOR).unwrap();
+        assert!(on.starts_with("On: "), "{on}");
+        assert!(!format!("{off}{on}").contains("VICTORY_"));
     }
 
     #[cfg(windows)]

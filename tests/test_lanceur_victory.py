@@ -650,6 +650,20 @@ def test_no_settings_file_or_none_leaves_the_tuned_set_as_it_is(tmp_path, faux_o
     assert _valeurs(sans.stdout)["VICTORY_COPY_COALESCE"] == "1024"
 
 
+def test_play_launches_default_to_the_monitors_resolution_and_dev_runs_do_not(tmp_path, faux_outil):
+    nom = ("VICTORY_NATIVE_DEFAULT",)
+    sans, _, _, _ = _lancer(tmp_path / "sans", faux_outil, echo=nom)
+    aucun, _, _, _ = _lancer(tmp_path / "none", faux_outil, echo=nom, reglages="none")
+    reglages = tmp_path / "settings.toml"
+    reglages.write_text('VICTORY_NATIVE_DEFAULT = "0"\n', encoding="utf-8")
+    choisi, _, _, _ = _lancer(tmp_path / "fichier", faux_outil, echo=nom, reglages=reglages)
+    for fini in (sans, aucun, choisi):
+        assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
+    assert _valeurs(sans.stdout)["VICTORY_NATIVE_DEFAULT"] == "1"      # pas encore de fichier : l'écran
+    assert _valeurs(aucun.stdout)["VICTORY_NATIVE_DEFAULT"] == "unset"  # dev.py : la 3840x2160 du titre
+    assert _valeurs(choisi.stdout)["VICTORY_NATIVE_DEFAULT"] == "0"     # le choix du menu gagne
+
+
 def test_dev_runs_ignore_the_users_settings_file():
     sys.path.insert(0, str(RACINE / "tools"))
     import dev
