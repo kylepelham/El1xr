@@ -45,6 +45,8 @@ mod dpp;
 /// shares the emitter's state.
 #[path = "descriptor_data.rs"]
 mod descriptor_data;
+#[path = "heap_address.rs"]
+pub(super) mod heap_address;
 
 /// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
 /// module so it shares the emitter's state.

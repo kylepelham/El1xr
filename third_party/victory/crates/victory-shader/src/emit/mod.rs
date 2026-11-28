@@ -162,9 +162,10 @@ pub use shader::{
     USER_GLASS_NATIVE, USER_SHADOW_BASE_FIRST, USER_SHADOW_BASE_SECOND, USER_THREAD_LIMIT, USER_VIEW_BIAS, constants_raw, set_title_view_limit, set_view_heap_limit,
     title_view_limit, view_heap_limit, REMAP_BASE, REMAP_LEN, SLOT_REMAP, set_title_remap_len,
     title_remap_len, FULL_REMAP, set_title_remap_full, title_remap_full, FAULT_DWORDS, FAULT_FLAG,
-    set_title_fault_slot, title_fault_slot,
+    set_title_fault_slot, title_fault_slot, SLOT_VIEW_ADDRESSES, VIEW_ADDRESSES_COUNT,
 };
 pub use lower::thread_limit::on as dispatchx_mask;
+pub use lower::heap_address::on as heap_view_address;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

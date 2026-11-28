@@ -63,7 +63,7 @@ const STRUCTURE: u32 = 11;
 /// The title address a ray-tracing structure view names: the description's
 /// `RaytracingAccelerationStructure.Location` (words 4-5, after the format,
 /// dimension, component mapping and padding). `None` for any other view.
-fn structure_address(view: &View) -> Option<u64> {
+pub(crate) fn structure_address(view: &View) -> Option<u64> {
     let words = match view {
         View::Shader(_, Some(desc)) => &desc[..],
         View::Placed(false, _, desc) => &desc[..10],

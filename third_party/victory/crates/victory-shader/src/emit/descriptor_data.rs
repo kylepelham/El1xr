@@ -171,11 +171,14 @@ impl<'a> Lower<'a> {
             {
                 (0, used, uav, props, image, true)
             } else if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((lo, hi)) = self
+                    .view_address(site)
+                    .or_else(|| self.heap_view_address(site))
             {
                 // A buffer view the code only takes the address of, to walk
                 // the memory behind it (a ray-tracing structure): the address
-                // from the host, the other dwords have no value.
+                // from the host (a table's, or with `VICTORY_HEAP_VIEW_ADDRESS`
+                // a heap slot's), the other dwords have no value.
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {

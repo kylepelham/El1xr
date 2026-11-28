@@ -38,8 +38,9 @@
 //! ([`Out::Prefix`]) and stands in for the reads; the title's alpha test after them gets the
 //! hit's barycentrics and primitive index and no console node address ([`Out::Primitive`]).
 //! The title's walk filters candidates in its loop (the receiver's own object, material bits);
-//! the arm does not. These programs are still refused, spliced or not: the title's code reads
-//! that heap descriptor as numbers, which the translator does not provide yet.
+//! the arm does not. The title's code reads that heap descriptor as numbers: the programs
+//! translate only with the host's view addresses (`VICTORY_HEAP_VIEW_ADDRESS=1`,
+//! `lower::heap_address`).
 //!
 //! Opaque geometry only (`CULL_NON_OPAQUE`); the closest hit, as the title's walks shrink their
 //! maximum distance at each accepted hit. Faces are not culled (the title culls one face per its

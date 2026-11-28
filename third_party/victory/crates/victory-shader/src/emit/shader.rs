@@ -61,6 +61,14 @@ pub const SLOT_TLAS_NEAR: u8 = 250;
 /// for one the host has none for), [`title_remap_len`] of them and one more, the null slot.
 /// The host binds the dwords from [`REMAP_BASE`] on of the [`SLOT_STRIDES`] buffer of the heap.
 pub const SLOT_REMAP: u8 = 249;
+/// (`VICTORY_HEAP_VIEW_ADDRESS=1`) The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of
+/// a shader that reads the address of a descriptor it loads from the view heap at an offset it
+/// computes (`heap_address`): a raw buffer of [`VIEW_ADDRESSES_COUNT`] pairs of dwords the host
+/// keeps, pair `i` the title address (low, high) of the buffer or ray-tracing structure view at
+/// title slot `i` (0: none). Slots past the last read the last, never written.
+pub const SLOT_VIEW_ADDRESSES: u8 = 248;
+/// Pairs of the [`SLOT_VIEW_ADDRESSES`] buffer.
+pub const VIEW_ADDRESSES_COUNT: u32 = 1 << 21;
 /// (heapcap) Where the [`SLOT_REMAP`] dwords start in the [`SLOT_STRIDES`] buffer: past every
 /// slot a capped host heap has.
 pub const REMAP_BASE: u32 = 1 << 20;

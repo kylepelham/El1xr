@@ -94,6 +94,7 @@ fn switches_in_the_shader_cache_key_are_retranslate() {
         "VICTORY_WAVE32_NVIDIA",
         "VICTORY_NATIVE_GLASS",
         "VICTORY_NATIVE_SHADOW",
+        "VICTORY_HEAP_VIEW_ADDRESS",
         "VICTORY_RT_MISS_SKY",
         "VICTORY_RT_GLASS_SKY",
     ] {

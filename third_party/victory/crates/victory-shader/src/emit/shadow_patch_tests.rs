@@ -343,10 +343,10 @@ fn the_shadow_traces_spliced_translate_and_validate() {
         assert_eq!(markers, want, "{}", trace.hash);
         let io = crate::io::raise(&p, &native).expect("io");
         let shader = super::super::emit(&c, &native, &p, &st, &io, &res);
-        if trace.per_wave {
+        let shader = if trace.per_wave {
             // The title's own walk reads its structure's descriptor, loaded from the resource
-            // heap at an offset a per-wave record names, as numbers (the picked base): the
-            // translator refuses that, spliced or not, until such a load reads title memory.
+            // heap at an offset a per-wave record names, as numbers (the picked base): refused,
+            // spliced or not, without the host's view addresses (`VICTORY_HEAP_VIEW_ADDRESS`).
             let unspliced = translate_unspliced(&c);
             for got in [shader.map(|_| ()), unspliced] {
                 assert!(
@@ -356,9 +356,14 @@ fn the_shadow_traces_spliced_translate_and_validate() {
                     trace.hash
                 );
             }
-            continue;
-        }
-        let shader = shader.expect("emit");
+            let forced = &super::super::lower::heap_address::FORCED;
+            forced.set(true);
+            let shader = super::super::emit(&c, &native, &p, &st, &io, &res);
+            forced.set(false);
+            shader.expect("emit with heap view addresses")
+        } else {
+            shader.expect("emit")
+        };
         let first = u32::from_le_bytes(shader.dxil[32..36].try_into().unwrap()) as usize;
         let features = u64::from_le_bytes(shader.dxil[first + 8..first + 16].try_into().unwrap());
         assert_ne!(features & 0x10_0000, 0, "{}: RaytracingTier1_1", trace.hash);
