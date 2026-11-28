@@ -620,6 +620,8 @@ pub(crate) struct State {
     /// `VICTORY_SHOW_AFTER` until this list's upload submission finishes on
     /// the GPU: `(title heap, slot index, descriptor handle, expected key)`.
     pending_shows: Vec<(usize, u32, u64, u64)>,
+    /// (`VICTORY_BAKE_CHECK`) The bake draw bound and not drawn yet.
+    bake_check: Option<bake_check::Pending>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// The last `CS_RayPrePass*` this list dispatched was the alpha one: its
@@ -1258,6 +1260,7 @@ impl State {
             root_uav_slots,
             ambient_tables,
             pending_shows,
+            bake_check,
             tables_gone,
             alpha_rays,
             glass_tlas,
@@ -1331,6 +1334,7 @@ impl State {
         root_uav_slots.clear();
         ambient_tables.clear();
         pending_shows.clear();
+        *bake_check = None;
         *tables_gone = false;
         *alpha_rays = false;
         *glass_tlas = None;
@@ -2864,6 +2868,10 @@ impl State {
             let mode = crate::bake_publish::mode();
             if mode > 0 {
                 self.bake_publish(p, mode);
+            }
+            // `VICTORY_BAKE_CHECK`: its inputs are looked at when it is drawn.
+            if crate::bake_check::on() {
+                self.bake_check_inputs(list, p);
             }
         }
     }
@@ -5045,6 +5053,9 @@ impl State {
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        if crate::bake_check::on() {
+            self.bake_check_drawn(list, ran);
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("draw", self.pipeline);
@@ -5161,6 +5172,9 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        if crate::bake_check::on() {
+            self.bake_check_drawn(list, ran);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -5907,6 +5921,7 @@ mod miss_views;
 mod reflect_views;
 
 mod bake_pass;
+mod bake_check;
 mod bake_publish;
 mod material_pass;
 mod skin_views;

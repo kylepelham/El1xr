@@ -1075,6 +1075,14 @@ impl PreludeUpload {
                 crate::bake_watch::alias_upload(self.resource, at, baked, baked_at);
             }
         }
+        // `VICTORY_BAKE_CHECK`: title memory uploaded over a bake result, or over its memory.
+        if crate::bake_check::on() {
+            crate::bake_check::written(0, self.resource, "title_upload", 0);
+            let (at, len) = self.staging.memory();
+            if let Some((_, baked)) = in_host_written(at as u64, len as u64, self.resource) {
+                crate::bake_check::written(0, baked, "alias_upload", self.resource);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
         // Levels on demand (`crate::tiles`): after `refresh()` has detiled,
@@ -1381,6 +1389,9 @@ pub(crate) fn card_writes(
     let fresh = tiled.claim(levels);
     if fresh != 0 {
         crate::bake_watch::add(crate::bake_watch::C::ZerosOverBaked, u64::from(host_wrote(resource as usize)));
+        if crate::bake_check::on() {
+            crate::bake_check::written(0, resource as usize, "zeros", 0);
+        }
     }
     // Of them, the ones whose zeros could not be recorded.
     let mut unzeroed = if host().is_none() { fresh } else { 0 };

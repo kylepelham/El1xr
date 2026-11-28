@@ -66,9 +66,10 @@ pub(crate) fn keeps_gone(pinned: bool) -> bool {
 static HELD: Mutex<BTreeMap<(usize, u32), (u64, u64)>> = Mutex::new(BTreeMap::new());
 static HELD_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// A list holds back the show of `index` (`VICTORY_SHOW_AFTER`). Kept only with `2`.
+/// A list holds back the show of `index` (`VICTORY_SHOW_AFTER`). Kept only with `2` (or with
+/// `VICTORY_BAKE_CHECK`, which only looks).
 pub(crate) fn held(heap: usize, index: u32, handle: u64, key: u64) {
-    if mode() != 2 {
+    if mode() != 2 && !crate::bake_check::on() {
         return;
     }
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
@@ -84,6 +85,15 @@ pub(crate) fn released(heap: usize, index: u32) {
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     held.remove(&(heap, index));
     HELD_LEN.store(held.len(), Relaxed);
+}
+
+/// (`VICTORY_BAKE_CHECK`) Whether a list holds back the show of `index`.
+pub(crate) fn is_held(heap: usize, index: u32) -> bool {
+    HELD_LEN.load(Relaxed) != 0
+        && HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(heap, index))
 }
 
 /// The show of `index` another list holds back, taken to be done now.

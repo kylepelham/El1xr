@@ -238,7 +238,7 @@ impl State {
 
 /// The title address, the bytes from the first mip shown and the shape of the texture placed in
 /// memory that slot `index` views (None: another kind of view).
-fn placed(heap: &crate::descriptor::Heap, index: u32) -> Option<(u64, u64, [u32; 4])> {
+pub(super) fn placed(heap: &crate::descriptor::Heap, index: u32) -> Option<(u64, u64, [u32; 4])> {
     let Some(View::Placed(false, resource, desc)) =
         heap.handle(index).and_then(crate::descriptor::view)
     else {
@@ -250,12 +250,12 @@ fn placed(heap: &crate::descriptor::Heap, index: u32) -> Option<(u64, u64, [u32;
     Some((address, len, crate::bake_why::shape(&resource)))
 }
 
-fn mapped(address: u64, len: u64) -> u64 {
+pub(super) fn mapped(address: u64, len: u64) -> u64 {
     crate::texture::mapped_bytes(address as *const u8, len as usize)
 }
 
 /// The bake pixel shader of `p`, as [`BAKE_PIXEL_SHADERS`] names it.
-fn bake_hash(p: &HostPipeline) -> &'static str {
+pub(super) fn bake_hash(p: &HostPipeline) -> &'static str {
     p.stages
         .iter()
         .find_map(|s| BAKE_PIXEL_SHADERS.iter().find(|&&h| h == s.shader.hash.as_str()))

@@ -390,6 +390,17 @@ pub(crate) fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key
     false
 }
 
+/// The view key title slot `handle` holds, as host slots record it (0: no view of ours).
+pub(crate) fn title_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot inside a live title heap.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
+
 /// Re-queues a deferred texture view slot when a command list is reset
 /// without being submitted, so its upload is not permanently orphaned.
 pub(crate) fn requeue_show(heap: usize, index: u32) {
@@ -3836,6 +3847,20 @@ impl HostHeap {
             .unwrap_or_else(|e| e.into_inner());
         let shown = kept.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// (`VICTORY_BAKE_CHECK`) The view key host slot `index` was made from (0: null), and
+    /// whether the queue of textures picked by index has it due at `frame` (None: not queued).
+    pub(crate) fn slot_check(&self, index: u32, frame: u64) -> (u64, Option<bool>) {
+        let made = self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .copied()
+            .unwrap_or(0);
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        (made, textures.slots.get(&index).map(|w| w.due <= frame))
     }
 
     /// What the queue of textures picked by index knows of title slot

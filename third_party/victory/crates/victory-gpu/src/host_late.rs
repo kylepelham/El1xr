@@ -872,7 +872,6 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 pub(super) fn read_backs(list: &HostList) {
-    #[cfg(feature = "diagnostics")]
     for work in &list.deferred().after {
         work();
     }

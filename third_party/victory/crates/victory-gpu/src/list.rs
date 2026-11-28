@@ -1145,6 +1145,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
             crate::texture::host_written(dst);
+            if crate::bake_check::on() {
+                crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
+            }
             if same {
                 return;
             }
@@ -1349,6 +1352,9 @@ extern "system" fn copy_texture_region(
             crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         }
         crate::texture::host_written(dst.resource);
+        if crate::bake_check::on() {
+            crate::bake_check::written(std::ptr::from_ref(list) as usize, dst.resource as usize, "copy", src.resource as usize);
+        }
         if same {
             return;
         }
@@ -1525,6 +1531,9 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        if crate::bake_check::on() {
+            crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
+        }
         #[cfg(windows)]
         crate::gpucost::mark(&list.list, || "title resolve");
         #[cfg(feature = "diagnostics")]
