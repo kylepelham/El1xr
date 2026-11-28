@@ -2124,6 +2124,7 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let _whole = BindLap::start(0);
         let _hitch = crate::hitch::span(crate::hitch::Phase::Bind);
+        crate::title_waits::bind();
         let l = &list.list;
         if crate::bake_watch::on() {
             let stages = p.stages.iter().map(|s| s.shader.hash.as_str());
