@@ -341,6 +341,7 @@ fn a_card_list_recorded_on_the_thread_writes_the_same_bytes() {
             pso: work.pso.clone(),
             differs: work.differs.0.clone(),
             join: false,
+            own: Vec::new(),
         };
         let Some(prelude) = host.make_prelude() else { return };
         let mut card = Some(Pending { sync: Some((rec, prelude.clone())), check: None });

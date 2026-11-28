@@ -176,6 +176,10 @@ pub(crate) fn wait(
     if crate::staging_hold::reads_as_is(resource as usize, t.filled) {
         return false;
     }
+    // (El1xr) `VICTORY_IDLE_EVICT_S` let its host copy go: made and uploaded now, never null.
+    if crate::idle_evict::reads_now(resource as usize) {
+        return false;
+    }
     if reads_filled(t, crate::texture::prepare::prune_safe()) {
         STATS[3].fetch_add(1, Relaxed);
         crate::flicker_catch::count(crate::flicker_catch::Kind::TableKeptFilled);

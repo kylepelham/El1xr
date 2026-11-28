@@ -400,6 +400,9 @@ pub(crate) struct Scan {
     pub sample: Vec<u32>,
     /// Live records in the host's own slots.
     pub live_own: u64,
+    /// Live views by kind ([`KINDS`]): in the host's own slots, and past them.
+    pub kinds_own: [u64; 5],
+    pub kinds_past: [u64; 5],
     /// Live records by 65,536-slot block (block = slot >> 16), whole heap.
     pub blocks: std::collections::BTreeMap<u32, u64>,
 }
@@ -435,9 +438,44 @@ impl Scan {
         *self.blocks.entry(slot >> 16).or_default() += 1;
     }
 
+    /// A live view of kind `kind` ([`KINDS`]) at `slot`.
+    pub(crate) fn kind(&mut self, slot: u32, kind: usize, count: u32) {
+        let kinds = if slot < count {
+            &mut self.kinds_own
+        } else {
+            &mut self.kinds_past
+        };
+        kinds[kind.min(KINDS.len() - 1)] += 1;
+    }
+
     /// Live title views in the whole heap.
     pub(crate) fn live_total(&self) -> u64 {
         self.live + self.live_own
+    }
+}
+
+/// The kinds of view the census counts: textures (placed or of a texture
+/// object), buffer views (placed or of a buffer object: typed, raw and
+/// structured), constant buffers, unordered views, the rest.
+pub(crate) const KINDS: [&str; 5] = ["texture", "buffer", "constant", "unordered", "other"];
+
+/// The [`KINDS`] index of `view`.
+pub(crate) fn kind_of(view: &super::super::View) -> usize {
+    use super::super::View;
+    const BUFFER: u32 = 1;
+    match view {
+        View::Constant(..) => 2,
+        View::Unordered(..) | View::Placed(true, ..) => 3,
+        View::Placed(false, resource, _) if resource[0] == BUFFER => 1,
+        View::Placed(false, ..) => 0,
+        View::Shader(resource, _) => {
+            if crate::resource::buffer_bytes(*resource as crate::object::This).is_some() {
+                1
+            } else {
+                0
+            }
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => 4,
     }
 }
 
@@ -520,8 +558,12 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
             };
             let [tag, i, generation] = [word(0), word(1), word(2)];
             let tagged = tag == super::super::VIEW_TAG;
-            let live = tagged && super::super::view_at(i, generation).is_some();
-            scan.add(*at + k as u32, tagged, live, count, null);
+            let view = tagged.then(|| super::super::view_at(i, generation)).flatten();
+            let slot = *at + k as u32;
+            scan.add(slot, tagged, view.is_some(), count, null);
+            if let Some(view) = &view {
+                scan.kind(slot, kind_of(view), count);
+            }
         }
         *at += n;
     }
@@ -557,6 +599,14 @@ pub(crate) fn watch(start: u64, step: u64, host: &super::HostHeap, title: u32, n
         switch_on = on(),
         live_total = scan.live_total(),
         live_own = scan.live_own,
+        own_textures = scan.kinds_own[0],
+        own_buffers = scan.kinds_own[1],
+        own_constants = scan.kinds_own[2],
+        own_unordered = scan.kinds_own[3],
+        past_textures = scan.kinds_past[0],
+        past_buffers = scan.kinds_past[1],
+        past_constants = scan.kinds_past[2],
+        past_unordered = scan.kinds_past[3],
         records = scan.records,
         live = scan.live,
         live_in_dynamic = scan.live_in_dynamic,
@@ -749,6 +799,12 @@ mod tests {
         scan.add(5, true, true, own, NULL);
         scan.add(6, true, false, own, NULL);
         scan.add(70_000, true, true, own, NULL);
+        scan.kind(5, 2, own);
+        scan.kind(70_000, 0, own);
+        scan.kind(938_783, 1, own);
+        scan.kind(1_100_000, 9, own);
+        assert_eq!(scan.kinds_own, [1, 0, 1, 0, 0]);
+        assert_eq!(scan.kinds_past, [0, 1, 0, 0, 1]);
         assert_eq!(scan.live_own, 2);
         assert_eq!(scan.live_total(), 4);
         assert_eq!(scan.blocks.get(&0), Some(&1));

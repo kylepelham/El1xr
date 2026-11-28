@@ -998,6 +998,9 @@ void main() {
     #[path = "../wide_tests.rs"]
     mod wide_tests;
 
+    #[path = "../send_own_warp_tests.rs"]
+    mod send_own_warp_tests;
+
     struct WarpHarness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
