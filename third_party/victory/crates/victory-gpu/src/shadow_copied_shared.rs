@@ -56,6 +56,11 @@ impl CopiedLock {
         self.0.write()
     }
 
+    /// The stamps to read only, shared whatever the switch (`VICTORY_PLAN_SNAPSHOT`'s snapshot).
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, CopiedPages> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The stamps to read only.
     pub(super) fn look(&self) -> Looked<'_> {
         if on() {

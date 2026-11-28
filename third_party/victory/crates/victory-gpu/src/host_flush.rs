@@ -417,6 +417,7 @@ pub(super) fn log(frames: f64) {
     super::send_thread::line(frames);
     super::card_rec::line(frames);
     crate::refresh_prof::log(frames);
+    crate::read_back_pool::line(frames);
     crate::shadow::refresh_stamp::line(frames);
     super::scoped_flush::line(frames);
     crate::compare_apart::line(frames);
