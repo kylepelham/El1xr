@@ -8,72 +8,20 @@
 
 use super::*;
 
-fn wanted() -> bool {
-    std::env::var_os("VICTORY_TEST_D3D12_DEBUG").is_some_and(|v| v == "1")
-}
-
 /// Enables the layer for devices made from now on, if wanted.
 pub(super) fn enable() {
-    if !wanted() {
-        return;
-    }
-    let mut layer: Option<ID3D12Debug> = None;
-    // SAFETY: a plain interface query.
-    if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok()
-        && let Some(layer) = layer
-    {
-        // SAFETY: before the device is made. GPU-based validation tracks
-        // states across submissions (decay included), which the layer on
-        // the CPU does not.
-        unsafe {
-            layer.EnableDebugLayer();
-            if let Ok(gbv) = layer.cast::<ID3D12Debug1>() {
-                gbv.SetEnableGPUBasedValidation(true);
-            }
-        }
-    }
+    crate::test_d3d12_debug::enable();
 }
 
 /// The layer's message queue of `device`, if wanted and there.
 pub(super) fn messages(device: &ID3D12Device) -> Option<ID3D12InfoQueue> {
-    wanted().then(|| device.cast().ok()).flatten()
+    crate::test_d3d12_debug::messages(device)
 }
 
 /// Moves the queue's messages of warning severity or worse into `out`
 /// (printed as they come), and empties the queue.
 pub(super) fn drain(queue: Option<&ID3D12InfoQueue>, out: &mut Vec<String>) {
-    let Some(queue) = queue else {
-        return;
-    };
-    // SAFETY: each message is read into a buffer of the size the queue
-    // reports, then the queue is emptied.
-    unsafe {
-        for i in 0..queue.GetNumStoredMessages() {
-            let mut size = 0;
-            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
-                continue;
-            }
-            let mut buffer = vec![0u64; size.div_ceil(8)];
-            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
-            if queue.GetMessage(i, Some(message), &mut size).is_ok() {
-                let m = &*message;
-                if m.Severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
-                    continue;
-                }
-                let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
-                let text = String::from_utf8_lossy(text);
-                let line = format!(
-                    "severity {} id {}: {}",
-                    m.Severity.0,
-                    m.ID.0,
-                    text.trim_end_matches('\0')
-                );
-                eprintln!("d3d12 debug layer: {line}");
-                out.push(line);
-            }
-        }
-        queue.ClearStoredMessages();
-    }
+    crate::test_d3d12_debug::drain(queue, out);
 }
 
 /// A list's ahead buffer used by its prelude in one submission and again

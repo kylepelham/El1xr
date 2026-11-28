@@ -318,6 +318,8 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod tex_check;
+#[cfg(all(windows, test))]
+pub(crate) mod test_d3d12_debug;
 mod tex_early;
 #[cfg(windows)]
 mod texback;

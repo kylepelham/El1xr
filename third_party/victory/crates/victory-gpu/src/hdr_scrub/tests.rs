@@ -50,6 +50,7 @@ fn on_warp(
     // SAFETY: plain object creation and use on a device of our own; every submission is
     // waited for before what it wrote is read.
     unsafe {
+        crate::test_d3d12_debug::enable();
         let Ok(adapter) = crate::host::warp_adapter() else {
             eprintln!("no WARP adapter: skipped");
             return None;
@@ -247,6 +248,7 @@ fn on_warp(
         assert_eq!(WaitForSingleObject(event, 60_000), WAIT_OBJECT_0);
         let _ = CloseHandle(event);
         assert!(device.GetDeviceRemovedReason().is_ok());
+        crate::test_d3d12_debug::assert_clean(&device, "hdr_scrub");
         let mut read = std::ptr::null_mut();
         back.Map(0, None, Some(&mut read)).unwrap();
         let read = read.cast::<u8>();

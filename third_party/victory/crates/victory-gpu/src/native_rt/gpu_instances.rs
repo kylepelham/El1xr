@@ -185,7 +185,7 @@ pub(super) fn record(
     // SAFETY: the mapped upload buffer holds at least `bytes`.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
     let size = u64::from(count.max(1)) * 64;
-    let out = super::buffer(device, size, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+    let out = super::buffer(device, size, D3D12_RESOURCE_STATE_COMMON)?;
     // SAFETY: an open list; live buffers of the sizes given; the title's
     // writes to its instances (its compute passes) are done first.
     unsafe {

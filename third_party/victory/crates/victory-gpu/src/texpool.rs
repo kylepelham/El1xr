@@ -35,6 +35,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 mod buffers;
+mod fence_rest;
 mod maker;
 mod reuse;
 #[cfg(test)]
@@ -390,7 +391,29 @@ impl<B: Clone> Pool<B> {
     /// [`Pool::reclaim`] lets go of are put in `freed`, for the caller to
     /// drop outside its lock.
     fn cut(&mut self, len: u64, align: u64, now: u64, ripe: Ripe, freed: &mut Vec<B>) -> Option<(Piece, B, bool)> {
-        freed.extend(self.reclaim(now, crate::host::submissions_finished(), self.spares()));
+        self.cut_at(
+            len,
+            align,
+            now,
+            crate::host::submissions_started(),
+            crate::host::submissions_finished(),
+            ripe,
+            freed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cut_at(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        started: u64,
+        finished: u64,
+        ripe: Ripe,
+        freed: &mut Vec<B>,
+    ) -> Option<(Piece, B, bool)> {
+        freed.extend(self.reclaim_at(now, started, finished, self.spares()));
         let mut found = None;
         let fresh = self.only_unused();
         for (i, block) in self.blocks.iter_mut().enumerate() {
@@ -522,11 +545,19 @@ impl<B: Clone> Pool<B> {
     }
 
     fn reclaim(&mut self, now: u64, finished: u64, spares: usize) -> Vec<B> {
+        self.reclaim_at(now, crate::host::submissions_started(), finished, spares)
+    }
+
+    fn reclaim_at(&mut self, now: u64, started: u64, finished: u64, spares: usize) -> Vec<B> {
         let mut gone = Vec::new();
         let mut any = false;
         let reuse = self.reuse;
         while let Some(&(resting, piece)) = self.resting.front()
-            && if reuse { resting.done(now, finished) } else { resting.over(now, finished) }
+            && if reuse {
+                resting.done(now, finished)
+            } else {
+                fence_rest::piece_ready(resting, now, started, finished)
+            }
         {
             self.resting.pop_front();
             if reuse {
@@ -691,6 +722,7 @@ fn us(since: std::time::Instant) -> u64 {
 /// The pools' time lines, one a pool that did anything, at most every five
 /// seconds: grep `pool time (` (and `title memory remapped` beside them).
 fn time_lines(now: u64) {
+    fence_rest::maybe_log(now);
     static LAST: AtomicU64 = AtomicU64::new(0);
     let last = LAST.load(Ordering::Relaxed);
     if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
@@ -750,11 +782,12 @@ fn make_into<B: Clone>(
     let began = std::time::Instant::now();
     let memory = make();
     let made = us(began);
+    let made_at = fence_rest::made_stamp(started, crate::host::submissions_started());
     let mut p = lock(pool);
     p.making = false;
     match memory {
         Some(memory) => {
-            p.add(memory, started);
+            p.add(memory, made_at);
             drop(p);
             time(which, T_MADE, 1);
             time(which, T_MAKE_US, made);

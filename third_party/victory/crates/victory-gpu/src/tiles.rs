@@ -981,9 +981,15 @@ void look() {
                 // The debug layer, before the device is made: a call that
                 // is not well formed is then refused and named by the
                 // runtime, not handed to the driver.
-                let mut layer: Option<ID3D12Debug> = None;
-                let layered = D3D12GetDebugInterface(&mut layer).is_ok() && layer.is_some();
-                layer.iter().for_each(|l| l.EnableDebugLayer());
+                let layered = if crate::test_d3d12_debug::wanted() {
+                    crate::test_d3d12_debug::enable();
+                    true
+                } else {
+                    let mut layer: Option<ID3D12Debug> = None;
+                    let ok = D3D12GetDebugInterface(&mut layer).is_ok() && layer.is_some();
+                    layer.iter().for_each(|l| l.EnableDebugLayer());
+                    ok
+                };
                 if card && !layered {
                     eprintln!("no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it");
                     return None;
@@ -1064,7 +1070,12 @@ void look() {
                         let text = String::from_utf8_lossy(text);
                         let text = text.trim_end_matches('\0');
                         eprintln!("D3D12 says (severity {}, id {}): {text}", m.Severity.0, m.ID.0);
-                        if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
+                        let limit = if crate::test_d3d12_debug::wanted() {
+                            D3D12_MESSAGE_SEVERITY_WARNING.0
+                        } else {
+                            D3D12_MESSAGE_SEVERITY_ERROR.0
+                        };
+                        if m.Severity.0 <= limit && first_error.is_none() {
                             first_error = Some(text.to_owned());
                         }
                     }

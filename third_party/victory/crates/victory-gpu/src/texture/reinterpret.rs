@@ -72,6 +72,7 @@ mod tests {
     fn warp() -> Option<ID3D12Device> {
         // SAFETY: plain DXGI and D3D12 queries.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
             let mut device: Option<ID3D12Device> = None;
@@ -265,6 +266,7 @@ mod tests {
                 assert_eq!(got, &words[row * SIZE as usize..(row + 1) * SIZE as usize]);
             }
             back.Unmap(0, None);
+            crate::test_d3d12_debug::assert_clean(&device, "texture::reinterpret");
         }
     }
 }

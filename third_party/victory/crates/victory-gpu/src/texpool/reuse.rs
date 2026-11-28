@@ -117,8 +117,9 @@ impl Zeroer {
     }
 
     fn completed(&self) -> u64 {
-        // SAFETY: a plain query.
-        unsafe { self.fence.GetCompletedValue() }
+        // SAFETY: a plain query; u64::MAX means the device was removed.
+        let v = unsafe { self.fence.GetCompletedValue() };
+        if v == u64::MAX { 0 } else { v }
     }
 
     /// Copies of zeros over `pieces` of the buffers placed over their blocks,
@@ -352,6 +353,7 @@ mod tests {
         // SAFETY: plain object creation and copies on a device of our own;
         // every mapping is of a live buffer of ours, of its size.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let Ok(adapter) = crate::host::warp_adapter() else {
                 eprintln!("no WARP adapter: skipped");
                 return;
@@ -478,6 +480,7 @@ mod tests {
             while z.completed() < again {
                 std::thread::yield_now();
             }
+            crate::test_d3d12_debug::assert_clean(&device, "texpool::reuse::pieces");
         }
     }
 
@@ -493,6 +496,7 @@ mod tests {
         // SAFETY: plain object creation and copies on a device of our own;
         // every mapping is of a live buffer of ours, of its size.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let Ok(adapter) = crate::host::warp_adapter() else {
                 eprintln!("no WARP adapter: skipped");
                 return;
@@ -568,6 +572,137 @@ mod tests {
                     panic!("round {round}: byte {at} of the buffer of zeros is {}", bytes[at]);
                 }
             }
+            crate::test_d3d12_debug::assert_clean(&device, "texpool::reuse::zeros");
+        }
+    }
+
+    /// (racefix #57) Tests `VICTORY_CARD_BLOCK_REUSE=1`'s exact cross-queue
+    /// layout on WARP under `VICTORY_TEST_D3D12_DEBUG=1` + GBV: `Zeroer`
+    /// zeroes piece A `[0, 64 KiB)` through the `whole` buffer on the COPY
+    /// queue while a disjoint placed buffer B `[64 KiB, 128 KiB)` in the same
+    /// 64 MiB `ID3D12Heap` is written on a DIRECT queue.
+    #[test]
+    fn the_zeroer_on_copy_queue_beside_a_live_placed_buffer_in_the_same_block() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        let _serial = crate::indirect::tests::WARP_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: plain D3D12 object creation and synchronization on a WARP device of our own.
+        unsafe {
+            crate::test_d3d12_debug::enable();
+            let Ok(adapter) = crate::host::warp_adapter() else {
+                eprintln!("no WARP adapter: skipped");
+                return;
+            };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                eprintln!("no WARP device: skipped");
+                return;
+            }
+            let device = device.unwrap();
+            let mut z = Zeroer::new(&device).unwrap();
+            while z.completed() < z.sent {
+                std::thread::yield_now();
+            }
+            let mut heap: Option<ID3D12Heap> = None;
+            device
+                .CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: 2 * K64,
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        Alignment: 0,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    },
+                    &mut heap,
+                )
+                .unwrap();
+            let heap = heap.unwrap();
+            let mut whole: Option<ID3D12Resource> = None;
+            device
+                .CreatePlacedResource(
+                    &heap,
+                    0,
+                    &super::super::buffers::buffer_desc(2 * K64, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut whole,
+                )
+                .unwrap();
+            let whole = whole.unwrap();
+            let mut live_b: Option<ID3D12Resource> = None;
+            device
+                .CreatePlacedResource(
+                    &heap,
+                    K64,
+                    &super::super::buffers::buffer_desc(K64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut live_b,
+                )
+                .unwrap();
+            let live_b = live_b.unwrap();
+            let mut upload: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_UPLOAD,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &super::super::buffers::buffer_desc(K64, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut upload,
+                )
+                .unwrap();
+            let upload = upload.unwrap();
+            let mut ptr = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut ptr)).unwrap();
+            std::ptr::write_bytes(ptr.cast::<u8>(), 0x5A, K64 as usize);
+            upload.Unmap(0, None);
+
+            let dq: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let da: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let dl: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None)
+                .unwrap();
+            let df: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let ev = CreateEventW(None, false, false, None).unwrap();
+
+            // Write disjoint placed buffer B on DIRECT while Zeroer zeroes piece A via `whole` on COPY.
+            dl.CopyBufferRegion(&live_b, 0, &upload, 0, K64);
+            dl.Close().unwrap();
+            dq.ExecuteCommandLists(&[Some(dl.cast().unwrap())]);
+            dq.Signal(&df, 1).unwrap();
+            let z_done = z
+                .send(&[(
+                    Piece {
+                        block: 0,
+                        start: 0,
+                        len: K64,
+                    },
+                    whole.clone(),
+                )])
+                .unwrap();
+
+            df.SetEventOnCompletion(1, ev).unwrap();
+            WaitForSingleObject(ev, INFINITE);
+            while z.completed() < z_done {
+                std::thread::yield_now();
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(ev);
+            crate::test_d3d12_debug::assert_clean(&device, "texpool::reuse::cross_queue_aliasing");
         }
     }
 }

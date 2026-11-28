@@ -120,6 +120,7 @@ mod tests {
     fn an_allocator_is_counted_until_it_is_destroyed() {
         // SAFETY: plain object creation on a device of our own.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let Ok(adapter) = crate::host::warp_adapter() else {
                 eprintln!("no WARP adapter: skipped");
                 return;
@@ -140,6 +141,7 @@ mod tests {
             assert!(counts().0 >= 1 && counts().2 >= 1);
             drop(allocator);
             assert!(gone.load(Ordering::Relaxed), "let go when the allocator is destroyed");
+            crate::test_d3d12_debug::assert_clean(&device, "alloc_count");
         }
     }
 

@@ -47,6 +47,7 @@ struct Rig {
     event: HANDLE,
     submitted: u64,
     targets: ID3D12DescriptorHeap,
+    debug: Option<ID3D12InfoQueue>,
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -67,10 +68,12 @@ impl Rig {
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: plain object creation on a device of our own.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let adapter = crate::host::warp_adapter().ok()?;
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             let device = device?;
+            let debug = crate::test_d3d12_debug::messages(&device);
             let queue: ID3D12CommandQueue = device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -102,6 +105,7 @@ impl Rig {
                 event,
                 submitted: 0,
                 targets,
+                debug,
                 _serial: serial,
             })
         }
@@ -122,6 +126,8 @@ impl Rig {
             assert_eq!(WaitForSingleObject(self.event, 60_000), WAIT_OBJECT_0);
             let removed = self.device.GetDeviceRemovedReason();
             assert!(removed.is_ok(), "device lost: {removed:?}");
+            // ID 820: ClearRenderTargetView without optimized clear value in test RT setup.
+            crate::test_d3d12_debug::assert_clean_queue_except(self.debug.as_ref(), "hold_frame", &[820]);
             self.allocator.Reset().unwrap();
             self.list.Reset(&self.allocator, None).unwrap();
         }

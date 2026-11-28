@@ -8680,6 +8680,7 @@ mod card_merge_tests {
     fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
+            crate::test_d3d12_debug::enable();
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
             let mut device: Option<ID3D12Device> = None;

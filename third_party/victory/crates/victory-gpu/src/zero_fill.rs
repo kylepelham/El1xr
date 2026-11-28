@@ -85,6 +85,7 @@ mod tests {
     /// odd length), the bytes after them left as they were.
     #[test]
     fn zeros_go_over_the_bytes_asked_for_only() {
+        crate::test_d3d12_debug::enable();
         let Ok(adapter) = crate::host::warp_adapter() else {
             eprintln!("no WARP adapter: skipped");
             return;
@@ -158,6 +159,7 @@ mod tests {
             let bytes = std::slice::from_raw_parts(read.cast::<u8>(), SIZE as usize);
             assert_eq!(bytes[..ZEROED as usize].iter().position(|&b| b != 0), None);
             assert!(bytes[ZEROED as usize..].iter().all(|&b| b == 0xCD));
+            crate::test_d3d12_debug::assert_clean(&device, "zero_fill");
         }
     }
 }

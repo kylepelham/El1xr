@@ -17,6 +17,7 @@ fn the_pass_draws_the_presented_texture_small() {
     // SAFETY: plain object creation and use on a device of our own; every
     // submission is waited for before what it wrote is read.
     unsafe {
+        crate::test_d3d12_debug::enable();
         let Ok(adapter) = crate::host::warp_adapter() else {
             eprintln!("no WARP adapter: skipped");
             return;
@@ -111,6 +112,8 @@ fn the_pass_draws_the_presented_texture_small() {
         assert_eq!(WaitForSingleObject(event, 60_000), WAIT_OBJECT_0);
         let _ = CloseHandle(event);
         assert!(device.GetDeviceRemovedReason().is_ok());
+        // ID 820: ClearRenderTargetView without optimized clear value in test RT setup.
+        crate::test_d3d12_debug::assert_clean_except(&device, "flicker_catch::pass", &[820]);
         let pixels = pixels_of(&readback).unwrap();
         assert_eq!(pixels[0], 0xff, "red at the top left");
         assert_eq!(pixels[WIDE / 2 - 1], 0xff, "red left of the middle");

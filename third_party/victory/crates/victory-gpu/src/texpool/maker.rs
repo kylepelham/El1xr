@@ -167,12 +167,13 @@ fn fill<B: Clone>(
         let began = std::time::Instant::now();
         let memory = make();
         let made = us(began);
+        let made_at = super::fence_rest::made_stamp(started, crate::host::submissions_started());
         let mut p = lock(pool);
         let Some(memory) = memory else {
             p.refused(now());
             return n;
         };
-        p.add(memory, started);
+        p.add(memory, made_at);
         drop(p);
         n += 1;
         time(which, T_MADE, 1);
