@@ -46,6 +46,13 @@ fn programs_are_listed_by_hash_or_name_part() {
         b"\0CS_RayMiss_de6b91a6_Wrapped\0",
         &parse_only(Some("glass"))
     ));
+    let tiles = b"\0CS_AlphaTransmissionDepthTileMipDilate_7f19bae0_Wrapped\0";
+    assert!(
+        !listed(tiles, &parse_only(Some("glass"))),
+        "depth tiles are data"
+    );
+    let denoise = b"\0CS_AlphaTransmissionDenoise_2871f2e9_Wrapped\0";
+    assert!(listed(denoise, &parse_only(Some("glass"))));
 }
 
 #[test]

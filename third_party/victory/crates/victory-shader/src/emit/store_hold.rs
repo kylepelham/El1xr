@@ -39,12 +39,15 @@ pub(super) enum Hold {
     KeepNan,
 }
 
-/// The name parts `VICTORY_CS_STORE_CLAMP_ONLY=glass` selects: the window transmission pyramid
-/// and its depth tiles, and the glass reflection chain around the alpha trace (frame ops dump
-/// `blackface/dev/cap_face_gs2a/frame-1024-ops.txt`).
-pub(super) const GLASS: [&str; 13] = [
-    "CS_AlphaTransmission",
+/// The name parts `VICTORY_CS_STORE_CLAMP_ONLY=glass` selects: the window transmission pyramid's
+/// colour stages and the glass reflection chain around the alpha trace (frame ops dump
+/// `blackface/dev/cap_face_gs2a/frame-1024-ops.txt`). Not the pyramid's R16_FLOAT depth tiles
+/// nor `CS_GatherAlphaVBuffer`: depths, not light.
+pub(super) const GLASS: [&str; 14] = [
     "CS_AlphTransmissionPrefilterMip",
+    "CS_AlphaTransmissionBlurGaussian",
+    "CS_AlphaTransmissionDenoise",
+    "CS_AlphaTransmissionHistoryResolve",
     "CS_DeferredFallbacksAlpha",
     "CS_RayMiss_",
     "CS_ResolveScreenSpace",
@@ -53,7 +56,6 @@ pub(super) const GLASS: [&str; 13] = [
     "CS_ShadeAlpha",
     "CS_VarianceFilterAlpha",
     "CS_SpatialFilterAlpha",
-    "CS_GatherAlphaVBuffer",
     "CS_SpatialFilter_",
     "CS_ScreenProbes_TemporalResolve_ReflectiveCaustics",
 ];
