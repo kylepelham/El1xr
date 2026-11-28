@@ -61,6 +61,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_EXPOSURE_EARLY", "Makes the auto-exposure pipelines early, so the world is not black."),
     ("VICTORY_EXPOSURE_WATCH", "Logs the exposure passes' targets and the constants they read."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
+    ("VICTORY_FAULT_UNLOCKED", "Write faults stop waiting for a guard walk closing their block."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
     ("VICTORY_FETCH_CHECK", "Relay fetches are hashed and fetched again if torn (black skin)."),
     ("VICTORY_FIXED_TRIPS", "Loops with a count fixed in code run to their end, not a stage cap."),
