@@ -113,6 +113,7 @@ mod ray_query_warp_tests;
 mod rect;
 mod sampler;
 mod shader;
+mod shadow_raster;
 mod sync_full;
 mod threading;
 mod underwater;
@@ -144,6 +145,7 @@ pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, native_glass};
 pub use miss_sky::miss_sky_key;
+pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEET, SLOT_MEMORY,
@@ -470,7 +472,9 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    sync_full::with_container(c, || emit_listed(c, native, p, st, io, res))
+    sync_full::with_container(c, || {
+        shadow_raster::with_container(c, || emit_listed(c, native, p, st, io, res))
+    })
 }
 
 /// [`emit`] inside the program's [`sync_full`] scope.
