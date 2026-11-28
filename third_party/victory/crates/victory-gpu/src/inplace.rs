@@ -138,6 +138,78 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    place_checked(start, len, window)
+}
+
+/// (El1xr) `VICTORY_INPLACE_WINDOWS=1` (off by default): a window of title
+/// memory outside buffers that would be a copy in the PC's memory with no
+/// card side (shaders read such a copy over the bus already) is the
+/// title's own memory instead, if it lies in private memory committed
+/// whole, the ask that makes it is sized and at least
+/// [`windows_min`] long, and [`most`] allows. Its copy (3.1 GB of them
+/// alive in train_b5m_mem, all charged to commit a second time) is not
+/// made. The card's reads of it are not cached in its L2 (feedcard: 0.91x
+/// streaming, 25x slower for the same 64 KiB read 16 times), hence only
+/// the large asks: vertex and index streams, not constants (root views
+/// are unsized asks, constant buffers small ones). What shaders write
+/// there is in title memory at once; it goes into the flights' account
+/// (`crate::port_order::account_on`) and is told written when its
+/// submission is done ([`told_written`]).
+pub(crate) fn windows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_WINDOWS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The least sized ask that makes a window in place with [`windows_on`],
+/// in bytes (`VICTORY_INPLACE_WINDOWS_MIN_KB`, 256).
+fn windows_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_INPLACE_WINDOWS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 10)
+}
+
+/// Whether a window is to be tried in place under [`windows_on`]: `ask`
+/// is the length of the ask that makes it (`None`: an unsized ask, a root
+/// view), `card` whether it gets a side on the card or in a GPU upload
+/// heap (then it stays there: the card reads it from its own memory).
+pub(crate) fn window_wanted(on: bool, ask: Option<u64>, card: bool, min: u64) -> bool {
+    on && !card && ask.is_some_and(|n| n >= min)
+}
+
+/// A window `[start, start + len)` in place under [`windows_on`] (see
+/// [`window_wanted`]); `None` leaves the caller to make its copy.
+pub(crate) fn place_window(start: u64, len: u64, ask: Option<u64>, card: bool) -> Option<Placed> {
+    if !window_wanted(windows_on(), ask, card, windows_min()) {
+        if windows_on() && !card {
+            WINDOWS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        return None;
+    }
+    let placed = place_checked(start, len, true);
+    if placed.is_some() {
+        WINDOWS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    placed
+}
+
+/// [`windows_on`] since the start: windows placed, windows of small or
+/// unsized asks left to their copies; then ranges shaders wrote in place
+/// told written, and their bytes.
+static WINDOWS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// (El1xr) What shaders wrote in place `[at, at + len)` is done (its
+/// submission ran): the pages count as written now, so host copies and
+/// textures of the same bytes, which the card's writes do not reach
+/// through write watching, take them again. With [`windows_on`].
+pub(crate) fn told_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::watch::written_through_view(at, len);
+    WINDOWS[2].fetch_add(1, Ordering::Relaxed);
+    WINDOWS[3].fetch_add(len as u64, Ordering::Relaxed);
+}
+
+fn place_checked(start: u64, len: u64, window: bool) -> Option<Placed> {
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -220,6 +292,18 @@ fn say() {
         s[6],
         s[7]
     );
+    if windows_on() {
+        let w: Vec<u64> = WINDOWS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "title memory in place (VICTORY_INPLACE_WINDOWS=1, asks of {} KiB and more): {} windows placed so far, {} small or unsized asks left to their copies; \
+             {} ranges shaders wrote in place told written ({} MB)",
+            windows_min() >> 10,
+            w[0],
+            w[1],
+            w[2],
+            w[3] >> 20
+        );
+    }
 }
 
 /// What a heap is opened on.
@@ -1432,7 +1516,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
+    if level() > 0 || windows_on() {
         say();
     }
     if probe_level() == 0 {
@@ -1638,6 +1722,45 @@ pub(crate) mod tests {
             }
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// (El1xr) `VICTORY_INPLACE_WINDOWS`: only a window with no side on
+    /// the card, made by a sized ask of the least length or more, is tried
+    /// in place: never an unsized ask (root views: constants among them),
+    /// never a small one, never one the card holds, never with the switch
+    /// off.
+    #[test]
+    fn only_large_sized_asks_of_windows_off_the_card_go_in_place() {
+        let min = 256 << 10;
+        assert!(window_wanted(true, Some(min), false, min));
+        assert!(window_wanted(true, Some(4 << 20), false, min));
+        assert!(!window_wanted(true, Some(min - 1), false, min), "a small ask: constants");
+        assert!(!window_wanted(true, Some(256), false, min));
+        assert!(!window_wanted(true, None, false, min), "an unsized ask: a root view");
+        assert!(!window_wanted(true, Some(4 << 20), true, min), "the card holds it");
+        assert!(!window_wanted(false, Some(4 << 20), false, min), "switch off");
+    }
+
+    /// (El1xr) What shaders wrote in place, once done, counts as written:
+    /// the pages are noted in the journal, so other copies of the same
+    /// bytes (which write watching never hears of, the card's writes not
+    /// being the CPU's) take them again; pages beside them are not.
+    #[test]
+    fn shader_writes_in_place_are_told_written_when_done() {
+        use crate::watch::{PAGE, was_written_since_batch};
+        // SAFETY: an allocation of the test's own, never written by anyone else.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            let page = base.next_multiple_of(PAGE) / PAGE;
+            let ask = |n: usize| was_written_since_batch(&(0..n).map(|k| (page + k, 0)).collect::<Vec<_>>());
+            assert_eq!(ask(4), vec![false; 4], "nothing written yet");
+            told_written((page + 1) * PAGE + 100, PAGE);
+            assert_eq!(ask(4), vec![false, true, true, false], "the two pages the range touches");
+            told_written((page + 3) * PAGE, 0);
+            assert!(!ask(4)[3], "an empty range tells nothing");
+            mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 
