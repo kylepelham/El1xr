@@ -727,6 +727,10 @@ fn all_shown_in(v: &Views, at: usize, len: usize) -> Option<bool> {
 }
 
 #[cfg(test)]
+#[path = "inplace_bench.rs"]
+mod bench;
+
+#[cfg(test)]
 mod all_shown_tests {
     use super::{BTreeMap, K64, Views, all_shown_in};
 

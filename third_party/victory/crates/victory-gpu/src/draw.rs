@@ -4678,6 +4678,30 @@ impl State {
                 }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        let written = crate::port_cbv::written_level();
+                        if written > 0
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                                .filter(|s| {
+                                    crate::port_cbv::written_fits(
+                                        s.in_place(),
+                                        s.window(),
+                                        s.shaders_wrote(),
+                                        s.span().1,
+                                    )
+                                })
+                        {
+                            if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                if written < 2 {
+                                    shadow.refresh(list, address, u64::from(size));
+                                } else {
+                                    list.keep(&shadow.buffer);
+                                }
+                                crate::port_cbv::viewed(&shadow);
+                                crate::port_cbv::from_written();
+                                continue;
+                            }
+                            crate::port_cbv::not_from_written();
+                        }
                         let in_place = crate::port_cbv::in_place_on();
                         let copies = crate::port_cbv::copies_on();
                         if in_place || copies {

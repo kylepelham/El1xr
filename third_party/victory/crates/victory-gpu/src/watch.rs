@@ -3806,10 +3806,15 @@ fn guard_shared(
                 for blk in d..prot_end {
                     let mut claims = Claims::none();
                     if claims.try_one(blk) && g.protected.contains(blk) && !g.clean.contains(blk) {
+                        let mut kept = false;
                         if guard4k::on() {
                             match guard4k::close(blk, &mut now) {
                                 guard4k::Closed::Failed => continue,
                                 guard4k::Closed::Pages { only: true } => pages_only.push(blk),
+                                guard4k::Closed::Kept => {
+                                    pages_only.push(blk);
+                                    kept = true;
+                                }
                                 guard4k::Closed::Pages { only: false } | guard4k::Closed::None => {}
                             }
                         }
@@ -3825,7 +3830,7 @@ fn guard_shared(
                         } else {
                             Vec::new()
                         };
-                        if uncovered.is_empty() {
+                        if uncovered.is_empty() && !kept {
                             g.clean.insert(blk);
                             let ep = clean_set(blk, true);
                             if ep != 0 {
