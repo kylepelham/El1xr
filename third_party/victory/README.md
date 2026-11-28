@@ -415,6 +415,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+In any build, `VICTORY_SAMPLE_PROFILE=<ms>` samples every thread's stack at that interval for a window (`VICTORY_SAMPLE_PROFILE_START_S`, default 150; `_SECONDS`, default 60) into `VICTORY_SAMPLE_PROFILE_OUT`; `tools/dev.py profile` runs it and writes the report of hot functions per thread.
+
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 

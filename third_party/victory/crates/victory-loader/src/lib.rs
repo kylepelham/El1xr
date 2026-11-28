@@ -28,6 +28,8 @@ pub mod frame_rate;
 pub mod prepare;
 pub mod resolution;
 pub mod resolve;
+#[cfg(windows)]
+pub mod sample_profile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]

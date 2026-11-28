@@ -217,6 +217,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    victory_loader::sample_profile::start();
     victory_hle::runtime::use_console_timers();
     victory_hle::modules::audio::mute::start();
     struct MuteStop;

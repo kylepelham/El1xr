@@ -31,6 +31,7 @@ import dev_live
 import dev_look
 import dev_mlrun
 import dev_multilive
+import dev_profile
 import dev_png
 import dev_prewarm
 import dev_runner
@@ -708,6 +709,56 @@ def cmd_bench(args: argparse.Namespace) -> int:
     snapped = f" snaps={snaps}{menu} snap_dir={snap_dir}" if args.snap_every > 0 or menu else ""
     print(f"{_dev_line('bench', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)}{snapped}")
     _print_driver_warning(resets_before, resets_after)
+    _print_hang_lines(log_path)
+    return 0 if ok else 1
+
+
+PROFILE_SLACK_S = 30
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """A bench run with the game's sampling profiler on (`VICTORY_SAMPLE_PROFILE`) for a window,
+    then the report (tools/dev_profile.py) of its hot functions per thread. `--report FILE` only
+    names and reports a profile file already written."""
+    if args.report:
+        out, profile, namer = dev_profile.report_file(Path(args.report))
+        print(f"DEV profile-report PASS samples={sum(s[3] for s in profile.samples)} report={out}")
+        for line in dev_profile.summary_lines(profile, namer):
+            print(f"DEV profile: {line}")
+        return 0
+    tag = args.tag or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_dir = DEV_DIR / f"profile_{re.sub(r'[^A-Za-z0-9_.-]+', '_', tag)}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = out_dir / "profile.txt"
+    data.unlink(missing_ok=True)
+    log_path = out_dir / "bench.log"
+    args.seconds = args.seconds or int(args.start_s + args.window_s + PROFILE_SLACK_S)
+    try:
+        overrides = {
+            **parse_overrides(args.override),
+            "VICTORY_SAMPLE_PROFILE": f"{args.interval_ms:g}",
+            "VICTORY_SAMPLE_PROFILE_START_S": f"{args.start_s:g}",
+            "VICTORY_SAMPLE_PROFILE_SECONDS": f"{args.window_s:g}",
+            "VICTORY_SAMPLE_PROFILE_OUT": str(data),
+        }
+        stats, _before, resets_after, _snaps = run_bench(args, overrides, log_path, out_dir / "snaps", "profile")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"DEV profile FAIL error={exc}")
+        return 1
+    if not data.exists():
+        print(f"DEV profile FAIL {bench_fields(stats)} no profile written (window past the run's end?) log={log_path}")
+        _print_hang_lines(log_path)
+        return 1
+    out, profile, namer = dev_profile.report_file(data)
+    m = profile.meta
+    ok = bench_ok(stats)
+    print(
+        f"{_dev_line('profile', ok, {})}{bench_fields(stats)} driver_resets={_count(resets_after)} "
+        f"samples={sum(s[3] for s in profile.samples)} threads={len(profile.threads)} "
+        f"suspended_us={m.get('suspended_us_mean', 0):.1f} stuck={int(m.get('stuck', 0))} report={out}"
+    )
+    for line in dev_profile.summary_lines(profile, namer):
+        print(f"DEV profile: {line}")
     _print_hang_lines(log_path)
     return 0 if ok else 1
 
@@ -1434,6 +1485,42 @@ def cmd_scout(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def add_bench_args(p: argparse.ArgumentParser) -> None:
+    """The run options `bench` and `profile` share (not --seconds)."""
+    p.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
+    p.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
+    p.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
+    p.add_argument(
+        "--profile", choices=dev_warm.RELEASE_PROFILES, default="release",
+        help="Run this release-family profile's victory.exe (build it first: `build --profile`). --diag wins.",
+    )
+    p.add_argument("--save", help="Named checkpoint under AnyXboxX-coord/saves/<name> (isolated copy per run).")
+    p.add_argument(
+        "--title-args",
+        action="append",
+        default=[],
+        metavar="ARGS",
+        help="Title arguments passed after `--` (repeatable, e.g. --title-args=-skipToIIS).",
+    )
+    p.add_argument("--skip-intro", action="store_true", help="Skip startup intro movie (VICTORY_SKIP_INTRO=1 / -SkipIntro).")
+    p.add_argument(
+        "--fast-boot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fast boot (default on): --skip-intro and --save default_checkpoint unless --save is given. "
+        "--no-fast-boot boots through the intro on the live save.",
+    )
+    p.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
+    p.add_argument(
+        "--quiet", action="store_true",
+        help="Hold every build slot during the run (waits for running builds) for numbers not skewed by builds.",
+    )
+    p.add_argument(
+        "--snap-every", type=float, default=0.0, metavar="N",
+        help="Save a PNG of the presented frame every N seconds (VICTORY_SNAP_EVERY_S) into dev/bench_snaps/.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev.py",
@@ -1467,39 +1554,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bench = sub.add_parser("bench", help="Run timed release benchmark under gpu.lock.")
     p_bench.add_argument("--seconds", type=int, default=75, help="Run duration in seconds (default: 75).")
-    p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
-    p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
-    p_bench.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
-    p_bench.add_argument(
-        "--profile", choices=dev_warm.RELEASE_PROFILES, default="release",
-        help="Run this release-family profile's victory.exe (build it first: `build --profile`). --diag wins.",
-    )
-    p_bench.add_argument("--save", help="Named checkpoint under AnyXboxX-coord/saves/<name> (isolated copy per run).")
-    p_bench.add_argument(
-        "--title-args",
-        action="append",
-        default=[],
-        metavar="ARGS",
-        help="Title arguments passed after `--` (repeatable, e.g. --title-args=-skipToIIS).",
-    )
-    p_bench.add_argument("--skip-intro", action="store_true", help="Skip startup intro movie (VICTORY_SKIP_INTRO=1 / -SkipIntro).")
-    p_bench.add_argument(
-        "--fast-boot",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Fast boot (default on): --skip-intro and --save default_checkpoint unless --save is given. "
-        "--no-fast-boot boots through the intro on the live save.",
-    )
-    p_bench.add_argument("--unmute", action="store_true", help="Do not mute game audio (default sets VICTORY_MUTE=1 and -Mute).")
-    p_bench.add_argument(
-        "--quiet", action="store_true",
-        help="Hold every build slot during the run (waits for running builds) for numbers not skewed by builds.",
-    )
-    p_bench.add_argument(
-        "--snap-every", type=float, default=0.0, metavar="N",
-        help="Save a PNG of the presented frame every N seconds (VICTORY_SNAP_EVERY_S) into dev/bench_snaps/.",
-    )
+    add_bench_args(p_bench)
     p_bench.set_defaults(func=cmd_bench)
+
+    p_prof = sub.add_parser(
+        "profile",
+        help="Bench run with the game's sampling profiler on for a window; writes dev/profile_<tag>/report.txt.",
+    )
+    p_prof.add_argument(
+        "--seconds", type=int, default=0, help="Run duration (default: start + window + 30 s)."
+    )
+    add_bench_args(p_prof)
+    p_prof.add_argument("--interval-ms", type=float, default=5.0, help="Sample every N ms (default: 5).")
+    p_prof.add_argument(
+        "--start-s", type=float, default=150.0, help="Window opens N s after the title starts (default: 150, settled)."
+    )
+    p_prof.add_argument("--window-s", type=float, default=60.0, help="Window length in seconds (default: 60).")
+    p_prof.add_argument("--tag", help="Folder tag (dev/profile_<tag>/; default: the time).")
+    p_prof.add_argument("--report", metavar="FILE", help="Only name and report this profile.txt (no game run).")
+    p_prof.set_defaults(func=cmd_profile)
 
     p_cap = sub.add_parser("capture", help="Run timed diag PNG capture under gpu.lock.")
     p_cap.add_argument("--seconds", type=int, default=90, help="Run duration in seconds (default: 90).")
