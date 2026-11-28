@@ -24,6 +24,7 @@ pub(crate) mod live_watch;
 pub(crate) mod queue_marks;
 mod recheck_tail;
 mod slot_wait;
+mod srgb_cast;
 pub(crate) mod view_ages;
 pub(crate) use list_views::on as list_views;
 
@@ -4790,9 +4791,10 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// family takes the texture's format, but for its sRGB or linear twin with
+/// `VICTORY_SRGB_CAST=1` on a host that casts ([`srgb_cast`]).
+/// shortcut: without that, such a view (sRGB of UNORM, say) reads without
+/// its conversion.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4843,6 +4845,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !srgb_cast::keeps(view, own, unordered)
     {
         *format = d.Format;
     }
