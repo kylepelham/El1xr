@@ -39,15 +39,20 @@ pub(in crate::watch) fn ask(pieces: &[(usize, usize)]) {
     let ends = ENDS.load(std::sync::atomic::Ordering::Acquire);
     let mut written: Vec<usize> = Vec::new();
     let hot = super::hot::Round::begin();
+    let quiet = super::quiet::Round::begin();
     let ahead = plan(pieces, |first, last| {
         if let Some(all) = hot.skipping(first, last) {
             written.extend(all);
+            return true;
+        }
+        if quiet.skipping(first, last) {
             return true;
         }
         let before = written.len();
         let answered = asked_kernel(first, last, &mut written);
         if answered {
             hot.judge(first, last, written.len() - before);
+            quiet.judge(first, last, &written[before..]);
         }
         answered
     });
