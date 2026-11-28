@@ -1598,6 +1598,7 @@ extern "system" fn clear_rtv(
             return;
         };
         crate::present_audit::target_cleared(record.resource as usize, color);
+        crate::flicker_catch::cleared(color[..3].iter().all(|&c| c == 0.0));
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
@@ -2145,6 +2146,7 @@ extern "system" fn execute_indirect(
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::drop_why::count("indirect");
+    crate::flicker_catch::dropped(0);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

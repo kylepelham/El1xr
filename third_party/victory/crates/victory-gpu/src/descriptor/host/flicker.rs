@@ -113,6 +113,7 @@ static TOTAL: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 /// Counts `what` in the current frame; the frame before is logged first if
 /// it had any.
 pub(super) fn count(what: Count) {
+    crate::flicker_catch::descriptor(what as usize);
     if !watch() {
         return;
     }
@@ -150,7 +151,11 @@ fn line(counts: &[u64; COUNTS]) -> String {
 /// A view was made of `copy`, shown from `first` (`None`: no level held
 /// with memory, so it reads zeros).
 pub(super) fn made_view(copy: &crate::resource::HostTexture, first: Option<u32>) {
-    if !watch() || copy.tiled.is_none() || first.is_some() {
+    if copy.tiled.is_none() || first.is_some() {
+        return;
+    }
+    if !watch() {
+        crate::flicker_catch::descriptor(Count::EmptyViews as usize);
         return;
     }
     count(Count::EmptyViews);

@@ -137,7 +137,7 @@ pub(crate) const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
 
 /// The format a texture of `format` is read through; `None` for formats
 /// the scan cannot read as floats.
-fn view_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn view_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         10 | 11 | 13 | 24 | 28 | 29 | 31 | 87 | 91 => format,

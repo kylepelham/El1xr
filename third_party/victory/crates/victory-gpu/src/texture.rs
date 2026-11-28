@@ -1090,6 +1090,7 @@ impl PreludeUpload {
     /// Records `CopyTextureRegion` onto `cmd_list` (the prelude command list).
     /// `self.copy.texture` must already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
     pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+        crate::flicker_catch::count(crate::flicker_catch::Kind::Uploads);
         // A host copy made whole from the store (`crate::texstore`): its larger
         // levels, once, before the ones from title memory.
         let prefill = self
@@ -1278,6 +1279,7 @@ impl Drop for Claimed {
 /// Records copies of zeros into every subresource of `texture`, which is in
 /// the copy destination state.
 pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12Resource) {
+    crate::flicker_catch::count(crate::flicker_catch::Kind::Zeroed);
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {

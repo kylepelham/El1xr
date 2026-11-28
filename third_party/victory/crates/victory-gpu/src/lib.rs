@@ -128,6 +128,7 @@ mod popwatch;
 mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
+mod flicker_catch;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
