@@ -280,6 +280,7 @@ def build_launcher_command(
     data_dir: Path | None = None,
     title_args: list[str] | None = None,
     extra: list[str] | None = None,
+    profile: str = "release",
 ) -> list[str]:
     parts = [
         # The user's settings file (the in-game menu's) stays out of runs: they stay reproducible.
@@ -295,6 +296,8 @@ def build_launcher_command(
     ]
     if diag:
         parts.append("-Diag")
+    elif profile != "release":
+        parts.extend(["-CargoProfile", profile])
     if mute:
         parts.append("-Mute")
     if skip_intro:
@@ -540,6 +543,12 @@ def cmd_build(args: argparse.Namespace) -> int:
         profile, steps = "both", [rel_step, diag_step]
     elif args.diag:
         profile, steps = "diag", [diag_step]
+    elif args.profile and args.profile != "release":
+        profile, steps = args.profile, [(
+            f"cargo build {args.profile}",
+            ["cargo", "build", "--profile", args.profile, "-p", "victory", "--manifest-path", str(VICTORY_MANIFEST)],
+            REPO_ROOT,
+        )]
     else:
         profile, steps = "release", [rel_step]
 
@@ -666,6 +675,7 @@ def run_bench(
             skip_intro=args.skip_intro,
             data_dir=data_dir,
             title_args=title_args,
+            profile=getattr(args, "profile", None) or "release",
         )
         monitor = getattr(args, "monitor", None)
         with acquire_gpu_lock(what), _quiet(args, what):
@@ -934,10 +944,11 @@ def train_verdict(plan: dev_train.Plan, done: dict[int, dict[str, object]], trai
 
 
 def run_prewarm(
-    game_dir: Path, overrides: dict[str, str], mute: bool, pipelines: bool, jobs: int, log_path: Path
+    game_dir: Path, overrides: dict[str, str], mute: bool, pipelines: bool, jobs: int, log_path: Path,
+    profile: str = "release",
 ) -> tuple[bool, dict[str, int]]:
     """One prewarm in this process (no build slot: it runs inside a train call's gpu lock window)."""
-    cmd = prewarm_command(game_dir, overrides, mute, False, pipelines, jobs)
+    cmd = prewarm_command(game_dir, overrides, mute, False, pipelines, jobs, profile=profile)
     with acquire_gpu_lock("prewarm") if pipelines else contextlib.nullcontext():
         ok, outputs = run_logged_steps([("prewarm", cmd, REPO_ROOT)], log_path)
     text = outputs.get("prewarm", "")
@@ -953,14 +964,15 @@ def train_warm(plan: dev_train.Plan, name: str, game_dir_arg: str | None, train_
         return True, "off"
     overrides, mute = apply_mute_default(dev_train.step_overrides(plan, name), plan.unmute)
     pipelines = plan.prewarm == "pipelines"
-    if is_warm(overrides, pipelines):
+    profile = dev_train.step_profile(plan, name)
+    if is_warm(overrides, pipelines, profile=profile):
         return True, "warm"
     game_dir = resolve_game_dir(game_dir_arg)
     print(f"DEV train: prewarm ({plan.prewarm}) of {name}", flush=True)
-    ok, counts = run_prewarm(game_dir, overrides, mute, pipelines, 0, train_dir / f"prewarm_{name}.log")
+    ok, counts = run_prewarm(game_dir, overrides, mute, pipelines, 0, train_dir / f"prewarm_{name}.log", profile)
     if not ok:
         return False, "failed"
-    dev_warm.write_stamp(warm_dir(), warm_signature(overrides), pipelines, counts, overrides, "train")
+    dev_warm.write_stamp(warm_dir(), warm_signature(overrides, profile=profile), pipelines, counts, overrides, "train")
     return True, f"made:{counts['translated']}"
 
 
@@ -971,20 +983,21 @@ def start_ahead(plan: dev_train.Plan, name: str, game_dir: Path, train_dir: Path
     """Translates `name`'s shader variant (translation only: no device, no gpu lock, no build slot) at idle priority
     while this arm runs, into the cache that arm will use. None when it is already stamped warm."""
     overrides, mute = apply_mute_default(dev_train.step_overrides(plan, name), plan.unmute)
-    if is_warm(overrides, False):
+    profile = dev_train.step_profile(plan, name)
+    if is_warm(overrides, False, profile=profile):
         return None
-    cmd = prewarm_command(game_dir, overrides, mute, False, False, plan.ahead_jobs)
+    cmd = prewarm_command(game_dir, overrides, mute, False, False, plan.ahead_jobs, profile=profile)
     log = train_dir / f"ahead_{name}.log"
     flags = subprocess.IDLE_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     with log.open("wb") as out:
         proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), stdout=out, stderr=subprocess.STDOUT, creationflags=flags)
     print(f"DEV train: translating {name}'s shaders ahead at idle priority ({plan.ahead_jobs} jobs) log={log}", flush=True)
-    return name, proc, log, overrides, time.monotonic()
+    return name, proc, log, overrides, time.monotonic(), profile
 
 
 def finish_ahead(ahead: tuple, kill: bool = False) -> dict[str, object]:
     """Waits for the prewarm ahead (it must end inside this call: Drift ends what a command started) and stamps it."""
-    name, proc, log, overrides, t0 = ahead
+    name, proc, log, overrides, t0, profile = ahead
     if kill:
         kill_process_tree(proc.pid)
     elif proc.poll() is None:
@@ -998,7 +1011,7 @@ def finish_ahead(ahead: tuple, kill: bool = False) -> dict[str, object]:
     counts = dev_prewarm.parse_summary(text)
     ok = proc.returncode == 0 and counts["shaders"] > 0 and not dev_prewarm.device_made(text)
     if ok:
-        dev_warm.write_stamp(warm_dir(), warm_signature(overrides), False, counts, overrides, "ahead")
+        dev_warm.write_stamp(warm_dir(), warm_signature(overrides, profile=profile), False, counts, overrides, "ahead")
     return {"set": name, "ok": ok, "translated": counts["translated"], "hits": counts["hits"],
             "secs": round(time.monotonic() - t0, 1), "log": str(log)}
 
@@ -1162,6 +1175,7 @@ def train_arm(
     bench_args = argparse.Namespace(
         game_dir=args.game_dir, fast_boot=plan.fast_boot, save=plan.save, skip_intro=False, title_args=[],
         unmute=plan.unmute, diag=False, seconds=seconds, quiet=quiet, snap_every=plan.snap_every, monitor=monitor,
+        profile=dev_train.step_profile(plan, name),
     )
     ahead = None
     t0 = time.monotonic()
@@ -1192,7 +1206,7 @@ def train_arm(
     text = read_log_text(log_path)
     done[step] = {
         "step": step, "set": name, "kind": "live" if arm is not None else "multilive" if ml_info else "set",
-        "overrides": overrides,
+        "overrides": overrides, "profile": bench_args.profile,
         "ok": bench_ok(stats), "stats": stats, "resets_before": before, "resets_after": after, "snaps": snaps,
         "log": str(log_path), "quiet": quiet, "prewarm": warm, "ahead": ahead_info, "seconds": seconds,
         "ended": ended, "fatal": dev_greps.scan_log(text, {}).fatal, "wall_s": round(time.monotonic() - t0, 1),
@@ -1310,20 +1324,23 @@ def warm_dir() -> Path:
     return DEV_DIR / "warm"
 
 
-def warm_signature(overrides: dict[str, str], diag: bool = False) -> str:
-    """The stamp signature of a prewarm with these launch overrides (mute applied), the current victory.exe and
-    launcher."""
-    exe = dev_warm.exe_identity(dev_warm.victory_exe(REPO_ROOT, diag), REPO_ROOT / "tools" / "lancer_victory.ps1")
+def warm_signature(overrides: dict[str, str], diag: bool = False, profile: str = "release") -> str:
+    """The stamp signature of a prewarm with these launch overrides (mute applied), the current victory.exe of this
+    profile and launcher."""
+    exe = dev_warm.exe_identity(dev_warm.victory_exe(REPO_ROOT, diag, profile), REPO_ROOT / "tools" / "lancer_victory.ps1")
     return dev_warm.signature(overrides, exe, diag)
 
 
-def is_warm(overrides: dict[str, str], pipelines: bool, diag: bool = False) -> bool:
-    return dev_warm.is_warm(warm_dir(), warm_signature(overrides, diag), pipelines, dev_warm.shader_cache_dir(overrides))
+def is_warm(overrides: dict[str, str], pipelines: bool, diag: bool = False, profile: str = "release") -> bool:
+    return dev_warm.is_warm(
+        warm_dir(), warm_signature(overrides, diag, profile), pipelines, dev_warm.shader_cache_dir(overrides)
+    )
 
 
 def prewarm_command(
     game_dir: Path, overrides: dict[str, str], mute: bool, diag: bool, pipelines: bool, jobs: int,
     host_wave: int = dev_prewarm.DEFAULT_HOST_WAVE, view_limit: int = dev_prewarm.DEFAULT_VIEW_LIMIT,
+    profile: str = "release",
 ) -> list[str]:
     # As `bench` (release) or `capture` (--diag) launch it, so the key is theirs: the same launcher set, the arm's
     # overrides, mute and skip-intro (not in the key, but kept identical).
@@ -1334,6 +1351,7 @@ def prewarm_command(
         mute=mute,
         skip_intro=True,
         extra=dev_prewarm.launcher_extra(pipelines, jobs),
+        profile=profile,
     )
 
 
@@ -1423,6 +1441,10 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--release", action="store_true", help="Build release profile (default).")
     grp.add_argument("--diag", action="store_true", help="Build diag profile with diagnostics.")
     grp.add_argument("--both", action="store_true", help="Build both release and diag profiles.")
+    grp.add_argument(
+        "--profile", choices=dev_warm.RELEASE_PROFILES,
+        help="Build this release-family profile (release-lto: fat LTO, one codegen unit; target/release-lto).",
+    )
     p_build.set_defaults(func=cmd_build)
 
     p_test = sub.add_parser(
@@ -1443,6 +1465,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--override", action="append", default=[], metavar="K=V", help="VICTORY_* override.")
     p_bench.add_argument("--game-dir", help="Game folder containing game_scarlett_master.exe.")
     p_bench.add_argument("--diag", action="store_true", help="Run the diag build (no PNG capture).")
+    p_bench.add_argument(
+        "--profile", choices=dev_warm.RELEASE_PROFILES, default="release",
+        help="Run this release-family profile's victory.exe (build it first: `build --profile`). --diag wins.",
+    )
     p_bench.add_argument("--save", help="Named checkpoint under AnyXboxX-coord/saves/<name> (isolated copy per run).")
     p_bench.add_argument(
         "--title-args",

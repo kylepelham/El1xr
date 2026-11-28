@@ -15,6 +15,8 @@
 //! so the HUD-less picture is also taken at the frame's first Scaleform draw
 //! onto that target (or one of its size). `VICTORY_CAMERA_DIAG=1` logs a
 //! frame's candidate passes now and then ([`crate::camera_diag`]).
+//! `VICTORY_DLSSG_EVERY_FRAME=1` also tags DLSS-G's depth and motion at the
+//! scene pass itself ([`crate::camera_tag`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,7 +135,7 @@ impl State {
             match info.role {
                 Role::None => {}
                 Role::Ui => self.camera_ui(list, stage, compute),
-                Role::SceneOut => self.camera_scene_out(compute),
+                Role::SceneOut => self.camera_scene_out(list, compute),
                 Role::UiDraw => self.camera_ui_draw(list, compute),
                 r => {
                     self.camera_velocity(stage, compute);
@@ -227,7 +229,7 @@ impl State {
             }
         }
         // DLSS-G without an upscale hook: the velocity pass is behind us.
-        crate::dlssg::tag_from_camera(list);
+        crate::dlssg::tag_from_camera(list, crate::camera_tag::Point::Ui);
         let current = self.targets.first().map_or(0, |&t| t as u64);
         if crate::camera_copy::hudless_on() && current != 0 && !compute {
             crate::camera_copy::copy_hudless(list, current);
@@ -236,9 +238,12 @@ impl State {
 }
 
 impl State {
-    fn camera_scene_out(&self, compute: bool) {
+    /// The scene at output size; with `VICTORY_DLSSG_EVERY_FRAME=1` DLSS-G
+    /// tags the velocity pass's depth and motion here (`crate::camera_tag`).
+    fn camera_scene_out(&self, list: &HostList, compute: bool) {
         if let (false, Some(&t)) = (compute, self.targets.first()) {
             *SCENE_OUT.lock().unwrap_or_else(|e| e.into_inner()) = (crate::camera::frame(), t as u64);
+            crate::dlssg::tag_from_camera(list, crate::camera_tag::Point::SceneOut);
         }
     }
 
@@ -265,7 +270,7 @@ impl State {
         }
         UI_FRAME.store(frame, Ordering::Relaxed);
         crate::camera::note_ui(crate::camera::Ui { texture: 0, target: current });
-        crate::dlssg::tag_from_camera(list);
+        crate::dlssg::tag_from_camera(list, crate::camera_tag::Point::Ui);
         if crate::camera_copy::hudless_on() {
             crate::camera_copy::copy_hudless(list, current);
         }

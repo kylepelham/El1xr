@@ -759,8 +759,10 @@ impl Lower<'_> {
                     let is = self.s.m.cmp(c1, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
                     let k = self.exchange_set(c1, k, turn);
+                    let site = self.exchange_site(c1, slot, k);
+                    let k = site.map_or(k, |s| s.1);
                     let at = self.begin_guarded(Some(is));
-                    let lds = self.s.lds();
+                    let lds = site.map_or_else(|| self.s.lds(), |s| s.0);
                     let ptr = self.s.m.element(self.cur, lds, k);
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);

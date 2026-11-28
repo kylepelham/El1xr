@@ -42,6 +42,10 @@
   Optional. Builds and runs the diag profile with the diagnostics feature instead of the release build the frame rates
   were measured with. -Dred implies it.
 
+.PARAMETER CargoProfile
+  Optional. The release-family cargo profile to build and run (default release; release-lto: fat LTO and one codegen
+  unit, in target\release-lto). -Diag wins over it.
+
 .PARAMETER SkipPipelines
   Optional. Passed unchanged to VICTORY_SKIP_PIPELINES when given.
 
@@ -118,6 +122,7 @@ param(
     [switch]$AutoA,
     [switch]$FrametimeDump,
     [switch]$Diag,
+    [ValidateSet('release', 'release-lto')][string]$CargoProfile = 'release',
     [string]$SkipPipelines,
     [switch]$NoTunedSettings,
     [switch]$Dred,
@@ -154,6 +159,9 @@ $useDiag = $Diag -or $Dred
 if ($useDiag) {
     $profileArgs = @('--profile', 'diag', '-p', 'victory', '--features', 'diagnostics')
     $exe = Join-Path $target 'diag\victory.exe'
+} elseif ($CargoProfile -ne 'release') {
+    $profileArgs = @('--profile', $CargoProfile, '-p', 'victory')
+    $exe = Join-Path $target "$CargoProfile\victory.exe"
 } else {
     $profileArgs = @('--release', '-p', 'victory')
     $exe = Join-Path $target 'release\victory.exe'
@@ -162,7 +170,7 @@ if ($useDiag) {
 # Always ask cargo: it does nothing when victory.exe is current, and rebuilds it after a pull that changes
 # third_party/victory (an old victory.exe would ignore the settings the new tree reads).
 Write-Host 'El1xr by Bone/Nevaa, running on VIctory (Marvisak and contributors).'
-Write-Host "Building VIctory ($(if ($useDiag) { 'diag profile, diagnostics feature' } else { 'release' }))..."
+Write-Host "Building VIctory ($(if ($useDiag) { 'diag profile, diagnostics feature' } else { $CargoProfile }))..."
 # Windows PowerShell 5.1 wraps redirected native stderr (`2>`) in NativeCommandError, which
 # $ErrorActionPreference = 'Stop' turns into a terminating error on benign warnings; rely on $LASTEXITCODE.
 $prevErrorAction = $ErrorActionPreference
