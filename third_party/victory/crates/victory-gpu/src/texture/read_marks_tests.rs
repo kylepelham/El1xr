@@ -94,6 +94,59 @@ fn a_texture_the_host_wrote_is_marked_and_not_uploaded() {
     release(t);
 }
 
+/// (`VICTORY_CARD_MIPS_TRACK`, live) A texture the card wrote one mip of
+/// is still uploaded from title memory with the switch on (its other mip),
+/// not with it off; one the card wrote whole is not, either way. (The
+/// switch's live test too: one test sets it, so no other races it.)
+#[test]
+fn a_texture_the_card_wrote_one_mip_of_is_uploaded_with_the_switch() {
+    let Some(host) = crate::host::host() else {
+        return; // no host GPU here
+    };
+    if std::env::var_os("VICTORY_CARD_MIPS_TRACK").is_some() {
+        return;
+    }
+    victory_core::settings::check_live(
+        "VICTORY_CARD_MIPS_TRACK",
+        "1",
+        super::card_mips::on,
+        false,
+        true,
+    );
+    let mut words = RGBA8_64;
+    words[7] = 1 | 2 << 16;
+    let i = ID3D12Resource::IID;
+    let iid = guid(i.data1, i.data2, i.data3, i.data4);
+    let mut t = std::ptr::null();
+    let made = crate::resource::create_at_address(
+        std::ptr::null(),
+        title_memory(1 << 16),
+        words.as_ptr().cast(),
+        0,
+        std::ptr::null(),
+        &iid,
+        &mut t,
+    );
+    assert_eq!(made, S_OK);
+    let texture = crate::resource::host_resource(t).unwrap();
+    assert_eq!(super::subresources(texture), 2);
+    super::host_written_sub(t, Some(1));
+    let read = |on: &str| {
+        victory_core::settings::set("VICTORY_CARD_MIPS_TRACK", on).unwrap();
+        let list = host.new_list().unwrap();
+        super::upload(&list, t, texture);
+        let read = !list.first_use(t as usize);
+        list.close();
+        victory_core::settings::set("VICTORY_CARD_MIPS_TRACK", "").unwrap();
+        read
+    };
+    assert!(!read(""), "off: the card's for good, as before");
+    assert!(read("1"), "on: mip 0 is the title's");
+    super::host_written(t);
+    assert!(!read("1"), "a whole write: the card's");
+    release(t);
+}
+
 /// A placed texture's kept "no target at its memory" answer does not hide
 /// a render target made there later, nor one gone after it.
 #[test]

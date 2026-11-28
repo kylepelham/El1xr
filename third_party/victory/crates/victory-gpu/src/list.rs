@@ -1367,7 +1367,10 @@ extern "system" fn copy_texture_region(
         if !same {
             crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         }
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written_sub(
+            dst.resource,
+            (dst.kind != FOOTPRINT).then_some(dst.footprint.offset as u32),
+        );
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst.resource as usize, "copy", src.resource as usize);
         }
@@ -1550,7 +1553,7 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written_sub(dst, Some(dst_sub));
         if crate::bake_check::on() {
             crate::bake_check::written(std::ptr::from_ref(list) as usize, dst as usize, "copy", src as usize);
         }

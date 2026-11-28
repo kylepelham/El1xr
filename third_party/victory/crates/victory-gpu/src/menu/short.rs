@@ -38,6 +38,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_CARD_COMPARE_SHARE", "Hashes each shared piece once in the card's write compare."),
     ("VICTORY_CARD_COPY_CONSTANTS", "Constants read after a card copy in a list see what the copy wrote."),
     ("VICTORY_CARD_DECL_JOIN", "Joins a submission's declared shader writes in one sort per copy."),
+    ("VICTORY_CARD_MIPS_TRACK", "Mips the card did not write are uploaded again from game memory."),
     ("VICTORY_CARD_PROF", "Logs where pre-submission card checks spend their time."),
     ("VICTORY_CARD_RECORD_SEND", "Records card sync and compare lists on the send thread."),
     ("VICTORY_CARD_SIDE", "Keeps buffers that shaders touch in card memory, not system memory."),
