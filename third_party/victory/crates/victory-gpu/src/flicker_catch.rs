@@ -112,9 +112,19 @@ pub(crate) enum Kind {
     /// Draws of passes over the screen dropped while their pipeline was
     /// being made (`crate::pipeline::make::screen_wait`).
     ScreenUnmade,
+    /// Title submissions (parts of them) sent from the queues' lines, counted
+    /// when sent, not when recorded.
+    SentRuns,
+    /// Of those, sent by a present that ran the lines out past waits not met.
+    ForcedRuns,
+    /// Submissions of the next frame kept aside when the present began
+    /// (the title records ahead while its present waits its turn).
+    KeptAside,
+    /// Milliseconds from the title's present call to its present beginning.
+    PresentLagMs,
 }
 
-pub(crate) const KINDS: usize = 29;
+pub(crate) const KINDS: usize = 33;
 const NAMES: [&str; KINDS] = [
     "ran",
     "dropped",
@@ -145,6 +155,10 @@ const NAMES: [&str; KINDS] = [
     "unmade_views",
     "kept_read",
     "screen_unmade",
+    "sent_runs",
+    "forced_runs",
+    "kept_aside",
+    "present_lag_ms",
 ];
 
 static NOW: [AtomicU32; KINDS] = [const { AtomicU32::new(0) }; KINDS];
@@ -190,6 +204,13 @@ static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
 pub(crate) fn count(kind: Kind) {
     if on() {
         NOW[kind as usize].fetch_add(1, Relaxed);
+    }
+}
+
+/// Counts `n` of `kind` in this frame.
+pub(crate) fn count_n(kind: Kind, n: u64) {
+    if on() {
+        NOW[kind as usize].fetch_add(n.min(u64::from(u32::MAX)) as u32, Relaxed);
     }
 }
 
@@ -326,7 +347,7 @@ pub(crate) fn settled(why: usize) {
 }
 
 /// What one frame did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Summary {
     pub(crate) frame: u64,
     pub(crate) counts: [u32; KINDS],
@@ -341,6 +362,21 @@ pub(crate) struct Summary {
     pub(crate) why: Vec<(usize, &'static str)>,
     /// (pipeline, its indirect paths' bits), by pipeline.
     pub(crate) paths: Vec<(usize, u8)>,
+}
+
+impl Default for Summary {
+    fn default() -> Self {
+        Summary {
+            frame: 0,
+            counts: [0; KINDS],
+            settled: 0,
+            ambient: 0,
+            programs: Vec::new(),
+            targets: Vec::new(),
+            why: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
 }
 
 impl Summary {

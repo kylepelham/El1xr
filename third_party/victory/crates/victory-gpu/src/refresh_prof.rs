@@ -139,4 +139,5 @@ pub(crate) fn log(frames: f64) {
         per(P::SnapRedone),
         ms(P::SnapHeldUs),
     );
+    crate::watch::guard_split_log(frames);
 }

@@ -60,6 +60,12 @@ mod guard4k;
 pub(crate) fn guard_4k_join() -> bool {
     guard4k::join()
 }
+mod guard_split;
+
+/// (feedcard, #88) The guard path's split line (`VICTORY_FLUSH_PROF`).
+pub(crate) fn guard_split_log(frames: f64) {
+    guard_split::log(frames);
+}
 pub(crate) mod empty_notice;
 mod holes;
 pub(crate) mod ask_split;
@@ -662,9 +668,13 @@ struct ClaimOne(usize);
 
 impl ClaimOne {
     fn wait(block: usize) -> Self {
+        if BUSY.try_set(block) {
+            return Self(block);
+        }
+        let waiting = guard_split::start();
         let mut spun = 0u64;
         let mut tries = 0u32;
-        while !BUSY.try_set(block) {
+        loop {
             tries += 1;
             spun += 1;
             if tries < 64 {
@@ -672,11 +682,19 @@ impl ClaimOne {
             } else {
                 std::thread::yield_now();
             }
+            if BUSY.try_set(block) {
+                break;
+            }
         }
-        if spun != 0 {
-            port6_count(P6_CLAIM_SPINS, spun);
-        }
+        port6_count(P6_CLAIM_SPINS, spun);
+        guard_split::add(guard_split::S::ClaimWaits, 1);
+        guard_split::finish(guard_split::S::ClaimWaitUs, waiting);
         Self(block)
+    }
+
+    /// The claim of `block` if it is free; never waits.
+    fn try_get(block: usize) -> Option<Self> {
+        BUSY.try_set(block).then_some(Self(block))
     }
 }
 
@@ -860,18 +878,31 @@ fn publish(epochs: &[(usize, usize, u64)]) {
     if port_guard() {
         // Hold each block's claim while setting `PUBLISHED`: a concurrent fault
         // opening it clears `PUBLISHED` after this sets it, never before.
-        let g = guards_read();
+        let publishing = guard_split::start();
+        let g = guard_split::shared(&GUARDS);
+        let try_only = guard_split::publish_try();
         for &(from, to, epoch) in epochs {
             if epoch == 0 || from >= to {
                 continue;
             }
             for block in from..to {
-                let _claim = ClaimOne::wait(block);
+                let _claim = if try_only {
+                    // (#88) `VICTORY_GUARD_PUBLISH_TRY`: a block claimed elsewhere is left
+                    // unpublished (its `PUBLISHED` is 0 since it was last not clean).
+                    let Some(claim) = ClaimOne::try_get(block) else {
+                        guard_split::add(guard_split::S::PublishSkipped, 1);
+                        continue;
+                    };
+                    claim
+                } else {
+                    ClaimOne::wait(block)
+                };
                 if g.clean.contains(block) && clean_epoch(block) == epoch {
                     published_set(block, epoch);
                 }
             }
         }
+        guard_split::finish(guard_split::S::PublishUs, publishing);
         return;
     }
     let g = guards_read();
@@ -1424,6 +1455,27 @@ fn clear_subpages_range(first: usize, last: usize) {
 /// Notes `page` written at asking `now`; what it held before (0: nothing). Says nothing of
 /// which 4 KiB pages, so with [`watch_4k`] or [`dirty4k_kept`] the whole page counts.
 fn written_set(page: usize, now: u64) -> u64 {
+    written_whole(page, now);
+    if dirty4k_kept() {
+        #[cfg(test)]
+        NOTE_LOCKS.set(NOTE_LOCKS.get() + 1);
+        let mut sub = SUB_PAGES.write().unwrap_or_else(|e| e.into_inner());
+        let before = stamp_set(page, now);
+        sub.remove(&page);
+        return before;
+    }
+    stamp_set(page, now)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Exclusive takings of [`SUB_PAGES`] by the guards' noting on this thread
+    /// (`VICTORY_GUARD_NOTE_ONCE`'s test).
+    static NOTE_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`written_set`]'s part before the page's stamp: the whole-page stamp with [`watch_4k`].
+fn written_whole(page: usize, now: u64) {
     #[cfg(feature = "diagnostics")]
     crate::trace_va::event("title write", (page * PAGE) as u64, PAGE as u64, now);
     if watch_4k() {
@@ -1435,13 +1487,6 @@ fn written_set(page: usize, now: u64) -> u64 {
             None => {}
         }
     }
-    if dirty4k_kept() {
-        let mut sub = SUB_PAGES.write().unwrap_or_else(|e| e.into_inner());
-        let before = stamp_set(page, now);
-        sub.remove(&page);
-        return before;
-    }
-    stamp_set(page, now)
 }
 
 /// The page's stamp alone: what it held before.
@@ -2881,11 +2926,11 @@ fn writes_with(
         }
         let now = next_asking();
         note_kernel_batch(&found[..count], now);
-        for &page in &guarded_pages {
-            written_set(page, now);
-        }
+        let noting = if failed { guard_split::start() } else { None };
+        guard_split::note_written(&guarded_pages, now);
         if failed {
             publish(&epochs);
+            guard_split::finish(guard_split::S::NoteUs, noting);
             crate::refresh_prof::add(crate::refresh_prof::P::GuardCalls, 1);
             crate::refresh_prof::finish(crate::refresh_prof::P::GuardUs, t_path);
         } else {
@@ -3347,8 +3392,13 @@ static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     aliased: GuardBlocks::new(),
 });
 
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+fn guards() -> guard_split::Excl {
+    guards_by(guard_split::Who::Other)
+}
+
+/// [`guards`], the hold counted for `who` (`VICTORY_FLUSH_PROF`).
+fn guards_by(who: guard_split::Who) -> guard_split::Excl {
+    guard_split::exclusive(&GUARDS, who)
 }
 
 /// The guards, to look at only.
@@ -3410,9 +3460,11 @@ fn guard_with_epochs_flags(
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let pre = guard_split::start();
     if !ask && first < last && clean_all(first, last) {
         // (Neptune) All clean, so all guarded and a view: said without the lock.
         count(4, 1);
+        guard_split::finish(guard_split::S::PreUs, pre);
         return Some((Vec::new(), Vec::new()));
     }
     let hot = guard_hot();
@@ -3457,11 +3509,13 @@ fn guard_with_epochs_flags(
         }
         if settled {
             count(4, 1);
+            guard_split::finish(guard_split::S::PreUs, pre);
             return Some((written, Vec::new()));
         }
     }
+    guard_split::finish(guard_split::S::PreUs, pre);
     let known = {
-        let g = guards_read();
+        let g = guard_split::shared(&GUARDS);
         let known = !ask
             && (g.is_known_view_block(first)
                 || crate::shadow::is_lazy_mapped_view_page(first)
@@ -3483,7 +3537,8 @@ fn guard_with_epochs_flags(
         if first < last && !VIEWS.all(first, last) {
             VIEWS.set_range(first, last);
         }
-        return Some(guard_shared(
+        let walking = guard_split::start();
+        let walked = guard_shared(
             first,
             last,
             hot,
@@ -3491,7 +3546,9 @@ fn guard_with_epochs_flags(
             skip_placeholders,
             coalesce,
             alias_batch,
-        ));
+        );
+        guard_split::finish(guard_split::S::WalkUs, walking);
+        return Some(walked);
     }
     let g = if single_lock && known {
         if !INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
@@ -3716,7 +3773,7 @@ fn guard_shared(
     port6_count(P6_GUARDS, 1);
     count(3, 1);
     crate::refresh_prof::add(crate::refresh_prof::P::GuardWalks, 1);
-    let g = guards_read();
+    let g = guard_split::shared(&GUARDS);
     if first >= last || g.clean.covers(first, last) {
         return (Vec::new(), Vec::new());
     }
@@ -3998,6 +4055,21 @@ fn cover_aliases_claimed(
     alias_batch: bool,
     claims: &mut Claims,
 ) -> Vec<usize> {
+    let t = guard_split::start();
+    let out = cover_aliases_claimed_untimed(g, from, to, coalesce, alias_batch, claims);
+    guard_split::finish(guard_split::S::AliasUs, t);
+    out
+}
+
+/// [`cover_aliases_claimed`], untimed.
+fn cover_aliases_claimed_untimed(
+    g: &Guards,
+    from: usize,
+    to: usize,
+    coalesce: bool,
+    alias_batch: bool,
+    claims: &mut Claims,
+) -> Vec<usize> {
     if alias_batch {
         let (sources, all_aliased, peers) =
             crate::inplace::aliases_in_range(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK));
@@ -4178,8 +4250,13 @@ fn is_view(start: usize, end: usize) -> bool {
     loop {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let t = guard_split::start();
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if t.is_some() {
+            guard_split::add(guard_split::S::QueryCalls, 1);
+            guard_split::finish(guard_split::S::QueryUs, t);
+        }
         if n == 0 {
             return false;
         }
@@ -4241,8 +4318,14 @@ fn os_virtual_query(
     use windows_sys::Win32::System::Memory::VirtualQuery;
     #[cfg(test)]
     OS_VIRTUAL_QUERY_CALLS.with(|c| c.set(c.get() + 1));
+    let t = guard_split::start();
     // SAFETY: a valid out pointer of the right size.
-    unsafe { VirtualQuery(addr as *const _, info, size_of_val(info)) }
+    let n = unsafe { VirtualQuery(addr as *const _, info, size_of_val(info)) };
+    if t.is_some() {
+        guard_split::add(guard_split::S::QueryCalls, 1);
+        guard_split::finish(guard_split::S::QueryUs, t);
+    }
+    n
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -4736,11 +4819,23 @@ fn open_here_with(g: &Guards, start: usize, end: usize, coalesce: bool) -> bool 
 /// concurrent refresh cannot re-protect it before the fault handler checks
 /// `writable(at)`.
 fn open_faulted(at: usize) -> (usize, bool) {
+    let t = guard_split::start();
+    let answer = open_faulted_untimed(at);
+    if t.is_some() {
+        guard_split::add(guard_split::S::FaultCalls, 1);
+        guard_split::finish(guard_split::S::FaultUs, t);
+    }
+    answer
+}
+
+/// [`open_faulted`], untimed.
+fn open_faulted_untimed(at: usize) -> (usize, bool) {
     let block = at / BLOCK;
     let began = std::time::Instant::now();
     let g = guards_read();
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
+    guard_split::add(guard_split::S::FaultLockUs, waited.as_micros() as u64);
     // Zero-allocation fast path for the common single-block unaliased fault.
     {
         let _claim = ClaimOne::wait(block);
@@ -4923,7 +5018,7 @@ pub fn writing(at: usize, len: usize) {
         false
     };
     if guarded {
-        open(&guards(), at, end);
+        open(&guards_by(guard_split::Who::KernelWrite), at, end);
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -5023,7 +5118,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     {
-        let g = guards();
+        let g = guards_by(guard_split::Who::DsWrite);
         let guarded = g.protected.count_in(at / BLOCK, end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -5055,7 +5150,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !view_guard() {
         return;
     }
-    let g = guards();
+    let g = guards_by(guard_split::Who::ViewsMapped);
     if light() {
         for &(at, n) in &ranges {
             let (first, last) = (at / BLOCK, at.saturating_add(n).div_ceil(BLOCK));
@@ -5268,7 +5363,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     clear_subpages_range(first, last);
-    let g = guards();
+    let g = guards_by(guard_split::Who::Remap);
     VIEWS.clear_range(first, last);
     if guard_hot() > 0 {
         for block in first..last {
@@ -5385,6 +5480,7 @@ fn install() {
         port_guard(),
         guard_open_ahead(),
         guard4k::on(),
+        crate::refresh_prof::on(),
     );
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| {
@@ -5423,7 +5519,7 @@ pub(crate) fn before_virtual_free(at: usize, len: usize) {
             part.0[p % PART].store(0, std::sync::atomic::Ordering::Release);
         }
     }
-    let g = guards();
+    let g = guards_by(guard_split::Who::BeforeFree);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     VIEWS.clear_range(first, last);
     let absent_runs = g.absent.take_range(first, last);
@@ -5450,7 +5546,7 @@ pub(crate) fn before_virtual_free(at: usize, len: usize) {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn before_virtual_protect(at: usize, len: usize) {
     crate::shadow::lazy_flush_range(at, len);
-    open(&guards(), at, at.saturating_add(len));
+    open(&guards_by(guard_split::Who::BeforeProtect), at, at.saturating_add(len));
 }
 
 /// Lock-free batch query: for each `(page, since)`, whether `PARTS` records a
@@ -5493,7 +5589,7 @@ pub(crate) fn transition_clean_guards_run_to_noaccess(
     if run_first >= run_last {
         return Vec::new();
     }
-    let g = guards();
+    let g = guards_by(guard_split::Who::LazyNoAccess);
     let mut eligible: Vec<usize> = Vec::with_capacity(run_last - run_first);
     for block in run_first..run_last {
         if g.protected.contains(block) && g.clean.contains(block) && !g.aliased.contains(block) {

@@ -150,6 +150,12 @@ mod code_table;
 /// SCC of scalar min/max, dual-use immediate samplers, the lane write's select (scout4 fixes).
 #[path = "isa_fixes.rs"]
 pub(super) mod isa_fixes;
+/// Normalized fields to the nearest float, tbuffer d16 packing (two of the fixes' switches).
+#[path = "isa_bundle.rs"]
+mod isa_bundle;
+/// Compute samples' implicit level from the lane quads (`VICTORY_COMPUTE_QUAD_LOD=1`).
+#[path = "quad_lod.rs"]
+mod quad_lod;
 /// The lanes past a `DispatchX` thread count store nothing (`VICTORY_DISPATCHX_MASK=1`).
 #[path = "thread_limit.rs"]
 pub(super) mod thread_limit;
@@ -6251,6 +6257,12 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
+                // `VICTORY_NORM_NEAREST=1`: the float nearest the quotient.
+                Numeric::Unorm if w <= 16 && isa_fixes::Fix::NormNearest.on() => self.norm_nearest(field, w),
+                Numeric::Snorm if w <= 16 && isa_fixes::Fix::NormNearest.on() => {
+                    let s = signed(self);
+                    self.snorm_nearest(s, w)
+                }
                 Numeric::Unorm => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                     let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());

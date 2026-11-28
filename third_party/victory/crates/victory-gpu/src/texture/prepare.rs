@@ -419,9 +419,11 @@ fn over_budget(handed: u64, outstanding: u64, budget: u64, urgent: bool) -> bool
 fn start_thread() {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Relaxed);
-    let started = std::thread::Builder::new()
-        .name(format!("victory texture prepare {n}"))
-        .spawn(run);
+    let mut builder = std::thread::Builder::new().name(format!("victory texture prepare {n}"));
+    if crate::stack_commit::on() {
+        builder = builder.stack_size(crate::stack_commit::RESERVE);
+    }
+    let started = builder.spawn(run);
     if let Err(e) = started {
         tracing::warn!(error = %e, "a texture prepare thread could not be started");
         // Its share is done here, on the thread that hands out: nothing
@@ -453,6 +455,9 @@ enum Outcome {
 
 fn run() {
     crate::topology::pin_background("victory-texture-prepare");
+    if crate::stack_commit::on() {
+        crate::stack_commit::commit();
+    }
     loop {
         let job = {
             let mut q = queue();

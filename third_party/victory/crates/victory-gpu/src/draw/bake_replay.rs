@@ -241,6 +241,12 @@ impl State {
                     ))
                 })
                 .collect();
+            // `VICTORY_BAKE_ZERO_WAIT`: an input that still reads zeros has not arrived.
+            if crate::bake_zero::wait_ms() > 0
+                && Self::bake_zero_still(heap, host, &shot.slots, &fresh, frame)
+            {
+                return false;
+            }
             crate::bake_replay::arrived(&fresh)
         })
     }

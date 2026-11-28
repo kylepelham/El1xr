@@ -38,6 +38,8 @@ pub mod device;
 #[cfg(windows)]
 mod alloc_backoff;
 #[cfg(windows)]
+mod stack_commit;
+#[cfg(windows)]
 mod buffer_ahead;
 #[cfg(windows)]
 mod ambient;
@@ -72,6 +74,8 @@ mod bake_spread;
 mod bake_watch;
 #[cfg(windows)]
 mod bake_why;
+#[cfg(windows)]
+mod bake_zero;
 #[cfg(windows)]
 mod draw;
 #[cfg(windows)]
@@ -114,6 +118,8 @@ mod joined_apart;
 mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
+#[cfg(windows)]
+mod heap_warm;
 #[cfg(windows)]
 mod round_share;
 #[cfg(windows)]
@@ -160,6 +166,8 @@ mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
 mod flicker_catch;
+#[cfg(windows)]
+mod present_own;
 mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;

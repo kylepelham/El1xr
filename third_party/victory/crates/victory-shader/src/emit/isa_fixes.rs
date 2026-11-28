@@ -1,4 +1,4 @@
-//! Three translation fixes to RDNA 2 semantics, each behind its own switch (off by default;
+//! Translation fixes to RDNA 2 semantics, each behind its own switch (off by default;
 //! every `VICTORY_*` name in this crate is part of the translation fingerprint, so the shader
 //! cache keeps the two outputs apart):
 //!
@@ -11,14 +11,38 @@
 //! - `VICTORY_WRITELANE_MASK=1`: `v_writelane_b32` takes its lane from S1 masked to the
 //!   console wave (S1[4:0] in wave32, S1[5:0] in wave64), in every form, not only the paired
 //!   one. Source: Belobug/VIctory-Belobug-AMD PR #650 (11run11), GPL-3.0.
+//! - `VICTORY_DOT2_ACC_NEG=1`: `v_dot2_f32_f16` (VOP3P) negates its accumulator once for
+//!   `neg_lo[2]`, not twice (`fsrc` already applies it). Source: uiliannn/VItoriaBr PR #26.
+//! - `VICTORY_SCC_SHIFT_ADD=1`: `s_lshl{1-4}_add_u32` set SCC to the carry out of
+//!   `(S0 << n) + S1` taken in 64 bits (the bits shifted out included), not `D != 0`. Source:
+//!   uiliannn/VItoriaBr PR #88 = TaynanGT/Vice-Tay PR #345; the shifted-out bits as the
+//!   reference interpreter (`rdna2_exec_bits.py` `lshl_add`) and the RDNA 3 pseudo-code.
+//! - `VICTORY_TBUFFER_D16=1`: `tbuffer_load_format_d16_*` pack two 16-bit channels a VGPR
+//!   (low half first; an odd last channel keeps the VGPR's high half), instead of a whole
+//!   VGPR a channel over the registers after the destination. Source: Marvisak/VIctory
+//!   `c430b1d` (Duff); the kept half as the reference interpreter (`rdna2_buffer_d16.py`).
+//! - `VICTORY_NORM_NEAREST=1`: UNORM and SNORM buffer fields of up to 16 bits load as the
+//!   float nearest their exact quotient (the reference interpreter's `ratio_bits`), built in
+//!   integers, not by the host's division (which may be an ulp off). Source: Marvisak/VIctory
+//!   `da82e44` (Marvis); a different construction (`isa_bundle.rs`).
+//! - `VICTORY_COMPUTE_QUAD_LOD=1`: a compute program's implicit-level samples take their
+//!   gradients from the console's lane quads, not level 0 (`quad_lod.rs`). Source:
+//!   hello3928/Project-VI `653b1197`, `78bcfdc3` (Marvisak/VIctory PR #2999).
 
 use std::sync::OnceLock;
+
+const COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Fix {
     SccMinMax,
     CmpSamplerSplit,
     WritelaneMask,
+    Dot2AccNeg,
+    SccShiftAdd,
+    TbufferD16,
+    NormNearest,
+    ComputeQuadLod,
 }
 
 impl Fix {
@@ -27,6 +51,11 @@ impl Fix {
             Fix::SccMinMax => "VICTORY_SCC_MINMAX",
             Fix::CmpSamplerSplit => "VICTORY_CMP_SAMPLER_SPLIT",
             Fix::WritelaneMask => "VICTORY_WRITELANE_MASK",
+            Fix::Dot2AccNeg => "VICTORY_DOT2_ACC_NEG",
+            Fix::SccShiftAdd => "VICTORY_SCC_SHIFT_ADD",
+            Fix::TbufferD16 => "VICTORY_TBUFFER_D16",
+            Fix::NormNearest => "VICTORY_NORM_NEAREST",
+            Fix::ComputeQuadLod => "VICTORY_COMPUTE_QUAD_LOD",
         }
     }
 
@@ -36,7 +65,7 @@ impl Fix {
         if let Some(on) = TEST.with(|t| t.get()[self as usize]) {
             return on;
         }
-        static ON: [OnceLock<bool>; 3] = [const { OnceLock::new() }; 3];
+        static ON: [OnceLock<bool>; COUNT] = [const { OnceLock::new() }; COUNT];
         *ON[self as usize].get_or_init(|| std::env::var(self.name()).is_ok_and(|v| v.trim() == "1"))
     }
 }
@@ -44,7 +73,7 @@ impl Fix {
 #[cfg(test)]
 thread_local! {
     /// A test's choices for [`Fix::on`], for its thread only.
-    static TEST: std::cell::Cell<[Option<bool>; 3]> = const { std::cell::Cell::new([None; 3]) };
+    static TEST: std::cell::Cell<[Option<bool>; COUNT]> = const { std::cell::Cell::new([None; COUNT]) };
 }
 
 /// Sets `fix` for this thread's lowering (`None`: as the environment says).
