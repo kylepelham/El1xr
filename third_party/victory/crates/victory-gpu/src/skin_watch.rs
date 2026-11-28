@@ -119,6 +119,39 @@ fn outputs_a_frame(kind: &str) -> usize {
 /// frames of 1,147.
 pub(crate) const ROWS: u32 = 8;
 pub(crate) const ROW_TEXELS: u32 = 4096;
+/// Slices of a volume read (the light-range volume has 13).
+pub(crate) const SLICES: u32 = 16;
+
+/// What the tiled lighting's light-range volume says of the tiles read: each texel holds the
+/// first light index (low 16 bits) and the last (high 16 bits) of its tile's lights of one
+/// kind, `0xffffffff` for none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ranges {
+    /// Tiles without lights.
+    pub(crate) none: u32,
+    /// The most lights one tile loops over.
+    pub(crate) widest: u32,
+    /// Ranges whose last light comes before the first: not written by the light loop.
+    pub(crate) bad: u32,
+}
+
+pub(crate) fn light_ranges(bytes: &[u8]) -> Ranges {
+    let mut r = Ranges::default();
+    for t in bytes.chunks_exact(4) {
+        let v = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+        if v == u32::MAX {
+            r.none += 1;
+            continue;
+        }
+        let (first, last) = (v & 0xffff, v >> 16);
+        if last < first {
+            r.bad += 1;
+        } else {
+            r.widest = r.widest.max(last - first + 1);
+        }
+    }
+    r
+}
 
 /// The rows to read of a `size` target inside `rect` (x, y, w, h; all of it when empty): each
 /// as (x, y, texels).
@@ -498,6 +531,16 @@ mod tests {
         assert_eq!(changed_rgb(&before, &after, 4, 28), Some([150, 20, 10]));
         assert_eq!(changed_rgb(&before, &before, 4, 28), None);
         assert_eq!(changed_rgb(&before, &after, 0, 28), None);
+    }
+
+    /// No lights, one tile with lights 3 to 7, and a range no light loop writes.
+    #[test]
+    fn light_ranges_are_read() {
+        let mut bytes = Vec::new();
+        for v in [u32::MAX, 3 | 7 << 16, 9 | 2 << 16, 0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(light_ranges(&bytes), Ranges { none: 1, widest: 5, bad: 1 });
     }
 
     /// Whole rows, spread over the height.
