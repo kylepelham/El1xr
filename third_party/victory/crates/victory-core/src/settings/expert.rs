@@ -263,6 +263,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_MOD_MENU_PROBE", Apply::Restart),
     ("VICTORY_MOD_MENU_PROBE_SET", Apply::Restart),
     ("VICTORY_MOD_MENU_SELFTEST", Apply::Restart),
+    ("VICTORY_MOD_MENU_TP_NATIVE", Apply::Restart),
+    ("VICTORY_MOD_MENU_TP_SKIP", Apply::Restart),
     ("VICTORY_MOUSE", Apply::Live),
     ("VICTORY_MOUSE_INVERT_Y", Apply::Live),
     ("VICTORY_MOUSE_SENS", Apply::Live),
