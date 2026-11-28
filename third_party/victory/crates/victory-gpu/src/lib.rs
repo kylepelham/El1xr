@@ -170,6 +170,7 @@ pub mod upscale;
 pub mod upscale_live;
 pub mod camera;
 pub mod camera_diag;
+pub mod camera_tag;
 #[cfg(windows)]
 pub mod camera_copy;
 #[cfg(windows)]

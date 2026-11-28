@@ -156,21 +156,38 @@ pub(crate) fn surface_of(title: u64) -> Option<(Surface, Arc<HostTexture>)> {
 /// their views were read (the title may let them go before the frame ends).
 static NOTED: Mutex<[Option<Arc<HostTexture>>; 3]> = Mutex::new([None, None, None]);
 
+type Velocity = (Arc<HostTexture>, Arc<HostTexture>);
+
+/// The velocity pass's depth and motion by frame, for DLSS-G without an
+/// upscale (`VICTORY_DLSSG_EVERY_FRAME`, [`crate::camera_tag`]).
+static TAGGER: Mutex<Option<crate::camera_tag::Tagger<Velocity>>> = Mutex::new(None);
+
+fn tagger<R>(f: impl FnOnce(&mut crate::camera_tag::Tagger<Velocity>) -> R) -> R {
+    let mut t = TAGGER.lock().unwrap_or_else(|e| e.into_inner());
+    f(t.get_or_insert_with(|| crate::camera_tag::Tagger::new(crate::camera_tag::every_frame())))
+}
+
 /// Holds the velocity pass's depth and motion, the blit's UI texture.
 pub(crate) fn note_held(depth: Option<Arc<HostTexture>>, motion: Option<Arc<HostTexture>>, ui: Option<Arc<HostTexture>>) {
+    let velocity = depth.is_some() || motion.is_some();
     let mut n = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     for (slot, v) in n.iter_mut().zip([depth, motion, ui]) {
         if v.is_some() {
             *slot = v;
         }
     }
+    if let (true, Some(d), Some(m)) = (velocity, &n[0], &n[1]) {
+        let textures = (d.clone(), m.clone());
+        drop(n);
+        tagger(|t| t.velocity(crate::camera::frame(), textures));
+    }
 }
 
-/// The frame being built's depth and motion vectors so far (the velocity
-/// pass's), for DLSS-G without an upscale (`dlssg::tag_from_camera`).
-pub(crate) fn noted_velocity() -> (Option<Arc<HostTexture>>, Option<Arc<HostTexture>>) {
-    let n = NOTED.lock().unwrap_or_else(|e| e.into_inner());
-    (n[0].clone(), n[1].clone())
+/// At a tag point (`dlssg::tag_from_camera`): the velocity pass's depth and
+/// motion vectors to tag, and how many frames back they were noted; once a
+/// frame.
+pub(crate) fn tag_textures(point: crate::camera_tag::Point) -> Option<(Velocity, u64)> {
+    tagger(|t| t.tag(crate::camera::frame(), point))
 }
 
 /// Records the copy of render target `target` (a title texture) into ours,

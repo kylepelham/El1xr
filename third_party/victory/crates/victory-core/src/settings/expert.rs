@@ -87,6 +87,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_DISPATCHX_THREADS", Apply::Restart),
     ("VICTORY_DISPATCH_UAV", Apply::Restart),
     ("VICTORY_DISPLAY_MODE", Apply::Restart),
+    ("VICTORY_DLSSG_EVERY_FRAME", Apply::Restart),
     ("VICTORY_DLSSG_FRAMES", Apply::Restart),
     ("VICTORY_DLSSG_SLEEP", Apply::Restart),
     ("VICTORY_DLSS_DEPTH_INVERTED", Apply::Restart),

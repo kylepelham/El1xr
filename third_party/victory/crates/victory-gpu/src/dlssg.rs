@@ -26,6 +26,9 @@
 //!    `PS_TAA2_SpatialUpscaleWithDithering` wrote) tags the depth and motion
 //!    of `PS_VelocityFill` the camera job noted, and the constants take the
 //!    camera's jitter and motion-vector scale ([`frame_upscale`]).
+//!    `VICTORY_DLSSG_EVERY_FRAME=1` also tags at the bind of that scene pass
+//!    and holds the last velocity textures and valid camera for a few frames
+//!    ([`crate::camera_tag`]): the UI draw comes only with the HUD.
 //! 3. [`before_present`] / [`after_present`] (`pacing.rs`): the frame's
 //!    constants from `camera::latest()` (`VICTORY_CAMERA_CAPTURE=1`), DLSS-G
 //!    switched off for frames without a valid camera (menus, loading) or
@@ -100,6 +103,11 @@ struct Session {
     /// from the camera.
     upscale_tags: u64,
     camera_tags: u64,
+    /// Camera tags of textures noted in an earlier frame, presents whose
+    /// constants took an earlier frame's camera (`VICTORY_DLSSG_EVERY_FRAME`).
+    held_tags: u64,
+    held_cameras: u64,
+    cameras: crate::camera_tag::CameraHold,
     /// Why DLSS-G was last off (for the window line).
     off_why: String,
     since: Instant,
@@ -339,6 +347,9 @@ fn start_after_init(
             generating: 0,
             upscale_tags: 0,
             camera_tags: 0,
+            held_tags: 0,
+            held_cameras: 0,
+            cameras: crate::camera_tag::CameraHold::default(),
             off_why: String::new(),
             since: Instant::now(),
             told_constants: false,
@@ -397,10 +408,10 @@ pub(crate) fn tag_inputs(list: &ID3D12GraphicsCommandList, inputs: &crate::frame
 }
 
 /// Without an upscale this frame: tags the velocity pass's depth and motion
-/// vectors (`camera_copy::noted_velocity`, `VICTORY_CAMERA_CAPTURE=1`), moved
-/// to a shader-read state on `list` (the title's UI composite's, after the
+/// vectors (`camera_copy::tag_textures`, `VICTORY_CAMERA_CAPTURE=1`), moved
+/// to a shader-read state on `list` (at `point`, which runs after the
 /// velocity pass) for Streamline's copy and back. Once a frame.
-pub(crate) fn tag_from_camera(list: &crate::host::HostList) {
+pub(crate) fn tag_from_camera(list: &crate::host::HostList, point: crate::camera_tag::Point) {
     if !active() {
         return;
     }
@@ -411,9 +422,10 @@ pub(crate) fn tag_from_camera(list: &crate::host::HostList) {
     if s.upscaled_now || s.camera_render.is_some() {
         return;
     }
-    let (Some(depth), Some(motion)) = crate::camera_copy::noted_velocity() else {
+    let Some(((depth, motion), age)) = crate::camera_copy::tag_textures(point) else {
         return;
     };
+    s.held_tags += u64::from(age > 0);
     // SAFETY: a live host texture.
     let desc = unsafe { motion.texture.GetDesc() };
     let render = [desc.Width as u32, desc.Height];
@@ -628,15 +640,22 @@ pub(crate) fn before_present() {
     if !active() {
         return;
     }
-    let cam = crate::camera::latest();
-    before_present_with(cam.as_deref());
+    before_present_with(crate::camera::latest());
 }
 
-fn before_present_with(cam: Option<&FrameCamera>) {
+fn before_present_with(latest: Option<std::sync::Arc<FrameCamera>>) {
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = guard.as_mut() else {
         return;
     };
+    let hold = if crate::camera_tag::every_frame() {
+        crate::camera_tag::HOLD_FRAMES
+    } else {
+        0
+    };
+    let (cam, held) = s.cameras.pick(latest, hold);
+    s.held_cameras += u64::from(held);
+    let cam = cam.as_deref();
     let token = TOKEN.load(Ordering::Relaxed);
     let up = frame_upscale(s.upscaled_now, s.camera_render, s.last.as_ref(), cam);
     let consts = constants(cam, up.as_ref());
@@ -773,6 +792,9 @@ pub(crate) fn after_present() {
                 generating_presents = s.generating,
                 upscale_tags = s.upscale_tags,
                 camera_tags = s.camera_tags,
+                held_tags = s.held_tags,
+                held_cameras = s.held_cameras,
+                every_frame = crate::camera_tag::every_frame(),
                 frames_per_present = state.num_frames_actually_presented,
                 generating = s.on,
                 off_why = %s.off_why,
@@ -783,6 +805,7 @@ pub(crate) fn after_present() {
             );
             (s.real, s.generating, s.since) = (0, 0, Instant::now());
             (s.upscale_tags, s.camera_tags) = (0, 0);
+            (s.held_tags, s.held_cameras) = (0, 0);
             s.off_why.clear();
         }
         let frame = FRAME.fetch_add(1, Ordering::Relaxed).wrapping_add(1);

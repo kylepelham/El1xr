@@ -183,6 +183,35 @@ fn the_constants_follow_what_tagged_this_frame() {
     assert!(why.contains("tagged this frame"), "{why}");
 }
 
+/// `VICTORY_DLSSG_EVERY_FRAME=1`: a present whose frame had no velocity pass
+/// (it fell into the previous frame) still gets constants, from the last
+/// valid camera, for the depth and motion the scene pass tagged; batch 5
+/// part C turned DLSS-G off there (`camera not valid: no velocity pass`).
+#[test]
+fn a_frame_without_a_velocity_pass_keeps_generating_on_the_held_camera() {
+    let mut good = still_camera();
+    good.frame = 41;
+    good.mv_scale = [1.0 / RENDER[0] as f32, 1.0 / RENDER[1] as f32];
+    let missed = FrameCamera {
+        frame: 42,
+        why: "no velocity pass this frame".into(),
+        ..FrameCamera::default()
+    };
+    let mut hold = crate::camera_tag::CameraHold::default();
+    hold.pick(Some(std::sync::Arc::new(good)), crate::camera_tag::HOLD_FRAMES);
+    let latest = Some(std::sync::Arc::new(missed));
+    let (cam, held) = hold.pick(latest.clone(), crate::camera_tag::HOLD_FRAMES);
+    assert!(held);
+    let up = frame_upscale(false, Some(RENDER), None, cam.as_deref()).expect("the held camera's values");
+    let c = constants(cam.as_deref(), Some(&up)).expect("constants");
+    assert_eq!(c.mvec_scale, [1.0 / RENDER[0] as f32, 1.0 / RENDER[1] as f32]);
+    // Switch off (hold 0): round 3, off for that present.
+    let (cam, held) = crate::camera_tag::CameraHold::default().pick(latest, 0);
+    assert!(!held);
+    let why = constants(cam.as_deref(), Some(&up)).unwrap_err();
+    assert!(why.contains("no velocity pass"), "{why}");
+}
+
 #[test]
 fn no_hudless_without_a_copy_of_this_frame() {
     assert!(hudless_for(None).is_none());
@@ -311,7 +340,7 @@ fn streamline_probe() {
             .unwrap();
         list.Close().unwrap();
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-        let cam = still_camera();
+        let cam = std::sync::Arc::new(still_camera());
         let mut failed_presents = 0;
         let started = Instant::now();
         let mut presents = 0u64;
@@ -343,7 +372,7 @@ fn streamline_probe() {
             );
             list.Close().unwrap();
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-            before_present_with(Some(&cam));
+            before_present_with(Some(cam.clone()));
             if chain.Present(0, DXGI_PRESENT(0)).is_err() {
                 failed_presents += 1;
             }
