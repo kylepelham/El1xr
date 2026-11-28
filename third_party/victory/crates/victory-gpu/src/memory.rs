@@ -43,6 +43,8 @@
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
+//! `VICTORY_BVH_DECLARE_OUTPUTS=1` (`crate::bvh_declare`) declares written
+//! only the builds' outputs and what writing draws' root arguments name.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -78,6 +80,14 @@ struct Memory {
     /// The first copy numbered by [`premap`] since the last [`ready`]
     /// (`usize::MAX`: none): the next draw brings it up to date.
     premapped: usize,
+    /// (`VICTORY_BVH_DECLARE_OUTPUTS`, `crate::bvh_declare`) Per copy, the
+    /// generation it became written in (0: read only), the last generation,
+    /// per list the generation it last declared at, the check's cursor and
+    /// frame.
+    written_at: Vec<u64>,
+    generation: u64,
+    lists: HashMap<usize, u64>,
+    check: (usize, u64),
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -115,7 +125,40 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             premapped: usize::MAX,
+            written_at: Vec::new(),
+            generation: 0,
+            lists: HashMap::new(),
+            check: (0, u64::MAX),
         })
+    }
+
+    /// The copy (its index) that holds `address`'s page.
+    fn copy_at(&self, address: u64) -> Option<usize> {
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        // SAFETY: inside the directory's mapping.
+        let n = unsafe { self.directory.1.add(page as usize * 2).read() };
+        (n != 0).then(|| n as usize - 1)
+    }
+
+    /// (`crate::bvh_declare`) The copies around `address` and the 4 MiB
+    /// after become written if their cells now are.
+    fn rejudge(&mut self, address: u64) {
+        let cells = crate::bvh_declare::cells();
+        for a in [address, (address & !(CELL - 1)) + CELL] {
+            if let Some(n) = self.copy_at(a)
+                && self.written_at[n] == 0
+                && {
+                    let (start, len) = self.copies[n].span();
+                    cells.span_written(start, len)
+                }
+            {
+                self.generation += 1;
+                self.written_at[n] = self.generation;
+            }
+        }
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -165,6 +208,10 @@ impl Memory {
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                let (s, l) = shadow.span();
+                let written = crate::bvh_declare::on() && crate::bvh_declare::cells().span_written(s, l);
+                self.generation += u64::from(written);
+                self.written_at.push(if written { self.generation } else { 0 });
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -264,6 +311,23 @@ pub(crate) fn premap(addresses: &[u64]) {
     }
 }
 
+/// (`VICTORY_BVH_DECLARE_OUTPUTS`, `crate::bvh_declare`) The builder hook
+/// names every range of a build (`named`) and which of them it writes
+/// (`outputs`: destination, scratch); copies already numbered around an
+/// output become written.
+pub(crate) fn hook(outputs: &[u64], named: &[u64]) {
+    if !crate::bvh_declare::on() {
+        return;
+    }
+    crate::bvh_declare::cells().hook(outputs, named);
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = guard.as_mut() {
+        for &a in outputs.iter().filter(|&&a| a != 0) {
+            m.rejudge(a);
+        }
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -287,23 +351,20 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        if crate::bvh_declare::on() && frame.is_multiple_of(SAY_EVERY) {
+            say(m);
+        }
     }
     let numbered = m.copies.len().min(std::mem::replace(&mut m.premapped, usize::MAX));
-    for &address in addresses {
-        m.name(address);
-    }
-    // A title address in two constants (low dword, then bits 32 to 39), or
-    // in one in 256-byte units. A constant that only looks like one names
-    // memory nothing reads; one that is not the title's memory is refused.
-    for (i, &c) in constants.iter().enumerate() {
-        if let Some(&high) = constants.get(i + 1)
-            && (1..=0xFF).contains(&high)
-            && c >= 0x1_0000
-        {
-            m.name(u64::from(c) | u64::from(high) << 32);
+    // Only the builder's outputs are declared written (`crate::bvh_declare`).
+    let outputs = writes && crate::bvh_declare::on();
+    for address in named(addresses, constants) {
+        if outputs {
+            crate::bvh_declare::cells().root_output(address);
         }
-        if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+        m.name(address);
+        if outputs {
+            m.rejudge(address);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -329,14 +390,39 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    // With only the outputs declared: the written copies the list has not
+    // declared yet (all of them at its first writing draw).
+    let declare = if outputs {
+        let at = std::ptr::from_ref(list) as usize;
+        let from = if first_write { None } else { m.lists.get(&at).copied() };
+        let fresh = from.is_none_or(|g| g < m.generation);
+        m.lists.insert(at, m.generation);
+        if first_write {
+            count(m);
+        }
+        if fresh {
+            crate::bvh_declare::to_declare(&m.written_at, from)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && !outputs && (first_write || n >= numbered) {
             shadow.gpu_writes(list, start, len);
         }
+    }
+    for n in declare {
+        let (start, len) = m.copies[n].span();
+        m.copies[n].gpu_writes(list, start, len);
+    }
+    if outputs {
+        check(m, list, frame);
     }
     if first_read {
         list.keep(&m.directory.0);
@@ -347,4 +433,91 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// The title addresses a draw's root arguments name: each root view, a
+/// title address in two constants (low dword, then bits 32 to 39), and one
+/// in 256-byte units. A constant that only looks like one names memory
+/// nothing reads; one that is not the title's memory is refused.
+pub(crate) fn named(addresses: &[u64], constants: &[u32]) -> Vec<u64> {
+    let mut out = addresses.to_vec();
+    for (i, &c) in constants.iter().enumerate() {
+        if let Some(&high) = constants.get(i + 1)
+            && (1..=0xFF).contains(&high)
+            && c >= 0x1_0000
+        {
+            out.push(u64::from(c) | u64::from(high) << 32);
+        }
+        if c >= 0x0100_0000 {
+            out.push(u64::from(c) << 8);
+        }
+    }
+    out
+}
+
+/// Frames between the declare summaries.
+const SAY_EVERY: u64 = 300;
+
+/// Writing lists, copies they declared written, bytes, copies numbered,
+/// bytes, since the last summary.
+static DECLARED: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A writing list's first draw: what it declares written against what is
+/// numbered.
+fn count(m: &Memory) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut d = [1, 0, 0, m.copies.len() as u64, 0];
+    for (shadow, &at) in m.copies.iter().zip(&m.written_at) {
+        let len = shadow.span().1;
+        d[4] += len;
+        if at > 0 {
+            d[1] += 1;
+            d[2] += len;
+        }
+    }
+    for (total, add) in DECLARED.iter().zip(d) {
+        total.fetch_add(add, Relaxed);
+    }
+}
+
+/// The declare summary since the last one.
+fn say(m: &Memory) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d: Vec<u64> = DECLARED.iter().map(|c| c.swap(0, Relaxed)).collect();
+    let lists = d[0].max(1);
+    let [checks, found] = crate::bvh_declare::checks();
+    let no_card = &crate::bvh_declare::READ_ONLY_NO_CARD;
+    tracing::info!(
+        "bvh declare outputs: per writing list {} of {} copies declared written ({} of {} MB), {} lists in {SAY_EVERY} frames; \
+         {} copies written of {} numbered; read-only windows given no extra card side {} ({} MB); checks {checks}, written though undeclared {found}",
+        d[1] / lists,
+        d[3] / lists,
+        d[2] / lists >> 20,
+        d[4] / lists >> 20,
+        d[0],
+        m.written_at.iter().filter(|&&at| at > 0).count(),
+        m.copies.len(),
+        no_card[0].load(Relaxed),
+        no_card[1].load(Relaxed) >> 20,
+    );
+}
+
+/// `VICTORY_BVH_DECLARE_CHECK=N`: in every Nth frame, the first writing
+/// list also declares one copy that is not written (round robin), and its
+/// landing is watched (`crate::bvh_declare::landed`).
+fn check(m: &mut Memory, list: &HostList, frame: u64) {
+    let every = crate::bvh_declare::check_every();
+    if every == 0 || !frame.is_multiple_of(every) || m.check.1 == frame {
+        return;
+    }
+    m.check.1 = frame;
+    let Some(n) = crate::bvh_declare::pick_check(&m.written_at, m.check.0) else {
+        return;
+    };
+    m.check.0 = n;
+    let shadow = &m.copies[n];
+    crate::bvh_declare::arm(shadow.id(), frame, shadow.shaders_wrote());
+    let (start, len) = shadow.span();
+    shadow.gpu_writes(list, start, len);
 }

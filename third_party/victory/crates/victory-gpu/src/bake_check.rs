@@ -691,6 +691,21 @@ fn outcome(id: u64, flag: &'static str) {
     b.outcomes.insert(id, flag);
 }
 
+/// (`VICTORY_FACE_WATCH`) What bake texture `resource` is a result of: `prog@frame flag`.
+pub(crate) fn result_of(resource: usize) -> Option<String> {
+    if !result_set()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&resource)
+    {
+        return None;
+    }
+    let b = book();
+    let (baked, _) = b.results.get(&resource)?;
+    let flag = b.outcomes.get(&baked.id).copied().unwrap_or("?");
+    Some(format!("{}@{} id={} {flag}", baked.prog, baked.frame, baked.id))
+}
+
 fn results_of(id: u64) -> Vec<usize> {
     let b = book();
     let mut r: Vec<usize> = b
@@ -761,6 +776,13 @@ pub(crate) fn written(list: usize, resource: usize, kind: &str, by: usize) {
     match wrote {
         Wrote::Result => {
             add(C::Results, 1);
+            #[cfg(windows)]
+            if crate::face_watch::on()
+                && let Some((at, desc)) = crate::resource::texture_memory(resource as crate::object::This)
+                && let Some(layout) = crate::resource::texture_layout(&desc)
+            {
+                crate::face_watch::note_result(at as u64, layout.size);
+            }
             let mut set = result_set().write().unwrap_or_else(|e| e.into_inner());
             set.insert(resource);
             if set.len() > 2 * MAX_RESULTS {

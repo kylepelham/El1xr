@@ -32,6 +32,16 @@ impl State {
         stage: &crate::pipeline::host::Stage,
         fields: &[u32],
     ) -> Option<Vec<u32>> {
+        self.material_record(stage, fields).map(|(_, _, slots)| slots)
+    }
+
+    /// The draw's material table and record byte offsets, and the heap slots the record names
+    /// at `fields` (`VICTORY_FACE_WATCH` too).
+    pub(super) fn material_record(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        fields: &[u32],
+    ) -> Option<(u32, u32, Vec<u32>)> {
         let t = stage.translated();
         let word = |index: u32| {
             let u = t.host.user_data.iter().find(|u| u.index == index)?;
@@ -53,6 +63,6 @@ impl State {
         };
         let (at, bytes) = byte_range(record, fields, len)?;
         let words = super::bake_pass::words(base.checked_add(at)?, bytes / 4)?;
-        Some(indices(&words, fields))
+        Some((table, record, indices(&words, fields)))
     }
 }

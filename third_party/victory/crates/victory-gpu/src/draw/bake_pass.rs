@@ -76,6 +76,8 @@ impl State {
             add(C::OwnUs, began.elapsed().as_micros() as u64);
         }
         let waited_ms = self.bake_wait(list, heap, host);
+        // `VICTORY_BAKE_ZERO_WAIT=<ms>`: an input still zeros holds the draw (`bake_zero`).
+        self.bake_zero_wait(list, p, heap, host);
         let mine = PINNED.take();
         let left = host.texture_slots_pick(&mine);
         if let Some(seen) = &fresh {

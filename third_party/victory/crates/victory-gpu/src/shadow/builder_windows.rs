@@ -29,7 +29,9 @@
 //!   left to commit after it.
 //!
 //! A window turned down is made as before (in the PC's memory, snapshotted
-//! at builder submissions): slower, not broken.
+//! at builder submissions): slower, not broken. With
+//! `VICTORY_BVH_DECLARE_OUTPUTS=1` (`crate::bvh_declare`) a window the
+//! builder only reads gets none past the total either: nothing compares it.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,14 +130,18 @@ fn free_commit() -> Option<u64> {
 /// their bytes.
 static TURNED_DOWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Whether a window of `size` bytes gets a card side that would take the
-/// windows past their own total (`base`, held `held` bytes before it), with
-/// the card's numbers `card` (`[budget, used]`). Within the total: always
-/// (the caller's own line holds). Turned down windows are counted and said
-/// (the first 16, then every 256th).
-pub(super) fn admits(size: u64, base: u64, held: u64, card: Option<[u64; 2]>) -> bool {
+/// Whether the window of `size` bytes at `start` gets a card side that would
+/// take the windows past their own total (`base`, held `held` bytes before
+/// it), with the card's numbers `card` (`[budget, used]`). Within the total:
+/// always (the caller's own line holds). Past it, not for a window the
+/// builder only reads (`crate::bvh_declare::card_side`). Turned down windows
+/// are counted and said (the first 16, then every 256th).
+pub(super) fn admits(start: u64, size: u64, base: u64, held: u64, card: Option<[u64; 2]>) -> bool {
     if held.saturating_add(size) <= base {
         return true;
+    }
+    if !crate::bvh_declare::card_side(start, size) {
+        return false;
     }
     let free = free_commit();
     let Err(why) = judge(size, card, free, floor()) else {
@@ -236,6 +242,7 @@ mod tests {
     #[test]
     fn within_the_total_it_is_always_given() {
         assert!(super::admits(
+            0,
             4 * MIB,
             3072 * MIB,
             1000 * MIB,

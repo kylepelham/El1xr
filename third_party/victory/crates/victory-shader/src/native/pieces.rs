@@ -55,6 +55,24 @@
 //! +0x170 SPI_PS_INPUT_CNTL_0.., as many as fit before the last 12 bytes
 //!        (render target information, which repeats the state piece)
 //!
+//! graphics packet of a mesh stage (the console's NGG program: the
+//! description's vertex slot is empty and its first extra slot holds the
+//! stage, code at +0x68 and metadata at +0x78; 300 descriptions of one run)
+//! +0x28 u16 0x170: 0x54 bytes at +0x58 that the plain layout lacks, and
+//!       after them the plain layout from +0x58 on (the second block starts
+//!       at +0x18c). In those bytes:
+//! +0x60 SPI_SHADER_PGM_RSRC1_GS (bits 0-5 VGPR granules - 1; waves of 64:
+//!       every one of the 300 programs counts lanes with v_mbcnt_hi)
+//! +0x64 SPI_SHADER_PGM_RSRC2_GS (bits 1-5 user SGPRs, which start at s8 as
+//!       for the title's mesh programs; bits 19-26 LDS in 512-byte granules)
+//! +0x70 three fields of 11, 11 and 10 bits (VGT_GS_ONCHIP_CNTL's), then
+//!       +0x74 and +0x78: 128 each in every call. They are the group's
+//!       lanes, vertices and primitives, but no capture tells which is
+//!       which, so a packet where they differ is refused
+//! +0x88 VGT_GS_OUT_PRIM_TYPE (2 triangles)
+//!       the other words held one value in every call (`MESH_SEEN`), and the
+//!       vertex program's registers at +0x38 and +0x3c are zero
+//!
 //! state piece
 //! +0x10 u8 x8 render target formats (DXGI numbers), 0 past the count
 //! +0x1c u32 0xffffffff (sample mask: a guess)
@@ -90,13 +108,17 @@
 //!
 //! ```text
 //! +0x00 "VPP1"
-//! +0x04 u8 stage (0 compute, 1 vertex, 2 pixel), u8 bit 0 wave32, u16 VGPRs
+//! +0x04 u8 stage (0 compute, 1 vertex, 2 pixel, 3 mesh), u8 bit 0 wave32,
+//!       u16 VGPRs
 //! +0x08 u32 user SGPRs
 //! +0x0c u32 x5 by stage
 //!       compute: COMPUTE_PGM_RSRC2, thread-group size x, y, z
 //!       vertex:  parameter exports, bit per parameter read flat, elements
 //!       pixel:   SPI_PS_INPUT_ADDR, DB_SHADER_CONTROL, SPI_SHADER_COL_FORMAT,
 //!                the vertex program's parameter exports, interpolants
+//!       mesh:    parameter exports, bit per parameter read flat, lanes (also
+//!                the vertex and primitive maxima), LDS bytes,
+//!                PA_CL_VS_OUT_CNTL
 //! +0x20 u32 size of what follows the header, u32 code size, u32 metadata
 //!       size, u32 0
 //! +0x30 vertex: elements of 48 bytes (32 of name, u32 semantic index, DXGI
@@ -108,13 +130,14 @@
 //! pipelines that differ in blend state alone share their programs, and two
 //! that differ in anything a program reads never do.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{FourCC, u16_at, u32_at};
 use crate::native::{
     self, COMPUTE_PIECES, ComputeIo, HwStage, NativeProgram, PsInput, RecordRules, RootParam, RootType, StageIo,
-    PIXEL_PIECES, Usage, VERTEX_BUFFERS, VsFetch, VsOutput,
+    MESH_PIECES, MeshIo, PIXEL_PIECES, Usage, VERTEX_BUFFERS, VsFetch, VsOutput,
 };
 
 /// What starts the part of ours.
@@ -240,6 +263,7 @@ const RECORD: usize = 32;
 const COMPUTE: u8 = 0;
 const VERTEX: u8 = 1;
 const PIXEL: u8 = 2;
+const MESH: u8 = 3;
 const WAVE32: u8 = 1;
 /// (metadata tag, where its records start, code bytes it does not count)
 const COMPUTE_METADATA: (u32, usize, usize) = (0x403, 0x18, 0);
@@ -287,6 +311,41 @@ const G_INPUT_CNTL: usize = 0x170;
 /// information after them.
 const G_SECOND_HEAD: usize = 0x38;
 const G_TARGET_INFO: usize = 12;
+
+// A mesh stage's packet: the mesh block, which the plain layout lacks.
+const G_FIXED_MESH: u16 = 0x170;
+const M_BLOCK: usize = 0x58;
+const M_LEN: usize = 0x54;
+const M_RSRC1_GS: usize = 0x60;
+const M_RSRC2_GS: usize = 0x64;
+const M_GROUP: usize = 0x70;
+const M_SIZES: [usize; 2] = [0x74, 0x78];
+const M_OUT_PRIM: usize = 0x88;
+/// The other words of the mesh block, each with the one value it held in
+/// every call captured, and the refusal for another value there.
+const MESH_SEEN: [(usize, u32, Refusal); 15] = [
+    (0x58, 0, "a mesh packet with a value at +0x58 (zero in every call captured)"),
+    (0x5c, 0, "a mesh packet with a value at +0x5c (zero in every call captured)"),
+    (0x68, 0xfffe, "a mesh packet with a value at +0x68 other than 0xfffe (in every call captured)"),
+    (0x6c, 0x7f_ffff, "a mesh packet with a value at +0x6c other than 0x7fffff (in every call captured)"),
+    (0x7c, 0, "a mesh packet with a value at +0x7c (zero in every call captured)"),
+    (0x80, 0, "a mesh packet with a value at +0x80 (zero in every call captured)"),
+    (0x84, 0, "a mesh packet with a value at +0x84 (zero in every call captured)"),
+    (0x8c, 0, "a mesh packet with a value at +0x8c (zero in every call captured)"),
+    (0x90, 1, "a mesh packet with a value at +0x90 other than 1 (in every call captured)"),
+    (0x94, 0, "a mesh packet with a value at +0x94 (zero in every call captured)"),
+    (0x98, 0, "a mesh packet with a value at +0x98 (zero in every call captured)"),
+    (0x9c, 0, "a mesh packet with a value at +0x9c (zero in every call captured)"),
+    (0xa0, 0x78_8000, "a mesh packet with a value at +0xa0 other than 0x788000 (in every call captured)"),
+    (0xa4, 0, "a mesh packet with a value at +0xa4 (zero in every call captured)"),
+    (0xa8, 0x8004, "a mesh packet with a value at +0xa8 other than 0x8004 (in every call captured)"),
+];
+/// The most lanes of a host mesh shader's group (D3D12; its vertex and
+/// primitive maxima go to 256).
+const MESH_LANES: u32 = 128;
+/// `SPI_SHADER_PGM_RSRC2_GS` fields taken: USER_SGPR (1-5),
+/// ES_VGPR_COMP_CNT (16-17, 1 in every call captured) and LDS_SIZE (19-26).
+const GS_RSRC2_HANDLED: u32 = 0x3e | 0x3_0000 | 0x7f8_0000;
 
 /// `SPI_PS_IN_CONTROL.PS_W32_EN`.
 const PS_W32_EN: u32 = 1 << 15;
@@ -572,6 +631,110 @@ struct Pixel {
     controls: Vec<u32>,
 }
 
+/// A mesh program's part of the packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mesh {
+    vgprs: u16,
+    user_sgprs: u32,
+    /// Lanes of a group, and its vertex and primitive maxima: one number
+    /// (see the module notes).
+    group: u32,
+    lds_bytes: u32,
+    /// `PA_CL_VS_OUT_CNTL`, judged as for a vertex program.
+    out_cntl: u32,
+}
+
+impl Mesh {
+    /// The mesh block of `packet`, a mesh stage's whole packet.
+    fn parse(packet: &[u8]) -> Result<Mesh, Refusal> {
+        if packet.len() < M_BLOCK + M_LEN {
+            return Err("a graphics packet of an unknown shape");
+        }
+        let word = |at: usize| u32_at(packet, at).unwrap_or(0);
+        for &(at, seen, why) in &MESH_SEEN {
+            if word(at) != seen {
+                return Err(why);
+            }
+        }
+        if word(G_RSRC1_VS) != 0 || word(G_RSRC2_VS) != 0 {
+            return Err("a mesh packet with registers for a vertex program");
+        }
+        let fields = word(M_GROUP);
+        let group = fields & 0x7ff;
+        let sizes = [fields >> 11 & 0x7ff, fields >> 22, word(M_SIZES[0]), word(M_SIZES[1])];
+        if sizes.iter().any(|&n| n != group) {
+            return Err(
+                "a mesh packet whose group sizes differ (which word is the lanes, the vertices or the primitives is not settled)",
+            );
+        }
+        if group == 0 || group > MESH_LANES {
+            return Err("a mesh packet with a group of no lanes or more than 128");
+        }
+        if word(M_OUT_PRIM) != 2 {
+            return Err("VGT_GS_OUT_PRIM_TYPE other than triangles (2)");
+        }
+        let rsrc2 = word(M_RSRC2_GS);
+        if rsrc2 & !GS_RSRC2_HANDLED != 0 {
+            return Err(outside(
+                rsrc2,
+                !GS_RSRC2_HANDLED,
+                &[
+                    (1, "SPI_SHADER_PGM_RSRC2_GS SCRATCH_EN (bit 0)"),
+                    (1 << 6, "SPI_SHADER_PGM_RSRC2_GS TRAP_PRESENT (bit 6)"),
+                    (0xff80, "SPI_SHADER_PGM_RSRC2_GS EXCP_EN (bits 7-15)"),
+                    (1 << 18, "SPI_SHADER_PGM_RSRC2_GS OC_LDS_EN (bit 18)"),
+                    (1 << 27, "SPI_SHADER_PGM_RSRC2_GS USER_SGPR_MSB (bit 27)"),
+                ],
+                "SPI_SHADER_PGM_RSRC2_GS bits above bit 27",
+            ));
+        }
+        if rsrc2 >> 16 & 3 != 1 {
+            return Err(
+                "SPI_SHADER_PGM_RSRC2_GS ES_VGPR_COMP_CNT (bits 16-17) other than 1 (in every call captured)",
+            );
+        }
+        Ok(Mesh {
+            vgprs: vgprs(word(M_RSRC1_GS), false),
+            user_sgprs: rsrc2 >> 1 & 0x1f,
+            group,
+            lds_bytes: (rsrc2 >> 19 & 0xff) * 512,
+            out_cntl: 0,
+        })
+    }
+}
+
+/// Whether `packet` has a mesh stage's shape (its first block's size).
+fn is_mesh(packet: &[u8]) -> bool {
+    u16_at(packet, G_FIXED_SIZE) == Ok(G_FIXED_MESH) && packet.len() >= M_BLOCK + M_LEN
+}
+
+/// A mesh stage's packet as the plain layout: without its mesh block, and
+/// with the plain size of the first block. Any other packet as it is.
+fn plain(packet: &[u8]) -> Cow<'_, [u8]> {
+    if !is_mesh(packet) {
+        return Cow::Borrowed(packet);
+    }
+    let mut v = Vec::with_capacity(packet.len() - M_LEN);
+    v.extend_from_slice(&packet[..M_BLOCK]);
+    v.extend_from_slice(&packet[M_BLOCK + M_LEN..]);
+    v[G_FIXED_SIZE..G_FIXED_SIZE + 2].copy_from_slice(&G_FIXED.to_le_bytes());
+    Cow::Owned(v)
+}
+
+/// The parameter exports of a vertex or mesh program made from pieces:
+/// `TEXCOORD<n>` in row n for `exp param<n>`.
+fn param_exports(params: u32) -> Vec<VsOutput> {
+    (0..params as u8)
+        .map(|n| VsOutput {
+            usage: Usage::Generic,
+            row: n,
+            param: n,
+            fp16: false,
+            pack2: false,
+        })
+        .collect()
+}
+
 /// A graphics pipeline's packet and state piece, read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Graphics {
@@ -592,6 +755,7 @@ pub struct Graphics {
     /// Clip distances the vertex program exports after its position.
     clips: u8,
     pixel: Option<Pixel>,
+    mesh: Option<Mesh>,
 }
 
 impl Graphics {
@@ -600,6 +764,15 @@ impl Graphics {
     /// module notes do not cover, and every value whose meaning for a
     /// translated program is not known.
     pub fn parse(packet: &[u8], state: &[u8], pixel: bool) -> Result<Graphics, Refusal> {
+        // A mesh stage's packet: its mesh block, then the rest as a plain
+        // packet.
+        let mesh = if is_mesh(packet) {
+            Some(Mesh::parse(packet)?)
+        } else {
+            None
+        };
+        let plain = plain(packet);
+        let packet: &[u8] = &plain;
         let word = |at: usize| u32_at(packet, at).unwrap_or(0);
         // The packet's two sizes must add up to it.
         let second = usize::from(u16_at(packet, G_SECOND_SIZE).unwrap_or(0));
@@ -960,6 +1133,10 @@ impl Graphics {
             params,
             clips,
             pixel,
+            mesh: mesh.map(|m| Mesh {
+                out_cntl: word(G_VS_OUT_CNTL),
+                ..m
+            }),
         })
     }
 
@@ -969,6 +1146,19 @@ impl Graphics {
     pub fn describe(packet: &[u8], state: &[u8]) -> String {
         use std::fmt::Write;
         let mut out = String::new();
+        if is_mesh(packet) {
+            for (name, at) in [
+                ("SPI_SHADER_PGM_RSRC2_GS", M_RSRC2_GS),
+                ("+0x70", M_GROUP),
+                ("+0x74", M_SIZES[0]),
+                ("+0x78", M_SIZES[1]),
+                ("VGT_GS_OUT_PRIM_TYPE", M_OUT_PRIM),
+            ] {
+                write!(out, "{name}={:#x} ", u32_at(packet, at).unwrap_or(0)).ok();
+            }
+        }
+        let plain = plain(packet);
+        let packet: &[u8] = &plain;
         let mut note = |name: &str, at: usize, from: &[u8]| {
             match u32_at(from, at) {
                 Ok(v) => write!(out, "{name}={v:#x} "),
@@ -1033,6 +1223,12 @@ impl Graphics {
         self.pixel.is_some()
     }
 
+    /// Whether the packet is a mesh stage's: the description then has no
+    /// vertex stage, and the mesh stage in its first extra slot.
+    pub fn has_mesh(&self) -> bool {
+        self.mesh.is_some()
+    }
+
     /// Bit per vertex parameter the pixel program reads flat. Such a
     /// parameter is declared a 32-bit integer on both sides, so that
     /// whatever the vertex program exports arrives bit for bit.
@@ -1067,8 +1263,49 @@ impl Graphics {
         }
     }
 
+    /// What the vertex or mesh program exports: its parameters, the
+    /// position, then the clip distances, up to four to a row, in the
+    /// registers after the position's (D3D_NAME_CLIP_DISTANCE is 2).
+    fn exported(&self) -> Vec<Row<'static>> {
+        let mut outputs: Vec<Row> = (0..self.params).map(|p| self.param(p)).collect();
+        outputs.push(self.position());
+        for v in 0..u32::from(self.clips).div_ceil(4) {
+            let left = u32::from(self.clips) - 4 * v;
+            outputs.push(Row {
+                name: "SV_ClipDistance",
+                index: v,
+                system: 2,
+                component: 3,
+                register: self.params + 1 + v,
+                mask: ((1u32 << left.min(4)) - 1) as u8,
+            });
+        }
+        outputs
+    }
+
+    /// The container for the mesh program, with room for its two pieces.
+    /// It has no inputs: it reads its vertices itself.
+    pub fn mesh(&self, code: usize, metadata: usize) -> Result<Draft, Refusal> {
+        let Some(mesh) = &self.mesh else {
+            return Err("a mesh stage whose packet is not a mesh stage's");
+        };
+        sizes(code, metadata, GRAPHICS_METADATA.1)?;
+        let outputs = self.exported();
+        let head = Head {
+            stage: MESH,
+            flags: 0,
+            vgprs: mesh.vgprs,
+            user_sgprs: mesh.user_sgprs,
+            words: [self.params, self.flat(), mesh.group, mesh.lds_bytes, mesh.out_cntl],
+        };
+        Ok(draft(&head, &[], code, metadata, Some([&[], &outputs[..]])))
+    }
+
     /// The container for the vertex program, with room for its two pieces.
     pub fn vertex(&self, code: usize, metadata: usize) -> Result<Draft, Refusal> {
+        if self.mesh.is_some() {
+            return Err("a vertex stage whose packet is a mesh stage's");
+        }
         sizes(code, metadata, GRAPHICS_METADATA.1)?;
         let mut extra = vec![0u8; ELEMENT * self.elements.len()];
         for (e, to) in self.elements.iter().zip(extra.chunks_exact_mut(ELEMENT)) {
@@ -1097,21 +1334,7 @@ impl Graphics {
                 })
             })
             .collect();
-        let mut outputs: Vec<Row> = (0..self.params).map(|p| self.param(p)).collect();
-        outputs.push(self.position());
-        // The clip distances: up to four to a row, in the registers after
-        // the position's (D3D_NAME_CLIP_DISTANCE is 2).
-        for v in 0..u32::from(self.clips).div_ceil(4) {
-            let left = u32::from(self.clips) - 4 * v;
-            outputs.push(Row {
-                name: "SV_ClipDistance",
-                index: v,
-                system: 2,
-                component: 3,
-                register: self.params + 1 + v,
-                mask: ((1u32 << left.min(4)) - 1) as u8,
-            });
-        }
+        let outputs = self.exported();
         let head = Head {
             stage: VERTEX,
             flags: 0,
@@ -1350,7 +1573,7 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
     let (extra, code, meta) = (take(0x20)?, take(0x24)?, take(0x28)?);
     let (tag, records_at, uncounted) = match stage {
         COMPUTE => COMPUTE_METADATA,
-        VERTEX | PIXEL => GRAPHICS_METADATA,
+        VERTEX | PIXEL | MESH => GRAPHICS_METADATA,
         _ => return Err(Malformed("a part made from pieces of an unknown stage")),
     };
     if vgprs > 256 || user_sgprs > 32 {
@@ -1451,15 +1674,7 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
             }
             StageIo::Vs {
                 inputs: Vec::new(),
-                outputs: (0..words[0] as u8)
-                    .map(|n| VsOutput {
-                        usage: Usage::Generic,
-                        row: n,
-                        param: n,
-                        fp16: false,
-                        pack2: false,
-                    })
-                    .collect(),
+                outputs: param_exports(words[0]),
                 fetch: elements
                     .iter()
                     .enumerate()
@@ -1478,6 +1693,33 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
                     })
                     .collect(),
             }
+        }
+        MESH => {
+            // Like a pixel program's entry below. The group input, the wave
+            // information and the user SGPRs from s8 are the title's mesh
+            // programs' (`HwStage::user_sgpr`).
+            r.layout.push(RootParam {
+                root: RootType::Other(MESH_PIECES),
+                table_offset_dwords: 0,
+                sgprs: 0,
+                base_register: 0,
+                user_data: 0,
+                slot: u8::MAX,
+            });
+            let (group, lds_bytes) = (words[2], words[3]);
+            if !extra.is_empty() || words[0] > 32 || group == 0 || group > MESH_LANES || lds_bytes > 64 << 10 {
+                return Err(Malformed("a mesh part with implausible sizes"));
+            }
+            StageIo::Ms(MeshIo {
+                outputs: param_exports(words[0]),
+                clip_cntl: words[4],
+                threads: group,
+                max_vertices: group,
+                max_primitives: group,
+                // (VGT_GS_OUT_PRIM_TYPE other than triangles is refused)
+                topology: 2,
+                lds_bytes,
+            })
         }
         _ => {
             // A pixel program owns no user SGPR for this entry: it only says the
@@ -1540,6 +1782,7 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
         stage: match stage {
             COMPUTE => HwStage::Cs,
             VERTEX => HwStage::Vs,
+            MESH => HwStage::Ms,
             _ => HwStage::Ps,
         },
         wave64,
@@ -2128,6 +2371,119 @@ mod tests {
         assert!(Graphics::parse(&packet, &state_piece(&[]), true).is_err());
         let with = graphics_packet(true, 1, &[(0, false)]);
         assert!(Graphics::parse(&with, &state_piece(&[]), false).is_err());
+    }
+
+    /// `plain` (a packet of [`graphics_packet`]) as a mesh stage's packet:
+    /// no vertex registers, and the mesh block of the captures (groups of
+    /// 128, 3 VGPR granules, 10 user SGPRs, one LDS granule) at +0x58.
+    fn mesh_packet(plain: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; M_LEN];
+        for &(at, seen, _) in &MESH_SEEN {
+            put(&mut block, at - M_BLOCK, seen);
+        }
+        put(&mut block, M_RSRC1_GS - M_BLOCK, 2);
+        put(&mut block, M_RSRC2_GS - M_BLOCK, 10 << 1 | 1 << 16 | 1 << 19);
+        put(&mut block, M_GROUP - M_BLOCK, 128 | 128 << 11 | 128 << 22);
+        for at in M_SIZES {
+            put(&mut block, at - M_BLOCK, 128);
+        }
+        put(&mut block, M_OUT_PRIM - M_BLOCK, 2);
+        let mut p = plain[..M_BLOCK].to_vec();
+        p.extend(block);
+        p.extend(&plain[M_BLOCK..]);
+        p[G_FIXED_SIZE..G_FIXED_SIZE + 2].copy_from_slice(&G_FIXED_MESH.to_le_bytes());
+        put(&mut p, G_RSRC1_VS, 0);
+        put(&mut p, G_RSRC2_VS, 0);
+        p
+    }
+
+    #[test]
+    fn a_mesh_stage_from_its_pieces() {
+        let plain = graphics_packet(true, 3, &[(0, false), (2, true)]);
+        let packet = mesh_packet(&plain);
+        let g = Graphics::parse(&packet, &state_piece(&[]), true).unwrap();
+        assert!(g.has_mesh() && g.has_pixel());
+        assert!(g.vertex(44, 0x30).is_err());
+        // The plain layout after the mesh block reads as in a plain packet.
+        let p = Graphics::parse(&plain, &state_piece(&[]), true).unwrap();
+        assert!(!p.has_mesh() && p.mesh(44, 0x30).is_err());
+        assert_eq!((g.registers, g.params, g.clips, &g.pixel), (p.registers, p.params, p.clips, &p.pixel));
+        let code = code(11);
+        let meta = metadata(
+            GRAPHICS_METADATA,
+            code.len(),
+            &[resource(0, 3, 0, 1, 4, 8, 0, 0), hash()],
+        );
+        let ms_bytes = fill(g.mesh(code.len(), meta.len()).unwrap(), &code, &meta);
+        let ms = checked(&ms_bytes).unwrap();
+        assert_eq!((ms.stage, ms.vgprs, ms.wave64), (HwStage::Ms, 12, true));
+        assert_eq!(ms.layout.last().map(|p| p.root), Some(RootType::Other(MESH_PIECES)));
+        let StageIo::Ms(io) = &ms.io else {
+            panic!("{:?}", ms.io)
+        };
+        assert_eq!(
+            (io.threads, io.max_vertices, io.max_primitives, io.topology, io.lds_bytes),
+            (128, 128, 128, 2, 512)
+        );
+        assert_eq!(
+            io.outputs.iter().map(|o| (o.row, o.param)).collect::<Vec<_>>(),
+            [(0, 0), (1, 1), (2, 2)]
+        );
+        // It exports what the vertex program of the plain packet would, and
+        // reads nothing.
+        let vs_bytes = fill(p.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let part = |bytes: &[u8], fourcc| {
+            crate::Container::parse(bytes).unwrap().part(fourcc).unwrap().data.to_vec()
+        };
+        assert_eq!(part(&ms_bytes, FourCC::OSG1), part(&vs_bytes, FourCC::OSG1));
+        assert_eq!(u32_at(&part(&ms_bytes, FourCC::ISG1), 0), Ok(0));
+        // Its program part is no vertex program's: the two never share a key.
+        assert_ne!(part(&ms_bytes, FourCC::PIECES), part(&vs_bytes, FourCC::PIECES));
+    }
+
+    #[test]
+    fn mesh_packets_not_understood_are_refused() {
+        let plain = graphics_packet(false, 1, &[]);
+        let state = state_piece(&[]);
+        let refused = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut p = mesh_packet(&plain);
+            change(&mut p);
+            Graphics::parse(&p, &state, false).unwrap_err()
+        };
+        assert!(Graphics::parse(&mesh_packet(&plain), &state, false).is_ok());
+        // Each word that held one value in every capture, by its place.
+        assert_eq!(refused(&|p| put(p, 0xa0, 0)), MESH_SEEN[12].2);
+        assert_eq!(refused(&|p| put(p, 0x58, 1)), MESH_SEEN[0].2);
+        // Group sizes that differ say nothing about which word is which.
+        assert!(refused(&|p| put(p, M_SIZES[1], 64)).contains("group sizes differ"));
+        assert!(refused(&|p| put(p, M_GROUP, 64 | 128 << 11 | 128 << 22)).contains("group sizes differ"));
+        let all = |n: u32| move |p: &mut Vec<u8>| {
+            put(p, M_GROUP, n | n << 11 | n << 22);
+            for at in M_SIZES {
+                put(p, at, n);
+            }
+        };
+        assert!(refused(&all(256)).contains("more than 128"));
+        assert!(Graphics::parse(&{ let mut p = mesh_packet(&plain); all(64)(&mut p); p }, &state, false).is_ok());
+        assert_eq!(refused(&|p| put(p, M_OUT_PRIM, 1)), "VGT_GS_OUT_PRIM_TYPE other than triangles (2)");
+        assert_eq!(
+            refused(&|p| put(p, M_RSRC2_GS, 10 << 1 | 1 << 16 | 1)),
+            "SPI_SHADER_PGM_RSRC2_GS SCRATCH_EN (bit 0)"
+        );
+        assert!(refused(&|p| put(p, M_RSRC2_GS, 10 << 1)).contains("ES_VGPR_COMP_CNT"));
+        assert_eq!(
+            refused(&|p| put(p, G_RSRC1_VS, 1)),
+            "a mesh packet with registers for a vertex program"
+        );
+        // The rest is judged as a plain packet, at its shifted place.
+        assert!(
+            refused(&|p| put(p, G_DEPTH_BIAS + M_LEN, 1)).contains("+0xac")
+        );
+        // Cut inside the mesh block: no shape known.
+        assert_eq!(
+            Graphics::parse(&mesh_packet(&plain)[..0x80], &state, false).unwrap_err(),
+            "a graphics packet of an unknown shape"
+        );
     }
 
     #[test]
@@ -2790,7 +3146,12 @@ mod tests {
                         }
                     };
                     t.parsed += 1;
-                    let vs = stage(t, "vertex", g.vertex(len(9), len(11)), 9);
+                    // The vertex stage, or the mesh stage in the first extra slot.
+                    let vs = if g.has_mesh() {
+                        stage(t, "mesh", g.mesh(len(13), len(15)), 13)
+                    } else {
+                        stage(t, "vertex", g.vertex(len(9), len(11)), 9)
+                    };
                     let ps = if pixel {
                         stage(t, "pixel", g.pixel(len(5), len(7)), 5)
                     } else {
@@ -2804,7 +3165,12 @@ mod tests {
                     // the vertex program's own inputs as the input layout.
                     #[cfg(windows)]
                     if let (Some(host), Some(ps)) = (&host, &ps) {
-                        match host.pipeline(&vs, ps) {
+                        let made = if g.has_mesh() {
+                            host.mesh_pipeline(&vs, ps).map(|_| ())
+                        } else {
+                            host.pipeline(&vs, ps).map(|_| ())
+                        };
+                        match made {
                             Ok(_) => t.made += 1,
                             Err(e) => note(
                                 t,

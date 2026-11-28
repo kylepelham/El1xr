@@ -240,10 +240,7 @@ pub(crate) fn vram_idle_ms_by_room(video_memory: Option<[u64; 4]>, room: bool) -
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_IDLE_BY_ROOM").is_none_or(|v| v != "0")) {
         return by_share;
     }
-    let [normal, moderate, high] = vram_idle_times([5_000, 2_500, 1_000]);
-    if crate::commitline::pressed() {
-        return high; // (El1xr) VICTORY_COMMIT_FLOOR_MB
-    }
+    let [normal, moderate, _] = vram_idle_times([5_000, 2_500, 1_000]);
     if room { normal } else { by_share.min(moderate) }
 }
 
@@ -305,6 +302,7 @@ fn sweep() {
     {
         return;
     }
+    crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::Sweep);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -3031,9 +3029,10 @@ fn late_exact() -> bool {
 /// (diagnostics; it reads the frame back at once). A frame that is saved
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
-/// idle host objects go (it needs nothing in the air).
+/// idle host objects go (it needs nothing in the air). Not while
+/// `VICTORY_PRESENT_OWN_FRAME` is set (`crate::present_own`).
 pub(crate) fn late_free_present() -> bool {
-    late_stage() > 2
+    crate::present_own::sent_ahead(late_stage(), crate::present_own::level())
 }
 
 /// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
@@ -4555,6 +4554,7 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + crate::sweep_every::every_ms() {
+            crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::SweepSettle);
             if sweep_aside::on() {
                 sweep_aside::ask();
             } else {

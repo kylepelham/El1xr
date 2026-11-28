@@ -11,6 +11,13 @@
 //! it) is read from these files. At most [`EXTRA`] such descriptions and
 //! [`PLAIN`] others are written, with `VICTORY_PIPELINE_PIECES` on or off.
 //!
+//! With `VICTORY_PIPELINE_PIECES=1` up to [`REFUSED`] more are written: the
+//! descriptions refused because a stage does not translate (8,580 calls in
+//! run b5k, 1,016 of the 1,296 stages "a descriptor changed after
+//! loading"), each only if it names a stage code not written before, so
+//! the replay test sees those stages' code (the first 300 of the other
+//! kinds come before most of them and hold none).
+//!
 //! Files: `1c8-<n>-desc.bin`, the 0x108-byte description; `1c8-<n>-blob<k>-<len>.bin`,
 //! pair `k` (description words 1 + 2k and 2 + 2k: an address and a length).
 
@@ -27,6 +34,10 @@ const MOST: u64 = 4 << 20;
 /// Descriptions written with a word in an extra slot, and without.
 const EXTRA: u32 = 300;
 const PLAIN: u32 = 300;
+/// Descriptions refused for a stage that does not translate.
+const REFUSED: u32 = 300;
+/// The refusal [`refused`] writes descriptions for.
+const UNTRANSLATED: &str = "a stage that does not translate";
 
 /// The folder, created; `None` when the variable is unset or empty.
 fn folder() -> Option<&'static PathBuf> {
@@ -48,18 +59,34 @@ fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// How many of each kind were taken so far: (with an extra slot, without).
+/// How many of each kind were taken so far: with an extra slot, without,
+/// and refused for a stage that does not translate.
 #[derive(Default)]
 struct Taken {
     extra: u32,
     plain: u32,
+    refused: u32,
+    /// The stage code addresses of the refused ones written.
+    codes: std::collections::HashSet<u64>,
 }
 
 impl Taken {
+    /// The number of the next refused description whose stage codes are
+    /// `codes`, if one of them is new and there is room.
+    fn take_refused(&mut self, codes: &[u64]) -> Option<u32> {
+        if self.refused >= REFUSED || codes.iter().all(|c| self.codes.contains(c)) {
+            return None;
+        }
+        let n = self.extra + self.plain + self.refused;
+        self.codes.extend(codes);
+        self.refused += 1;
+        Some(n)
+    }
+
     /// The number of the next description of its kind, if its kind is not
     /// full yet.
     fn take(&mut self, extra: bool) -> Option<u32> {
-        let n = self.extra + self.plain;
+        let n = self.extra + self.plain + self.refused;
         let count = if extra {
             &mut self.extra
         } else {
@@ -86,45 +113,100 @@ fn pieces(words: &[u64; WORDS]) -> Vec<(usize, u64, u64)> {
         .collect()
 }
 
+/// The description at `desc` as bytes and words, if it can be read.
+fn described(desc: *const u8) -> Option<([u8; DESC], [u64; WORDS])> {
+    let mut bytes = [0u8; DESC];
+    if desc.is_null() || crate::read_there::read_there(desc, &mut bytes) < FIRST_EXTRA * 8 {
+        return None;
+    }
+    let mut words = [0u64; WORDS];
+    for (w, b) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *w = u64::from_le_bytes(*b);
+    }
+    Some((bytes, words))
+}
+
+/// The addresses of the stage codes `words` names: the pixel and vertex
+/// stages' and each extra slot's first word.
+fn stage_codes(words: &[u64; WORDS]) -> Vec<u64> {
+    [5, 9, 13, 17, 21, 25, 29]
+        .iter()
+        .map(|&at| words[at])
+        .filter(|&a| a != 0)
+        .collect()
+}
+
+static TAKEN: Mutex<Option<Taken>> = Mutex::new(None);
+
 /// Device method 0x1c8 got `desc`: written if the variable names a folder
 /// and its kind still has room. On the title's thread; costs nothing unset.
 pub(crate) fn call(desc: *const u8) {
     let Some(folder) = folder() else {
         return;
     };
-    let mut bytes = [0u8; DESC];
-    if desc.is_null() || crate::read_there::read_there(desc, &mut bytes) < FIRST_EXTRA * 8 {
-        return;
-    }
-    let mut words = [0u64; WORDS];
-    for (w, b) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
-        *w = u64::from_le_bytes(*b);
-    }
-    static TAKEN: Mutex<Taken> = Mutex::new(Taken { extra: 0, plain: 0 });
-    let Some(n) = TAKEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take(has_extra(&words))
-    else {
+    let Some((bytes, words)) = described(desc) else {
         return;
     };
+    let (n, full) = {
+        let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+        let t = taken.get_or_insert_with(Taken::default);
+        let Some(n) = t.take(has_extra(&words)) else {
+            return;
+        };
+        (n, t.extra == EXTRA && t.plain == PLAIN)
+    };
+    write(folder, n, &bytes, &words);
+    if full {
+        tracing::info!(
+            descriptions = EXTRA + PLAIN,
+            "VICTORY_PIPELINE_DUMP: all descriptions written"
+        );
+    }
+}
+
+/// Device method 0x1c8 refused `desc` for `why`: written if the variable
+/// names a folder, `why` is a stage that does not translate, one of its
+/// stage codes was not written before and there is room.
+pub(crate) fn refused(desc: *const u8, why: &str) {
+    if why != UNTRANSLATED {
+        return;
+    }
+    let Some(folder) = folder() else {
+        return;
+    };
+    let Some((bytes, words)) = described(desc) else {
+        return;
+    };
+    let (n, full) = {
+        let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+        let t = taken.get_or_insert_with(Taken::default);
+        let Some(n) = t.take_refused(&stage_codes(&words)) else {
+            return;
+        };
+        (n, t.refused == REFUSED)
+    };
+    write(folder, n, &bytes, &words);
+    if full {
+        tracing::info!(
+            descriptions = REFUSED,
+            "VICTORY_PIPELINE_DUMP: all refused descriptions written"
+        );
+    }
+}
+
+/// Writes description `n` and the pieces its words name.
+fn write(folder: &std::path::Path, n: u32, bytes: &[u8; DESC], words: &[u64; WORDS]) {
     let write = |name: String, data: &[u8]| {
         if let Err(e) = std::fs::write(folder.join(&name), data) {
             tracing::warn!(file = %name, error = %e, "VICTORY_PIPELINE_DUMP: not written");
         }
     };
-    write(format!("1c8-{n:03}-desc.bin"), &bytes);
-    for (k, address, len) in pieces(&words) {
+    write(format!("1c8-{n:03}-desc.bin"), bytes);
+    for (k, address, len) in pieces(words) {
         let mut piece = vec![0u8; len as usize];
         if crate::read_there::read_there(address as *const u8, &mut piece) == piece.len() {
             write(format!("1c8-{n:03}-blob{k:02}-{len:x}.bin"), &piece);
         }
-    }
-    if n + 1 == EXTRA + PLAIN {
-        tracing::info!(
-            descriptions = n + 1,
-            "VICTORY_PIPELINE_DUMP: all descriptions written"
-        );
     }
 }
 
@@ -186,6 +268,31 @@ mod tests {
             assert!(t.take(false).is_some());
         }
         assert_eq!(t.take(false), None);
-        assert!(EXTRA + PLAIN <= 1000, "names keep three digits");
+        assert!(EXTRA + PLAIN + REFUSED <= 1000, "names keep three digits");
+    }
+
+    #[test]
+    fn refused_ones_need_a_new_stage_and_number_on() {
+        let mut t = Taken::default();
+        assert_eq!(t.take(false), Some(0));
+        assert_eq!(t.take_refused(&[0x10, 0x20]), Some(1));
+        // the same stages again, or a subset: nothing new to see
+        assert_eq!(t.take_refused(&[0x20, 0x10]), None);
+        assert_eq!(t.take_refused(&[0x10]), None);
+        // one new stage beside a known one
+        assert_eq!(t.take_refused(&[0x10, 0x30]), Some(2));
+        assert_eq!(t.take(true), Some(3));
+        for a in 0..u64::from(REFUSED) {
+            t.take_refused(&[0x1000 + a]);
+        }
+        assert_eq!(t.refused, REFUSED);
+        assert_eq!(t.take_refused(&[0x9999]), None);
+    }
+
+    #[test]
+    fn stage_codes_are_the_stages_first_words() {
+        let w = logged();
+        // pixel code, then the +0x68 slot's (no vertex stage)
+        assert_eq!(stage_codes(&w), [0xd55a8ee00, 0xd55a92200]);
     }
 }

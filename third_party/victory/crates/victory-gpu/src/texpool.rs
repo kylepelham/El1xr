@@ -35,6 +35,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 mod buffers;
+mod reuse;
 #[cfg(test)]
 mod unmap_costs;
 pub(crate) use buffers::{card_buffer, shared_buffer, upload_buffer};
@@ -170,7 +171,13 @@ impl Resting {
     }
 
     fn over(self, now: u64, finished: u64) -> bool {
-        now >= self.at + REST || (now >= self.at + SETTLE && finished >= self.begun + LAG)
+        now >= self.at + REST || self.done(now, finished)
+    }
+
+    /// (El1xr) Every submission begun when it came back has finished, with no
+    /// time limit: before the copy queue writes zeros over it (`buffers::reuse`).
+    fn done(self, now: u64, finished: u64) -> bool {
+        now >= self.at + SETTLE && finished >= self.begun + LAG
     }
 }
 
@@ -255,6 +262,13 @@ struct Pool<B> {
     /// (El1xr) A pool of the PC's memory: past `VICTORY_UPLOAD_CAP_MB` it
     /// keeps no empty block (`crate::commitline`).
     capped: bool,
+    /// (El1xr) A fresh pool whose pieces are zeroed and cut again
+    /// (`VICTORY_CARD_BLOCK_REUSE`, `buffers::reuse`): `free` holds only memory
+    /// as it was made or zeroed since; a piece back and done resting waits in
+    /// `dirty` until the copy queue zeroes it (`clearing`, by fence value).
+    reuse: bool,
+    dirty: Vec<Piece>,
+    clearing: VecDeque<(u64, Piece)>,
 }
 
 impl<B: Clone> Pool<B> {
@@ -268,6 +282,9 @@ impl<B: Clone> Pool<B> {
             fresh: false,
             making: false,
             capped: false,
+            reuse: false,
+            dirty: Vec::new(),
+            clearing: VecDeque::new(),
         }
     }
 
@@ -293,18 +310,26 @@ impl<B: Clone> Pool<B> {
             fresh: true,
             making: false,
             capped: false,
+            reuse: false,
+            dirty: Vec::new(),
+            clearing: VecDeque::new(),
         }
     }
 
     /// Where a piece of `block` may start: past what was ever used in a
     /// fresh pool.
     fn least(&self, block: &Block<B>) -> u64 {
-        if self.fresh { block.used_to } else { 0 }
+        if self.only_unused() { block.used_to } else { 0 }
+    }
+
+    /// Pieces are cut only above what was ever used: fresh, and not reusing.
+    fn only_unused(&self) -> bool {
+        self.fresh && !self.reuse
     }
 
     /// A block with no piece that can be cut whole again.
     fn empty(&self, block: &Block<B>) -> bool {
-        block.free.whole(BLOCK) && (!self.fresh || block.used_to == 0)
+        block.free.whole(BLOCK) && (!self.only_unused() || block.used_to == 0)
     }
 
     /// A piece of `len` bytes, the memory it lies in, and whether that part
@@ -360,7 +385,7 @@ impl<B: Clone> Pool<B> {
     fn cut(&mut self, len: u64, align: u64, now: u64, ripe: Ripe, freed: &mut Vec<B>) -> Option<(Piece, B, bool)> {
         freed.extend(self.reclaim(now, crate::host::submissions_finished(), self.spares()));
         let mut found = None;
-        let fresh = self.fresh;
+        let fresh = self.only_unused();
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
@@ -458,14 +483,35 @@ impl<B: Clone> Pool<B> {
         gone
     }
 
+    /// (El1xr) For the commit line: bytes its pieces in use hold (resting ones not counted),
+    /// and bytes a new piece may still be cut from (in a fresh pool only above what was ever
+    /// used). The rest of its blocks is resting or, in a fresh pool, used once and never cut
+    /// again until the whole block is back.
+    fn usage(&self) -> [u64; 2] {
+        let (mut held, mut cuttable) = (0u64, 0u64);
+        for block in self.blocks.iter().flatten() {
+            let free: u64 = block.free.0.values().sum();
+            held += BLOCK - free;
+            cuttable += if self.only_unused() { BLOCK - block.used_to } else { free };
+        }
+        let resting: u64 = self.resting.iter().map(|(_, piece)| piece.len).sum::<u64>()
+            + self.dirty.iter().map(|piece| piece.len).sum::<u64>()
+            + self.clearing.iter().map(|(_, piece)| piece.len).sum::<u64>();
+        [held.saturating_sub(resting), cuttable]
+    }
+
     fn reclaim(&mut self, now: u64, finished: u64, spares: usize) -> Vec<B> {
         let mut gone = Vec::new();
         let mut any = false;
+        let reuse = self.reuse;
         while let Some(&(resting, piece)) = self.resting.front()
-            && resting.over(now, finished)
+            && if reuse { resting.done(now, finished) } else { resting.over(now, finished) }
         {
             self.resting.pop_front();
-            if let Some(block) = self.blocks[piece.block].as_mut() {
+            if reuse {
+                self.dirty.push(piece);
+                any = true;
+            } else if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
                 any |= block.free.whole(BLOCK);
             }
@@ -473,8 +519,87 @@ impl<B: Clone> Pool<B> {
         if !any {
             return gone;
         }
+        if reuse {
+            gone.extend(self.let_go_unheld());
+        }
+        gone.extend(self.let_go_spares(spares));
+        gone
+    }
+
+    /// (El1xr) Reuse: the blocks every piece of which is back, free or waiting
+    /// for zeros (none held, resting or being zeroed), go unzeroed, as used
+    /// blocks of a fresh pool go.
+    fn let_go_unheld(&mut self) -> Vec<B> {
+        let mut back = vec![0u64; self.blocks.len()];
+        for piece in &self.dirty {
+            back[piece.block] += piece.len;
+        }
+        let mut gone = Vec::new();
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if back[i] > 0 && block.as_ref().is_some_and(|b| b.free.0.values().sum::<u64>() + back[i] == BLOCK) {
+                gone.extend(block.take().map(|b| b.memory));
+                self.alive.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if !gone.is_empty() {
+            let blocks = &self.blocks;
+            self.dirty.retain(|piece| blocks[piece.block].is_some());
+        }
+        gone
+    }
+
+    /// (El1xr) Reuse: up to `most` bytes of the pieces waiting for zeros (at
+    /// least one), oldest first, each with its block's memory; they are in no
+    /// list until [`Pool::clearing`] or [`Pool::dirty_again`] takes them back,
+    /// so their blocks stay.
+    fn take_dirty(&mut self, most: u64) -> Vec<(Piece, B)> {
+        let mut bytes = 0;
+        let n = self.dirty.iter().take_while(|piece| {
+            bytes += piece.len;
+            bytes <= most
+        });
+        let n = n.count().max(1).min(self.dirty.len());
+        let blocks = &self.blocks;
+        self.dirty
+            .drain(..n)
+            .filter_map(|piece| Some((piece, blocks[piece.block].as_ref()?.memory.clone())))
+            .collect()
+    }
+
+    /// (El1xr) Reuse: `pieces` are being zeroed by the copy that fence value
+    /// `value` follows.
+    fn clearing(&mut self, value: u64, pieces: impl IntoIterator<Item = Piece>) {
+        self.clearing.extend(pieces.into_iter().map(|piece| (value, piece)));
+    }
+
+    /// (El1xr) Reuse: `pieces` were not sent to be zeroed; they wait again.
+    fn dirty_again(&mut self, pieces: impl IntoIterator<Item = Piece>) {
+        self.dirty.extend(pieces);
+    }
+
+    /// (El1xr) Reuse: the pieces whose zeros the copy queue has written by
+    /// fence value `completed` may be cut again; the empty blocks past
+    /// `spares` go.
+    fn cleared(&mut self, completed: u64, spares: usize) -> Vec<B> {
+        let mut any = false;
+        while let Some(&(value, piece)) = self.clearing.front()
+            && value <= completed
+        {
+            self.clearing.pop_front();
+            if let Some(block) = self.blocks[piece.block].as_mut() {
+                block.free.give(piece.start, piece.len);
+                any |= block.free.whole(BLOCK);
+            }
+        }
+        if any { self.let_go_spares(spares) } else { Vec::new() }
+    }
+
+    /// The empty blocks past `spares` (and past the pool's most) go, and in a
+    /// fresh pool that does not reuse, every used one.
+    fn let_go_spares(&mut self, spares: usize) -> Vec<B> {
+        let mut gone = Vec::new();
         let most = spares.min(self.most);
-        let fresh = self.fresh;
+        let fresh = self.only_unused();
         let mut spare = 0;
         for block in &mut self.blocks {
             if let Some(b) = block.as_ref()
@@ -694,6 +819,13 @@ pub(crate) const BLOCK_BYTES: u64 = BLOCK;
 pub(crate) fn blocks_alive() -> [u64; 5] {
     let b = buffers::blocks_alive();
     [TEXTURE_BLOCKS.load(Ordering::Relaxed), STAGING_BLOCKS.load(Ordering::Relaxed), b[0], b[1], b[2]]
+}
+
+/// (El1xr) Per pool, as [`blocks_alive`] names them: bytes held by pieces in use, and bytes
+/// a piece may still be cut from (`Pool::usage`).
+pub(crate) fn pool_usage() -> [[u64; 2]; 5] {
+    let b = buffers::usage();
+    [lock(&TEXTURES).usage(), lock(&STAGING).usage(), b[0], b[1], b[2]]
 }
 
 /// (El1xr) Frees the pieces of the pools of the PC's memory (staging,
@@ -1307,6 +1439,28 @@ mod tests {
         pool.give(taken[7], 20 + REST);
         assert_eq!(pool.trim(20 + 2 * REST, 0).len(), 1);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    /// (El1xr) A fresh pool's usage counts what was cut once and given back as neither held
+    /// nor cuttable: the memory the card buffer blocks hold for nothing; a plain pool cuts it
+    /// again.
+    #[test]
+    fn usage_tells_held_cuttable_and_lost() {
+        static ALIVE_HERE: AtomicU64 = AtomicU64::new(0);
+        let make = || Some(0u32);
+        const K64: u64 = 64 << 10;
+        for fresh in [true, false] {
+            let mut pool: Pool<u32> = if fresh { Pool::fresh(2, &ALIVE_HERE) } else { Pool::new(2, &ALIVE_HERE) };
+            let a = pool.take(4 * K64, K64, 0, make).unwrap().0;
+            let _b = pool.take(K64, K64, 0, make).unwrap().0;
+            assert_eq!(pool.usage(), [5 * K64, BLOCK - 5 * K64]);
+            pool.give(a, 0);
+            // Resting: neither held nor cuttable.
+            assert_eq!(pool.usage(), [K64, BLOCK - 5 * K64]);
+            pool.reclaim(REST, 0, 2);
+            let lost = if fresh { 4 * K64 } else { 0 };
+            assert_eq!(pool.usage(), [K64, BLOCK - K64 - lost]);
+        }
     }
 
     #[test]

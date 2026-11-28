@@ -11,7 +11,8 @@
 //! +0x18 0x14 bytes, not read    +0x18 state piece
 //! +0x28 code                    +0x28 pixel code, +0x38 pixel metadata
 //! +0x38 metadata                +0x48 vertex code, +0x58 vertex metadata
-//!                               +0x68 20 words, zero in every call seen
+//!                               +0x68 mesh code, +0x78 mesh metadata
+//!                               +0x88 16 words, zero in every call seen
 //! ```
 //!
 //! Where the bytes are: all of it is in title memory when the method is
@@ -236,6 +237,14 @@ fn untranslated() -> &'static std::sync::RwLock<std::collections::HashSet<[u8; 3
     })
 }
 
+/// A stage from pieces that does not translate while refusing is on: every
+/// pipeline naming it is refused at creation ([`refuse_failed`]) and the
+/// title makes its own, so none of its draws is dropped (1,296 such stages
+/// in run b5k were logged as refusals that dropped draws).
+pub(crate) fn refused_instead(container: &[u8]) -> bool {
+    refusing() && is_pieces(container)
+}
+
 /// Worker side of a failed translation: keeps `container`'s key for the next
 /// run when it is one from pieces and refusing is on.
 pub(crate) fn note_untranslated(container: &[u8]) {
@@ -281,6 +290,17 @@ fn refuse_failed(shaders: &[Arc<Shader>]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// `VICTORY_PIPELINE_PIECES_MESH=1`, read once, off by default, and only
+/// with `VICTORY_PIPELINE_PIECES=1`: a description with a mesh stage (the
+/// console's NGG program, in the first extra slot, with an empty vertex
+/// slot) is made from its pieces too. Off, it is refused by its slot as
+/// before and the title makes its own. Its container has a mesh program
+/// part, so its translation never shares a key with another stage's.
+fn mesh_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES_MESH").is_ok_and(|v| v == "1"))
+}
+
 /// `VICTORY_PIPELINE_PIECES_ONLY=compute` or `=graphics`, read once: only
 /// that kind of pipeline is made from pieces and the other kind is refused
 /// as with the switch off, so a wrong picture can be put down to one kind
@@ -315,11 +335,12 @@ fn compute(
 
 /// Refuses a description whose words after the vertex stage are not zero.
 /// They are room for five more stage slots of four words (code, then
-/// metadata, as the two before them; a guess, no capture had any set), and
-/// a title's description of a pipeline with a stage besides the pixel and
-/// the vertex stage sets one: run 10 had 11,000 such calls. Which stage a
-/// slot is was not captured either (the console's order of stages would
-/// make them the geometry, export, hull and local stages, a guess), so
+/// metadata, as the two before them), and a title's description of a
+/// pipeline with a stage besides the pixel and the vertex stage sets one:
+/// run 10 had 11,000 such calls. The first slot holds a mesh stage (run b6:
+/// 300 descriptions, each with an empty vertex slot and a mesh packet), which
+/// [`graphics_parts`] makes under [`mesh_enabled`] and passes here without
+/// it (`first` false). Which stage the other slots are was not captured, so
 /// each refusal names the slot and the first call of each logs its words.
 ///
 /// What support would take: the host translates the vertex, mesh, pixel and
@@ -330,8 +351,14 @@ fn compute(
 /// of the console's geometry path, say) needs its metadata kind and the
 /// packet's registers for it understood, which only a capture of such a
 /// description gives.
-fn other_stages(rest: &[u64; 20]) -> Result<(), Refusal> {
-    let Some(slot) = rest.chunks(4).position(|w| w.iter().any(|&v| v != 0)) else {
+fn other_stages(rest: &[u64; 20], first: bool) -> Result<(), Refusal> {
+    let skip = if first { 0 } else { 1 };
+    let Some(slot) = rest
+        .chunks(4)
+        .enumerate()
+        .skip(skip)
+        .find_map(|(i, w)| w.iter().any(|&v| v != 0).then_some(i))
+    else {
         return Ok(());
     };
     let why = [
@@ -355,12 +382,30 @@ fn other_stages(rest: &[u64; 20]) -> Result<(), Refusal> {
     Err(why)
 }
 
-/// The containers of the stages `d` describes, vertex first, and the
-/// pipeline's state.
+/// The mesh stage in the first extra slot: its code and its metadata.
+fn mesh_slot(d: &GraphicsDesc) -> [Pair; 2] {
+    let pair = |i: usize| Pair {
+        address: d.rest[i],
+        len: d.rest[i + 1],
+    };
+    [pair(0), pair(2)]
+}
+
+/// The containers of the stages `d` describes, vertex (or mesh) first, and
+/// the pipeline's state.
 fn graphics_parts(
     d: &GraphicsDesc,
 ) -> Result<(Vec<(&'static str, Vec<u8>)>, GraphicsState), Refusal> {
-    other_stages(&d.rest)?;
+    let mesh = mesh_slot(d);
+    let has_mesh = mesh.iter().any(|p| p.address != 0 || p.len != 0);
+    other_stages(&d.rest, !(has_mesh && mesh_enabled()))?;
+    if has_mesh
+        && [d.vertex_code, d.vertex_metadata]
+            .iter()
+            .any(|p| p.address != 0 || p.len != 0)
+    {
+        return Err("a graphics description with both a vertex and a mesh stage");
+    }
     // A pixel stage is there whole or not at all.
     let pixel = [d.pixel_code, d.pixel_metadata];
     let has_pixel = pixel.iter().any(|p| p.address != 0 || p.len != 0);
@@ -383,10 +428,17 @@ fn graphics_parts(
         )?;
         filled(draft, code, metadata)
     };
-    let mut stages = vec![(
-        "vertex",
-        stage(d.vertex_code, d.vertex_metadata, Graphics::vertex)?,
-    )];
+    // (the packet decides the kind: a mesh packet with a vertex slot, or a
+    // plain one with a mesh slot, is refused by `Graphics::vertex` or
+    // `Graphics::mesh`)
+    let mut stages = vec![if has_mesh {
+        ("mesh", stage(mesh[0], mesh[1], Graphics::mesh)?)
+    } else {
+        (
+            "vertex",
+            stage(d.vertex_code, d.vertex_metadata, Graphics::vertex)?,
+        )
+    }];
     if has_pixel {
         stages.push((
             "pixel",
@@ -1189,19 +1241,34 @@ mod tests {
 
     #[test]
     fn extra_stage_slots_are_refused_by_slot() {
-        assert_eq!(other_stages(&[0; 20]), Ok(()));
+        assert_eq!(other_stages(&[0; 20], true), Ok(()));
         let mut rest = [0u64; 20];
         let mut reasons = Vec::new();
         for slot in 0..5 {
             rest = [0; 20];
             rest[slot * 4 + 3] = 0x40;
-            reasons.push(other_stages(&rest).unwrap_err());
+            reasons.push(other_stages(&rest, true).unwrap_err());
+            // With the mesh stage made, only the first slot passes.
+            assert_eq!(other_stages(&rest, false).is_ok(), slot == 0, "{slot}");
         }
         // Each slot has a reason of its own.
         reasons.sort_unstable();
         reasons.dedup();
         assert_eq!(reasons.len(), 5);
         assert_ne!(rest, [0; 20]);
+    }
+
+    #[test]
+    fn the_mesh_slot_is_the_first_extra_slot() {
+        let mut d = GraphicsDesc::default();
+        d.rest[..4].copy_from_slice(&[0x1_0000_0000, 0x4c0, 0x2_0000_0000, 0x1a0]);
+        let [code, metadata] = mesh_slot(&d);
+        assert_eq!((code.address, code.len), (0x1_0000_0000, 0x4c0));
+        assert_eq!((metadata.address, metadata.len), (0x2_0000_0000, 0x1a0));
+        // A mesh stage beside a vertex stage is no pipeline the host makes.
+        d.vertex_code = Pair { address: 0x3_0000_0000, len: 0x40 };
+        let refused = graphics_parts(&d).err();
+        assert!(refused.is_some_and(|why| why.contains("extra slot") || why.contains("both")), "{refused:?}");
     }
 
     /// The packet and state piece of every graphics description captured

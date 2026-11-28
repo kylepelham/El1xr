@@ -16,11 +16,21 @@
 //! Unset or `0`: off (the structure as before). Part of the translation: the shader cache keys
 //! on it.
 //!
+//! A program whose wave-wide form puts a group barrier of the translator's own (the two host
+//! waves exchanging a branch's decision, a split-LDS meeting) into a loop keeps the per-lane
+//! form too ([`watch`]): `ptfx_CS_lightAtlas_Sprite` (`2561af9577c47289`) lost the card that
+//! way (batch 5 part J). Its light loop is entered behind an `s_cbranch_execz` that the
+//! "without skips" form leaves out and closed by `s_cbranch_vccz` on a vector compare; taken for
+//! the wave, a console wave with no lane in the loop never sets VCC and goes round for ever.
+//! Upstream's `VICTORY_WAVE_WIDE_AUTO` refuses the same shape (`emit::wide_auto`). The programs
+//! the runtime gives the paired form (`VICTORY_WAVE_PAIRS_ONLY`) are translated with the switch
+//! off ([`per_lane`], `emit::without_lane_mask_wide`).
+//!
 //! Ported from DoubleGhosty/cool_fox `34e99a33b4` (Hasusmogus, #66: `lane_split_loses`,
 //! `structure_per_lane`), `d2f23973f6` and `a4af70be0f` (the per-lane retry, `VICTORY_LANE_SPLIT`,
 //! in the cache key), with the store-guard test of `bd8b4f524a` (steven-seagull27), GPL-3.0.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crate::ShaderError;
 
@@ -67,7 +77,7 @@ pub(crate) fn on() -> bool {
 }
 
 /// `f` with the structure as with the switch off, on this thread.
-fn per_lane<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn per_lane<T>(f: impl FnOnce() -> T) -> T {
     struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -81,35 +91,99 @@ fn per_lane<T>(f: impl FnOnce() -> T) -> T {
 /// What a translation gives: the program, and the wave size it requires of the host.
 type Emitted<T> = Result<(T, Option<u32>), ShaderError>;
 
+thread_local! {
+    /// Inside [`watch`]: whether the lowering in progress put a group barrier of the
+    /// translator's own into a loop, and the programs (DXIL) the lowerings that did gave.
+    static LOOPED: RefCell<Option<(bool, Vec<Vec<u8>>)>> = const { RefCell::new(None) };
+}
+
+/// Whether [`watch`] is running on this thread.
+pub(crate) fn watching() -> bool {
+    LOOPED.with_borrow(|l| l.is_some())
+}
+
+/// A lowering starts (each one counts on its own).
+pub(crate) fn lowering_starts() {
+    LOOPED.with_borrow_mut(|l| {
+        if let Some(l) = l {
+            l.0 = false;
+        }
+    });
+}
+
+/// The lowering in progress put a group barrier of the translator's own into a block of a loop.
+pub(crate) fn barrier_in_loop() {
+    LOOPED.with_borrow_mut(|l| {
+        if let Some(l) = l {
+            l.0 = true;
+        }
+    });
+}
+
+/// The lowering in progress gave `dxil`.
+pub(crate) fn lowered(dxil: &[u8]) {
+    LOOPED.with_borrow_mut(|l| {
+        if let Some((true, done)) = l {
+            done.push(dxil.to_vec());
+        }
+    });
+}
+
+/// Runs `f` (a translation) and says whether the program it gave came from a lowering that put
+/// a group barrier of the translator's own into a loop. Two host waves that leave such a loop
+/// on different rounds, or never, wait there for each other.
+pub(crate) fn watch<T>(f: impl FnOnce() -> Emitted<T>, dxil: impl Fn(&T) -> &[u8]) -> (Emitted<T>, bool) {
+    let was = LOOPED.replace(Some((false, Vec::new())));
+    let r = f();
+    let done = LOOPED.replace(was).map(|l| l.1).unwrap_or_default();
+    let looped = matches!(&r, Ok((t, _)) if done.iter().any(|d| d.as_slice() == dxil(t)));
+    (r, looped)
+}
+
+/// The error of a program whose wave-wide form puts a group barrier into a loop, with
+/// `VICTORY_LANE_MASK_WIDE=exact`.
+pub(crate) const LOOP_BARRIER: &str = "a group barrier of the translator's in a loop";
+
 /// `first`, the translation whose structure took `wide` branches wave-wide (none: nothing this
-/// switch changed); where it was refused, or needs 64-lane waves a host of `host_wave` lanes
-/// does not have, the translation `retry` makes with every branch split per lane, as with the
-/// switch off, if that one does better; for a refused one, that translation's result, error
-/// and all.
+/// switch changed); where it was refused, needs 64-lane waves a host of `host_wave` lanes
+/// does not have, or put a group barrier of the translator's own into a loop (`looped`), the
+/// translation `retry` makes with every branch split per lane, as with the switch off, if that
+/// one does better; for a refused or looped one, that translation's result, error and all.
 pub(crate) fn again<T>(
     first: Emitted<T>,
     wide: usize,
+    looped: bool,
     host_wave: u32,
     retry: impl FnOnce() -> Emitted<T>,
 ) -> Emitted<T> {
     let narrow = |w: &Option<u32>| *w == Some(64) && host_wave == 32;
-    let refused = match &first {
-        Ok((_, w)) => narrow(w),
-        Err(e) => matches!(e, ShaderError::Unsupported { .. }),
-    };
-    if !refused || wide == 0 || mode() != Mode::On || PER_LANE.get() {
+    let refused = looped
+        || match &first {
+            Ok((_, w)) => narrow(w),
+            Err(e) => matches!(e, ShaderError::Unsupported { .. }),
+        };
+    if !refused || wide == 0 || PER_LANE.get() {
         return first;
     }
+    match mode() {
+        Mode::On => {}
+        Mode::Exact if looped => {
+            return Err(ShaderError::Unsupported { offset: 0, what: LOOP_BARRIER });
+        }
+        _ => return first,
+    }
     let again = per_lane(retry);
-    // (a refused program takes the per-lane result whatever it is, its error too: the caller's
-    // next forms go on from the error the switch-off form gives)
+    // (a refused or looped program takes the per-lane result whatever it is, its error too:
+    // the caller's next forms go on from the error the switch-off form gives)
     let better = match (&first, &again) {
         (Err(_), _) => true,
+        _ if looped => true,
         (Ok(_), Err(_)) => false,
         (Ok(_), Ok((_, w))) => !narrow(w),
     };
     if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
         let what = match &first {
+            Ok(_) if looped => LOOP_BARRIER.to_owned(),
             Ok((_, w)) => format!("wave {w:?}"),
             Err(e) => e.to_string(),
         };
@@ -146,31 +220,38 @@ mod tests {
             })
         };
         let was = TEST_LANE_MASK_WIDE.replace(Some(true));
-        let r = again(refused(), 1, 32, || {
+        let r = again(refused(), 1, false, 32, || {
             assert!(!on(), "the retry's structure splits per lane");
             Ok((1, Some(32)))
         });
         assert!(matches!(r, Ok((1, Some(32)))));
         // the per-lane error replaces the wave-wide one
-        let other = again(refused(), 1, 32, || -> Emitted<u8> {
+        let other = again(refused(), 1, false, 32, || -> Emitted<u8> {
             Err(ShaderError::Unsupported { offset: 4, what: "an opaque lane mask" })
         });
         assert!(matches!(other, Err(ShaderError::Unsupported { what: "an opaque lane mask", .. })));
         // nothing to split: no retry
-        assert!(again(refused(), 0, 32, || unreachable!()).is_err());
+        assert!(again(refused(), 0, false, 32, || unreachable!()).is_err());
         // a program that runs keeps its form
         assert!(matches!(
-            again(Ok((2, Some(32))), 3, 32, || unreachable!()),
+            again(Ok((2, Some(32))), 3, false, 32, || unreachable!()),
             Ok((2, _))
         ));
         // a retry still at 64 lanes is no better
         assert!(matches!(
-            again(Ok((2, Some(64))), 3, 32, || Ok((1, Some(64)))),
+            again(Ok((2, Some(64))), 3, false, 32, || Ok((1, Some(64)))),
             Ok((2, _))
         ));
+        // a program that put a barrier into a loop takes the per-lane result, whatever it is
+        assert!(matches!(
+            again(Ok((2, Some(32))), 3, true, 32, || Ok((1, Some(64)))),
+            Ok((1, Some(64)))
+        ));
+        assert!(again(Ok((2, Some(32))), 3, true, 32, refused).is_err());
         assert!(on());
         TEST_LANE_MASK_WIDE.set(Some(false));
-        assert!(again(refused(), 1, 32, || unreachable!()).is_err());
+        assert!(again(refused(), 1, false, 32, || unreachable!()).is_err());
+        assert!(matches!(again(Ok((2, None)), 1, true, 32, || unreachable!()), Ok((2, _))));
         TEST_LANE_MASK_WIDE.set(was);
     }
 }

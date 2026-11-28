@@ -66,7 +66,9 @@ impl State {
     /// (`VICTORY_HEAP_FIND_REFS=1`) The bind's tables that reach a found
     /// slot, and the words of its root constants, root views and buffer
     /// views that name one (`crate::heap_find::wanted`).
-    fn heap_find_refs(&self, p: &HostPipeline, roots: &[Root], hits: &mut Vec<String>) {
+    /// `p`: the host pipeline (`None` for a dropped draw: no buffer views
+    /// are known then).
+    fn heap_find_refs(&self, p: Option<&HostPipeline>, roots: &[Root], hits: &mut Vec<String>) {
         use crate::heap_find::{MOST_SCAN, near, search, search_memory, slots_in, wanted};
         let Some(heap) = self
             .heaps
@@ -111,7 +113,7 @@ impl State {
                 _ => {}
             }
         }
-        for stage in &p.stages {
+        for stage in p.iter().flat_map(|p| p.stages.iter()) {
             for u in stage.translated().used.iter() {
                 if u.root != RootType::Table || !matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
                     continue;
@@ -132,6 +134,56 @@ impl State {
                 }
             }
         }
+    }
+
+    /// (round 8) Whether the bind is a draw of the scene colour or a UI
+    /// in the frames after a Bink write, not into the target followed.
+    fn heap_find_scene_or_ui(&self, compute: bool, spans: &[(u64, u64)]) -> bool {
+        use crate::resource::find_facts::{object_size, object_span};
+        if compute || !crate::heap_find::after_write() {
+            return false;
+        }
+        let Some(&rt0) = self.targets.first() else {
+            return false;
+        };
+        let rt0 = rt0 as This;
+        let Some((start, len)) = object_span(rt0) else {
+            return false;
+        };
+        !crate::heap_find::meets(spans, start, len)
+            && object_size(rt0).is_some_and(|(w, h)| crate::heap_find::scene_or_ui(w, h))
+    }
+
+    /// (round 8, `VICTORY_HEAP_FIND_REFS`) A draw or dispatch that was not
+    /// run (no host pipeline, or dropped later): its tables that reach a
+    /// found slot and its root constants and root views that name one, in
+    /// the frames after a Bink write. Over a thousand draws a frame are
+    /// dropped without a host pipeline and never reach [`Self::heap_find`].
+    pub(super) fn heap_find_dropped(&self, compute: bool) {
+        if !crate::heap_find::recording()
+            || !crate::heap_find::refs()
+            || !(crate::heap_find::refs_all() || crate::heap_find::after_write())
+        {
+            return;
+        }
+        let roots = if compute {
+            &self.compute
+        } else {
+            &self.graphics
+        };
+        let mut hits = Vec::new();
+        self.heap_find_refs(None, roots, &mut hits);
+        if hits.is_empty() {
+            return;
+        }
+        let head = format!(
+            "dropped {} pipeline={:#x} {} made={}",
+            if compute { "dispatch" } else { "draw" },
+            self.pipeline,
+            crate::pipeline::named_shaders_of(self.pipeline as This),
+            crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+        );
+        crate::heap_find::log_draw(crate::heap_find::next_bind(), &head, &hits);
     }
 
     pub(super) fn heap_find(&self, list: &HostList, p: &HostPipeline, compute: bool) {
@@ -209,8 +261,11 @@ impl State {
                 ));
             }
         }
-        if crate::heap_find::refs() {
-            self.heap_find_refs(p, roots, &mut hits);
+        if crate::heap_find::refs()
+            && (crate::heap_find::refs_all() || self.heap_find_scene_or_ui(compute, &spans))
+        {
+            crate::heap_find::refs_bind();
+            self.heap_find_refs(Some(p), roots, &mut hits);
         }
         if hits.is_empty() {
             return;

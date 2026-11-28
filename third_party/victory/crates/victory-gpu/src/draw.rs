@@ -2100,6 +2100,7 @@ impl State {
             self.replay(list);
         }
         self.bind_heaps(list);
+        crate::heap_warm::offer(&self.heaps);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2870,6 +2871,10 @@ impl State {
         // `VICTORY_MATERIAL_TEXTURE_DEMAND=1`: a character draw's textures go first next pass.
         if !compute && crate::material_demand::on() {
             self.material_textures(p);
+        }
+        // `VICTORY_FACE_WATCH`: a watched character draw's record slots as they stand.
+        if !compute && crate::face_watch::on() {
+            self.face_watch(p);
         }
         // `VICTORY_BAKE_INPUTS=1`: a bake draw's own textures first (`bake_pass`).
         if p.is_bake && !compute && crate::bake_inputs::on() {
@@ -3888,6 +3893,8 @@ impl State {
             crate::drop_why::set("MissingHostPipeline");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("dispatch", self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(true);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -4331,6 +4338,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("mesh", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 
@@ -5071,6 +5080,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("draw", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 
@@ -5195,6 +5206,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::drop_why::count_of("indexed", self.pipeline);
             dropped(self.pipeline);
+            #[cfg(windows)]
+            self.heap_find_dropped(false);
         }
     }
 }
@@ -5972,6 +5985,8 @@ mod bake_check;
 mod bake_fresh;
 mod bake_publish;
 mod bake_replay;
+mod bake_zero;
+mod face_watch;
 mod material_pass;
 mod skin_views;
 mod zero_views;

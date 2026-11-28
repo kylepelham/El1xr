@@ -102,18 +102,27 @@ fn in_cycle(st: &Structured, b: usize) -> bool {
 }
 
 impl Lower<'_> {
-    /// For [`watch_loop_barriers`]: a group barrier of the translator's own goes into DXIL block
-    /// `block`, which is the end of an earlier IR block (a ballot taken where its mask is
-    /// written) or a block of the one being lowered.
-    pub(super) fn note_barrier(&self, block: usize) {
-        if LOOP_BARRIER.get() != Some(false) {
+    /// For [`watch_loop_barriers`]: a group barrier of the translator's own (`own`; else the
+    /// title's, which only this switch counts) goes into DXIL block `block`, which is the end
+    /// of an earlier IR block (a ballot taken where its mask is written) or a block of the one
+    /// being lowered. A barrier of the translator's own is noted for
+    /// [`crate::lane_split::watch`] too.
+    pub(super) fn note_barrier(&self, block: usize, own: bool) {
+        let auto = LOOP_BARRIER.get() == Some(false);
+        let lanes = own && crate::lane_split::watching();
+        if !auto && !lanes {
             return;
         }
         let ir = (0..self.tail.len())
             .find(|&d| d != self.cur_ir && self.tail[d] == Some(block))
             .unwrap_or(self.cur_ir);
         if in_cycle(self.x.st, ir) {
-            LOOP_BARRIER.set(Some(true));
+            if auto {
+                LOOP_BARRIER.set(Some(true));
+            }
+            if lanes {
+                crate::lane_split::barrier_in_loop();
+            }
         }
     }
 }

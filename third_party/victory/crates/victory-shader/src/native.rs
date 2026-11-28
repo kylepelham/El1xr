@@ -287,6 +287,9 @@ pub const PIXEL_PIECES: u32 = 0x201;
 /// vertex buffer table either.
 pub const COMPUTE_PIECES: u32 = 0x202;
 
+/// The same mark for a mesh program made from loose pieces.
+pub const MESH_PIECES: u32 = 0x203;
+
 /// An element of the input layout that a vertex program fetches itself
 /// ([`VERTEX_BUFFERS`]): `bytes` bytes of each vertex of buffer `slot`, from
 /// byte `offset`, in DXGI `format`. Its channels are row `row` of the input

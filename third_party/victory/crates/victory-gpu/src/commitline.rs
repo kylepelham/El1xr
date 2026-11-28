@@ -15,11 +15,15 @@
 //! - `VICTORY_UPLOAD_CAP_MB=<MB>`: past that much upload memory alive (committed upload
 //!   buffers and blocks of the upload pool), the upload, staging and shared pools keep no
 //!   empty block, the staging buffers' pool (`VICTORY_STAGE_POOL_MB`) keeps nothing and lets go
-//!   of what it holds, and the pools are trimmed at every line.
+//!   of what it holds, and the pools are trimmed at every line. Staging buffers of textures
+//!   go once out of use 2 s instead of 10 s ([`staging_idle_ms`]).
 //! - `VICTORY_COMMIT_FLOOR_MB=<MB>`: with less free commit than that, host copies of textures
-//!   the title fills go after the shortest idle time (`crate::host::vram_idle_ms_by_room`)
-//!   and the texture queue makes no new ones (`crate::resource::room`), as when the card is
-//!   full.
+//!   the title fills that no slot and no list holds go once out of use 2.5 s and 60 frames
+//!   (instead of 5 s; `crate::resource::let_go_idle`), each one logged, and staging buffers
+//!   as past the cap. It never refuses a new host copy: the first version also closed the
+//!   texture queue (`crate::resource::room`) and cut the idle time to 1 s, and the diner went
+//!   dark after world entry (`train_b5k_single/02_mem`: textures a draw needed were never
+//!   made while free commit stayed under the floor for 50 s).
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -30,8 +34,15 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 /// their bytes.
 static UPLOAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Times the cap trimmed the pools, blocks let go by it, and times the floor was found pressed.
-static ACTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Times the cap trimmed the pools, blocks let go by it, idle sweeps under the floor, host
+/// copies of textures let go by the floor alone and their bytes, sweeps of staging buffers
+/// shortened by the cap or the floor.
+static ACTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Under the floor, host copies of textures go once out of use this long (never sooner)...
+const FLOOR_IDLE_MS: u64 = 2_500;
+/// ...and this many frames (at 20 to 30 frames a second, 2 to 3 s).
+const FLOOR_IDLE_FRAMES: u64 = 60;
 
 /// A size in MB as bytes; unset, unparsed or 0: 0 (off).
 fn mb_bits(value: Option<&str>) -> u64 {
@@ -99,16 +110,82 @@ fn free_commit() -> u64 {
 }
 
 /// Under `VICTORY_COMMIT_FLOOR_MB` of free commit.
-pub(crate) fn pressed() -> bool {
+fn pressed() -> bool {
     let floor = commit_floor();
-    if floor.is_none() {
-        return false;
+    floor.is_some() && under(free_commit(), floor)
+}
+
+/// The floor's idle time and frames for an idle sweep's `ms` and `frames`: shorter only where
+/// `ms` is longer than its own, and then never fewer frames than its own.
+fn floor_times(ms: u64, frames: u64) -> Option<(u64, u64)> {
+    (ms > FLOOR_IDLE_MS).then_some((FLOOR_IDLE_MS, frames.max(FLOOR_IDLE_FRAMES)))
+}
+
+/// For the idle sweep of host copies of textures the title fills (`crate::resource::let_go_idle`),
+/// given its usual idle time and frames: those to use, and whether the floor shortened them.
+/// Under the floor the pools of the PC's memory are also trimmed, once a second at most.
+pub(crate) fn floor_idle(ms: u64, frames: u64) -> (u64, u64, bool) {
+    if !pressed() {
+        return (ms, frames, false);
     }
-    let pressed = under(free_commit(), floor);
-    if pressed {
-        ACTED[2].fetch_add(1, Relaxed);
+    ACTED[2].fetch_add(1, Relaxed);
+    match floor_times(ms, frames) {
+        Some((ms, frames)) => (ms, frames, true),
+        None => (ms, frames, false),
     }
-    pressed
+}
+
+/// Staging buffers of textures are kept this long out of use past the cap or under the floor.
+const STAGING_IDLE_MS: u64 = 2_000;
+
+/// The idle time of the staging buffers of textures (`crate::texture::let_go_idle`), given the
+/// usual one (10 s with 4 GB of RAM free): past `VICTORY_UPLOAD_CAP_MB` or under
+/// `VICTORY_COMMIT_FLOOR_MB`, 2 s. Only the texture's next upload pays (it detiles into a new
+/// one); its card copy stays. In `train_b5k_single/02_mem` they held 2.3 GB of upload memory
+/// (27 of the staging pool's 64 MB blocks) past the 1 GB cap: the cap let go of empty blocks
+/// alone, and the 10 s follows free RAM (30 GB), not commit.
+pub(crate) fn staging_idle_ms(ms: u64) -> u64 {
+    if ms > STAGING_IDLE_MS && (upload_over_cap() || pressed()) {
+        ACTED[5].fetch_add(1, Relaxed);
+        return STAGING_IDLE_MS;
+    }
+    ms
+}
+
+/// How long ago a [`crate::host::moment`] was: milliseconds and frames.
+fn idle_of(moment: u64) -> (u64, u64) {
+    let now = crate::host::moment();
+    let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
+    (tenths * 100, (now >> 32).saturating_sub(moment >> 32))
+}
+
+/// The host copies of textures (title texture, bytes, last use as a moment) an idle sweep let
+/// go only because of the floor: counted, and a line naming the first few.
+pub(crate) fn floor_report(went: &[(usize, u64, u64)]) {
+    if went.is_empty() {
+        return;
+    }
+    let bytes: u64 = went.iter().map(|&(_, b, _)| b).sum();
+    ACTED[3].fetch_add(went.len() as u64, Relaxed);
+    ACTED[4].fetch_add(bytes, Relaxed);
+    let first: Vec<String> = went
+        .iter()
+        .take(4)
+        .map(|&(at, b, used)| {
+            let (ms, frames) = idle_of(used);
+            format!("{at:#x} {} KiB idle {ms} ms {frames} frames", b >> 10)
+        })
+        .collect();
+    tracing::info!(
+        "commit floor: free {} MB under {} MB: let go {} host copies of textures ({} MB) out of use {FLOOR_IDLE_MS} ms and {FLOOR_IDLE_FRAMES} frames that the usual time keeps, none held by a slot or a list; first: {}; since the start {} ({} MB)",
+        free_commit() >> 20,
+        commit_floor().unwrap_or(0) >> 20,
+        went.len(),
+        bytes >> 20,
+        first.join(", "),
+        ACTED[3].load(Relaxed),
+        ACTED[4].load(Relaxed) >> 20,
+    );
 }
 
 fn memory_status() -> windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
@@ -169,6 +246,16 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
     let m = memory_status();
     let blocks = crate::texpool::blocks_alive();
     let block_mb = |i: usize| mb(blocks[i] * crate::texpool::BLOCK_BYTES);
+    let usage = crate::texpool::pool_usage();
+    let pools = ["texture", "staging", "card", "shared", "upload"]
+        .iter()
+        .zip(usage)
+        .enumerate()
+        .map(|(i, (name, [held, cuttable]))| {
+            format!("{name} {}/{}/{}", block_mb(i), mb(held), mb(cuttable))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let copies = crate::shadow::memory();
     let staged = crate::texture::memory();
     let htex = crate::resource::HOST_TEXTURES[1].load(Relaxed);
@@ -188,7 +275,8 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
          the PC's memory shared with the card {} MB (title memory host copies {} MB, shared blocks {} MB; upload memory {} MB: committed upload buffers {} {} MB with staging blocks {} MB, upload blocks {} MB, staging buffers' pool kept {} MB; texture staging alive {} MB); \
          title virtual allocations {} MB (views of title pages {} MB, mapped, outside private); \
          the rest {} MB (driver, heaps: pipeline library file {} MB, translated shaders {} MB, containers {} MB, command allocators {}); \
-         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} asks)",
+         blocks MB/held by pieces MB/still cuttable MB: {}; \
+         VICTORY_UPLOAD_CAP_MB {} (over now {}, trims {}, blocks and buffers let go {}, now {}), VICTORY_COMMIT_FLOOR_MB {} (pressed {} sweeps, host copies let go {} ({} MB)), staging sweeps at 2 s {}",
         mb(charged),
         mb(limit),
         mb(peak),
@@ -219,6 +307,7 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
         mb(k[3]),
         mb(k[1]),
         allocators.0,
+        pools,
         upload_cap().map_or(0, mb),
         upload_over_cap(),
         ACTED[0].load(Relaxed),
@@ -226,6 +315,9 @@ pub(crate) fn log(card: [u64; 4], private: u64, peak_private: u64) {
         trimmed,
         commit_floor().map_or(0, mb),
         ACTED[2].load(Relaxed),
+        ACTED[3].load(Relaxed),
+        mb(ACTED[4].load(Relaxed)),
+        ACTED[5].load(Relaxed),
     );
 }
 
@@ -242,6 +334,17 @@ mod tests {
         assert!(!under(0, None));
         assert!(!under(4 << 30, Some(4 << 30)));
         assert!(under((4 << 30) - 1, Some(4 << 30)));
+    }
+
+    /// The floor shortens only a longer idle time, to its own, with at least its frames: a
+    /// copy a draw used in the last 2.5 s or 60 frames is never let go by it.
+    #[test]
+    fn the_floor_never_lets_go_of_a_copy_used_lately() {
+        assert_eq!(floor_times(5_000, 4), Some((FLOOR_IDLE_MS, FLOOR_IDLE_FRAMES)));
+        assert_eq!(floor_times(5_000, 200), Some((FLOOR_IDLE_MS, 200)));
+        assert_eq!(floor_times(FLOOR_IDLE_MS, 4), None);
+        assert_eq!(floor_times(1_000, 4), None);
+        assert!(FLOOR_IDLE_MS >= 2_500 && FLOOR_IDLE_FRAMES >= 60);
     }
 
     /// Both switches are live: a launch can A/B them, and off is 0.

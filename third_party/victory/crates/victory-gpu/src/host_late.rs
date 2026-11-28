@@ -259,12 +259,16 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
-pub(crate) fn land() {
+/// a queue does for the lists it ran (`crate::list::recycle`). The number of
+/// lists the flights ran.
+pub(crate) fn land() -> usize {
     let landed = std::mem::take(&mut line().landed);
+    let mut lists_ran = 0;
     for (lists, order) in landed {
+        lists_ran += order.len();
         crate::list::recycle(lists, &order);
     }
+    lists_ran
 }
 
 fn fence_reached(completed: u64, target: u64) -> bool {

@@ -75,6 +75,8 @@ mod bake_watch;
 #[cfg(windows)]
 mod bake_why;
 #[cfg(windows)]
+mod bake_zero;
+#[cfg(windows)]
 mod draw;
 #[cfg(windows)]
 mod dred;
@@ -116,6 +118,8 @@ mod joined_apart;
 mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
+#[cfg(windows)]
+mod heap_warm;
 #[cfg(windows)]
 mod round_share;
 #[cfg(windows)]
@@ -162,6 +166,8 @@ mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
 mod flicker_catch;
+#[cfg(windows)]
+mod present_own;
 mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;
@@ -225,11 +231,15 @@ pub mod shader_cache;
 mod wave_more;
 mod zero_out;
 #[cfg(windows)]
+mod face_watch;
+#[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 pub mod bvh_premap;
+#[cfg(windows)]
+mod bvh_declare;
 #[cfg(windows)]
 mod skin_fill;
 #[cfg(windows)]

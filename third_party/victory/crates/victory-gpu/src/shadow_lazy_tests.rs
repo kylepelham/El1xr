@@ -2910,3 +2910,46 @@ fn merge_due_leaves_out_only_merges_that_do_nothing() {
     shadow.copy_back_done(&[(block.addr(), block.addr() + LEN)]);
     assert!(!agree(&shadow, "landed"));
 }
+
+/// (entryhitch) `VICTORY_HEAP_WARM`: `warm::fill` brings a copy in exactly
+/// as `update` would (the same bytes in the copy, carded or not), takes
+/// only what changed after, leaves a later `update` nothing to copy, and
+/// leaves a copy with shader writes pending alone.
+#[test]
+fn warm_fill_brings_in_what_update_would() {
+    let Some(h) = host() else {
+        return;
+    };
+    const LEN: usize = 4 * PAGE;
+    for carded in [false, true] {
+        let block = VirtualBlock::new(LEN, true);
+        for i in 0..LEN {
+            // SAFETY: inside our allocation.
+            unsafe { block.ptr.add(i).write((i * 7 + 3) as u8) };
+        }
+        let warmed = make_test_shadow(h, block.addr() as u64, LEN as u64, carded).expect("shadow");
+        let plain = make_test_shadow(h, block.addr() as u64, LEN as u64, carded).expect("shadow");
+        let held = |s: &Shadow| {
+            // SAFETY: the copy's CPU mapping, `LEN` bytes.
+            unsafe { std::slice::from_raw_parts(s.data, LEN) }.to_vec()
+        };
+        // SAFETY: as above.
+        let title = || unsafe { std::slice::from_raw_parts(block.ptr, LEN) }.to_vec();
+        assert_eq!(warm::fill(&warmed, block.addr(), LEN), Some(LEN));
+        let _ = plain.update(block.addr(), LEN);
+        assert!(held(&warmed) == title(), "carded={carded}: the warmed copy differs from title memory");
+        assert!(held(&warmed) == held(&plain), "carded={carded}: warmed and updated copies differ");
+        assert_eq!(warmed.update(block.addr(), LEN), 0, "carded={carded}: nothing new, yet update copied");
+        // The title writes a page: the next fill takes it alone.
+        // SAFETY: inside our allocation.
+        unsafe { block.ptr.add(2 * PAGE + 5).write(0xEE) };
+        let again = warm::fill(&warmed, block.addr(), LEN).expect("warmable");
+        assert!((1..=PAGE).contains(&again), "carded={carded}: one written page, {again} bytes copied");
+        let _ = plain.update(block.addr(), LEN);
+        assert!(held(&warmed) == held(&plain), "carded={carded}: after a write, the copies differ");
+        // Shader writes pending: left alone.
+        warmed.writing(block.addr(), LEN);
+        assert_eq!(warm::fill(&warmed, block.addr(), LEN), None);
+        warmed.copy_back_done(&[(block.addr(), block.addr() + LEN)]);
+    }
+}

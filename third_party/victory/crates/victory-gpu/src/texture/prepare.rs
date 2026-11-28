@@ -708,6 +708,9 @@ pub(crate) fn prune() {
         gone.extend(stale);
     }
     STATS[8].fetch_add(gone.len() as u64, Relaxed);
+    if !gone.is_empty() {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::PrepPruned);
+    }
     drop(gone);
 }
 

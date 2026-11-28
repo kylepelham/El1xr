@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub(crate) mod detect;
+pub(crate) mod periodic;
 #[cfg(windows)]
 pub(crate) mod pass;
 
@@ -112,9 +113,19 @@ pub(crate) enum Kind {
     /// Draws of passes over the screen dropped while their pipeline was
     /// being made (`crate::pipeline::make::screen_wait`).
     ScreenUnmade,
+    /// Title submissions (parts of them) sent from the queues' lines, counted
+    /// when sent, not when recorded.
+    SentRuns,
+    /// Of those, sent by a present that ran the lines out past waits not met.
+    ForcedRuns,
+    /// Submissions of the next frame kept aside when the present began
+    /// (the title records ahead while its present waits its turn).
+    KeptAside,
+    /// Milliseconds from the title's present call to its present beginning.
+    PresentLagMs,
 }
 
-pub(crate) const KINDS: usize = 29;
+pub(crate) const KINDS: usize = 33;
 const NAMES: [&str; KINDS] = [
     "ran",
     "dropped",
@@ -145,6 +156,10 @@ const NAMES: [&str; KINDS] = [
     "unmade_views",
     "kept_read",
     "screen_unmade",
+    "sent_runs",
+    "forced_runs",
+    "kept_aside",
+    "present_lag_ms",
 ];
 
 static NOW: [AtomicU32; KINDS] = [const { AtomicU32::new(0) }; KINDS];
@@ -190,6 +205,13 @@ static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
 pub(crate) fn count(kind: Kind) {
     if on() {
         NOW[kind as usize].fetch_add(1, Relaxed);
+    }
+}
+
+/// Counts `n` of `kind` in this frame.
+pub(crate) fn count_n(kind: Kind, n: u64) {
+    if on() {
+        NOW[kind as usize].fetch_add(n.min(u64::from(u32::MAX)) as u32, Relaxed);
     }
 }
 
@@ -326,7 +348,7 @@ pub(crate) fn settled(why: usize) {
 }
 
 /// What one frame did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Summary {
     pub(crate) frame: u64,
     pub(crate) counts: [u32; KINDS],
@@ -341,6 +363,24 @@ pub(crate) struct Summary {
     pub(crate) why: Vec<(usize, &'static str)>,
     /// (pipeline, its indirect paths' bits), by pipeline.
     pub(crate) paths: Vec<(usize, u8)>,
+    /// Our periodic tasks run (bits of [`periodic::Task`]).
+    pub(crate) periodic: u32,
+}
+
+impl Default for Summary {
+    fn default() -> Self {
+        Summary {
+            frame: 0,
+            counts: [0; KINDS],
+            settled: 0,
+            ambient: 0,
+            programs: Vec::new(),
+            targets: Vec::new(),
+            why: Vec::new(),
+            paths: Vec::new(),
+            periodic: 0,
+        }
+    }
 }
 
 impl Summary {
@@ -376,6 +416,7 @@ pub(crate) fn frame_done(frame: u64) {
     let counts = NOW.each_ref().map(|c| c.swap(0, Relaxed));
     let settled = SETTLED.swap(0, Relaxed);
     let ambient = AMBIENT.swap(0, Relaxed);
+    let periodic = periodic::take();
     let taken = FRAME
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -403,6 +444,7 @@ pub(crate) fn frame_done(frame: u64) {
         targets,
         why,
         paths,
+        periodic,
     });
     while ring.len() > RING {
         ring.pop_front();
@@ -720,7 +762,7 @@ pub(crate) fn report(event: &detect::Event) -> String {
         );
     };
     format!(
-        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}",
+        "flicker catch: frame {frame} vs {} ({head}): {}; {}; {}; settled={}/{}; ambient {} / before {}; {}; {}",
         frame - 1,
         programs_diff(&before, &dark, after.as_ref(), &named),
         watched(&before, &dark, after.as_ref(), &named, watched_names()),
@@ -729,7 +771,8 @@ pub(crate) fn report(event: &detect::Event) -> String {
         settle_names(before.settled),
         ambient_names(dark.ambient),
         ambient_names(before.ambient),
-        targets_diff(&before, &dark)
+        targets_diff(&before, &dark),
+        periodic::line(before.periodic, dark.periodic, after.as_ref().map(|a| a.periodic))
     )
 }
 
