@@ -7421,13 +7421,17 @@ pub(crate) fn diff_copy_direct(
         // SAFETY: `held` is valid writable host memory of `len >= vec_len` bytes,
         // `mask` has 32 `u64` words (2,048 * 32 = 64 KiB), AVX2 and VEH are active.
         let (done, asm_faulted) = unsafe {
-            diff_copy_direct_avx2(
-                src,
-                held.as_mut_ptr(),
-                vec_len,
-                mask.as_mut_ptr(),
-                fault_slot,
-            )
+            if diff_wide::on() {
+                diff_wide::diff_copy_wide_avx2(src, held.as_mut_ptr(), vec_len, mask.as_mut_ptr(), fault_slot)
+            } else {
+                diff_copy_direct_avx2(
+                    src,
+                    held.as_mut_ptr(),
+                    vec_len,
+                    mask.as_mut_ptr(),
+                    fault_slot,
+                )
+            }
         };
         FAST_FAULT_RIP.with(|r| r.set(0));
         let veh_faulted = FAST_COPY.with(|copy| copy.replace((0, 0, false)).2);
@@ -9261,6 +9265,10 @@ mod scoped_flush;
 mod run_wait;
 #[path = "host_ask.rs"]
 mod ask;
+#[path = "host_pass_merge.rs"]
+mod pass_merge;
+#[path = "host_diff_wide.rs"]
+mod diff_wide;
 #[path = "host_sparse_zero.rs"]
 mod sparse_zero;
 use step_reads::blocked_by;

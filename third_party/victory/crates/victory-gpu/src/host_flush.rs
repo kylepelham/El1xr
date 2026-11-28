@@ -23,17 +23,44 @@ pub(super) enum Task<C> {
 
 /// One pass of a wide flush: each copy's steps up to its first long refresh
 /// as one task, or, when that refresh comes first, its pieces as tasks of
-/// their own; what follows is left for the next pass, in order.
+/// their own; what follows is left for the next pass, in order. With `merge`
+/// (`VICTORY_FLUSH_PASS_MERGE`), a long refresh whose copy's steps around it
+/// are all on other pages runs beside them in this pass.
 pub(super) fn split_pass<C: Clone>(
     pending: Vec<ShadowBatch<C>>,
     page: usize,
+    merge: bool,
 ) -> (Vec<Task<C>>, Vec<ShadowBatch<C>>) {
     let mut tasks: Vec<Task<C>> = Vec::with_capacity(pending.len());
     let mut next: Vec<ShadowBatch<C>> = Vec::new();
+    let long = |s: &ShadowStep| matches!(*s, ShadowStep::Refresh(f, t) if t.saturating_sub(f) >= SPLIT_MIN);
     for mut copy in pending {
-        let big = copy.steps.iter().position(
-            |s| matches!(*s, ShadowStep::Refresh(f, t) if t.saturating_sub(f) >= SPLIT_MIN),
-        );
+        let big = copy.steps.iter().position(long);
+        if merge && let Some(at) = big {
+            let end = copy.steps[at + 1..].iter().position(long).map_or(copy.steps.len(), |q| at + 1 + q);
+            if let Some(around) = super::pass_merge::beside(&copy.steps, at, end, page)
+                && let ShadowStep::Refresh(from, to) = copy.steps[at]
+            {
+                for (a, b) in pieces(from, to, page) {
+                    tasks.push(Task::Chunk(copy.shadow.clone(), a, b));
+                }
+                if !around.is_empty() {
+                    tasks.push(Task::Copy(ShadowBatch {
+                        shadow: copy.shadow.clone(),
+                        refresh_span: None,
+                        steps: around,
+                    }));
+                }
+                if end < copy.steps.len() {
+                    next.push(ShadowBatch {
+                        shadow: copy.shadow,
+                        refresh_span: None,
+                        steps: copy.steps.split_off(end),
+                    });
+                }
+                continue;
+            }
+        }
         match big {
             Some(0) => {
                 if let ShadowStep::Refresh(from, to) = copy.steps.remove(0) {
@@ -170,6 +197,7 @@ fn refresh_wide(copies: Vec<HostCopy>) {
     let prof = crate::refresh_prof::on();
     let one_pass = super::one_pass::on();
     let small = SMALL_ALONE.get_bool();
+    let merge = super::pass_merge::on();
     let mut pending = copies;
     while !pending.is_empty() {
         if alone_now(&pending, small, only_carded_writes) {
@@ -204,7 +232,7 @@ fn refresh_wide(copies: Vec<HostCopy>) {
             return;
         }
         let pass = Instant::now();
-        let (tasks, next) = split_pass(pending, crate::watch::PAGE);
+        let (tasks, next) = split_pass(pending, crate::watch::PAGE, merge);
         add(F::Passes, 1);
         let one = &super::one_pass::STATS;
         one[super::one_pass::RUNS].fetch_add(1, Ordering::Relaxed);
@@ -441,6 +469,7 @@ pub(super) fn log(frames: f64) {
     }
     super::beside::line(frames);
     super::pass_order::line(frames);
+    super::pass_merge::line(frames);
     super::send_thread::line(frames);
     super::card_rec::line(frames);
     crate::land_aside::line(frames);
@@ -540,7 +569,7 @@ mod tests {
                 break;
             }
             wide += 1;
-            let (tasks, next) = split_pass(pending, crate::watch::PAGE);
+            let (tasks, next) = split_pass(pending, crate::watch::PAGE, false);
             // The kept threads run tasks in any order: last first here.
             for t in tasks.into_iter().rev() {
                 match t {
@@ -640,7 +669,7 @@ mod tests {
             let mut pass = 0u64;
             while !pending.is_empty() {
                 pass += 1;
-                let (tasks, next) = split_pass(pending, p);
+                let (tasks, next) = split_pass(pending, p, false);
                 let keys: Vec<u64> = (0..tasks.len() as u64).collect();
                 let tasks = if ordered {
                     // Any costs: a hash of the task and the pass.
@@ -681,6 +710,202 @@ mod tests {
             ja.retain(|s| s.0 != 0);
             jb.retain(|s| s.0 != 0);
             assert_eq!(ja, jb, "writes and barriers in order");
+        }
+    }
+
+    /// A copy as a model for `merged_passes_end_the_same_in_fewer`: per 64 KiB page its state
+    /// and whether a snapshot holds it.
+    type Model = std::collections::BTreeMap<usize, (u64, bool)>;
+
+    /// One step on the model: steps on a shared page do not commute (a refresh mixes itself into
+    /// each page it covers that no snapshot holds, a snapshot mixes itself in and holds the page);
+    /// steps on other pages do.
+    fn apply(m: &mut Model, step: ShadowStep, p: usize) {
+        let (a, b, write) = match step {
+            ShadowStep::Refresh(f, t) => (f, t, false),
+            ShadowStep::Write(at, len) => (at, at + len.max(1), true),
+            ShadowStep::Barrier => return,
+        };
+        let id = ((a as u64) << 20) ^ b as u64 ^ (u64::from(write) << 63);
+        for page in a / p..b.div_ceil(p) {
+            let e = m.entry(page).or_insert((page as u64, false));
+            if write {
+                *e = (e.0.rotate_left(7) ^ id, true);
+            } else if !e.1 {
+                e.0 = e.0.wrapping_mul(31).wrapping_add(id);
+            }
+        }
+    }
+
+    fn next(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed as usize
+    }
+
+    /// Random copies: small refreshes and snapshots anywhere (now and then on a long refresh's
+    /// pages), long refreshes from any byte, barriers.
+    fn random_copies(seed: &mut u64, p: usize) -> Vec<ShadowBatch<usize>> {
+        (0..2 + next(seed) % 9)
+            .map(|id| {
+                let steps = (0..next(seed) % 9)
+                    .map(|_| {
+                        let at = (next(seed) % 400) * p / 4 + next(seed) % 64;
+                        match next(seed) % 7 {
+                            0 | 1 => ShadowStep::Refresh(at, at + SPLIT_MIN + next(seed) % (3 * SPLIT_MIN)),
+                            2 | 3 => ShadowStep::Refresh(at, at + 1 + next(seed) % (2 * p)),
+                            4 | 5 => ShadowStep::Write(at, next(seed) % 4096),
+                            _ => ShadowStep::Barrier,
+                        }
+                    })
+                    .collect();
+                batch(id, steps)
+            })
+            .collect()
+    }
+
+    /// Runs `copies` pass by pass, the steps of each pass's tasks interleaved at random: each
+    /// copy's model and the passes taken.
+    fn run_passes(copies: Vec<ShadowBatch<usize>>, merge: bool, seed: &mut u64, p: usize) -> (Vec<Model>, usize) {
+        let mut models: Vec<Model> = vec![Model::new(); copies.len()];
+        let mut pending = copies;
+        let mut passes = 0;
+        while !pending.is_empty() {
+            passes += 1;
+            let (tasks, rest) = split_pass(pending, p, merge);
+            let mut queues: Vec<(usize, std::collections::VecDeque<ShadowStep>)> = tasks
+                .into_iter()
+                .map(|t| match t {
+                    Task::Copy(c) => (c.shadow, c.steps.into_iter().collect()),
+                    Task::Chunk(id, a, b) => (id, [ShadowStep::Refresh(a, b)].into_iter().collect()),
+                })
+                .filter(|q: &(usize, std::collections::VecDeque<ShadowStep>)| !q.1.is_empty())
+                .collect();
+            while !queues.is_empty() {
+                let i = next(seed) % queues.len();
+                let step = queues[i].1.pop_front().unwrap();
+                apply(&mut models[queues[i].0], step, p);
+                if queues[i].1.is_empty() {
+                    queues.swap_remove(i);
+                }
+            }
+            pending = rest;
+        }
+        (models, passes)
+    }
+
+    /// (#88) `VICTORY_FLUSH_PASS_MERGE`: over random copies and random interleavings of each
+    /// pass's tasks, the merged passes leave every copy as the passes before do (and as its steps
+    /// one after the other, long refreshes in pieces), in no more passes, and fewer overall.
+    #[test]
+    fn merged_passes_end_the_same_in_fewer() {
+        let p = crate::watch::PAGE;
+        let mut seed = 0x5eed_0088_u64;
+        let (mut before, mut after, mut merged_any) = (0, 0, false);
+        for round in 0..3000 {
+            let copies = random_copies(&mut seed, p);
+            let clone = |c: &[ShadowBatch<usize>]| c.iter().map(|b| batch(b.shadow, b.steps.clone())).collect::<Vec<_>>();
+            let mut alone: Vec<Model> = vec![Model::new(); copies.len()];
+            for c in &copies {
+                for &s in &c.steps {
+                    match s {
+                        ShadowStep::Refresh(f, t) if t - f >= SPLIT_MIN => {
+                            for (a, b) in pieces(f, t, p) {
+                                apply(&mut alone[c.shadow], ShadowStep::Refresh(a, b), p);
+                            }
+                        }
+                        _ => apply(&mut alone[c.shadow], s, p),
+                    }
+                }
+            }
+            let (off, passes_off) = run_passes(clone(&copies), false, &mut seed, p);
+            let (on, passes_on) = run_passes(clone(&copies), true, &mut seed, p);
+            assert_eq!(off, alone, "round {round}: the passes before");
+            assert_eq!(on, alone, "round {round}: merged");
+            assert!(passes_on <= passes_off, "round {round}");
+            merged_any |= passes_on < passes_off;
+            before += passes_off;
+            after += passes_on;
+        }
+        assert!(merged_any && after < before, "passes {before} -> {after}");
+        eprintln!("passes over 3000 random flushes: {before} -> {after}");
+        // A snapshot on a page of the long refresh: split as before.
+        let near = || vec![batch(0, vec![ShadowStep::Refresh(0, SPLIT_MIN), ShadowStep::Write(SPLIT_MIN - 1, 1)])];
+        assert_eq!(run_passes(near(), true, &mut seed, p).1, 2);
+        let far = || vec![batch(0, vec![ShadowStep::Refresh(0, SPLIT_MIN), ShadowStep::Write(SPLIT_MIN, 1)])];
+        assert_eq!(run_passes(far(), true, &mut seed, p).1, 1);
+        assert_eq!(run_passes(far(), false, &mut seed, p).1, 2);
+    }
+
+    /// (#88) A final flush's shape on the kept threads (`wide_chunks`), each step spinning for its
+    /// bytes at 4 GB/s (part Q): passes and wall per flush with the merge off and on.
+    /// `cargo test --release -p victory-gpu --lib bench_pass_merge -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_pass_merge() {
+        let p = crate::watch::PAGE;
+        fn spin(bytes: usize) {
+            let until = Instant::now() + std::time::Duration::from_nanos(bytes as u64 / 4);
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
+        // 40 copies: 6 with a 3-6 MB refresh and a few small steps elsewhere before and after it,
+        // the rest a few small refreshes and snapshots.
+        let shape = || -> Vec<ShadowBatch<usize>> {
+            (0..40)
+                .map(|i| {
+                    let base = i * (64 << 20);
+                    let small = |k: usize| ShadowStep::Refresh(base + (140 + k) * p, base + (140 + k) * p + (25 << 10));
+                    let steps = if i % 7 == 0 {
+                        vec![
+                            small(0),
+                            ShadowStep::Write(base + 150 * p, 256),
+                            ShadowStep::Refresh(base, base + (3 << 20) + (i % 4) * (1 << 20)),
+                            ShadowStep::Write(base + 152 * p, 256),
+                            small(3),
+                        ]
+                    } else {
+                        vec![small(0), ShadowStep::Write(base + 50 * p, 256), small(2)]
+                    };
+                    batch(i, steps)
+                })
+                .collect()
+        };
+        for round in 0..3 {
+            for merge in [false, true] {
+                let flushes = 200;
+                let t = Instant::now();
+                let mut passes = 0;
+                for _ in 0..flushes {
+                    let mut pending = shape();
+                    while !pending.is_empty() {
+                        passes += 1;
+                        let (tasks, rest) = split_pass(pending, p, merge);
+                        let tasks = Arc::new(tasks);
+                        let total = tasks.len();
+                        crate::shadow::wide_chunks(total, 1, move |start, end| {
+                            for t in &tasks[start..end] {
+                                match t {
+                                    Task::Copy(c) => c.steps.iter().for_each(|s| match *s {
+                                        ShadowStep::Refresh(f, t) => spin(t - f),
+                                        ShadowStep::Write(_, l) => spin(l * 8),
+                                        ShadowStep::Barrier => {}
+                                    }),
+                                    Task::Chunk(_, a, b) => spin(b - a),
+                                }
+                            }
+                        });
+                        pending = rest;
+                    }
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / flushes as f64;
+                eprintln!(
+                    "round {round} merge={merge}: {:.1} passes a flush, {us:.0} us a flush",
+                    passes as f64 / flushes as f64
+                );
+            }
         }
     }
 
