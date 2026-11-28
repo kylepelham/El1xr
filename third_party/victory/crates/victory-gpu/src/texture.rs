@@ -855,7 +855,7 @@ pub(crate) fn host_written_in(resource: This, sub: Option<u32>, list: usize) {
         };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
-            if crate::bake_reuse::on() {
+            if crate::bake_reuse::on() || crate::bake_reuse::keep::kept_count() > 0 {
                 crate::bake_reuse::card_wrote(at as u64, bytes);
             }
             HOST_WRITTEN_AT
@@ -910,7 +910,51 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// memory, which the copy never reached: the copied texels are on the
 /// card in the other texture, where no shader that reads this view finds
 /// them.
-pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+/// Snapshot of partial card-written subresource bits for `resource` (for `VICTORY_BAKE_REUSE_KEEP`).
+pub(crate) fn card_mips_snapshot(resource: usize) -> Option<Arc<[u64]>> {
+    card_mips::snapshot(resource)
+}
+
+/// Marks `resource` as GPU-written after adopting a retained host copy
+/// (`VICTORY_BAKE_REUSE_KEEP=1`) so subsequent reads preserve the adopted pixels
+/// instead of uploading stale/zero title memory over them.
+pub(crate) fn mark_adopted(resource: This, mips: Option<Arc<[u64]>>) {
+    unstage(resource);
+    card_mips::restore(resource as usize, mips);
+    {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(Default::default)
+            .insert(resource as usize);
+    }
+    crate::resource::mark_host_written(resource);
+    if let Some((at, desc)) = crate::resource::texture_memory(resource) {
+        // SAFETY: 56 bytes in the description's layout.
+        let words = unsafe {
+            std::ptr::from_ref(&desc)
+                .cast::<[u32; 14]>()
+                .read_unaligned()
+        };
+        let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+        if !at.is_null() && bytes > 0 {
+            HOST_WRITTEN_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    at as u64,
+                    (
+                        bytes,
+                        words[4],
+                        words[6],
+                        words[7],
+                        words[8],
+                        resource as usize,
+                    ),
+                );
+        }
+    }
+}
+
+pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14], resource: usize) {
     if crate::bake_reuse::on() {
         crate::bake_reuse::placed(address, desc);
     }
@@ -918,7 +962,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
             .next_back()
-            .filter(|(at, d)| address < **at + d.0)
+            .filter(|(at, d)| address < **at + d.0 && d.5 != resource)
             .map(|(at, d)| (*at, *d))
     };
     if let Some((at, (bytes, width, height, layers_levels, format, _))) = hit {

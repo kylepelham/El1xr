@@ -24,6 +24,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BAKE_ONE_BUDGET", "Bake passes share one texture time budget, helper threads included."),
     ("VICTORY_BAKE_PUBLISH", "Shows textures a bake uploaded in its own list before the bake draws."),
     ("VICTORY_BAKE_REPLAY", "Redraws an incomplete face or skin bake once all its textures are current."),
+    ("VICTORY_BAKE_REUSE_KEEP", "Adopts retained GPU-written copies when a texture is remade there."),
     ("VICTORY_BAKE_REUSE_WATCH", "Logs textures made or uploaded where a released bake result was."),
     ("VICTORY_BAKE_ROOM", "Lets a bake's own texture go on the card past the room limit."),
     ("VICTORY_BAKE_SPREAD", "Bake passes make only their own textures; the rest go to helper threads."),

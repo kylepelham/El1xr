@@ -1578,6 +1578,24 @@ fn lazy() -> bool {
 /// unordered access flag). Its host copy can be made again from that
 /// memory; any other texture's contents exist on the host alone.
 #[cfg(windows)]
+/// Normalized host layout key for `VICTORY_BAKE_REUSE_KEEP=1`.
+#[cfg(windows)]
+fn bake_reuse_layout(desc: &ResourceDesc, bytes: u64) -> crate::bake_reuse::keep::LayoutKey {
+    let sample_count = desc.sample_count.max(1);
+    crate::bake_reuse::keep::LayoutKey {
+        bytes,
+        dimension: desc.dimension,
+        width: desc.width,
+        height: desc.height,
+        depth_or_array_size: desc.depth_or_array_size,
+        mip_levels: desc.mip_levels,
+        format: pc_format(desc.format),
+        sample_count,
+        sample_quality: if sample_count > 1 { desc.sample_quality } else { 0 },
+        flags: desc.flags & 0xf,
+    }
+}
+
 fn fills(desc: &ResourceDesc) -> bool {
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
@@ -1696,6 +1714,30 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
+        }
+        // (`VICTORY_BAKE_REUSE_KEEP=1`) Adopt a retained GPU-written host copy if
+        // one exists at this address with matching layout and untouched title memory.
+        if fills(&r.desc)
+            && matches!(r.backing, Backing::Address(_) | Backing::Placed { .. })
+            && crate::bake_reuse::keep_on()
+            && let Some(bytes) = footprint(&r.desc).map(|f| f.size).filter(|&b| b > 0)
+            && let Some((host, card_mips)) = crate::bake_reuse::keep::adopt(
+                r.data() as u64,
+                bytes,
+                bake_reuse_layout(&r.desc, bytes),
+            )
+        {
+            r.host
+                .host_written
+                .store(true, std::sync::atomic::Ordering::Release);
+            *made = Some((host, None));
+            r.host.used.store(crate::host::moment(), Relaxed);
+            let adopted = made.clone();
+            drop(made);
+            crate::texture::mark_adopted(this, card_mips);
+            crate::readable_once::bump(this as usize);
+            crate::descriptor::texture_made(this as usize);
+            return adopted;
         }
         // The card had no room for it a moment ago: not asked again on
         // every use (`NO_ROOM_AGAIN_MS`).
@@ -2588,6 +2630,7 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     card_kept::tick();
+    crate::bake_reuse::keep::tick();
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -3007,6 +3050,11 @@ impl HostTexture {
     /// [`crate::texture::title_written`] of this texture.
     pub(crate) fn title_written(&self) -> bool {
         crate::texture::title_written_flags(self.flags)
+    }
+
+    /// Bytes of host VRAM held by this texture copy.
+    pub(crate) fn host_bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// A texture made without memory of its own (`crate::tiles`): counted
@@ -3519,6 +3567,23 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        if fills(&desc)
+            && matches!(resource.backing, Backing::Address(_) | Backing::Placed { .. })
+            && crate::bake_reuse::keep_on()
+            && let Some(bytes) = footprint(&desc).map(|f| f.size).filter(|&b| b > 0)
+            && let Some((host, card_mips)) = crate::bake_reuse::keep::adopt(
+                resource.data() as u64,
+                bytes,
+                bake_reuse_layout(&desc, bytes),
+            )
+        {
+            *resource.host.made.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, None));
+            resource
+                .host
+                .host_written
+                .store(true, std::sync::atomic::Ordering::Release);
+            crate::texture::mark_adopted(at as This, card_mips);
+        }
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
@@ -3583,11 +3648,33 @@ impl Drop for Resource {
             }
         }
         // A running submission may still read the host copy (and a depth
-        // texture's colour twin).
+        // texture's colour twin). With `VICTORY_BAKE_REUSE_KEEP=1`, a placed
+        // GPU-written texture's host copy goes into the bounded short-lived reuse
+        // cache instead of retiring immediately.
         if let Some((host, twin)) = made {
-            crate::host::retire(host);
-            if let Some(twin) = twin {
-                crate::host::retire(twin);
+            if twin.is_none()
+                && fills(&self.desc)
+                && matches!(self.backing, Backing::Address(_) | Backing::Placed { .. })
+                && self
+                    .host
+                    .host_written
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && crate::bake_reuse::keep_on()
+                && let Some(bytes) = footprint(&self.desc).map(|f| f.size).filter(|&b| b > 0)
+            {
+                let res_id = std::ptr::from_ref::<Resource>(self) as usize;
+                crate::bake_reuse::keep::retain(
+                    self.data() as u64,
+                    bytes,
+                    bake_reuse_layout(&self.desc, bytes),
+                    res_id,
+                    host,
+                );
+            } else {
+                crate::host::retire(host);
+                if let Some(twin) = twin {
+                    crate::host::retire(twin);
+                }
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
@@ -4012,7 +4099,7 @@ fn texture_at_locked(address: u64, raw: [u32; 14], kept: bool) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    crate::texture::placed_in_host_written(address, desc);
+    crate::texture::placed_in_host_written(address, desc, out as usize);
     resource(out)
         .host
         .placed

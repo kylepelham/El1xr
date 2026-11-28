@@ -24,6 +24,10 @@
 //! The first [`MAX_LINES`] events of each kind get a line, then every power of two; one
 //! `bake reuse frame` line per frame with any event carries the counts.
 
+pub(crate) mod keep;
+#[cfg(all(test, windows))]
+mod keep_tests;
+
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -34,6 +38,10 @@ pub(crate) static ON: victory_core::settings::Live =
 
 pub(crate) fn on() -> bool {
     ON.get() > 0
+}
+
+pub(crate) fn keep_on() -> bool {
+    keep::on()
 }
 
 /// Released card-written spans kept at most.
@@ -111,7 +119,9 @@ const SAME: usize = 1;
 const UPLOAD: usize = 2;
 const REBAKED: usize = 3;
 const RELEASED: usize = 4;
-static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+const ADOPTED: usize = 5;
+const INVALIDATED: usize = 6;
+static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn grave<R>(f: impl FnOnce(&mut Grave) -> R) -> R {
@@ -120,12 +130,14 @@ fn grave<R>(f: impl FnOnce(&mut Grave) -> R) -> R {
 }
 
 /// At the first event of a new frame: the line for the frame before.
-fn frame_line() -> u64 {
+pub(crate) fn frame_line() -> u64 {
     let now = crate::frame::current();
     let prev = FRAME.swap(now, Relaxed);
     if prev != now && prev != u64::MAX {
-        let c: [u64; 5] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed));
+        let c: [u64; 7] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed));
         if c.iter().any(|&n| n > 0) {
+            let kept = keep::kept_count();
+            let kept_mib = keep::kept_bytes() as f64 / (1024.0 * 1024.0);
             tracing::info!(
                 frame = prev,
                 released = c[RELEASED],
@@ -133,6 +145,10 @@ fn frame_line() -> u64 {
                 placed_same_layout = c[SAME],
                 title_uploads = c[UPLOAD],
                 rebaked = c[REBAKED],
+                adopted = c[ADOPTED],
+                invalidated = c[INVALIDATED],
+                kept,
+                kept_mib = format_args!("{kept_mib:.2}"),
                 "bake reuse frame"
             );
         }
@@ -141,9 +157,35 @@ fn frame_line() -> u64 {
 }
 
 fn said(kind: usize) -> bool {
-    static LINES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static LINES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
     let n = LINES[kind].fetch_add(1, Relaxed) + 1;
     n <= MAX_LINES || n.is_power_of_two()
+}
+
+pub(crate) fn note_adopted(at: u64, layout: keep::LayoutKey, age_frames: u64, bytes: u64) {
+    let frame = frame_line();
+    COUNTS[ADOPTED].fetch_add(1, Relaxed);
+    if said(ADOPTED) {
+        tracing::info!(
+            frame,
+            address = format_args!("{at:#x}"),
+            width = layout.width,
+            height = layout.height,
+            mips = layout.mip_levels,
+            layers = layout.depth_or_array_size,
+            format = layout.format,
+            bytes,
+            age_frames,
+            "bake reuse: adopted retained GPU-written host copy"
+        );
+    }
+}
+
+pub(crate) fn note_invalidated(n: u64) {
+    if n > 0 {
+        frame_line();
+        COUNTS[INVALIDATED].fetch_add(n, Relaxed);
+    }
 }
 
 /// [`crate::texture::forget`]: the title released `resource`, which the card wrote, at `at`.
@@ -165,9 +207,12 @@ pub(crate) fn released(at: u64, bytes: u64, layout: [u32; 4], resource: usize) {
 
 /// [`crate::texture::host_written`]: the card wrote a texture at `[at, at + bytes)`.
 pub(crate) fn card_wrote(at: u64, bytes: u64) {
-    frame_line();
-    let n = grave(|g| g.rewritten(at, bytes));
-    COUNTS[REBAKED].fetch_add(n as u64, Relaxed);
+    keep::invalidate(at, bytes);
+    if on() {
+        frame_line();
+        let n = grave(|g| g.rewritten(at, bytes));
+        COUNTS[REBAKED].fetch_add(n as u64, Relaxed);
+    }
 }
 
 /// A texture was placed at `address` with description words `desc`.
