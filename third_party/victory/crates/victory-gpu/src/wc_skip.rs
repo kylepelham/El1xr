@@ -142,6 +142,9 @@ fn should_skip_in(
 /// Whether a flagged card-copy piece of `bytes` belonging to declared title
 /// range `declared = (from, to)` should be skipped instead of copied back.
 pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
+    if crate::default_back::skip(declared, bytes) {
+        return true;
+    }
     if !skip_wc_back() {
         return false;
     }
