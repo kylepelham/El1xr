@@ -73,6 +73,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_CONSOLE_DXC", Apply::Retranslate),
     ("VICTORY_CONSOLE_UAV_CLEAR", Apply::Restart),
     ("VICTORY_CONSTANTS_WAIT", Apply::Restart),
+    ("VICTORY_CONSUMER_GATE", Apply::Restart),
     ("VICTORY_COPY_ASK", Apply::Restart),
     ("VICTORY_COPY_MODE", Apply::Restart),
     ("VICTORY_COPY_OVER_TITLE", Apply::Restart),
