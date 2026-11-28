@@ -926,6 +926,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// At present `frame`: the line for a frame that dropped passes over the
+/// screen for want of their pipeline.
+#[cfg(windows)]
+pub(crate) fn presented(frame: u64) {
+    make::presented(frame);
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -990,6 +997,7 @@ pub(crate) fn note_drop(this: This) {
         "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
+        make::note_dropped(&p.host);
         #[cfg(feature = "diagnostics")]
         let skipped = skipped_shader(p).map(|hash| format!("skipped shader {hash}"));
         #[cfg(not(feature = "diagnostics"))]

@@ -309,6 +309,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_SCRATCH_ANY_SIZE", Apply::Restart),
     ("VICTORY_SCRATCH_POOL", Apply::Restart),
     ("VICTORY_SCRATCH_SPARE_MB", Apply::Restart),
+    ("VICTORY_SCREEN_PIPELINE_WAIT", Apply::Live),
     ("VICTORY_SHADER_CACHE_KEY", Apply::Retranslate),
     ("VICTORY_SHADER_CENSUS", Apply::Retranslate),
     ("VICTORY_SHADER_LOOP_LIMIT", Apply::Retranslate),

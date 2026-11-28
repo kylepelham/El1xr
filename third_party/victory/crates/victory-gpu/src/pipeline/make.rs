@@ -34,6 +34,7 @@ use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
 mod compute_wait;
+mod screen_wait;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -61,6 +62,9 @@ pub(crate) struct Pending {
     /// (bootfast) Queued at creation by `VICTORY_PIPELINE_EAGER`
     /// ([`super::eager`]); set under [`QUEUE`]'s lock.
     eager: AtomicBool,
+    /// A pass over the screen ([`GraphicsState::screen_pass`],
+    /// [`screen_wait`]).
+    screen: bool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -246,6 +250,7 @@ impl Pending {
         let left_out = left_out(&shaders);
         let scene_input = left_out.is_none() && scene_input(&shaders);
         Pending {
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             scene_input,
             scene_waited: AtomicBool::new(false),
             shaders,
@@ -448,15 +453,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED, 0);
+        screen_wait::front(p);
         if p.scene_input {
             wait_scene_input(p, crate::frame::current());
         } else {
             wait(p, crate::frame::current());
         }
         compute_wait::after(p, crate::frame::current());
+        screen_wait::after(p, crate::frame::current());
         super::eager::waited(p.made.get().is_some());
     }
     p.made.get()?.as_ref()
+}
+
+/// A draw of `p` was dropped ([`screen_wait::dropped`]).
+pub(crate) fn note_dropped(p: &Pending) {
+    screen_wait::dropped(p);
+}
+
+/// At present `frame` ([`screen_wait::presented`]).
+pub(crate) fn presented(frame: u64) {
+    screen_wait::presented(frame);
 }
 
 /// How `p` came to be queued, at its first draw or dispatch

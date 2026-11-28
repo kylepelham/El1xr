@@ -1290,6 +1290,8 @@ fn present_now(named: Named) {
     }
     #[cfg(not(windows))]
     let _ = named;
+    #[cfg(windows)]
+    crate::pipeline::presented(frame);
     crate::hitch::presented(frame);
 }
 /// Diagnostics: logs a presented frame that is black after one that was

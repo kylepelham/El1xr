@@ -182,6 +182,18 @@ pub(super) fn wait_more(
     if p.slow() {
         return Err((Dropped::HeldTooLong, Duration::ZERO));
     }
+    wait_taken(p, frame, l, frames)
+}
+
+/// Waits for `p` within `l`, taken from `frames`, however long the driver
+/// has held it: moved to the front of the workers' queue first. How long it
+/// waited, or that it is still not made.
+pub(super) fn wait_taken(
+    p: &Arc<Pending>,
+    frame: u64,
+    l: Limits,
+    frames: &Mutex<FrameTake>,
+) -> Result<Duration, (Dropped, Duration)> {
     to_front(p);
     let allowed = frames
         .lock()
