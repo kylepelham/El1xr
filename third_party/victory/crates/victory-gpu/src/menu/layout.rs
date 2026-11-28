@@ -77,7 +77,7 @@ const TAB_GAP: f32 = 4.0;
 const BANNER_H: f32 = 40.0;
 const FOOTER_H: f32 = 46.0;
 /// The description under the list: a hairline, then up to this many lines of help text.
-pub const ABOUT_LINES: usize = 4;
+pub const ABOUT_LINES: usize = 6;
 const ABOUT_LINE_H: f32 = 19.0;
 const ABOUT_H: f32 = 14.0 + ABOUT_LINES as f32 * ABOUT_LINE_H;
 const ROW_H: f32 = 60.0;

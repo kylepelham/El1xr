@@ -21,6 +21,7 @@ pub mod input;
 pub mod layout;
 pub mod model;
 pub mod selftest;
+pub mod short;
 pub mod state;
 
 #[cfg(windows)]

@@ -320,16 +320,22 @@ impl Drop for Text {
     }
 }
 
-/// The line under a setting's label: what it gives (`detail`) or its help, then the switch's
-/// name for experts only (players read the label and the line).
+/// The line under a setting's label: what it gives (`detail`), its short line ([`short`]) or its
+/// help, then the switch's name for experts only (players read the label and the line).
 pub(super) fn setting_line(info: &Info, model: &dyn MenuModel, expert: bool) -> String {
     let detail = model.detail(info.name);
-    match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
+    let line = detail.as_deref().or_else(|| short(info.name)).unwrap_or(info.help);
+    match (line, info.label == info.name) {
         (help, true) => help.to_string(),
         ("", false) => info.name.to_string(),
         (help, false) if expert => format!("{help}   {}", info.name),
         (help, false) => help.to_string(),
     }
+}
+
+/// A developer-tab setting's short line ([`super::short::SHORT`]).
+fn short(name: &str) -> Option<&'static str> {
+    super::short::SHORT.iter().find(|(n, _)| *n == name).map(|&(_, line)| line)
 }
 
 /// The selected row's whole description for the band under the list: a setting's full help
@@ -678,12 +684,12 @@ fn short_path(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::model::{Registry, registry_lock};
-    use super::super::state::{Tab, rows, tabs};
+    use super::super::state::{rows, tabs};
     use super::*;
 
     /// What would be cut at `w` x `h` on every tab, the expert one too: a label wider than its
-    /// room, a Display row's line wider than its room (players read those in the row), and a
-    /// description longer than the band under the list.
+    /// room, a listed setting's line wider than its room, and a description longer than the band
+    /// under the list.
     fn cut(w: i32, h: i32) -> Vec<String> {
         let model = Registry::default();
         let mut menu = Menu::default();
@@ -710,7 +716,7 @@ mod tests {
                 if let Row::Setting(i) = row {
                     let info = &model.infos()[i];
                     wide(LABEL, "label", info.label, room);
-                    if tab == Tab::DISPLAY && !info.expert {
+                    if !info.expert {
                         wide(HELP, "line", &setting_line(info, &model, false), room);
                     }
                 }
@@ -729,7 +735,13 @@ mod tests {
     fn nothing_is_cut_at_1080_or_1440() {
         let _lock = registry_lock();
         let cut: Vec<String> = [(1920, 1080), (2560, 1440)].iter().flat_map(|&(w, h)| cut(w, h)).collect();
-        assert!(cut.is_empty(), "{} cut:\n{}", cut.len(), cut.join("\n"));
+        assert!(
+            cut.is_empty(),
+            "{} cut (a listed setting's row line: give it a line in menu/short.rs; a description: \
+             shorten the registry help to {ABOUT_LINES} lines):\n{}",
+            cut.len(),
+            cut.join("\n")
+        );
     }
 
     #[test]
