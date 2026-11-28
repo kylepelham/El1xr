@@ -236,6 +236,14 @@ fn untranslated() -> &'static std::sync::RwLock<std::collections::HashSet<[u8; 3
     })
 }
 
+/// A stage from pieces that does not translate while refusing is on: every
+/// pipeline naming it is refused at creation ([`refuse_failed`]) and the
+/// title makes its own, so none of its draws is dropped (1,296 such stages
+/// in run b5k were logged as refusals that dropped draws).
+pub(crate) fn refused_instead(container: &[u8]) -> bool {
+    refusing() && is_pieces(container)
+}
+
 /// Worker side of a failed translation: keeps `container`'s key for the next
 /// run when it is one from pieces and refusing is on.
 pub(crate) fn note_untranslated(container: &[u8]) {
