@@ -694,7 +694,9 @@ impl ClaimOne {
 
     /// The claim of `block` if it is free; never waits.
     fn try_get(block: usize) -> Option<Self> {
-        BUSY.try_set(block).then_some(Self(block))
+        // Not `then_some(Self(block))`: that builds the claim either way, and dropping the
+        // unused one clears the bit of whoever holds the block (batch 5 part M's crash).
+        BUSY.try_set(block).then(|| Self(block))
     }
 }
 
@@ -3461,9 +3463,15 @@ fn guard_with_epochs_flags(
     let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let pre = guard_split::start();
+    if pre.is_some() {
+        guard_split::add(guard_split::S::PreCalls, 1);
+    }
     if !ask && first < last && clean_all(first, last) {
         // (Neptune) All clean, so all guarded and a view: said without the lock.
         count(4, 1);
+        if pre.is_some() {
+            guard_split::add(guard_split::S::PreSettled, 1);
+        }
         guard_split::finish(guard_split::S::PreUs, pre);
         return Some((Vec::new(), Vec::new()));
     }
@@ -3496,7 +3504,12 @@ fn guard_with_epochs_flags(
                     // Ordinary reservations (or when placeholder skip is disabled):
                     // reuse one VirtualQuery across the contiguous uncommitted region.
                     if block >= uncommitted_until {
+                        let t = if pre.is_some() { guard_split::start() } else { None };
                         uncommitted_until = holes::uncommitted_end_cached(block);
+                        if t.is_some() {
+                            guard_split::add(guard_split::S::PreHoleCalls, 1);
+                            guard_split::finish_ns(guard_split::S::PreHoleNs, t);
+                        }
                     }
                     if block < uncommitted_until {
                         continue;
@@ -3509,6 +3522,9 @@ fn guard_with_epochs_flags(
         }
         if settled {
             count(4, 1);
+            if pre.is_some() {
+                guard_split::add(guard_split::S::PreSettled, 1);
+            }
             guard_split::finish(guard_split::S::PreUs, pre);
             return Some((written, Vec::new()));
         }
@@ -3786,9 +3802,11 @@ fn guard_shared(
     let mut cursor = first;
     // (feedcard) `VICTORY_GUARD_4K=1`: blocks whose open 4 KiB pages were noted written alone.
     let mut pages_only: Vec<usize> = Vec::new();
+    // `VICTORY_GUARD_STAMP_FRESH=1`: a fresh asking for each block's pages (see `guard4k`).
+    let fresh = guard4k::stamp_fresh();
     let mut asked = 0;
     let mut now = || {
-        if asked == 0 {
+        if fresh || asked == 0 {
             asked = next_asking();
         }
         asked
@@ -4613,18 +4631,29 @@ fn protect_here(
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    uncommitted_span(block).0
+}
+
+/// [`uncommitted_end`], and whether the run is reserved (not free).
+fn uncommitted_span(block: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION};
     let Some(addr) = block.checked_mul(BLOCK) else {
-        return block;
+        return (block, false);
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let n = os_virtual_query(addr, &mut info);
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK, info.State == MEM_RESERVE)
     } else {
-        block
+        (block, false)
     }
+}
+
+/// The title's memory `[at, at + len)` was committed by an ordinary call (no mapping changed):
+/// the guards forget any uncommitted run they keep there (`VICTORY_GUARD_HOLES_KEPT`).
+pub fn title_pages_committed(at: usize, len: usize) {
+    holes::forget(at, len);
 }
 
 /// Restores `PAGE_READWRITE` for contiguous blocks `[from, to)` in a single
@@ -6398,7 +6427,7 @@ mod tests {
         }
     }
 
-    fn syscall_counts() -> (u64, u64) {
+    pub(super) fn syscall_counts() -> (u64, u64) {
         (
             OS_VIRTUAL_PROTECT_CALLS.with(|c| c.get()),
             OS_VIRTUAL_QUERY_CALLS.with(|c| c.get()),
