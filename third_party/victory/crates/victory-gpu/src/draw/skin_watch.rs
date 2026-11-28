@@ -7,13 +7,12 @@ use crate::skin_watch::{LIGHTING, RESOLVE};
 use std::sync::Arc;
 
 const COPY_SOURCE: u32 = 0x800;
-/// Bytes of the read-back buffer per row: [`crate::bake_check::ROW_TEXELS`] of the widest
-/// format, 512-aligned.
-const ROW_BYTES: u64 = crate::bake_check::ROW_TEXELS as u64 * 16;
 
 /// A few rows of one texture copied into a read-back buffer of ours.
 pub(super) struct Rows {
     buffer: ID3D12Resource,
+    /// The buffer's bytes.
+    bytes: u64,
     /// Per row its offset in the buffer and its texels.
     rows: Vec<(u64, u32)>,
     texel: u32,
@@ -30,10 +29,7 @@ impl Rows {
             if self.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
                 return None;
             }
-            let all = std::slice::from_raw_parts(
-                data.cast::<u8>(),
-                (u64::from(crate::bake_check::ROWS) * ROW_BYTES) as usize,
-            );
+            let all = std::slice::from_raw_parts(data.cast::<u8>(), self.bytes as usize);
             let mut out = Vec::new();
             for &(offset, n) in &self.rows {
                 let at = offset as usize;
@@ -48,12 +44,13 @@ impl Rows {
 }
 
 /// A skin lighting or resolve draw being recorded: its kind, frame, and its first target's
-/// rows read before it.
+/// rows read before it with what is told of them.
 pub(super) struct Watch {
     kind: &'static str,
     frame: u64,
-    before: Option<(usize, Arc<Rows>)>,
+    before: Option<(usize, Arc<Rows>, crate::skin_watch::Output)>,
 }
+
 
 /// Records the copies of a few rows (inside `rect`, x y w h; all of it when empty) of
 /// subresource 0 of `copy` into a read-back buffer, from whatever state the list holds it in
@@ -70,7 +67,7 @@ fn read_rows(
         return None;
     }
     let size = [desc.Width as u32, desc.Height];
-    let rows = crate::bake_check::rows(rect, size);
+    let rows = crate::skin_watch::rows(rect, size);
     if rows.is_empty() {
         return None;
     }
@@ -96,8 +93,9 @@ fn read_rows(
     if texel == 0 || texel > 16 || u64::from(texel) * desc.Width != row_bytes {
         return None;
     }
-    let buffer =
-        bake_check::read_back_buffer(&host.device, u64::from(crate::bake_check::ROWS) * ROW_BYTES)?;
+    let pitch = (u64::from(rows[0].2) * u64::from(texel)).next_multiple_of(512);
+    let bytes = rows.len() as u64 * pitch;
+    let buffer = bake_check::read_back_buffer(&host.device, bytes)?;
     let back = list.transition_held(copy, COPY_SOURCE);
     if let Some((before, now)) = back {
         let barrier = crate::host::transition(
@@ -110,7 +108,7 @@ fn read_rows(
     }
     let mut out = Vec::new();
     for (k, &(x, y, n)) in rows.iter().enumerate() {
-        let offset = k as u64 * ROW_BYTES;
+        let offset = k as u64 * pitch;
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
@@ -156,6 +154,7 @@ fn read_rows(
     }
     Some(Rows {
         buffer,
+        bytes,
         rows: out,
         texel,
         format: desc.Format.0 as u32,
@@ -200,7 +199,7 @@ impl State {
     }
 
     /// Before an indirect draw: when it is a skin lighting or resolve draw, its watch, and the
-    /// first target's rows read for the first two of each kind a frame.
+    /// first target's rows read (every skin lighting draw, the first resolve draws a frame).
     pub(super) fn skin_watch_before(&self, list: &HostList, kind: u32) -> Option<Watch> {
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
@@ -217,9 +216,22 @@ impl State {
         if (kind == LIGHTING || kind == RESOLVE)
             && let Some(&target) = self.targets.first()
             && let Some(copy) = crate::resource::host_copy(target as This)
-            && crate::skin_watch::take_output(frame, kind)
+            && let Some(index) = crate::skin_watch::take_output(frame, kind)
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
         {
-            before = read_rows(list, &copy, self.viewport_rect()).map(|r| (target, Arc::new(r)));
+            let output = crate::skin_watch::Output {
+                frame,
+                kind,
+                index,
+                pixel: p
+                    .stages
+                    .iter()
+                    .find(|s| s.shader.stage == "pixel")
+                    .map_or_else(String::new, |s| s.shader.hash.clone()),
+                blended: p.state.contains("blend true"),
+            };
+            before = read_rows(list, &copy, self.viewport_rect())
+                .map(|r| (target, Arc::new(r), output));
         }
         Some(Watch {
             kind,
@@ -247,14 +259,10 @@ impl State {
         if !ran {
             return;
         }
-        if let Some((target, before)) = w.before
+        if let Some((target, before, output)) = w.before
             && let Some(copy) = crate::resource::host_copy(target as This)
             && let Some(after) = read_rows(list, &copy, self.viewport_rect())
         {
-            let (frame, kind) = (w.frame, w.kind);
-            let pixel = crate::pipeline::host_pipeline(self.pipeline as This)
-                .and_then(|p| p.stages.iter().find(|s| s.shader.stage == "pixel"))
-                .map_or_else(String::new, |s| s.shader.hash.clone());
             list.defer_after(move || {
                 let texel = after.texel as usize;
                 let (c, rgb) = match (before.bytes(), after.bytes()) {
@@ -267,10 +275,10 @@ impl State {
                     _ => (crate::skin_watch::Change::default(), None),
                 };
                 let shape = format!("f{} {}x{}", after.format, after.size[0], after.size[1]);
-                crate::skin_watch::output_landed(frame, kind, &pixel, &shape, c, rgb);
+                crate::skin_watch::output_landed(&output, &shape, c, rgb);
             });
         }
-        if w.kind == LIGHTING && crate::skin_watch::take(w.frame, "inputs", 1) {
+        if w.kind == LIGHTING && crate::skin_watch::take(w.frame, "inputs", 1).is_some() {
             self.skin_watch_inputs(list, w.frame);
         }
     }
@@ -278,25 +286,40 @@ impl State {
     /// Skin's probe inputs (`crate::skin_fill::ATLAS`, `LAYERS`): a few rows of each read, the
     /// all-zero texels counted once the list has run.
     fn skin_watch_inputs(&self, list: &HostList, frame: u64) {
-        let view = |(slot, offset): (u8, u32)| match self.roots_ref(false).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => {
-                match crate::descriptor::view(table + u64::from(offset) * 4) {
-                    Some(View::Shader(r, _)) if r != 0 => Some(r),
-                    _ => None,
-                }
-            }
-            _ => None,
+        let read = |(slot, offset): (u8, u32)| {
+            let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
+                return Err("no_table".to_owned());
+            };
+            let r = match crate::descriptor::view(table + u64::from(offset) * 4) {
+                Some(View::Shader(r, _)) if r != 0 => r,
+                other => return Err(format!("no_view {}", view_kind(other.as_ref()))),
+            };
+            let copy = crate::resource::host_copy(r as This)
+                .ok_or_else(|| format!("no_copy {r:#x}"))?;
+            read_rows(list, &copy, [0; 4]).ok_or_else(|| {
+                // SAFETY: a live texture.
+                let d = unsafe { copy.texture.GetDesc() };
+                format!(
+                    "unreadable dim {} f{} {}x{}x{} samples {}",
+                    d.Dimension.0,
+                    d.Format.0,
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.SampleDesc.Count
+                )
+            })
         };
         for (name, place) in [
             ("atlas", crate::skin_fill::ATLAS),
             ("layers", crate::skin_fill::LAYERS),
         ] {
-            let Some(rows) = view(place)
-                .and_then(|r| crate::resource::host_copy(r as This))
-                .and_then(|copy| read_rows(list, &copy, [0; 4]))
-            else {
-                crate::skin_watch::input_landed(frame, name, "no_view", (0, 0));
-                continue;
+            let rows = match read(place) {
+                Ok(rows) => rows,
+                Err(why) => {
+                    crate::skin_watch::input_landed(frame, name, &why, (0, 0));
+                    continue;
+                }
             };
             list.defer_after(move || {
                 let counts = rows.bytes().map_or((0, 0), |b| {
@@ -321,5 +344,14 @@ impl State {
                 self.skin_watch_bound()
             }
         });
+    }
+}
+
+/// What a table entry that is not a texture view holds, for the log.
+fn view_kind(view: Option<&View>) -> &'static str {
+    match view {
+        None => "none",
+        Some(View::Shader(..)) => "null_shader",
+        Some(_) => "other",
     }
 }
