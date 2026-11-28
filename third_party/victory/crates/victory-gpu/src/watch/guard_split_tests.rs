@@ -218,6 +218,9 @@ struct View {
     len: usize,
 }
 
+// SAFETY: the section handle is only closed by `drop`; the view is plain shared memory.
+unsafe impl Sync for View {}
+
 impl View {
     fn new(blocks: usize) -> Self {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -405,4 +408,144 @@ fn bench_publish_try() {
             started.elapsed().as_secs_f64() * 1000.0,
         );
     }
+}
+
+/// (#88, batch 5 part M) Refreshes racing each other and the title's write faults on one view
+/// never lose a write: each refresher keeps its own copy, taking a page when its stamp is newer
+/// than the asking it last took it at (as `Shadow::copy_stale`), and once the writers are quiet
+/// its copy is the memory. With `VICTORY_GUARD_PUBLISH_TRY` the crash's claim bug made writes to
+/// read-only blocks go unhandled here (the test process died); with `VICTORY_GUARD_4K` a page
+/// closed late in a walk was stamped with the walk's first asking, and lost writes.
+fn racing_refreshes_lose_nothing(publish_try: bool, guard_4k: bool) -> usize {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    const BLOCKS: usize = 8;
+    const WRITERS: usize = 3;
+    const REFRESHERS: usize = 4;
+    const ROUNDS: usize = 300;
+    let _reset = Reset;
+    let setup = move || {
+        super::super::PORT_GUARD_IN_TEST.set(true);
+        PUBLISH_TRY_FORCED.set(Some(publish_try));
+        NOTE_ONCE_FORCED.set(Some(publish_try));
+        super::super::guard4k::FORCED.with(|f| f.set(guard_4k));
+    };
+    setup();
+    let view = View::new(BLOCKS);
+    view.refresh(0);
+    let missed = AtomicUsize::new(0);
+    let round_start = Barrier::new(REFRESHERS + WRITERS);
+    let round_end = Barrier::new(REFRESHERS + WRITERS);
+    let settle = Barrier::new(REFRESHERS);
+    std::thread::scope(|s| {
+        for w in 0..WRITERS {
+            let (view, round_start, round_end) = (&view, &round_start, &round_end);
+            s.spawn(move || {
+                setup();
+                let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (w as u64 + 1);
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut write = |n: usize, yield_now: bool| {
+                    for _ in 0..n {
+                        let at = view.at + (next() as usize % (view.len / 8)) * 8;
+                        // SAFETY: inside our live view; the guards' handler opens it.
+                        unsafe { (at as *mut u64).write_volatile(next() | 1) };
+                        if yield_now {
+                            std::thread::yield_now();
+                        }
+                    }
+                };
+                for _ in 0..ROUNDS {
+                    write(24, false);
+                    round_start.wait();
+                    // Beside the refreshes.
+                    write(16, true);
+                    round_end.wait();
+                    // Quiet while the refreshers take their last look and compare.
+                    round_end.wait();
+                }
+            });
+        }
+        for _ in 0..REFRESHERS {
+            let (view, round_start, round_end, settle, missed) =
+                (&view, &round_start, &round_end, &settle, &missed);
+            s.spawn(move || {
+                setup();
+                // SAFETY: our live view, read only.
+                let memory = unsafe { std::slice::from_raw_parts(view.at as *const u8, view.len) };
+                let first = view.at / PAGE;
+                let (asked, _) = view.refresh(0);
+                let mut copy = memory.to_vec();
+                let mut copied = vec![asked; view.len / PAGE];
+                let mut take = |copy: &mut [u8]| {
+                    let (asked, pages) =
+                        super::super::writes(view.at, view.at + view.len, true).expect("a view");
+                    for (p, w) in pages {
+                        let p = p - first;
+                        if w > copied[p] {
+                            let r = p * PAGE..(p + 1) * PAGE;
+                            copy[r.clone()].copy_from_slice(&memory[r]);
+                            copied[p] = asked;
+                        }
+                    }
+                };
+                for _ in 0..ROUNDS {
+                    round_start.wait();
+                    for _ in 0..4 {
+                        take(&mut copy);
+                    }
+                    round_end.wait();
+                    // A walk can find a block another walk just closed clean before that one
+                    // notes it written; the next asking is told it.
+                    take(&mut copy);
+                    settle.wait();
+                    take(&mut copy);
+                    if copy.as_slice() != memory {
+                        missed.fetch_add(1, Relaxed);
+                        copy.copy_from_slice(memory);
+                    }
+                    round_end.wait();
+                }
+            });
+        }
+    });
+    missed.into_inner()
+}
+
+#[test]
+fn racing_refreshes_lose_nothing_blocks() {
+    for publish_try in [false, true] {
+        let missed = racing_refreshes_lose_nothing(publish_try, false);
+        assert_eq!(missed, 0, "VICTORY_GUARD_PUBLISH_TRY={publish_try}, block guards");
+    }
+}
+
+#[test]
+fn racing_refreshes_lose_nothing_4k() {
+    for publish_try in [false, true] {
+        let missed = racing_refreshes_lose_nothing(publish_try, true);
+        assert_eq!(missed, 0, "VICTORY_GUARD_PUBLISH_TRY={publish_try}, 4 KiB guards");
+    }
+}
+
+/// (Batch 5 part M's crash) A `try_get` that finds the block claimed leaves the holder's claim:
+/// it used to build the claim before knowing, and dropping it cleared the holder's bit, so the
+/// guards' walks and write faults no longer kept off each other's blocks.
+#[test]
+fn a_missed_try_leaves_the_holders_claim() {
+    use super::super::{BLOCK, BUSY, ClaimOne};
+    let at = reserve(1);
+    let block = at / BLOCK;
+    assert!(BUSY.try_set(block));
+    assert!(ClaimOne::try_get(block).is_none());
+    assert!(!BUSY.try_set(block), "the holder's claim was cleared");
+    BUSY.clear(block);
+    assert!(ClaimOne::try_get(block).is_some());
+    assert!(BUSY.try_set(block), "dropped with its owner");
+    BUSY.clear(block);
+    release(at, 1);
 }

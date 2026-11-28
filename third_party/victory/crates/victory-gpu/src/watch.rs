@@ -694,7 +694,9 @@ impl ClaimOne {
 
     /// The claim of `block` if it is free; never waits.
     fn try_get(block: usize) -> Option<Self> {
-        BUSY.try_set(block).then_some(Self(block))
+        // Not `then_some(Self(block))`: that builds the claim either way, and dropping the
+        // unused one clears the bit of whoever holds the block (batch 5 part M's crash).
+        BUSY.try_set(block).then(|| Self(block))
     }
 }
 
@@ -3786,13 +3788,10 @@ fn guard_shared(
     let mut cursor = first;
     // (feedcard) `VICTORY_GUARD_4K=1`: blocks whose open 4 KiB pages were noted written alone.
     let mut pages_only: Vec<usize> = Vec::new();
-    let mut asked = 0;
-    let mut now = || {
-        if asked == 0 {
-            asked = next_asking();
-        }
-        asked
-    };
+    // A fresh asking for each block's pages, taken after they are read-only again: one taken at
+    // the walk's first block predates a later block's close, and a refresh that copied that page
+    // at an asking in between would never take a write made before the close.
+    let mut now = next_asking;
 
     while cursor < last {
         if let Some(clean_end) = g.clean.run_end_in(cursor, last) {
