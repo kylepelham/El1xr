@@ -201,6 +201,7 @@ pub(crate) fn log(frames: f64) {
     if let Some(line) = line(stats, frames, hash_every(), full_every()) {
         tracing::info!("{line}");
     }
+    super::hash_behind::log(frames);
 }
 
 #[cfg(test)]
