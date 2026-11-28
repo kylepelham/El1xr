@@ -51,6 +51,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
+    ("VICTORY_FIXED_TRIPS", "Loops with a count fixed in code run to their end, not a stage cap."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
     ("VICTORY_FLUSH_ONE_PASS", "Runs a wide flush in one pass on helper threads, without barriers."),
     ("VICTORY_FLUSH_PASS_MERGE", "Runs a long refresh in the same flush pass as its copy's other steps."),
@@ -81,6 +82,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_LOOPS_WAVE", "Translates wave64 compute loops so each host wave branches together."),
     ("VICTORY_MAP_THREADS_ALL", "Runs the remaining memory mapping calls on the mapping threads too."),
     ("VICTORY_MASK_ELSEWHERE", "Computes lane masks read as numbers from their operands, not refusing."),
+    ("VICTORY_MASK_MOVES", "Wave64 lane masks copied a word at a time keep their lanes."),
     ("VICTORY_MATERIAL_TEXTURE_DEMAND", "Loads character material textures first in the next texture pass."),
     ("VICTORY_MEET_PRUNE", "Shader translator proves more loops uniform, avoiding slow fallbacks."),
     ("VICTORY_MERGE_SUBMISSIONS", "Sends consecutive game submissions as one host submission."),
@@ -147,6 +149,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_HASH_BEHIND", "Runs the periodic texture change hash on its own threads."),
     ("VICTORY_TEXTURE_HEAPS", "Places host copies of streamed textures in shared memory blocks."),
     ("VICTORY_TEX_EARLY", "Starts texture checks as soon as they are reached, on helper threads."),
+    ("VICTORY_U32_CLAMP", "Clamped unsigned adds saturate as on the console, instead of a refusal."),
     ("VICTORY_UPLOAD_BLOCKS", "Takes upload buffers from pooled blocks instead of making each."),
     ("VICTORY_UPSCALE_LIVE_TEST", "Steps through upscaler settings live on a timer, for testing."),
     ("VICTORY_UPSCALE_OFF_STRETCH", "Turning the upscaler off live stretches the image until the next start."),
@@ -163,6 +166,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_WAVE_WIDE_MORE", "More wave64 programs run in wave-wide form on 32-lane hardware."),
     ("VICTORY_WIDE_REFRESH", "Spreads a flush's host copy refreshes over helper threads."),
     ("VICTORY_WIDE_WAKE_ONE", "Wakes only as many helper threads as there are jobs."),
+    ("VICTORY_WREXEC_SCC", "Waterfall loops leave SCC false after them, instead of a refusal."),
     ("VICTORY_ZERO_OUT", "Listed shader programs clear their outputs instead of running."),
 ];
 
