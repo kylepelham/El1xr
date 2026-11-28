@@ -16,12 +16,19 @@
 //!
 //! The clock hold (`MOD_CLOCK_HOLD`) sets the clock on every game tick while it is on and logs
 //! `mod menu: clock hold at H` / `mod menu: clock hold off` when it changes.
+//!
+//! Teleport ([`teleport`]) needs a set-coords native that offline analysis did not pin: Find
+//! teleport ([`finder`]) names it in game, or `VICTORY_MOD_MENU_TP_NATIVE=<hash>:<slots>` does at
+//! start (logged as `mod menu: teleport native <hash> from VICTORY_MOD_MENU_TP_NATIVE`).
 
+pub mod candidates;
 pub mod census;
+pub mod finder;
 pub mod model;
 pub mod natives;
 pub mod probe;
 pub mod queue;
+pub mod teleport;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -109,6 +116,19 @@ pub unsafe fn init(base: usize, size: usize) {
                     Err(e) => tracing::warn!("mod menu: census off ({e})"),
                 }
             }
+            if let Ok(v) = std::env::var("VICTORY_MOD_MENU_TP_NATIVE") {
+                match teleport::parse_native(&v) {
+                    Some((h, n)) => {
+                        teleport::set_native(h, n);
+                        tracing::info!(
+                            "mod menu: teleport native {h:#018x} slots={n} from VICTORY_MOD_MENU_TP_NATIVE"
+                        );
+                    }
+                    None => tracing::warn!(
+                        "mod menu: VICTORY_MOD_MENU_TP_NATIVE={v} ignored (want <hash hex>:<slots 4..32>)"
+                    ),
+                }
+            }
             Ok(Table { base, scan })
         }
         Err(e) => {
@@ -145,15 +165,16 @@ pub fn game_tick() {
     }
     side_logs();
     hold_clock();
-    if QUEUE.idle() {
-        return;
-    }
     let mut native = |hash: u64, args: &[u64]| {
         let rva = table.scan.find(hash)?;
         // SAFETY: a handler the scan found in the mapped image, on the title's thread; the
-        // options and scripts pass each native the slots it takes.
+        // options, scripts and finders pass each native the slots its shape takes.
         Some(unsafe { natives::invoke(table.base + rva as usize, args) })
     };
+    finder::tick(&mut native);
+    if QUEUE.idle() {
+        return;
+    }
     QUEUE.drain(|call| match call.script {
         Some(script) => script(&mut native, &call.args),
         None => native(call.hash, &call.args),

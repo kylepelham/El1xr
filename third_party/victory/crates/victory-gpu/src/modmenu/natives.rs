@@ -235,6 +235,11 @@ pub struct CallContext {
 /// The most argument slots a call passes.
 pub const MAX_ARGS: usize = 32;
 
+/// Argument or result slots, 16-byte aligned: vector arguments and results are four packed
+/// floats in two slots, which handlers may move with aligned vector loads and stores.
+#[repr(C, align(16))]
+struct Slots([u64; MAX_ARGS]);
+
 /// Calls the handler at `entry` with `args` and returns its first four result slots.
 ///
 /// # Safety
@@ -242,13 +247,13 @@ pub const MAX_ARGS: usize = 32;
 /// thread, with the arguments that native takes.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn invoke(entry: usize, args: &[u64]) -> [u64; 4] {
-    let mut slots = [0u64; MAX_ARGS];
+    let mut slots = Slots([0u64; MAX_ARGS]);
     let n = args.len().min(MAX_ARGS);
-    slots[..n].copy_from_slice(&args[..n]);
-    let mut ret = [0u64; 8];
+    slots.0[..n].copy_from_slice(&args[..n]);
+    let mut ret = Slots([0u64; MAX_ARGS]);
     let mut ctx = CallContext {
-        args: slots.as_mut_ptr(),
-        ret: ret.as_mut_ptr(),
+        args: slots.0.as_mut_ptr(),
+        ret: ret.0.as_mut_ptr(),
         count: n as i32,
         pad: 0,
         rest: [0; 12],
@@ -258,7 +263,7 @@ pub unsafe fn invoke(entry: usize, args: &[u64]) -> [u64; 4] {
         let handler: unsafe extern "C" fn(*mut CallContext) = std::mem::transmute(entry);
         handler(&mut ctx);
     }
-    [ret[0], ret[1], ret[2], ret[3]]
+    [ret.0[0], ret.0[1], ret.0[2], ret.0[3]]
 }
 
 #[cfg(test)]
