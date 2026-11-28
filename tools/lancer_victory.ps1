@@ -331,6 +331,7 @@ if (-not $NoTunedSettings) {
         VICTORY_DSTORAGE_STAGING_MB      = '256'       # batch 5T/U: 256 MiB of DirectStorage source in flight, not 32 (loading bundle)
         VICTORY_DSTORAGE_POLL_WAIT       = '1'         # batch 5T/U: the title's disk-read poll returns as reads finish (loading bundle)
         VICTORY_BAKE_STAGE_ALL           = '1'         # batch 5T/U: bake passes staged together while loading (loading bundle)
+        VICTORY_WIDE_LOCK                = '1'         # batch 5W/X: lock around wave-wide/paired shader translation overrides (fixes race caching wrong form)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
     foreach ($name in $tuned.Keys) {
