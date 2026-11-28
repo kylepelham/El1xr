@@ -44,6 +44,8 @@ pub(crate) mod refresh_stamp;
 pub(crate) mod merge_due;
 #[path = "shadow_wide_wake.rs"]
 pub(crate) mod wide_wake;
+#[path = "shadow_warm.rs"]
+pub(crate) mod warm;
 pub use lazy::LazyAccessHold;
 pub(crate) use lazy::{
     LAZY_ARMED_COUNT, LAZY_EAGER, LAZY_RESYNC, LazyRemapGuard, has_lazy_mapped_view_pages,

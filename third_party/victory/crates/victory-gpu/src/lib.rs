@@ -117,6 +117,8 @@ mod port_order;
 #[cfg(windows)]
 mod heap_rounds;
 #[cfg(windows)]
+mod heap_warm;
+#[cfg(windows)]
 mod round_share;
 #[cfg(windows)]
 mod host;
