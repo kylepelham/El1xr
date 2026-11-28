@@ -2576,6 +2576,7 @@ pub(crate) fn let_go_idle() {
     slot_evict(&all, video, idle_ms, IDLE_FRAMES);
     drop(all);
     if went > 0 {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::TexturesGone);
         crate::host::trail(|| {
             format!(
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",

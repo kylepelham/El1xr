@@ -4970,6 +4970,9 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+    if !gone.is_empty() {
+        crate::flicker_catch::periodic::ran(crate::flicker_catch::periodic::Task::ShadowsGone);
+    }
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
