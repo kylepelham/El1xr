@@ -69,6 +69,17 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
         }
     }
     lap.mark(P::StaleWalk);
+    stale_spans(spans, &mut lap)
+}
+
+/// The tail of [`stale_under_flights`], after the walk of the lists: the
+/// merges under writes of `spans` (per copy, the span of what is refreshed).
+pub(super) fn stale_spans(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    lap: &mut crate::card_prof::Lap,
+) -> bool {
+    use crate::card_prof::P;
+    use std::sync::Arc;
     if late_exact() {
         // (entryhitch) `VICTORY_STALE_QUICK`: only the copies whose merge can do anything.
         if crate::shadow::merge_due::on() {
@@ -759,8 +770,11 @@ pub(super) fn late_line(frames: f64) {
             .iter()
             .map(|a| a.swap(0, Ordering::Relaxed) as f64 / (frames * 1000.0))
             .collect();
+        let stale_aside = super::stale_aside::take(frames);
         tracing::info!(
-            "preparing breakdown per frame: sync_heaps {:.2} ms, make_waiting {:.2} ms, ask_once {:.2} ms, stale_flights {:.2} ms,              run_flush_one {:.2} ms, run_other {:.2} ms, batch_flush {:.2} ms, snapshots {:.2} ms, card_before {:.2} ms, exec_submit {:.2} ms",
+            "preparing breakdown per frame: sync_heaps {:.2} ms, make_waiting {:.2} ms, ask_once {:.2} ms, stale_flights {:.2} ms,              run_flush_one {:.2} ms, run_other {:.2} ms, batch_flush {:.2} ms, snapshots {:.2} ms, card_before {:.2} ms, exec_submit {:.2} ms; \
+             stale_flights aside {:.1} checks, {:.2} ms on victory-ask-aside, {:.2} ms of it waited for at the gate, \
+             {:.1} made at the gate (VICTORY_STALE_ASIDE); heap-sync rounds asked ahead {:.1} (VICTORY_HEAP_ROUND_AHEAD)",
             p[0],
             p[1],
             p[2],
@@ -771,6 +785,11 @@ pub(super) fn late_line(frames: f64) {
             p[7],
             p[8],
             p[9],
+            stale_aside[0],
+            stale_aside[1],
+            stale_aside[2],
+            stale_aside[3],
+            crate::round_share::ahead_take(frames),
         );
         flush::log(frames);
         crate::card_prof::log(frames);
