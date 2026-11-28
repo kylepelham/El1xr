@@ -74,6 +74,7 @@ mod bake_replay;
 mod bake_spread;
 #[cfg(windows)]
 mod bind_hash;
+mod table_prof;
 #[cfg(windows)]
 mod bake_watch;
 #[cfg(windows)]
