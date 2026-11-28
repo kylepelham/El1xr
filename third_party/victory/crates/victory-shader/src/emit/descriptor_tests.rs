@@ -573,3 +573,107 @@ fn every_view_index_the_title_computes_reads_the_whole_heap_table_under_heap_cap
         }
     }
 }
+
+#[test]
+fn a_flagged_table_entry_notes_its_title_slot_in_the_fault_buffer_under_heap_cap_5() {
+    // (heapcap, VICTORY_HEAP_CAP=5) Entries as the host keeps them: title 0 -> 0, title 1 -> 1
+    // (the UAV the program stores to), title 3 -> 3 (packed, shown), title 5 -> 5 | FAULT_FLAG
+    // (packed, armed: read, and noted as touched), title 898,339 -> 2 | FAULT_FLAG (live, not
+    // packed: null, and noted), title 4 -> 2 (dead: null, not noted). The fault buffer is the
+    // raw UAV at slot 6.
+    use super::shader::{FAULT_DWORDS, FAULT_FLAG, FULL_REMAP};
+    let program = heap_indexed();
+    let translate_with = |fault: Option<u32>| {
+        let full = super::shader::TITLE_REMAP_FULL_HERE.replace(Some(true));
+        let slot = super::shader::TITLE_FAULT_SLOT_HERE.replace(fault);
+        let shader = translate_limited(&program, None);
+        super::shader::TITLE_FAULT_SLOT_HERE.set(slot);
+        super::shader::TITLE_REMAP_FULL_HERE.set(full);
+        shader
+    };
+    let faulting = translate_with(Some(6));
+    assert_ne!(faulting.dxil, translate_with(None).dxil);
+    assert_eq!(translate_with(Some(0)).dxil, translate_with(None).dxil, "0: =4's");
+    let (t0, t3, t5) = (
+        [[0.0f32; 4]; 13 * 7],
+        [[0.0f32; 4]; 5 * 3],
+        [[0.0f32; 4]; 9 * 2],
+    );
+    let views = [
+        View::Texture(13, 7, &t0),
+        View::RawUav(4),
+        View::NullTexture,
+        View::Texture(5, 3, &t3),
+        View::NullTexture,
+        View::Texture(9, 2, &t5),
+        View::RawUav(FAULT_DWORDS),
+    ];
+    let mut table = vec![2u32; FULL_REMAP as usize];
+    table[0] = 0;
+    table[1] = 1;
+    table[3] = 3;
+    table[5] = 5 | FAULT_FLAG;
+    table[898_339] = 2 | FAULT_FLAG;
+    let place = |k: u32| (1 + k % (FAULT_DWORDS - 1)) as usize;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&faulting)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let run = |s0: u32| {
+            let mut ud = vec![0u32; faulting.user_data_dwords().max(1) as usize];
+            for u in &faulting.user_data {
+                if (u.root, u.dword) == (RootType::Constants, 0) {
+                    ud[u.index as usize] = s0;
+                }
+            }
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))
+        };
+        let noted = |words: &[Vec<u32>]| -> Vec<u32> {
+            words[1].iter().copied().filter(|&w| w != 0).collect()
+        };
+        let w = run(3);
+        assert_eq!(w[0][..2], [5, 3], "{label}: shown: its own view");
+        assert!(noted(&w).is_empty(), "{label}: shown, not armed: nothing noted");
+        let w = run(5);
+        assert_eq!(w[0][..2], [9, 2], "{label}: armed: still its own view");
+        assert_eq!(w[1][place(5)], 5, "{label}: armed: noted as touched");
+        assert_eq!(noted(&w), [5], "{label}");
+        let w = run(898_339);
+        assert_eq!(w[1][place(898_339)], 898_339, "{label}: live, not packed: noted");
+        assert_eq!(noted(&w), [898_339], "{label}");
+        let null = w[0][..2].to_vec();
+        assert!(![[13, 7], [5, 3], [9, 2]].iter().any(|t| null == t), "{label}: {null:?}");
+        let w = run(4);
+        assert_eq!(w[0][..2], null[..], "{label}: dead: null");
+        assert!(noted(&w).is_empty(), "{label}: dead: nothing noted");
+        let w = run(0);
+        assert_eq!(w[0][..2], [13, 7], "{label}");
+        assert!(noted(&w).is_empty(), "{label}");
+    }
+}

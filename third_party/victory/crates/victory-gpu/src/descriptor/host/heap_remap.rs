@@ -39,6 +39,8 @@ use windows::Win32::Graphics::Direct3D12::{D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12De
 
 use super::super::View;
 
+mod demand;
+
 /// Frames between looks at every title slot past the host heap.
 pub(crate) const RESCAN_EVERY: u64 = 300;
 /// Frames a packed slot given back waits before another title slot gets it.
@@ -82,6 +84,12 @@ pub(crate) fn compact_slots() -> u32 {
     })
 }
 
+/// (`=4`, `=5`) The packed slots of a heap of `dynamic` dynamic slots whose
+/// title null slot is dynamic slot `at`: all after it but the `keep` last.
+pub(crate) fn packed_full(at: u32, dynamic: u32, keep: u32) -> u32 {
+    dynamic.saturating_sub(at + 1 + keep)
+}
+
 /// The packed slots of a heap of `dynamic` dynamic slots whose title null
 /// slot is dynamic slot `at`: `compact_slots()`, never more than leaves
 /// half the dynamic slots.
@@ -109,6 +117,10 @@ struct Owner {
     /// Bumped at every make, so a late result of an earlier one is told apart.
     generation: u64,
     stage: Stage,
+    /// (`=5`) The last frame a shader is known to have read it (0: never
+    /// known), and the frame its entry was flagged to ask whether one does.
+    touched: u64,
+    armed: Option<u64>,
 }
 
 /// What [`Packed::place`] says to do for a title slot.
@@ -165,6 +177,15 @@ pub(crate) struct Packed {
     /// host resource: to ready and show, or to make again.
     made_queue: VecDeque<(u32, u64)>,
     failed_queue: VecDeque<(u32, u64)>,
+    /// (`=5`) Packed on demand; the fault buffer's mapping (0: none); title
+    /// slots a shader read with no packed view (and their records), first to
+    /// pack; where the arming and eviction looks go on.
+    demand: bool,
+    faults: usize,
+    wanted: VecDeque<(u32, [u32; 3])>,
+    wanted_set: std::collections::HashSet<u32>,
+    arm_hand: usize,
+    evict_hand: usize,
 }
 
 /// Since the last line.
@@ -184,6 +205,14 @@ pub(crate) struct Counts {
     pub worker_us: u64,
     pub ready_us: u64,
     pub ready_bytes: u64,
+    /// (`=5`) Fault notes: touched (armed and read), wanted (live, no packed
+    /// view), dead; entries armed; packed views evicted; notes read.
+    pub touched: u64,
+    pub wanted: u64,
+    pub dead: u64,
+    pub armed: u64,
+    pub evicted: u64,
+    pub notes: u64,
 }
 
 impl Packed {
@@ -208,6 +237,29 @@ impl Packed {
             table: 0,
             made_queue: VecDeque::new(),
             failed_queue: VecDeque::new(),
+            demand: false,
+            faults: 0,
+            wanted: VecDeque::new(),
+            wanted_set: Default::default(),
+            arm_hand: 0,
+            evict_hand: 0,
+        }
+    }
+
+    /// (`=5`) Packed on demand, its fault buffer mapped at `faults`.
+    pub(crate) fn with_demand(mut self, faults: usize) -> Self {
+        (self.demand, self.faults) = (true, faults);
+        self
+    }
+
+    /// The table value of a title slot with no packed view: the null slot,
+    /// flagged under `=5` when its view is `live` (a shader that reads it
+    /// says so).
+    fn unpacked(&self, live: bool) -> u32 {
+        if self.demand && live {
+            self.title_null | victory_shader::emit::FAULT_FLAG
+        } else {
+            self.title_null
         }
     }
 
@@ -297,11 +349,14 @@ impl Packed {
             (None, None) => return Placed::Nothing,
         };
         self.generation += 1;
+        let touched = self.owner[k as usize].map_or(0, |o| o.touched);
         self.owner[k as usize] = key.map(|key| Owner {
             title: slot,
             key,
             generation: self.generation,
             stage: Stage::Queued,
+            touched,
+            armed: None,
         });
         self.counts.queued += 1;
         Placed::Make {
@@ -452,6 +507,8 @@ struct FullTable {
     id: u64,
     buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     gpu: u64,
+    /// (`=5`) The fault buffer, held as the table is.
+    faults: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
 }
 
 // SAFETY: a buffer and its mapping, written under the state's locks or once at birth.
@@ -462,7 +519,13 @@ static FULL_TABLES: Mutex<Vec<FullTable>> = Mutex::new(Vec::new());
 /// A whole-heap table for `host`: dword `i` the host slot of title view
 /// slot `i`: its own below `own` (all below `null` when `own` is 0), else
 /// `title_null`; the last dword `title_null`.
-fn full_table(host: &super::HostHeap, own: u32, title_null: u32, null: u32) -> Option<usize> {
+fn full_table(
+    host: &super::HostHeap,
+    own: u32,
+    title_null: u32,
+    null: u32,
+    faults: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, usize)>,
+) -> Option<usize> {
     let gpu_host = crate::host::host()?;
     let dwords = victory_shader::emit::FULL_REMAP;
     let (buffer, data) = gpu_host.upload_buffer(u64::from(dwords) * 4)?;
@@ -470,13 +533,19 @@ fn full_table(host: &super::HostHeap, own: u32, title_null: u32, null: u32) -> O
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let table = data.cast::<u32>();
+    // (`=5`) slots past the own ones may be live: a shader that reads one says so
+    let past = if faults.is_some() {
+        title_null | victory_shader::emit::FAULT_FLAG
+    } else {
+        title_null
+    };
     for i in 0..dwords {
         let slot = if own == 0 {
             i.min(null)
         } else if i < own {
             i
         } else {
-            title_null
+            past
         };
         // SAFETY: inside the fresh mapping of `dwords` dwords.
         unsafe { table.add(i as usize).write(slot) };
@@ -492,6 +561,7 @@ fn full_table(host: &super::HostHeap, own: u32, title_null: u32, null: u32) -> O
         id: host.id,
         buffer,
         gpu,
+        faults: faults.map(|f| f.0),
     });
     Some(table as usize)
 }
@@ -673,10 +743,21 @@ pub(super) fn born(host: &super::HostHeap) {
     let packs = !full || host.count == title_null;
     let reserved = super::heap_cap::reserved_of(title_null, host.count, host.dynamic)
         .filter(|_| packs);
+    let demand = super::heap_cap::demand_on();
+    let null = victory_shader::emit::view_heap_limit();
+    // (`=5`) every heap's fault slot views a buffer (the packing heap's) or nothing
+    let faults = if demand {
+        let fault = super::heap_cap::fault_slot_of(null);
+        let buffer = reserved.and_then(|_| demand::fault_buffer());
+        demand::fault_view(buffer.as_ref().map(|b| &b.0), host.cpu(fault));
+        buffer
+    } else {
+        None
+    };
+    let fault_map = faults.as_ref().map_or(0, |f| f.1);
     let table = if full {
-        let null = victory_shader::emit::view_heap_limit();
         let own = if reserved.is_some() { title_null } else { 0 };
-        full_table(host, own, title_null, null)
+        full_table(host, own, title_null, null, faults)
     } else {
         table(host).map(|table| {
             // a zero entry would read slot 0
@@ -694,8 +775,7 @@ pub(super) fn born(host: &super::HostHeap) {
         return;
     };
     let cap = if full {
-        // what `heap_cap::reserve` kept past the null slot: the dynamic slots not free
-        host.dynamic.saturating_sub(at + 1 + host.free.load(Relaxed))
+        packed_full(at, host.dynamic, super::heap_cap::dynamic_kept())
     } else {
         compact_of(compact_slots(), at, host.dynamic)
     };
@@ -719,7 +799,12 @@ pub(super) fn born(host: &super::HostHeap) {
     if state.len() >= 4 {
         state.remove(0);
     }
-    state.push(Packed::new(host.id, title_null, cap).with_table(table, base, len));
+    let packed = Packed::new(host.id, title_null, cap).with_table(table, base, len);
+    state.push(if demand && fault_map != 0 {
+        packed.with_demand(fault_map)
+    } else {
+        packed
+    });
 }
 
 /// The root SRV of the remap table for a list that draws with `host`'s
@@ -731,6 +816,9 @@ pub(crate) fn root(list: &crate::host::HostList, host: &super::HostHeap) -> Opti
         let table = tables.iter().find(|t| t.id == host.id)?;
         if list.first_use(ONCE) {
             list.keep(&table.buffer);
+            if let Some(faults) = &table.faults {
+                list.keep(faults);
+            }
         }
         return Some(table.gpu);
     }
@@ -756,6 +844,9 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
     };
     take_done(packed, host);
     let frame = crate::frame::current();
+    if packed.demand {
+        demand::step(packed, host, start, step, frame);
+    }
     let end = title.min(packed.entry_base.saturating_add(packed.entry_len));
     if packed.title_null >= end {
         return;
@@ -816,27 +907,43 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
             let Some(entry) = packed.entry(slot) else {
                 continue;
             };
-            let (at, generation, view) =
-                match packed.place(slot, view.as_ref().map(|_| key), again, frame) {
-                    Placed::Make { at, generation } => {
-                        makes += 1;
-                        (at, generation, view)
-                    }
-                    Placed::Drop(at) => (at, 0, None),
-                    Placed::Same | Placed::Overflow | Placed::Nothing => continue,
-                };
-            // Off the table first: shown again once made and readied.
-            packed.put(entry, packed.title_null);
-            send(Op {
-                heap: host.heap.clone(),
-                id: host.id,
-                at,
-                cpu: host.cpu(at),
-                generation,
-                view,
-            });
+            // (`=5`) packed only when a shader asks: a slot with no packed view is
+            // flagged while live, so the first read asks for it
+            if packed.demand && !packed.map.contains_key(&slot) {
+                packed.put(entry, packed.unpacked(view.is_some()));
+                continue;
+            }
+            let placed = packed.place(slot, view.as_ref().map(|_| key), again, frame);
+            if let Placed::Make { .. } = placed {
+                makes += 1;
+            }
+            apply(packed, host, entry, placed, view);
         }
     }
+}
+
+/// Does what [`Packed::place`] said for title slot entry `entry` (`view`
+/// its view): off the table first (shown again once made and readied), the
+/// make or null queued; an overflow left unpacked (flagged under `=5`).
+fn apply(packed: &Packed, host: &super::HostHeap, entry: u32, placed: Placed, view: Option<View>) {
+    let (at, generation, view) = match placed {
+        Placed::Make { at, generation } => (at, generation, view),
+        Placed::Drop(at) => (at, 0, None),
+        Placed::Overflow => {
+            packed.put(entry, packed.unpacked(true));
+            return;
+        }
+        Placed::Same | Placed::Nothing => return,
+    };
+    packed.put(entry, packed.title_null);
+    send(Op {
+        heap: host.heap.clone(),
+        id: host.id,
+        at,
+        cpu: host.cpu(at),
+        generation,
+        view,
+    });
 }
 
 /// Once a frame from `draw.rs` `heap_buffers`, with the list it records:
@@ -940,6 +1047,14 @@ fn line(packed: &mut Packed, frame: u64, title: u32) {
         ready_ms = c.ready_us / 1000,
         worker_ms = c.worker_us / 1000,
         dropped = c.dropped,
+        demand = packed.demand,
+        notes = c.notes,
+        touched = c.touched,
+        wanted = c.wanted,
+        wanted_now = packed.wanted.len(),
+        dead = c.dead,
+        armed = c.armed,
+        evicted = c.evicted,
         overflow = c.overflow,
         unread = c.unread,
         looked = c.looked,
@@ -1169,7 +1284,7 @@ mod tests {
         };
         let null = 999_999;
         let check = |own: u32, title_null: u32, want: &dyn Fn(u32) -> u32| {
-            let table = full_table(&heap, own, title_null, null).expect("a table") as *const u32;
+            let table = full_table(&heap, own, title_null, null, None).expect("a table") as *const u32;
             for i in [0, 1, 7, 8, 499_999, 500_000, 999_999, 1_000_000, 1_245_183, full - 2, full - 1] {
                 // SAFETY: inside the table's mapping.
                 let got = unsafe { table.add(i as usize).read() };

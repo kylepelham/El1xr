@@ -35,6 +35,10 @@
 //!   before, `VICTORY_HEAP_CAP_DYNAMIC` (default 2^18) slots stay dynamic,
 //!   and every slot between packs the live views of title slots from the
 //!   identity limit up, as `=3` does. Logs as `2` does, over the whole heap.
+//! - `5`: as `4`, packed on demand: shaders note the title slots they read
+//!   that have no packed view yet (and packed ones the host asks about), and
+//!   the host packs those first and evicts packed views no shader touched
+//!   for a while ([`super::heap_remap`], `demand`).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -45,7 +49,7 @@ pub(crate) const SCAN_EVERY: u64 = 300;
 fn parse(value: Option<&str>) -> u8 {
     value
         .and_then(|v| v.trim().parse::<u8>().ok())
-        .map_or(0, |n| n.min(4))
+        .map_or(0, |n| n.min(5))
 }
 
 fn mode() -> u8 {
@@ -64,16 +68,21 @@ pub(crate) fn remap_on() -> bool {
     mode() >= 3
 }
 
-/// Whether the whole heap goes through the table (`VICTORY_HEAP_CAP=4`).
+/// Whether the whole heap goes through the table (`VICTORY_HEAP_CAP=4` or `5`).
 pub(crate) fn full_on() -> bool {
-    mode() == 4
+    mode() >= 4
+}
+
+/// Whether packed views follow what shaders read (`VICTORY_HEAP_CAP=5`).
+pub(crate) fn demand_on() -> bool {
+    mode() == 5
 }
 
 /// Whether title slots past the host heap are logged.
 pub(crate) fn log_on() -> bool {
     static LOG: OnceLock<bool> = OnceLock::new();
     *LOG.get_or_init(|| {
-        matches!(mode(), 2 | 4)
+        matches!(mode(), 2 | 4 | 5)
             || std::env::var("VICTORY_HEAP_CAP_LOG").is_ok_and(|v| v.trim() == "1")
     })
 }
@@ -114,6 +123,17 @@ pub(super) fn extra_slots(null: u32, dynamic: u32) -> u32 {
     } else {
         dynamic
     }
+}
+
+/// (`=5`) The host slot of the fault buffer's raw UAV on a heap whose last
+/// slot is `null`: the one before it, the last dynamic slot.
+pub(crate) fn fault_slot_of(null: u32) -> u32 {
+    null - 1
+}
+
+/// (`=5`) Dynamic slots kept past the packed ones on a capped heap.
+pub(crate) fn dynamic_kept() -> u32 {
+    dynamic_keep(victory_shader::emit::view_heap_limit())
 }
 
 /// The host's title null slot (where a capped heap's title slots end and
@@ -166,6 +186,12 @@ pub(crate) fn tell_translator(null: u32) {
         victory_shader::emit::set_title_view_limit(0);
         victory_shader::emit::set_title_remap_len(0);
         victory_shader::emit::set_title_remap_full(slot.is_some());
+        let fault = if demand_on() && slot.is_some() {
+            fault_slot_of(null)
+        } else {
+            0
+        };
+        victory_shader::emit::set_title_fault_slot(fault);
         if let Some(slot) = slot {
             tracing::info!(
                 identity = slot,
@@ -218,16 +244,25 @@ pub(super) fn reserve(
     if sampler {
         return 0;
     }
+    // (`=5`) every view heap's fault slot is ours: never a per-draw table's
+    let mut fault = 0;
+    if demand_on() {
+        let slot = fault_slot_of(victory_shader::emit::view_heap_limit());
+        if let Some(k) = slot.checked_sub(first_dynamic).filter(|&k| k < dynamic) {
+            taken.set_taken(k as usize, 1);
+            fault = 1;
+        }
+    }
     let title_null = title_null();
     // (`=4`) only the heap whose own slots end at the identity limit packs
     if full_on() && first_dynamic != title_null {
-        return 0;
+        return fault;
     }
     let Some(at) = reserved_of(title_null, first_dynamic, dynamic) else {
-        return 0;
+        return fault;
     };
     let n = if full_on() {
-        dynamic.saturating_sub(at + dynamic_keep(title_null + dynamic)).max(1)
+        1 + super::heap_remap::packed_full(at, dynamic, dynamic_kept())
     } else if remap_on() {
         1 + super::heap_remap::compact_of(super::heap_remap::compact_slots(), at, dynamic)
     } else {
@@ -242,7 +277,7 @@ pub(super) fn reserve(
         reserved = n,
         "heap cap: host view slot {title_null} kept null; title slots {first_dynamic} and up have no host slot"
     );
-    n
+    n + fault
 }
 
 /// The root SRV of the `=3` remap table for a list drawing with `host`'s
@@ -588,7 +623,8 @@ mod tests {
         assert_eq!(parse(Some(" 2 ")), 2);
         assert_eq!(parse(Some("3")), 3);
         assert_eq!(parse(Some("4")), 4);
-        assert_eq!(parse(Some("9")), 4);
+        assert_eq!(parse(Some("5")), 5);
+        assert_eq!(parse(Some("9")), 5);
     }
 
     #[test]
