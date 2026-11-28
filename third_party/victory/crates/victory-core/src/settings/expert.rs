@@ -173,6 +173,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_HDR_SCRUB", Apply::Restart),
     ("VICTORY_HEAD_MAP_WAIT", Apply::Restart),
     ("VICTORY_HEAP_CAP_COMPACT", Apply::Restart),
+    ("VICTORY_HEAP_CAP_DYNAMIC", Apply::Restart),
+    ("VICTORY_HEAP_CAP_IDENTITY", Apply::Restart),
     ("VICTORY_HEAP_CAP_LOG", Apply::Restart),
     ("VICTORY_HEAP_EARLY_ROUNDS", Apply::Restart),
     ("VICTORY_HEAP_FIND", Apply::Live),

@@ -55,6 +55,19 @@ pub(crate) const RECHECK_BUDGET: usize = 256;
 /// Time and staged bytes a [`ready_pass`] spends at most.
 const READY_SPAN: std::time::Duration = std::time::Duration::from_millis(3);
 const READY_BYTES: u64 = 64 << 20;
+/// Made views waiting past which a [`ready_pass`] catches up: 4,096 views,
+/// 8 ms and 192 MB a pass (`heap_textures` takes 192 MB a frame too).
+const CATCH_UP: usize = 4096;
+
+/// Views, time and bytes a [`ready_pass`] spends with `backlog` made views
+/// waiting.
+pub(crate) fn ready_budget(backlog: usize) -> (usize, std::time::Duration, u64) {
+    if backlog > CATCH_UP {
+        (CATCH_UP, std::time::Duration::from_millis(8), 192 << 20)
+    } else {
+        (READY_BUDGET, READY_SPAN, READY_BYTES)
+    }
+}
 
 /// Host slots packed title views get (`VICTORY_HEAP_CAP_COMPACT`, 0 to
 /// 131,072; default 65,536), taken from the dynamic slots.
@@ -143,6 +156,15 @@ pub(crate) struct Packed {
     seeded: bool,
     last_rescan: u64,
     pub counts: Counts,
+    /// Table entry `k` names title slot `entry_base + k`, `entry_len` of
+    /// them and a last one, null; the table's first dword (0: none).
+    entry_base: u32,
+    entry_len: u32,
+    table: usize,
+    /// Packed slots (index, make) made since, and those whose make found no
+    /// host resource: to ready and show, or to make again.
+    made_queue: VecDeque<(u32, u64)>,
+    failed_queue: VecDeque<(u32, u64)>,
 }
 
 /// Since the last line.
@@ -181,6 +203,24 @@ impl Packed {
             seeded: false,
             last_rescan: 0,
             counts: Counts::default(),
+            entry_base: title_null,
+            entry_len: victory_shader::emit::REMAP_LEN,
+            table: 0,
+            made_queue: VecDeque::new(),
+            failed_queue: VecDeque::new(),
+        }
+    }
+
+    /// Its table: entry `k` names title slot `base + k`, `len` of them.
+    pub(crate) fn with_table(mut self, table: usize, base: u32, len: u32) -> Self {
+        (self.table, self.entry_base, self.entry_len) = (table, base, len);
+        self
+    }
+
+    /// Points table entry `entry` at host slot `value`.
+    fn put(&self, entry: u32, value: u32) {
+        if self.table != 0 {
+            put(self.table as *mut u32, self.entry_len, entry, value);
         }
     }
 
@@ -200,8 +240,8 @@ impl Packed {
 
     /// The table entry of title slot `slot`, if the table covers it.
     pub(crate) fn entry(&self, slot: u32) -> Option<u32> {
-        slot.checked_sub(self.title_null)
-            .filter(|&k| k < victory_shader::emit::REMAP_LEN)
+        slot.checked_sub(self.entry_base)
+            .filter(|&k| k < self.entry_len)
     }
 
     fn owner_at(&mut self, at: u32) -> Option<&mut Owner> {
@@ -280,6 +320,14 @@ impl Packed {
             }
             _ => false,
         };
+        if current {
+            let k = at - self.base;
+            if ok {
+                self.made_queue.push_back((k, generation));
+            } else {
+                self.failed_queue.push_back((k, generation));
+            }
+        }
         if !current {
             self.counts.stale += 1;
         } else if ok {
@@ -291,7 +339,7 @@ impl Packed {
     }
 
     fn due(&self, k: usize, stage: Stage) -> Option<Due> {
-        let o = self.owner[k].as_ref().filter(|o| o.stage == stage)?;
+        let o = self.owner.get(k)?.as_ref().filter(|o| o.stage == stage)?;
         Some(Due {
             at: self.base + k as u32,
             title: o.title,
@@ -300,20 +348,40 @@ impl Packed {
         })
     }
 
-    /// Made views to ready, at most `most`.
-    pub(crate) fn take_made(&self, most: usize) -> Vec<Due> {
-        (0..self.owner.len())
-            .filter_map(|k| self.due(k, Stage::Made))
-            .take(most)
-            .collect()
+    /// Made views to ready, at most `most`, oldest first; those not readied
+    /// go back with [`Packed::untake`].
+    pub(crate) fn take_made(&mut self, most: usize) -> Vec<Due> {
+        let mut out = Vec::new();
+        while out.len() < most
+            && let Some((k, generation)) = self.made_queue.pop_front()
+        {
+            out.extend(
+                self.due(k as usize, Stage::Made)
+                    .filter(|d| d.generation == generation),
+            );
+        }
+        out
+    }
+
+    /// Made views [`Packed::take_made`] gave that were not readied: first
+    /// again next time.
+    pub(crate) fn untake(&mut self, dues: &[Due]) {
+        for d in dues.iter().rev() {
+            self.made_queue.push_front((d.at - self.base, d.generation));
+        }
+    }
+
+    /// Made views waiting to be readied (some may be stale).
+    pub(crate) fn made_backlog(&self) -> usize {
+        self.made_queue.len()
     }
 
     /// Shown views to ready again, `most` of them from where the last look
-    /// ended, in turn.
+    /// ended, in turn (looking at no more than 64 slots for each).
     pub(crate) fn take_shown(&mut self, most: usize) -> Vec<Due> {
         let n = self.owner.len();
         let mut out = Vec::new();
-        for _ in 0..n {
+        for _ in 0..n.min(most.saturating_mul(64)) {
             if out.len() >= most {
                 break;
             }
@@ -337,15 +405,20 @@ impl Packed {
         Some(entry)
     }
 
-    /// Title slots whose make found no host resource, at most `most`.
-    fn failed(&self, most: usize) -> Vec<u32> {
-        self.owner
-            .iter()
-            .flatten()
-            .filter(|o| o.stage == Stage::Failed)
-            .map(|o| o.title)
-            .take(most)
-            .collect()
+    /// Title slots whose make found no host resource, at most `most`,
+    /// oldest first.
+    fn failed(&mut self, most: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        while out.len() < most
+            && let Some((k, generation)) = self.failed_queue.pop_front()
+        {
+            out.extend(
+                self.due(k as usize, Stage::Failed)
+                    .filter(|d| d.generation == generation)
+                    .map(|d| d.title),
+            );
+        }
+        out
     }
 }
 
@@ -365,15 +438,66 @@ pub(crate) fn dirty(lo: u32, hi: u32) {
     }
 }
 
-/// The table entries of `host`'s strides buffer: `REMAP_LEN + 1` dwords.
+/// The `=3` table entries of `host`'s strides buffer: `REMAP_LEN + 1` dwords.
 fn table(host: &super::HostHeap) -> Option<*mut u32> {
     let (_, _, data) = host.strides.as_ref()?;
     // SAFETY: the buffer is SLOT_STRIDES_COUNT dwords; REMAP_BASE + REMAP_LEN + 1 of them.
     Some(unsafe { (*data as *mut u32).add(victory_shader::emit::REMAP_BASE as usize) })
 }
 
-fn put(table: *mut u32, entry: u32, value: u32) {
-    if entry <= victory_shader::emit::REMAP_LEN {
+/// (`=4`) The whole-heap tables, by host heap: the buffer (held for the
+/// lists that bind it) and its GPU address; its mapping
+/// (`victory_shader::emit::FULL_REMAP` dwords) is the packed state's.
+struct FullTable {
+    id: u64,
+    buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    gpu: u64,
+}
+
+// SAFETY: a buffer and its mapping, written under the state's locks or once at birth.
+unsafe impl Send for FullTable {}
+
+static FULL_TABLES: Mutex<Vec<FullTable>> = Mutex::new(Vec::new());
+
+/// A whole-heap table for `host`: dword `i` the host slot of title view
+/// slot `i`: its own below `own` (all below `null` when `own` is 0), else
+/// `title_null`; the last dword `title_null`.
+fn full_table(host: &super::HostHeap, own: u32, title_null: u32, null: u32) -> Option<usize> {
+    let gpu_host = crate::host::host()?;
+    let dwords = victory_shader::emit::FULL_REMAP;
+    let (buffer, data) = gpu_host.upload_buffer(u64::from(dwords) * 4)?;
+    crate::host::name(&buffer, || "heap cap: title view slot to host slot".to_owned());
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let table = data.cast::<u32>();
+    for i in 0..dwords {
+        let slot = if own == 0 {
+            i.min(null)
+        } else if i < own {
+            i
+        } else {
+            title_null
+        };
+        // SAFETY: inside the fresh mapping of `dwords` dwords.
+        unsafe { table.add(i as usize).write(slot) };
+    }
+    // SAFETY: as above.
+    unsafe { table.add(dwords as usize - 1).write(if own == 0 { null } else { title_null }) };
+    let mut tables = FULL_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    // the newest heaps (the title makes a few); a list binding an older one holds it
+    if tables.len() >= 16 {
+        tables.remove(0);
+    }
+    tables.push(FullTable {
+        id: host.id,
+        buffer,
+        gpu,
+    });
+    Some(table as usize)
+}
+
+fn put(table: *mut u32, len: u32, entry: u32, value: u32) {
+    if entry <= len {
         // SAFETY: inside the mapping; shaders read it while we write (a
         // dword, either value is one the entry had).
         unsafe { table.add(entry as usize).write_volatile(value) };
@@ -533,35 +657,59 @@ fn take_done(packed: &mut Packed, host: &super::HostHeap) {
     }
 }
 
-/// A new view heap (`HostHeap::new`): with the switch, its table starts all
-/// null and its packed slots free.
+/// A new view heap (`HostHeap::new`): with the switch, its table starts
+/// with no packed view (`=3`: every entry null; `=4`: the host's own slots
+/// their own, the rest null) and its packed slots free.
 pub(super) fn born(host: &super::HostHeap) {
     if !super::heap_cap::remap_on() || host.sampler {
         return;
     }
-    let title_null = victory_shader::emit::title_view_limit();
+    let title_null = super::heap_cap::title_null();
     if title_null == 0 {
         return;
     }
-    let Some(table) = table(host) else {
-        tracing::warn!(
-            "heap cap: no strides buffer; title view slots past the host heap read null"
-        );
+    let full = super::heap_cap::full_on();
+    // the heap whose own slots end at the title null slot packs; others only get a table
+    let packs = !full || host.count == title_null;
+    let reserved = super::heap_cap::reserved_of(title_null, host.count, host.dynamic)
+        .filter(|_| packs);
+    let table = if full {
+        let null = victory_shader::emit::view_heap_limit();
+        let own = if reserved.is_some() { title_null } else { 0 };
+        full_table(host, own, title_null, null)
+    } else {
+        table(host).map(|table| {
+            // a zero entry would read slot 0
+            for entry in 0..=victory_shader::emit::REMAP_LEN {
+                put(table, victory_shader::emit::REMAP_LEN, entry, title_null);
+            }
+            table as usize
+        })
+    };
+    let Some(table) = table else {
+        tracing::warn!("heap cap: no remap table; title view indices read null or their own slot");
         return;
     };
-    // Every heap's table, packed or not: a zero entry would read slot 0.
-    for entry in 0..=victory_shader::emit::REMAP_LEN {
-        put(table, entry, title_null);
-    }
-    let Some(at) = super::heap_cap::reserved_of(title_null, host.count, host.dynamic) else {
+    let Some(at) = reserved else {
         return;
     };
-    let cap = compact_of(compact_slots(), at, host.dynamic);
+    let cap = if full {
+        // what `heap_cap::reserve` kept past the null slot: the dynamic slots not free
+        host.dynamic.saturating_sub(at + 1 + host.free.load(Relaxed))
+    } else {
+        compact_of(compact_slots(), at, host.dynamic)
+    };
+    let (base, len) = if full {
+        (0, victory_shader::emit::FULL_REMAP - 1)
+    } else {
+        (title_null, victory_shader::emit::REMAP_LEN)
+    };
     tracing::info!(
         title_null,
         packed_first = title_null + 1,
         packed = cap,
         dynamic_left = host.dynamic - cap - 1,
+        whole_heap_table = full,
         "heap cap: title view slots past the host heap get packed host slots {} to {}",
         title_null + 1,
         title_null + 1 + cap
@@ -571,14 +719,22 @@ pub(super) fn born(host: &super::HostHeap) {
     if state.len() >= 4 {
         state.remove(0);
     }
-    state.push(Packed::new(host.id, title_null, cap));
+    state.push(Packed::new(host.id, title_null, cap).with_table(table, base, len));
 }
 
 /// The root SRV of the remap table for a list that draws with `host`'s
 /// heap (`draw.rs`, `SLOT_REMAP`).
 pub(crate) fn root(list: &crate::host::HostList, host: &super::HostHeap) -> Option<u64> {
-    let gpu = host.strides_gpu()?;
     const ONCE: usize = usize::MAX - 0x5f;
+    if super::heap_cap::full_on() {
+        let tables = FULL_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let table = tables.iter().find(|t| t.id == host.id)?;
+        if list.first_use(ONCE) {
+            list.keep(&table.buffer);
+        }
+        return Some(table.gpu);
+    }
+    let gpu = host.strides_gpu()?;
     if list.first_use(ONCE)
         && let Some(buffer) = host.strides_buffer()
     {
@@ -598,14 +754,9 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
     let Some(packed) = guard.iter_mut().find(|p| p.id == host.id) else {
         return;
     };
-    let Some(table) = table(host) else { return };
     take_done(packed, host);
     let frame = crate::frame::current();
-    let end = title.min(
-        packed
-            .title_null
-            .saturating_add(victory_shader::emit::REMAP_LEN),
-    );
+    let end = title.min(packed.entry_base.saturating_add(packed.entry_len));
     if packed.title_null >= end {
         return;
     }
@@ -675,7 +826,7 @@ pub(super) fn refresh(start: u64, step: u64, host: &super::HostHeap, title: u32)
                     Placed::Same | Placed::Overflow | Placed::Nothing => continue,
                 };
             // Off the table first: shown again once made and readied.
-            put(table, entry, packed.title_null);
+            packed.put(entry, packed.title_null);
             send(Op {
                 heap: host.heap.clone(),
                 id: host.id,
@@ -697,28 +848,35 @@ pub(crate) fn ready_pass(host: &super::HostHeap, mut ready: impl FnMut(&View) ->
         return;
     }
     let started = std::time::Instant::now();
-    let (made, shown) = {
+    let (made, shown, budget) = {
         let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(packed) = guard.iter_mut().find(|p| p.id == host.id) else {
             return;
         };
+        let budget = ready_budget(packed.made_backlog());
         (
-            packed.take_made(READY_BUDGET),
+            packed.take_made(budget.0),
             packed.take_shown(RECHECK_BUDGET),
+            budget,
         )
     };
     if made.is_empty() && shown.is_empty() {
         return;
     }
-    let Some(table) = table(host) else { return };
     let (mut bytes, mut readied, mut rechecked) = (0u64, Vec::new(), 0u64);
-    for (due, again) in made
+    let mut left = made.len();
+    for (n, (due, again)) in made
         .iter()
         .map(|d| (d, false))
         .chain(shown.iter().map(|d| (d, true)))
+        .enumerate()
     {
-        if started.elapsed() >= READY_SPAN || bytes >= READY_BYTES {
+        if started.elapsed() >= budget.1 || bytes >= budget.2 {
+            left = n.min(made.len());
             break;
+        }
+        if !again {
+            left = made.len() - n - 1;
         }
         // a view let go since: the next look at its slot drops it
         let Some(view) = super::super::view_at(due.key[1], due.key[2]) else {
@@ -735,9 +893,11 @@ pub(crate) fn ready_pass(host: &super::HostHeap, mut ready: impl FnMut(&View) ->
     let Some(packed) = guard.iter_mut().find(|p| p.id == host.id) else {
         return;
     };
+    // not reached in time: first next time
+    packed.untake(&made[made.len() - left..]);
     for due in &readied {
         if let Some(entry) = packed.show(due) {
-            put(table, entry, due.at);
+            packed.put(entry, due.at);
         }
     }
     packed.counts.readied += readied.len() as u64;
@@ -992,6 +1152,58 @@ mod tests {
         let next: Vec<u32> = p.take_shown(3).iter().map(|d| d.title).collect();
         assert_eq!(first, [NULL_SLOT, NULL_SLOT + 1, NULL_SLOT + 2]);
         assert_eq!(next, [NULL_SLOT + 3, NULL_SLOT + 4, NULL_SLOT]);
+    }
+
+    #[test]
+    fn the_whole_heap_table_names_every_title_slot_and_starts_identity_then_null() {
+        // (`=4`) entries from title slot 0
+        let full = victory_shader::emit::FULL_REMAP;
+        let p = Packed::new(1, 500_000, 8).with_table(0, 0, full - 1);
+        assert_eq!(p.entry(5), Some(5));
+        assert_eq!(p.entry(500_000), Some(500_000));
+        assert_eq!(p.entry(1_245_183), Some(1_245_183));
+        assert_eq!(p.entry(full - 1), None);
+        // the table a heap starts with: its own slots their own, the rest null
+        let Some(heap) = super::super::HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let null = 999_999;
+        let check = |own: u32, title_null: u32, want: &dyn Fn(u32) -> u32| {
+            let table = full_table(&heap, own, title_null, null).expect("a table") as *const u32;
+            for i in [0, 1, 7, 8, 499_999, 500_000, 999_999, 1_000_000, 1_245_183, full - 2, full - 1] {
+                // SAFETY: inside the table's mapping.
+                let got = unsafe { table.add(i as usize).read() };
+                assert_eq!(got, want(i), "title slot {i}");
+            }
+        };
+        check(500_000, 500_000, &|i| if i < 500_000 && i != full - 1 { i } else { 500_000 });
+        // a heap that does not pack: as before the table, its index up to the null slot
+        check(0, 500_000, &|i| if i == full - 1 { null } else { i.min(null) });
+    }
+
+    #[test]
+    fn made_views_are_readied_oldest_first_and_those_not_reached_come_first_again() {
+        let mut p = Packed::new(1, NULL_SLOT, 8);
+        for s in 0..4 {
+            let (at, generation) = make_at(p.place(NULL_SLOT + s, Some([1, s, 1]), false, 0));
+            assert!(p.made(at, generation, true));
+        }
+        let got = p.take_made(3);
+        assert_eq!(got.iter().map(|d| d.title - NULL_SLOT).collect::<Vec<_>>(), [0, 1, 2]);
+        // only the first was readied in time
+        p.untake(&got[1..]);
+        assert!(p.show(&got[0]).is_some());
+        assert_eq!(p.made_backlog(), 3);
+        let next = p.take_made(10);
+        assert_eq!(next.iter().map(|d| d.title - NULL_SLOT).collect::<Vec<_>>(), [1, 2, 3]);
+        // a remake since makes the queued one stale: not given
+        let (at, generation) = make_at(p.place(NULL_SLOT + 1, Some([1, 9, 1]), false, 1));
+        p.untake(&next);
+        let again = p.take_made(10);
+        assert_eq!(again.iter().map(|d| d.title - NULL_SLOT).collect::<Vec<_>>(), [2, 3]);
+        assert!(p.made(at, generation, false));
+        assert_eq!(p.failed(10), [NULL_SLOT + 1]);
+        assert!(p.failed(10).is_empty(), "taken once");
     }
 
     #[test]

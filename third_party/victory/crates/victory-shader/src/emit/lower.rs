@@ -6666,6 +6666,16 @@ impl<'a> Lower<'a> {
     /// select: no branch on the common path.
     fn title_index(&mut self, index: V) -> V {
         let c = self.cur;
+        let i32t = self.s.t.i32;
+        // (`VICTORY_HEAP_CAP=4`) The whole heap through the table: one load, nothing else.
+        if super::shader::title_remap_full() {
+            let last = self.s.m.i32(super::shader::FULL_REMAP - 1);
+            let k = self
+                .s
+                .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            self.s.m.tag(k, Tag::Clamp);
+            return self.remap_entry(k);
+        }
         let limit = super::shader::title_view_limit();
         let len = super::shader::title_remap_len();
         if limit == 0 || len == 0 {
@@ -6674,11 +6684,18 @@ impl<'a> Lower<'a> {
         let base = self.s.m.i32(limit);
         let past = self.s.m.bin(c, Bin::Sub, index, base);
         let last = self.s.m.i32(len);
-        let i32t = self.s.t.i32;
         let k = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[past, last]);
         self.s.m.tag(k, Tag::Clamp);
+        let remapped = self.remap_entry(k);
+        let below = self.s.m.cmp(c, pred::IULT, index, base);
+        self.s.m.select(c, below, index, remapped)
+    }
+
+    /// (heapcap) Dword `k` of the remap table (`SLOT_REMAP`), in the current block.
+    fn remap_entry(&mut self, k: V) -> V {
+        let c = self.cur;
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, k, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_REMAP);
@@ -6694,9 +6711,7 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let remapped = self.as_int(f);
-        let below = self.s.m.cmp(c, pred::IULT, index, base);
-        self.s.m.select(c, below, index, remapped)
+        self.as_int(f)
     }
 
     /// The heap index of a descriptor that may differ between lanes,
