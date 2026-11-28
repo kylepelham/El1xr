@@ -9,8 +9,75 @@
 //!
 //! Ported from Peppacodes/playablegames-peppa (`cb412956cf`, originally
 //! fxceless/victory-fork PR #1146 by beamdotdev), GPL-3.0.
+//!
+//! (critpath #88) `VICTORY_RESET_ASIDE=1` (Live, off by default) does the
+//! same and, with it, resets each landed list's prelude ahead
+//! (`crate::host::run_wait::reset_ahead`, as `VICTORY_PRELUDE_AHEAD`): both
+//! resets leave the submitting thread. `VICTORY_PRELUDE_AHEAD` alone only
+//! moved the prelude resets from `run_other` to this landing, which ran on the
+//! submitting thread after each submission (b5g: run_other -1.1 ms, the frame
+//! unmoved). Only settled flights land (their fence was reached), and a
+//! landed list is reached by nothing else until it is back in the pool, so
+//! the thread that lands it does not matter. The landing is timed either way
+//! (the line `landed lists reset per frame`).
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::Instant;
+
+static RESET_ASIDE: victory_core::settings::Live =
+    victory_core::settings::Live::flag("VICTORY_RESET_ASIDE");
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: `VICTORY_RESET_ASIDE` for calls made on this thread.
+    pub(crate) static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_RESET_ASIDE`: landed lists and their preludes are reset on
+/// `victory-land-aside`.
+pub(crate) fn reset_aside_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FORCED.with(std::cell::Cell::get) {
+        return on;
+    }
+    RESET_ASIDE.get_bool()
+}
+
+/// Since the last line: landings, lists landed and nanoseconds, on the
+/// submitting thread (inline) and on `victory-land-aside`.
+const INLINE: usize = 0;
+const ASIDE: usize = 3;
+static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// One landing by `land` (it returns the lists landed), counted at `at`.
+fn timed(at: usize, land: impl FnOnce() -> usize) {
+    let started = Instant::now();
+    let lists = land();
+    if lists == 0 {
+        return;
+    }
+    COUNTS[at].fetch_add(1, Relaxed);
+    COUNTS[at + 1].fetch_add(lists as u64, Relaxed);
+    COUNTS[at + 2].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// The frame line's, in both settings.
+pub(crate) fn line(frames: f64) {
+    let c: Vec<f64> = COUNTS.iter().map(|c| c.swap(0, Relaxed) as f64).collect();
+    tracing::info!(
+        "landed lists reset per frame: {:.1} lists in {:.1} landings on the submitting thread {:.2} ms, {:.1} lists in \
+         {:.1} landings on victory-land-aside {:.2} ms (VICTORY_RESET_ASIDE={}, VICTORY_LAND_ASIDE={})",
+        c[INLINE + 1] / frames,
+        c[INLINE] / frames,
+        c[INLINE + 2] / 1e6 / frames,
+        c[ASIDE + 1] / frames,
+        c[ASIDE] / frames,
+        c[ASIDE + 2] / 1e6 / frames,
+        u8::from(reset_aside_on()),
+        u8::from(wanted()),
+    );
+}
 
 /// Parses `VICTORY_LAND_ASIDE`: opt-in on `"1"`, off otherwise.
 fn parse_switch(value: Option<&str>) -> bool {
@@ -67,18 +134,25 @@ impl AsideWorker {
 }
 
 /// Calls [`crate::host::land`] at the end of a submission: offloaded to
-/// `victory-land-aside` when `VICTORY_LAND_ASIDE=1`, inline otherwise.
+/// `victory-land-aside` when `VICTORY_LAND_ASIDE=1` or
+/// `VICTORY_RESET_ASIDE=1`, inline otherwise.
 pub(crate) fn after_submission() {
-    static ASIDE: OnceLock<Option<AsideWorker>> = OnceLock::new();
-    if wanted() {
-        let aside = ASIDE.get_or_init(|| AsideWorker::spawn("victory-land-aside", crate::host::land));
-        if let Some(worker) = aside
+    static WORKER: OnceLock<Option<AsideWorker>> = OnceLock::new();
+    route(wanted() || reset_aside_on(), &WORKER, crate::host::land);
+}
+
+/// One landing by `land`: triggered on the worker in `worker` (spawned the
+/// first time) when `aside`, inline otherwise or if there is no worker.
+fn route(aside: bool, worker: &OnceLock<Option<AsideWorker>>, land: fn() -> usize) {
+    if aside {
+        let worker = worker.get_or_init(|| AsideWorker::spawn("victory-land-aside", move || timed(ASIDE, land)));
+        if let Some(worker) = worker
             && worker.trigger()
         {
             return;
         }
     }
-    crate::host::land();
+    timed(INLINE, land);
 }
 
 #[cfg(test)]
@@ -148,5 +222,38 @@ mod tests {
             Some(caller),
             "aside worker must run on a separate thread"
         );
+    }
+
+    static LANDED_ON: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+
+    fn land_here() -> usize {
+        LANDED_ON.lock().unwrap().push(std::thread::current().id());
+        3
+    }
+
+    fn landings() -> Vec<ThreadId> {
+        LANDED_ON.lock().unwrap().clone()
+    }
+
+    /// (critpath #88) `VICTORY_RESET_ASIDE`: off, the landing runs on the
+    /// submitting thread before `after_submission` returns and no worker is
+    /// made; on, on the worker; off again, inline again.
+    #[test]
+    fn route_lands_inline_when_off_and_on_the_worker_when_on() {
+        let caller = std::thread::current().id();
+        let worker = OnceLock::new();
+        route(false, &worker, land_here);
+        assert_eq!(landings(), [caller]);
+        assert!(worker.get().is_none(), "no worker while off");
+        route(true, &worker, land_here);
+        let started = std::time::Instant::now();
+        while landings().len() < 2 {
+            assert!(started.elapsed() < Duration::from_secs(5), "the worker landed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(landings()[1], caller, "landed on the worker");
+        route(false, &worker, land_here);
+        assert_eq!(landings().len(), 3);
+        assert_eq!(landings()[2], caller, "inline again once off");
     }
 }
