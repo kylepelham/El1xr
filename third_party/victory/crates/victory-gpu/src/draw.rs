@@ -3739,7 +3739,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::Role;
         // (foxhound) `VICTORY_AMBIENT_SPECULAR`: reflections (`miss_views`).
         if role == Role::Miss {
             return self.ambient_miss(list, p);
@@ -3748,98 +3748,8 @@ impl State {
         if role.holds_image() {
             return self.ambient_hold(list, p, role);
         }
-        let Some(t) = p.stages.first().map(|s| s.translated()) else {
-            return false;
-        };
-        let Some(heap) = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten()
-        else {
-            return false;
-        };
-        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            t.used.iter().find(|u| {
-                u.kind == kind
-                    && u.root == RootType::Table
-                    && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
-                return None;
-            };
-            let resource = match (
-                kind,
-                crate::descriptor::view(table + u64::from(offset) * 4)?,
-            ) {
-                (ResourceType::Srv, View::Shader(r, _))
-                | (ResourceType::Uav, View::Unordered(r, ..)) => r,
-                _ => return None,
-            };
-            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
-                Some(m) => m.1,
-                None => self.user_value(true, slot, RootType::Table, 0),
-            };
-            let host = crate::resource::host_resource(resource as This)?;
-            // SAFETY: a live resource.
-            let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
-        };
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
-            Role::Miss => crate::ambient::MISS_LIGHT,
-            Role::Reflect => crate::ambient_reflect::REFLECTIONS[0],
-            Role::Knee => crate::ambient_reflect::KNEE_IMAGE,
-        };
-        let Some((of, image)) = entry(ResourceType::Uav, at) else {
-            once!(
-                ?role,
-                "no stand-in for the indirect light: missing image UAV"
-            );
-            return false;
-        };
-        let depth = match role {
-            Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
-                    once!(
-                        ?role,
-                        "no stand-in for the indirect light: missing depth SRV"
-                    );
-                    return false;
-                };
-                if (seen.Width, seen.Height) != (of.Width, of.Height) {
-                    once!(
-                        ?role,
-                        "no stand-in for the indirect light: depth dimensions differ"
-                    );
-                    return false;
-                }
-                Some(depth)
-            }
-            Role::Radiance | Role::Air | Role::Miss | Role::Reflect | Role::Knee => None,
-        };
-        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
-        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || volume != (role == Role::Air) {
-            once!(
-                ?role,
-                format = of.Format.0,
-                "no stand-in for the indirect light: another image"
-            );
-            return false;
-        }
-        crate::ambient::after(
-            list,
-            role,
-            &Views {
-                image,
-                depth,
-                size: [of.Width as u32, of.Height],
-                slices: u32::from(of.DepthOrArraySize),
-                depth_size: [of.Width as u32, of.Height],
-            },
-        )
+        // `crate::ambient_places`: the resolve, the radiance cache, the air (`light_views`).
+        self.ambient_light(list, p, role)
     }
 
     /// Runs a dispatch on the host.
@@ -5899,6 +5809,8 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 
 #[cfg(all(test, windows))]
 mod indirect_signature_tests;
+
+mod light_views;
 
 mod miss_views;
 
