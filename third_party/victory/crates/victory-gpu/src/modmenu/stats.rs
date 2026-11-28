@@ -54,6 +54,29 @@ static WANTED_GET: AtomicU64 = AtomicU64::new(0);
 static GOD: AtomicBool = AtomicBool::new(false);
 static NEVER_WANTED: AtomicBool = AtomicBool::new(false);
 
+/// The found setters for the settings file ([`super::found`]): (hash, slots, float) and, for
+/// armour and wanted, the getter that read them back.
+pub fn health_found() -> Option<(u64, usize, bool)> {
+    HEALTH_SET.get()
+}
+pub fn armour_found() -> Option<(u64, usize, bool, u64)> {
+    ARMOUR_SET.get().map(|(h, n, f)| (h, n, f, ARMOUR_GET.load(Relaxed)))
+}
+pub fn wanted_found() -> Option<(u64, usize, bool, u64)> {
+    WANTED_SET.get().map(|(h, n, f)| (h, n, f, WANTED_GET.load(Relaxed)))
+}
+pub fn set_health_found(h: u64, n: usize, f: bool) {
+    HEALTH_SET.set(h, n, f);
+}
+pub fn set_armour_found(h: u64, n: usize, f: bool, getter: u64) {
+    ARMOUR_SET.set(h, n, f);
+    ARMOUR_GET.store(getter, Relaxed);
+}
+pub fn set_wanted_found(h: u64, n: usize, f: bool, getter: u64) {
+    WANTED_SET.set(h, n, f);
+    WANTED_GET.store(getter, Relaxed);
+}
+
 /// Argument slots for a setter: the target's slots, the value (as float bits when the setter
 /// reads a float), zeros up to `slots`.
 pub fn setter_args(target: &[u64], value: i32, slots: usize, float: bool) -> Vec<u64> {

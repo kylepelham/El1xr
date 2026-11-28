@@ -10,12 +10,13 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = crate::fetch_check::compare_source(CARD_COMPARE);
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -32,8 +33,10 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
+        // (El1xr) With `VICTORY_FETCH_CHECK` the hashes follow the results.
+        const _: () = assert!(RESULTS == crate::fetch_check::HASH_AT);
         let (differs, data) = self
-            .shared_buffer(RESULTS)
+            .shared_buffer(if crate::fetch_check::on() { 2 * RESULTS } else { RESULTS })
             .ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -220,7 +223,7 @@ impl Host {
     fn make_card_snap(&self) -> Option<CardSnap> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let source = format!("#define SNAP 1\n{CARD_COMPARE}");
+        let source = crate::fetch_check::compare_source(&format!("#define SNAP 1\n{CARD_COMPARE}"));
         let slots = snap_slots();
         let made = (|| -> windows::core::Result<CardSnap> {
             let mut code: Option<ID3DBlob> = None;
@@ -824,11 +827,24 @@ impl Host {
         let mut kept_total = 0u64;
         // (Neptune) The slots these plans' compares asked for.
         let mut handed = 0u32;
+        let check = crate::fetch_check::on();
+        // (El1xr) `VICTORY_FETCH_CHECK`: per piece, the hash of the last
+        // compare of it, and of the compare that kept it.
+        let mut latest_hash: std::collections::HashMap<(usize, u32), u32> = Default::default();
+        let mut kept_hash: std::collections::HashMap<(usize, u32), u32> = Default::default();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
+            let differs_at = differs;
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
+            // (El1xr) `VICTORY_FETCH_CHECK`: the hashes the compares stored
+            // behind their results, and the pieces found torn before.
+            // SAFETY: as `differs`; the buffer is twice as long with the check.
+            let hashes = check.then(|| unsafe {
+                std::slice::from_raw_parts((differs_at + crate::fetch_check::HASH_AT as usize) as *const u32, dwords)
+            });
+            let suspects = if check { crate::fetch_check::suspects() } else { Default::default() };
             // Per plan, the pieces to fetch; and for each piece the last
             // plan that flagged it, with the number of the slot its compare
             // kept it in, if it did.
@@ -851,7 +867,21 @@ impl Host {
                         } else {
                             1
                         };
-                        flags.push((copy, r.span.first + p, d != 0));
+                        let mut want = d != 0;
+                        if let Some(hashes) = hashes
+                            && r.compared
+                            && let Some(&h) = hashes.get((r.at + p) as usize)
+                        {
+                            latest_hash.insert((copy, r.span.first + p), h);
+                            if d >= 2 {
+                                kept_hash.insert((copy, r.span.first + p), h);
+                            }
+                            if !want && suspects.contains(&(r.shadow.id(), r.span.first + p)) {
+                                want = true;
+                                crate::fetch_check::fetched_as_suspect();
+                            }
+                        }
+                        flags.push((copy, r.span.first + p, want));
                         if let Some(base) = plan.snap
                             && r.compared
                             && d != 0
@@ -938,6 +968,21 @@ impl Host {
         }
         crate::shadow::lazy::filter_card_pieces(&mut pieces, &mut total);
         crate::shadow::lazy::filter_card_kept(&mut kept, &mut kept_total);
+        // (El1xr) `VICTORY_FETCH_CHECK`: each piece fetched whole, to be
+        // hashed; `pieces` and `kept` stay what is merged.
+        let wide = check.then(|| {
+            crate::fetch_check::widen(&mut pieces, &mut kept, |copy, piece, kept| {
+                if kept { &kept_hash } else { &latest_hash }.get(&(copy, piece)).copied()
+            })
+        });
+        let (copy_pieces, copy_kept) = match &wide {
+            Some(w) => {
+                total = w.live_total;
+                kept_total = w.kept_total;
+                (&w.live, &w.kept)
+            }
+            None => (&pieces, &kept),
+        };
         // (Neptune) With kept pieces about, the notes of the sends behind
         // the last flight landed stay: the flights in the air merge their
         // kept pieces with their own send numbers (`relay_own_queue`, 4).
@@ -999,7 +1044,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for (at, from, len) in
-                        crate::relay_runs::relay_kept_runs(&kept, crate::relay_runs::enabled())
+                        crate::relay_runs::relay_kept_runs(copy_kept, crate::relay_runs::enabled())
                     {
                         list.CopyBufferRegion(&buffer, at, snaps, from, len);
                     }
@@ -1042,7 +1087,7 @@ impl Host {
                     list.Reset(&allocator, None)?;
                     crate::gpucost::begin(&list, crate::gpucost::FETCH_RELAY);
                     for (shadow, lo, hi, at) in
-                        crate::relay_runs::relay_copy_runs(&pieces, crate::relay_runs::enabled())
+                        crate::relay_runs::relay_copy_runs(copy_pieces, crate::relay_runs::enabled())
                     {
                         list.CopyBufferRegion(
                             &buffer,
@@ -1089,6 +1134,9 @@ impl Host {
         if let Some((_, event, _)) = live_down {
             // SAFETY: this thread's event, set by its fence above.
             unsafe { WaitForSingleObject(event, INFINITE) };
+        }
+        if let Some(w) = &wide {
+            crate::fetch_check::verify(&w.checks, live_down.map(|d| d.0), kept_down.map(|d| d.0));
         }
         // This fetch may bring bytes of flights in the air now: their own
         // slots are older than what it puts in the CPU's side there

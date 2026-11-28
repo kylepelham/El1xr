@@ -28,10 +28,24 @@
 //! - `VICTORY_COMPUTE_QUAD_LOD=1`: a compute program's implicit-level samples take their
 //!   gradients from the console's lane quads, not level 0 (`quad_lod.rs`). Source:
 //!   hello3928/Project-VI `653b1197`, `78bcfdc3` (Marvisak/VIctory PR #2999).
+//! - `VICTORY_FIXED_TRIPS=1`: a loop whose trip count the code fixes (a constant counter, one
+//!   step, one exit) runs to its end instead of being cut at the stage's loop limit
+//!   (`trips.rs`). Source: DexNom/VIctory PR #137 (11run11).
+//! - `VICTORY_WREXEC_SCC=1`: the SCC that the `s_andn2_wrexec` closing a waterfall loop writes
+//!   is false after the loop (it is left only with no lane), instead of the program being
+//!   refused for a lane mask read as data (`sop.rs`). Source: Marvisak/VIctory PR #3016.
+//! - `VICTORY_U32_CLAMP=1`: unsigned VOP3 add/sub (`_nc`, `_co`, `_co_ci`, `v_add3_u32`) honour
+//!   their clamp bit: the vector result saturates at 0 or `u32::MAX`, the carry out is the
+//!   unclamped one (`valu.rs`); refused before. Source: LooperSalty/AnyXboxX `ca0c86b9d2`
+//!   (Mauro Alvarez), from Marvisak/VIctory PR #1398.
+//! - `VICTORY_MASK_MOVES=1`: a wave64 mask pair restored one dword at a time through `s_mov_b32`
+//!   copies (as the spill pass writes a pair parked in VGPR lanes) is still the mask it was
+//!   copied from, when both words come from that mask in their order (`structure.rs`). Source:
+//!   jzvgrow-dot/Victory-4080Super `4eea7337d8`, from DexNom/VIctory `76749ce58d`.
 
 use std::sync::OnceLock;
 
-const COUNT: usize = 8;
+const COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Fix {
@@ -43,6 +57,10 @@ pub(crate) enum Fix {
     TbufferD16,
     NormNearest,
     ComputeQuadLod,
+    FixedTrips,
+    WrexecScc,
+    U32Clamp,
+    MaskMoves,
 }
 
 impl Fix {
@@ -56,6 +74,10 @@ impl Fix {
             Fix::TbufferD16 => "VICTORY_TBUFFER_D16",
             Fix::NormNearest => "VICTORY_NORM_NEAREST",
             Fix::ComputeQuadLod => "VICTORY_COMPUTE_QUAD_LOD",
+            Fix::FixedTrips => "VICTORY_FIXED_TRIPS",
+            Fix::WrexecScc => "VICTORY_WREXEC_SCC",
+            Fix::U32Clamp => "VICTORY_U32_CLAMP",
+            Fix::MaskMoves => "VICTORY_MASK_MOVES",
         }
     }
 

@@ -130,9 +130,11 @@ impl Lower<'_> {
                 _ => None,
             })
             .collect();
-        let last = self.loop_cap().saturating_sub(1);
+        let cap = self.loop_cap();
         let mut cond = cond;
         for (h, by_taken) in left {
+            let trips = self.trips.get(&h).copied();
+            let last = super::trips::counted_limit(cap, super::super::loop_limit(), trips).saturating_sub(1);
             let phi = self.counters[&h].0;
             let c = self.cur;
             let limit = self.s.m.i32(last);

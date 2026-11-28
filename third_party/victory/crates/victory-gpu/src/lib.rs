@@ -152,6 +152,8 @@ mod pacing;
 #[cfg(windows)]
 mod pixels;
 #[cfg(windows)]
+mod fetch_check;
+#[cfg(windows)]
 mod relay_runs;
 #[cfg(windows)]
 mod screenshot;
@@ -253,6 +255,8 @@ mod zero_fill;
 mod shadow_idle;
 #[cfg(windows)]
 mod face_watch;
+#[cfg(windows)]
+mod exposure_watch;
 #[cfg(windows)]
 mod target_reuse;
 #[cfg(windows)]
