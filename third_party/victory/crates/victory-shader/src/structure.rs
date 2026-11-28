@@ -1016,6 +1016,21 @@ impl<'a> Lanes<'a> {
         Some((lo, hi))
     }
 
+    /// The value `value` is an `s_mov_b32` copy (of a copy...) of.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
+    }
+
     fn born(&self, v: Value) -> usize {
         match (self.defs.get(&v), self.phis.get(&v)) {
             (Some(&(b, _)), _) | (_, Some(&(b, _))) => self.index[b],
@@ -1038,6 +1053,18 @@ impl<'a> Lanes<'a> {
         }
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
+        }
+        // `VICTORY_MASK_MOVES=1`: a scalar pair parked in two VGPR lanes and restored one dword
+        // at a time (the spill pass makes these scalar moves) is the mask it came from, when
+        // both words still come from that known mask in their order.
+        if self.p.wave64 && crate::emit::isa_fixes::Fix::MaskMoves.on() {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
         }
         let p = self.p;
         let (m, derived) = match self.join(k) {
@@ -1651,6 +1678,40 @@ mod tests {
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 256).unwrap()
+    }
+
+    /// `VICTORY_MASK_MOVES=1`: a wave64 mask restored through split `s_mov_b32` copies across a
+    /// branch is the compare's mask when both words come from it in order (off: not).
+    /// (jzvgrow-dot/Victory-4080Super `4eea7337d8`, DexNom/VIctory `76749ce58d`.)
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        use crate::emit::isa_fixes::{Fix, set_for_test};
+        for on in [true, false] {
+            set_for_test(Fix::MaskMoves, Some(on));
+            for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+                let p = build(
+                    &[
+                        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                        0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                        0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                        0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                        0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                        high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                        0xBE84_0302, // s_mov_b32 s4, s2
+                        0xBE85_0303, // s_mov_b32 s5, s3
+                        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                        0x7E02_0280, // v_mov_b32 v1, 0
+                        S_ENDPGM,
+                    ],
+                    true,
+                );
+                let s = structure(&p).unwrap();
+                let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+                let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+                assert_eq!(s.masks[&restored] == s.masks[&compare], intact && on, "on={on} high={high:#x}");
+            }
+            set_for_test(Fix::MaskMoves, None);
+        }
     }
 
     fn guarded(s: &Structured) -> usize {

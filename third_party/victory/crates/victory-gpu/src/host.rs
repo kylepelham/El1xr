@@ -697,6 +697,7 @@ fn card_clock_watch(clock: &'static CardClock) {
 fn card_clock_line(frames: f64, ms: f64) {
     crate::timeline::line(frames);
     crate::title_waits::line(frames);
+    ask_aside::line(frames);
     crate::merge_runs::line(frames);
     readcopy::frame_line(frames);
     sweep_aside::line(frames);
@@ -1009,7 +1010,7 @@ pub(crate) struct HostList {
     /// Whether this list bound a shader-visible descriptor heap (or recorded
     /// a draw/dispatch) since its last reset, so submitting it needs
     /// `descriptor::sync_heaps` and `make_waiting`.
-    uses_heaps: std::sync::atomic::AtomicBool,
+    pub(crate) uses_heaps: std::sync::atomic::AtomicBool,
     /// `VICTORY_HEAP_ROUND_SHARE`: the heap-sync ticket it needs a round
     /// from, stamped when the title gave it to a queue (0: none).
     pub(crate) heap_stamp: std::sync::atomic::AtomicU64,
@@ -2093,6 +2094,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
             }
 #endif
             differs.Store(out_at + group.x * 4u, flag);
+#ifdef HASH_AT
+            // (El1xr) `VICTORY_FETCH_CHECK`: the hash, for the landing to
+            // check what it fetches against (`crate::fetch_check`).
+            differs.Store(HASH_AT + out_at + group.x * 4u, all.x ^ (all.y * 3u) ^ (all.z * 5u) ^ (all.w * 7u));
+#endif
             // With the copy-back on its own thread: the next compare of the
             // piece finds what is written from here on.
             if (compare == 2u) hashes.Store4(piece * 16u, all);
@@ -4615,7 +4621,34 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
+        type StaleOut = Option<std::sync::Arc<stale_aside::Out>>;
+        let mut aside_ask: Option<(ask_aside::Pending, Vec<(usize, usize)>, StaleOut)> = None;
+        if crate::watch::once() && ask_aside::on() {
+            let t_ask = std::time::Instant::now();
+            let ranges = ask::ranges(runs);
+            let given = (ranges.clone(), crate::watch::look_skip::taken());
+            // (`VICTORY_STALE_ASIDE`) The check behind flights goes with it, after the asking.
+            let t_stale = std::time::Instant::now();
+            let check = (behind && stale_aside::on()).then(|| stale_aside::gather(runs)).flatten();
+            let out = check.as_ref().map(stale_aside::Check::out);
+            let stale_us = t_stale.elapsed().as_micros() as u64;
+            aside_ask = ask_aside::start(move || {
+                crate::watch::look_skip::handed(given.1);
+                crate::watch::ask_once(&given.0);
+                if let Some(check) = check {
+                    check.run();
+                }
+            })
+            .map(|pending| (pending, ranges, out));
+            PREP_PARTS[2].fetch_add(
+                (t_ask.elapsed().as_micros() as u64).saturating_sub(stale_us),
+                Ordering::Relaxed,
+            );
+            PREP_PARTS[3].fetch_add(stale_us, Ordering::Relaxed);
+        }
+        if aside_ask.is_some() {
+            // Joined at the gate in the walk below, with the check behind flights.
+        } else if crate::watch::once() {
             let t_ask = std::time::Instant::now();
             let ranges = ask::ranges(runs);
             crate::watch::ask_once(&ranges);
@@ -4657,11 +4690,13 @@ impl Host {
             |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>| {
                 for (list, textures) in pending.drain(..) {
                     let mut uploads = Vec::new();
+                    let claims = run_split::claims();
                     for upload in textures {
                         if let Some(first_upload) = upload.finish_refresh() {
                             uploads.push((upload, first_upload));
                         }
                     }
+                    drop(claims);
                     firsts.push(lists.len());
                     let _laps = run_split::prelude();
                     if let Some(prelude) = run_wait::prelude(|| list.prelude(&uploads)) {
@@ -4670,19 +4705,72 @@ impl Host {
                     lists.push(list.list.cast().ok());
                 }
             };
-        for list in runs {
-            if list.cbv_epoch() > 0 && !pending_preludes.is_empty() {
-                batch.flush_textures();
-                finalize_preludes(&mut pending_preludes);
+        // The gate's own time is on the line as ask_once and stale_flights, not run_other.
+        let mut gate_us = 0u64;
+        {
+            // (`VICTORY_ASK_ASIDE`) The asking joined, then the check behind flights as above.
+            let aside = aside_ask.is_some();
+            let mut pass = || {
+                let Some((pending, ranges, out)) = aside_ask.take() else {
+                    return false;
+                };
+                let t_gate = std::time::Instant::now();
+                pending.join();
+                let waited = t_gate.elapsed().as_micros() as u64;
+                let handed = out.is_some();
+                let checked = out.and_then(|out| out.result(waited));
+                let on_check = checked.map_or(0, |c| c.1);
+                PREP_PARTS[2].fetch_add(waited - on_check, Ordering::Relaxed);
+                PREP_PARTS[3].fetch_add(on_check, Ordering::Relaxed);
+                let mut is_stale = checked.is_some_and(|c| c.0);
+                if behind && checked.is_none() {
+                    if handed {
+                        stale_aside::at_gate();
+                    }
+                    let t_stale = std::time::Instant::now();
+                    is_stale = stale_under_flights(runs);
+                    PREP_PARTS[3].fetch_add(t_stale.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+                if is_stale {
+                    let settling = std::time::Instant::now();
+                    self.settle(&mut submitted, WHY_STALE);
+                    settled += settling.elapsed();
+                    let t_ask2 = std::time::Instant::now();
+                    crate::watch::ask_once(&ranges);
+                    PREP_PARTS[2].fetch_add(t_ask2.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+                gate_us += t_gate.elapsed().as_micros() as u64;
+                is_stale
+            };
+            let mut gate = if aside {
+                ask_aside::Gate::new(&mut pass)
+            } else {
+                ask_aside::Gate::open()
+            };
+            for list in runs {
+                if list.cbv_epoch() > 0 && !pending_preludes.is_empty() {
+                    if gate.pass(true) {
+                        batch.release_held();
+                    }
+                    batch.flush_textures();
+                    finalize_preludes(&mut pending_preludes);
+                }
+                let (list_wrote_heap, textures) =
+                    list.run_deferred(&mut batch, heap_rounds.asked(), &mut gate);
+                if list_wrote_heap {
+                    crate::round_share::list_wrote();
+                    heap_rounds.wrote();
+                }
+                pending_preludes.push((list, textures));
             }
-            let (list_wrote_heap, textures) = list.run_deferred(&mut batch, heap_rounds.asked());
-            if list_wrote_heap {
-                crate::round_share::list_wrote();
+            if gate.pass(false) {
+                batch.release_held();
+            }
+            if gate.settled {
                 heap_rounds.wrote();
             }
-            pending_preludes.push((list, textures));
         }
-        let def_us = t_def.elapsed().as_micros() as u64;
+        let def_us = (t_def.elapsed().as_micros() as u64).saturating_sub(gate_us);
         let flush_one_delta = PREP_PARTS[4]
             .load(Ordering::Relaxed)
             .saturating_sub(flush_one_before);
@@ -5664,7 +5752,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| run_split::made(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -6400,6 +6488,7 @@ impl HostList {
         &self,
         batch: &mut Batch,
         check_heap_writes: bool,
+        gate: &mut ask_aside::Gate<'_>,
     ) -> (bool, Vec<crate::texture::PreludeUpload>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -6411,6 +6500,9 @@ impl HostList {
             let (started, copied) = match step {
                 Step::CardCopy(.., cpu) if !cpu.load(Ordering::Relaxed) => continue,
                 Step::Copy(dst, src, len) | Step::CardCopy(dst, src, len, _) => {
+                    if gate.pass(true) {
+                        batch.release_held();
+                    }
                     let (dst, src, len) = (*dst, *src, *len);
                     let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
@@ -6461,6 +6553,9 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work, _) => {
+                    if gate.pass(true) {
+                        batch.release_held();
+                    }
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
@@ -6499,15 +6594,11 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        if crate::tex_check::parallel_refresh() && crate::tex_early::on() {
-                            let staging = upload.staging.clone();
-                            batch
-                                .early
-                                .start(move || crate::shadow::as_wide_job(|| staging.refresh()));
-                        } else if crate::tex_check::parallel_refresh() {
-                            batch.pending_textures.push(upload.staging.clone());
+                        if gate.pending() {
+                            ask_aside::held();
+                            batch.held.push(upload.staging.clone());
                         } else {
-                            upload.staging.refresh();
+                            batch.check_texture(upload.staging.clone());
                         }
                     }
                     textures.push(upload.clone());
@@ -6741,6 +6832,8 @@ struct Batch {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Due staging buffers deferred until the next title write or flush.
     pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// (`VICTORY_ASK_ASIDE`) Due staging buffers noted before the asking was joined.
+    held: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Due checks started at their step (`VICTORY_TEX_EARLY=1`), joined where
     /// `pending_textures` are run.
     early: crate::tex_early::Early,
@@ -6842,6 +6935,24 @@ impl Batch {
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
         flush::fills(started.elapsed().as_micros() as u64, total_bytes);
+    }
+
+    /// A due texture's check: started, queued or done, as the switches say.
+    fn check_texture(&mut self, staging: std::sync::Arc<crate::texture::Staging>) {
+        if crate::tex_check::parallel_refresh() && crate::tex_early::on() {
+            self.early.start(move || crate::shadow::as_wide_job(|| staging.refresh()));
+        } else if crate::tex_check::parallel_refresh() {
+            self.pending_textures.push(staging);
+        } else {
+            staging.refresh();
+        }
+    }
+
+    /// (`VICTORY_ASK_ASIDE`) The checks held until the asking was joined, in their order.
+    fn release_held(&mut self) {
+        for staging in std::mem::take(&mut self.held) {
+            self.check_texture(staging);
+        }
     }
 
     /// Refreshes any queued due textures side by side (`crate::tex_check`).
@@ -9276,6 +9387,11 @@ mod scoped_flush;
 mod run_wait;
 #[path = "host_ask.rs"]
 mod ask;
+/// (critpath #88) `VICTORY_ASK_ASIDE=1`: the submission's asking beside the walk of its lists.
+#[path = "host_ask_aside.rs"]
+mod ask_aside;
+#[path = "host_stale_aside.rs"]
+mod stale_aside;
 #[path = "host_pass_merge.rs"]
 mod pass_merge;
 #[path = "host_diff_wide.rs"]
