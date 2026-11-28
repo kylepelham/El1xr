@@ -57,6 +57,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_EXPOSURE_EARLY", "Makes the auto-exposure pipelines early, so the world is not black."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
+    ("VICTORY_FETCH_CHECK", "Relay fetches are hashed and fetched again if torn (black skin)."),
     ("VICTORY_FLUSH_BESIDE", "Runs end-of-submission refreshes while preludes are recorded."),
     ("VICTORY_FLUSH_ONE_PASS", "Runs a wide flush in one pass on helper threads, without barriers."),
     ("VICTORY_FLUSH_PASS_MERGE", "Runs a long refresh in the same flush pass as its copy's other steps."),

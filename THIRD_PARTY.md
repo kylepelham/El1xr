@@ -101,6 +101,7 @@ Depuis le 25 novembre au soir, la base est **Neptune (VIctory Edit.) 2026-11-25c
 | [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) (Shawn, nawnie ; reprise de `6e6f879`) | GPL-3.0 ou ultérieure | | `v_div_fixup` qui résout les opérandes nuls et infinis avant un quotient NaN, x/±inf = ±0 (`feb90adeb1`, `VICTORY_DIV_INF_ZERO=1`, `victory-shader/src/emit/div_zero.rs`) |
 | [crbns/victory-tapin](https://github.com/crbns/victory-tapin) (crbns) | GPL-3.0 ou ultérieure | | Programmes d'exposition automatique et quatre calculs tardifs faits comme entrées de scène (`09c6420bdc`, `VICTORY_EXPOSURE_EARLY=1`, `victory-gpu/src/pipeline/make/exposure_early.rs`) |
 | [Skyfrye/anyXboxx-diffbase](https://github.com/Skyfrye/anyXboxx-diffbase) (Skyfrye) | GPL-3.0 ou ultérieure | | Trace d'ombre `CS_TraceShadowRays` liée et ses écritures déclarées mais lancée sans groupes quand aucune structure ne peut être touchée (`2903af0f35`, `VICTORY_SHADOW_TRACE_IDLE=1` ou `2`, `victory-gpu/src/shadow_idle.rs`) |
+| [anoyarou/VIctory-RDNA4-linux](https://github.com/anoyarou/VIctory-RDNA4-linux) (Anoyarou ; d'après avatarmanz/VIctory-7900XTX #13, #138, #148) | GPL-3.0 ou ultérieure | | Vérification des pièces rapatriées par le relais contre le hachage fait par la comparaison carte, pièces déchirées rapatriées de nouveau par le vol suivant (`017fb0b`, `host/torn.rs`, peau noire avec `VICTORY_RELAY=2`, fxceless/victory-fork #89 ; `VICTORY_FETCH_CHECK=1`, `victory-gpu/src/fetch_check.rs`) |
 
 ### Base précédente (jusqu'au 25 novembre au soir)
 
