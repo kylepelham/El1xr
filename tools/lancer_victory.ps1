@@ -293,6 +293,11 @@ if (-not $NoTunedSettings) {
         VICTORY_LOAD_FPS                 = '60'        # batch 4: loading screen up to 60 fps until the world (boot -5 s)
         VICTORY_LOAD_END                 = 'world'     # batch 4: loading rate ends at the first world frame
         VICTORY_LOAD_UNPACED             = '1'         # batch 4: loading screen not paced by our clock
+        VICTORY_RAW_CHECK                = '2'         # batch 5: raw indirect records checked (8-9 s world-entry stall gone)
+        VICTORY_WIDE_WAKE_ONE            = '1'         # batch 5: spread work wakes one kept thread per job (+1.4 fps with WAIT_SPIN)
+        VICTORY_WAIT_SPIN                = '50'        # batch 5: spin 50 us for the last helper before sleeping
+        VICTORY_AMBIENT_ONCE             = '1'         # batch 5: ambient stand-in counts one bounce (steady p99 -11 ms)
+        VICTORY_PRESENT_SMOOTH_READY     = '2'         # batch 5: no present smoothing before the world (first world frame 20.3 s vs 26.1)
         VICTORY_HOLD_LAST_FRAME          = '1'         # batch 4: an all-black present shows the last good frame (40 of 71 hidden)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }

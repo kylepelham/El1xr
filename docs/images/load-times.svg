@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="430" viewBox="0 0 900 430" role="img" aria-labelledby="title desc">
-  <title id="title">Batch 3: launch, settling and hitches before and after the pooled blocks, RTX 5090, 4K</title>
-  <desc id="desc">Before and after bars from quiet back-to-back runs on the same build. Launch to the first world frame: 58 to 67 seconds before, 32 seconds now. Launch to settled play: 117 to 120 seconds before, 49 seconds now. Frames over 250 ms in the world: 51 to 74 before, 20 now. Before is two runs without pooled blocks; now is one run with them.</desc>
+  <title id="title">Batch 4: launch time, black frames and black faces before and after its kept switches, RTX 5090, 4K</title>
+  <desc id="desc">Before and after bars from batch 4 runs; each pair ran on one build. Launch to the first world frame: 32 to 33 seconds with the loading switches off, 27 to 28 seconds with them on, two runs each, back to back. Black frames that reached the screen in the first 90 seconds: 152 with the last-frame hold off, 31 with it on, one quiet run each. Diner snapshots with a black face per run: 0 to 3 in three runs without bake inputs, 0 in two runs with them (24 snapshots).</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -29,36 +29,39 @@
     <rect width="900" height="4" fill="url(#sunset)"/>
   </g>
   <rect x=".5" y=".5" width="899" height="429" rx="18" fill="none" stroke="#2c2048"/>
-  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Batch 3, 27 Nov 2026</text>
-  <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">Faster into the world</text>
+  <text class="s up" x="36" y="42" font-size="12.5" font-weight="700" fill="#ff3d8b">Batch 4, 27 Nov 2026</text>
+  <text class="d up" x="34" y="78" font-size="32" letter-spacing=".04em" fill="#f6eefe">Fewer black frames, faster in</text>
   <text class="s up" x="36" y="118" font-size="12" font-weight="700" fill="#f6eefe">Launch to first world frame</text>
+  <text class="s" x="864" y="118" font-size="12.5" text-anchor="end" fill="#a99bc6">loading switches off / on, 2 runs each</text>
   <text class="s" x="222" y="139" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="173" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
   <rect class="grow t1" x="236" y="126" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t1" x="236" y="126" width="485" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="142" font-size="20" font-style="italic" fill="#ddd3ee">58-67 s</text>
-  <rect class="grow t2" x="236" y="156" width="267" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t2" x="236" y="156" width="267" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="515" y="178" font-size="28" font-style="italic" fill="#ffd36e">32 s</text>
-  <text class="s up" x="36" y="218" font-size="12" font-weight="700" fill="#f6eefe">Launch to settled play</text>
+  <rect class="grow t1" x="236" y="126" width="543" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="808" y="142" font-size="20" font-style="italic" fill="#ddd3ee">32-33 s</text>
+  <rect class="grow t2" x="236" y="156" width="475" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t2" x="236" y="156" width="458" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="723" y="178" font-size="28" font-style="italic" fill="#ffd36e">27-28 s</text>
+  <text class="s up" x="36" y="218" font-size="12" font-weight="700" fill="#f6eefe">Black frames shown, first 90 s</text>
+  <text class="s" x="864" y="218" font-size="12.5" text-anchor="end" fill="#a99bc6">last-frame hold off / on, quiet</text>
   <text class="s" x="222" y="239" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="273" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
   <rect class="grow t3" x="236" y="226" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t3" x="236" y="226" width="546" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="242" font-size="20" font-style="italic" fill="#ddd3ee">117-120 s</text>
-  <rect class="grow t4" x="236" y="256" width="229" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t4" x="236" y="256" width="229" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="477" y="278" font-size="28" font-style="italic" fill="#ffd36e">49 s</text>
-  <text class="s up" x="36" y="318" font-size="12" font-weight="700" fill="#f6eefe">Frames over 250 ms in the world</text>
+  <rect class="grow t3" x="236" y="226" width="560" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="808" y="242" font-size="20" font-style="italic" fill="#ddd3ee">152</text>
+  <rect class="grow t4" x="236" y="256" width="114" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t4" x="236" y="256" width="114" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="362" y="278" font-size="28" font-style="italic" fill="#ffd36e">31</text>
+  <text class="s up" x="36" y="318" font-size="12" font-weight="700" fill="#f6eefe">Black-face diner snaps per run</text>
+  <text class="s" x="864" y="318" font-size="12.5" text-anchor="end" fill="#a99bc6">bake inputs off (3 runs) / on (2 runs)</text>
   <text class="s" x="222" y="339" font-size="13" text-anchor="end" fill="#a99bc6">before</text>
   <text class="s" x="222" y="373" font-size="13" text-anchor="end" fill="#a99bc6">now</text>
   <rect class="grow t5" x="236" y="326" width="560" height="18" fill="#3b2d58" opacity=".55"/>
-  <rect class="grow t5" x="236" y="326" width="386" height="18" fill="#3b2d58"/>
-  <text class="d fade t6" x="808" y="342" font-size="20" font-style="italic" fill="#ddd3ee">51-74</text>
-  <rect class="grow t6" x="236" y="356" width="151" height="26" fill="url(#sunset)" opacity=".45"/>
-  <rect class="grow t6" x="236" y="356" width="151" height="26" fill="url(#sunset)"/>
-  <text class="d fade t6" x="399" y="378" font-size="28" font-style="italic" fill="#ffd36e">20</text>
+  <rect class="grow t5" x="236" y="326" width="0" height="18" fill="#3b2d58"/>
+  <text class="d fade t6" x="808" y="342" font-size="20" font-style="italic" fill="#ddd3ee">0-3</text>
+  <rect class="grow t6" x="236" y="356" width="3" height="26" fill="url(#sunset)" opacity=".45"/>
+  <rect class="grow t6" x="236" y="356" width="3" height="26" fill="url(#sunset)"/>
+  <text class="d fade t6" x="251" y="378" font-size="28" font-style="italic" fill="#ffd36e">0</text>
   <rect x="36" y="194" width="828" height="1" fill="#2c2048"/>
   <rect x="36" y="294" width="828" height="1" fill="#2c2048"/>
-  <text class="s" x="36" y="408" font-size="13" fill="#a99bc6">RTX 5090, 4K, quiet 200 s runs, back to back. Less is better. Before: same build without pooled blocks, two runs (pale end: spread).</text>
+  <text class="s" x="36" y="408" font-size="13" fill="#a99bc6">RTX 5090, 4K, batch 4. Each before/after pair ran on one build. Less is better. Pale end of a bar: spread between runs.</text>
 </svg>

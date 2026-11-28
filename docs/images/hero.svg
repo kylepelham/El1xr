@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" role="img" aria-labelledby="title desc">
   <title id="title">El1xr: Grand Theft Auto VI for Xbox Series, running on a Windows PC</title>
-  <desc id="desc">Banner with a sunset over the sea, palm silhouettes and the El1xr wordmark. Headline figures: 23.5 fps in the world at 4K on an RTX 5090 (median of a quiet batch 3 run), 0 refused GPU pipelines, 32 seconds from launch to the first world frame, status playable as of 27 November 2026.</desc>
+  <desc id="desc">Banner with a sunset over the sea, palm silhouettes and the El1xr wordmark. Headline figures: 23.1 to 25.7 fps at 4K on an RTX 5090 (two quiet 200-second batch 4 runs), 0 refused GPU pipelines, 27 to 28 seconds from launch to the first world frame, status playable as of 27 November 2026.</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -54,12 +54,12 @@
     <text class="s" x="46" y="222" font-size="14" fill="#f6d6e6">Game code runs natively. Kernel, D3D12.X and RDNA 2 shaders are translated.</text>
   </g>
   <g class="d" font-style="italic">
-    <g class="fade t4"><text x="46" y="300" font-size="30" fill="#ffd36e">23.5 FPS</text><text class="s up" x="47" y="322" font-size="12" font-style="normal" fill="#ddd3ee">4K, RTX 5090, world</text></g>
-    <rect x="196" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t5"><text x="216" y="300" font-size="30" fill="#ffd36e">0</text><text class="s up" x="217" y="322" font-size="12" font-style="normal" fill="#ddd3ee">refused pipelines</text></g>
-    <rect x="356" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t6"><text x="376" y="300" font-size="30" fill="#ffd36e">32 S</text><text class="s up" x="377" y="322" font-size="12" font-style="normal" fill="#ddd3ee">launch to world</text></g>
-    <rect x="516" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t7"><text x="536" y="300" font-size="30" fill="#2de2e6">PLAYABLE</text><text class="s up" x="537" y="322" font-size="12" font-style="normal" fill="#ddd3ee">status, 27 Nov 2026</text></g>
+    <g class="fade t4"><text x="46" y="300" font-size="30" fill="#ffd36e">23.1-25.7 FPS</text><text class="s up" x="47" y="322" font-size="12" font-style="normal" fill="#ddd3ee">4K, RTX 5090, quiet runs</text></g>
+    <rect x="226" y="278" width="1" height="46" fill="#4a3070"/>
+    <g class="fade t5"><text x="246" y="300" font-size="30" fill="#ffd36e">0</text><text class="s up" x="247" y="322" font-size="12" font-style="normal" fill="#ddd3ee">refused pipelines</text></g>
+    <rect x="391" y="278" width="1" height="46" fill="#4a3070"/>
+    <g class="fade t6"><text x="411" y="300" font-size="30" fill="#ffd36e">27-28 S</text><text class="s up" x="412" y="322" font-size="12" font-style="normal" fill="#ddd3ee">launch to world</text></g>
+    <rect x="551" y="278" width="1" height="46" fill="#4a3070"/>
+    <g class="fade t7"><text x="571" y="300" font-size="30" fill="#2de2e6">PLAYABLE</text><text class="s up" x="572" y="322" font-size="12" font-style="normal" fill="#ddd3ee">status, 27 Nov 2026</text></g>
   </g>
 </svg>
