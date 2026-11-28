@@ -3775,6 +3775,21 @@ impl State {
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // `VICTORY_CONSUMER_GATE`: a consumer whose producer was dropped is
+        // held; a producer that is not run holds its consumers.
+        let role = crate::consumer_gate::role(self.pipeline as This);
+        if crate::consumer_gate::holds(role) {
+            crate::drop_why::set("consumer of a dropped producer held (VICTORY_CONSUMER_GATE)");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::drop_why::count_of("dispatch", self.pipeline);
+            return;
+        }
+        let issued = crate::consumer_gate::issued_count();
+        self.dispatch_run(list, x, y, z);
+        crate::consumer_gate::after(role, crate::consumer_gate::issued_count() != issued);
+    }
+
+    fn dispatch_run(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         let _traced = crate::trace_va::dispatch(self.pipeline as This, list as *const HostList as usize);
         #[cfg(feature = "diagnostics")]
@@ -3882,6 +3897,7 @@ impl State {
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.hdr_scrub(list, p);
+        crate::consumer_gate::issued();
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on(role)
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
@@ -5119,6 +5135,11 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         crate::drop_why::pipeline(self.pipeline);
+        let role = crate::consumer_gate::role(self.pipeline as This);
+        if crate::consumer_gate::holds(role) {
+            crate::drop_why::set("consumer of a dropped producer held (VICTORY_CONSUMER_GATE)");
+            return false;
+        }
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
         if ran
             && kind == 2
@@ -5126,6 +5147,7 @@ impl State {
         {
             self.hdr_scrub(list, p);
         }
+        crate::consumer_gate::after(role, ran);
         // (foxhound) `VICTORY_AMBIENT_SPECULAR`: after an indirect dispatch of the miss program too;
         // `crate::ambient_reflect`'s holds after one without a count buffer.
         if ran

@@ -73,6 +73,8 @@ mod dred;
 #[cfg(windows)]
 mod alloc_count;
 #[cfg(windows)]
+mod consumer_gate;
+#[cfg(windows)]
 mod hang_watch;
 #[cfg(windows)]
 mod raw_watch;

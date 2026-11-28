@@ -79,6 +79,9 @@ pub(crate) struct Shader {
     /// The decoration bake family its container names (`crate::bake_name`), looked up on first asking.
     #[cfg(windows)]
     bake: OnceLock<Option<crate::bake_name::Kind>>,
+    /// Its part in a producer and consumer chain (`crate::consumer_gate`), looked up on first asking.
+    #[cfg(windows)]
+    chain: OnceLock<Option<crate::consumer_gate::Role>>,
 }
 
 impl Shader {
@@ -219,6 +222,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 zero: OnceLock::new(),
                 bake: OnceLock::new(),
+                #[cfg(windows)]
+                chain: OnceLock::new(),
             })
         })
         .clone()
@@ -244,6 +249,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         skin: OnceLock::new(),
         zero: OnceLock::new(),
         bake: OnceLock::new(),
+        chain: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)
@@ -950,6 +956,19 @@ pub(crate) fn bound(this: This) {
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
+}
+
+/// The compute stage's part in a producer and consumer chain
+/// (`crate::consumer_gate`), by its program's name.
+#[cfg(windows)]
+pub(crate) fn chain_role(this: This) -> Option<crate::consumer_gate::Role> {
+    if this.is_null() {
+        return None;
+    }
+    let shader = pipeline(this).shaders.iter().find(|s| s.stage == "compute")?;
+    *shader
+        .chain
+        .get_or_init(|| program_name(&shader.container).and_then(crate::consumer_gate::role_of))
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
