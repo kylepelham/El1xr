@@ -240,7 +240,7 @@ if (-not $NoTunedSettings) {
         VICTORY_WIDE_THREADS             = '16'
         VICTORY_UNDER_WRITES_MASKS_LEAST = '1'         # small changes go up in one pass per buffer
         VICTORY_INDIRECT_RAW             = '2'         # indirect draws use the game's own arguments
-        VICTORY_TEXTURE_HASH_EVERY       = '8'         # re-hash unguarded textures at default cadence instead of every 32 frames
+        VICTORY_TEXTURE_HASH_EVERY       = '8'         # guarded textures no write was seen to are read and hashed every 8 frames (the code default)
         VICTORY_LEVELS_ON_DEMAND         = '1'         # card memory only for the mip levels the game holds
         VICTORY_VIEWS_REMADE_QUIET       = '0'         # apply mip/LOD view promotions immediately instead of deferring while submissions are in flight
         VICTORY_BVH_NO_HIT               = '1'         # ray tests return clean miss when BVH builder is off: fixes oily skin, lit corners, and GPU cost
