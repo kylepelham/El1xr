@@ -220,15 +220,24 @@ fn refresh_wide(copies: Vec<HostCopy>) {
                 .filter(|t| matches!(t, Task::Chunk(..)))
                 .count() as u64,
         );
+        // (#88) `VICTORY_FLUSH_PASS_ORDER`: handed out longest first.
+        let order = super::pass_order::on();
+        let (tasks, keys) = if order {
+            let keys: Vec<u64> = tasks.iter().map(task_key).collect();
+            super::pass_order::longest_first(tasks, keys, super::pass_order::cost)
+        } else {
+            (tasks, Vec::new())
+        };
         let tasks = Arc::new(tasks);
+        let keys = Arc::new(keys);
         let total = tasks.len();
         crate::shadow::wide_chunks(total, 1, move |start, end| {
             let mut copied = 0usize;
             let mut busy_us = 0u64;
             let mut max_us = 0u64;
             let mut max_span = 0usize;
-            for task in &tasks[start..end] {
-                let each = prof.then(Instant::now);
+            for (i, task) in tasks[start..end].iter().enumerate() {
+                let each = (prof || order).then(Instant::now);
                 let (bytes, span) = match task {
                     Task::Copy(copy) => {
                         let b = copy.run_wide();
@@ -262,6 +271,9 @@ fn refresh_wide(copies: Vec<HostCopy>) {
                 copied += bytes;
                 if let Some(t) = each {
                     let us = t.elapsed().as_micros() as u64;
+                    if order {
+                        super::pass_order::learn(keys[start + i], us);
+                    }
                     busy_us += us;
                     if us > max_us {
                         max_us = us;
@@ -281,6 +293,20 @@ fn refresh_wide(copies: Vec<HostCopy>) {
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         stats()[F::PassMaxUs as usize].fetch_max(us, Ordering::Relaxed);
         pending = next;
+    }
+}
+
+/// A task's key for `VICTORY_FLUSH_PASS_ORDER`: its copy and the address it starts at.
+fn task_key(task: &Task<Arc<crate::shadow::Shadow>>) -> u64 {
+    match task {
+        Task::Copy(copy) => {
+            let from = match copy.steps.first() {
+                Some(ShadowStep::Refresh(f, _)) | Some(ShadowStep::Write(f, _)) => *f,
+                _ => 0,
+            };
+            super::pass_order::key(copy.shadow.id(), from)
+        }
+        Task::Chunk(shadow, from, _) => super::pass_order::key(shadow.id(), *from),
     }
 }
 
@@ -414,6 +440,7 @@ pub(super) fn log(frames: f64) {
         );
     }
     super::beside::line(frames);
+    super::pass_order::line(frames);
     super::send_thread::line(frames);
     super::card_rec::line(frames);
     crate::land_aside::line(frames);
@@ -585,6 +612,76 @@ mod tests {
             fewer += wide_off - wide_on;
         }
         assert!(fewer >= 2, "the small passes did not wake the kept threads");
+    }
+
+    /// (#88) `VICTORY_FLUSH_PASS_ORDER`: each pass's tasks handed out longest first (by any
+    /// costs) do the same steps of each copy in the same order.
+    #[test]
+    fn passes_longest_first_do_the_same_steps_in_the_same_order() {
+        let p = crate::watch::PAGE;
+        let long = SPLIT_MIN + 3 * p;
+        let copies = || -> Vec<ShadowBatch<usize>> {
+            (0..9)
+                .map(|i| {
+                    batch(i, vec![
+                        ShadowStep::Refresh(i * long, (i + 1) * long),
+                        ShadowStep::Write(i, 1),
+                        ShadowStep::Refresh(i * p, i * p + 3 * p),
+                        ShadowStep::Barrier,
+                        ShadowStep::Refresh(i * long, i * long + long),
+                    ])
+                })
+                .chain((9..14).map(|i| batch(i, vec![ShadowStep::Refresh(i * p, i * p + p)])))
+                .collect()
+        };
+        let run = |ordered: bool| -> Vec<Vec<ShadowStep>> {
+            let mut did: Vec<Vec<ShadowStep>> = vec![Vec::new(); 14];
+            let mut pending = copies();
+            let mut pass = 0u64;
+            while !pending.is_empty() {
+                pass += 1;
+                let (tasks, next) = split_pass(pending, p);
+                let keys: Vec<u64> = (0..tasks.len() as u64).collect();
+                let tasks = if ordered {
+                    // Any costs: a hash of the task and the pass.
+                    super::super::pass_order::longest_first(tasks, keys, |k| {
+                        (k ^ pass << 32).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40
+                    })
+                    .0
+                } else {
+                    tasks
+                };
+                for t in tasks {
+                    match t {
+                        Task::Copy(c) => did[c.shadow].extend(c.steps),
+                        Task::Chunk(id, a, b) => did[id].push(ShadowStep::Refresh(a, b)),
+                    }
+                }
+                pending = next;
+            }
+            did
+        };
+        let (plain, ordered) = (run(false), run(true));
+        for (a, b) in plain.iter().zip(&ordered) {
+            let (mut ja, mut jb) = (joined(a), joined(b));
+            // Pieces of one long refresh may now run in another order: compare them sorted
+            // within each refresh (they are disjoint and make up the same range).
+            let norm = |v: &mut Vec<(u8, usize, usize)>| v.sort_unstable();
+            let pieces = |s: &[ShadowStep]| -> Vec<(u8, usize, usize)> {
+                let mut v: Vec<_> = s.iter().map(|&s| match s {
+                    ShadowStep::Refresh(a, b) => (0, a, b),
+                    ShadowStep::Write(a, l) => (1, a, l),
+                    ShadowStep::Barrier => (2, 0, 0),
+                }).collect();
+                norm(&mut v);
+                v
+            };
+            assert_eq!(pieces(a), pieces(b), "the same steps");
+            // And the steps between the long refreshes keep their order.
+            ja.retain(|s| s.0 != 0);
+            jb.retain(|s| s.0 != 0);
+            assert_eq!(ja, jb, "writes and barriers in order");
+        }
     }
 
     #[test]

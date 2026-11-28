@@ -45,11 +45,16 @@ pub(super) fn line(frames: f64) {
     }
     let [opened, alone, whole, failed, kept, probed] =
         [0, 1, 2, 3, 4, 5].map(|i| COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let [joined, joined_blocks, split] =
+        [0, 1, 2].map(|i| RUN_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "4 KiB guards per frame (VICTORY_GUARD_4K=1): {opened:.0} pages opened alone; checks noted {alone:.0} blocks \
          at their 4 KiB pages alone and {whole:.0} written whole too; {failed:.1} pages not made read-only again; \
-         {kept:.0} pages left open and noted written, {probed:.0} of them closed to see (VICTORY_GUARD_4K_KEEP={})",
-        keep_for()
+         {kept:.0} pages left open and noted written, {probed:.0} of them closed to see (VICTORY_GUARD_4K_KEEP={}); \
+         {joined:.0} closes joined over neighbouring blocks for {joined_blocks:.0} blocks, {split:.1} runs closed block by \
+         block after a joined call failed (VICTORY_GUARD_4K_RUNS={})",
+        keep_for(),
+        u8::from(runs())
     );
 }
 
@@ -348,6 +353,119 @@ thread_local! {
     pub(super) static STAMP_FRESH_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// (feedcard, #88) `VICTORY_GUARD_4K_RUNS=1` (Live; off by default): a guard walk closes the open
+/// 4 KiB pages of a run of neighbouring protected blocks, all claimed, in one `VirtualProtect` from
+/// the first open page to the end of the last, instead of one call a block (or a run of pages).
+///
+/// Why: part Q's split had about 540 such calls a frame, 4.3-4.8 ms on the refresh threads, each
+/// a trip under the process's address-space lock and a TLB flush on every core running the title.
+/// `GUARD_4K_JOIN` (one call a block) cut calls 18% and time 10%: most blocks have one run. Pages
+/// written together often lie in neighbouring blocks (rings, per-frame data), which one call takes.
+///
+/// The same pages end read-only: every block in the run is protected and claimed, so only its
+/// noted open pages are writable ([`fault`] notes before it opens, and needs the claim); the rest
+/// is read-only already. Each block's pages are noted written at an asking taken after the call,
+/// as [`close`] does. Where the call cannot be made (the run crosses two of the runtime's views)
+/// each block is closed alone, as before. Not with `VICTORY_GUARD_4K_KEEP`. Not in the cache key.
+static RUNS: victory_core::settings::Live = victory_core::settings::Live::flag("VICTORY_GUARD_4K_RUNS");
+
+pub(super) fn runs() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = RUNS_FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    RUNS.get_bool() && keep_for() == 0
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RUNS_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Since the last line: joined calls, blocks with open pages they closed, runs closed block by
+/// block after a joined call failed.
+pub(super) static RUN_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`close`] of `blocks` (ascending; each protected, not clean, its claim held), the open pages of
+/// neighbouring blocks in one call. `bridge(b)`: block `b` (between two of them) is protected and
+/// its claim held too, so a call may run over it.
+pub(super) fn close_many(blocks: &[usize], bridge: impl Fn(usize) -> bool, now: &mut dyn FnMut() -> u64) -> Vec<Closed> {
+    let mut out: Vec<Closed> = Vec::with_capacity(blocks.len());
+    let mut taken: Vec<u64> = Vec::with_capacity(blocks.len());
+    for &block in blocks {
+        taken.push(part_of(&OPEN, block, false).map_or(0, |p| p.0[block % super::PART].swap(0, AcqRel)));
+    }
+    let mut i = 0;
+    while i < blocks.len() {
+        // A run: blocks i..j, each next to the one before or bridged to it.
+        let mut j = i + 1;
+        while j < blocks.len() && (blocks[j - 1] + 1..blocks[j]).all(&bridge) {
+            j += 1;
+        }
+        let with: Vec<usize> = (i..j).filter(|&k| taken[k] & SUBS != 0).collect();
+        let mut done = vec![false; j - i];
+        if let (Some(&f), Some(&l)) = (with.first(), with.last()) {
+            let pages_f = taken[f] & SUBS;
+            let pages_l = taken[l] & SUBS;
+            let from = blocks[f] * BLOCK + pages_f.trailing_zeros() as usize * KERNEL_PAGE;
+            let to = blocks[l] * BLOCK + (64 - pages_l.leading_zeros() as usize) * KERNEL_PAGE;
+            let t = crate::refresh_prof::start();
+            let ok = protect_run(from, to - from, windows_sys::Win32::System::Memory::PAGE_READONLY);
+            crate::refresh_prof::add(crate::refresh_prof::P::Protect4kCalls, 1);
+            crate::refresh_prof::finish(crate::refresh_prof::P::Protect4kUs, t);
+            if ok {
+                RUN_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RUN_STATS[1].fetch_add(with.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                for &k in &with {
+                    done[k - i] = true;
+                }
+            } else {
+                RUN_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        for k in i..j {
+            let block = blocks[k];
+            let pages = taken[k] & SUBS;
+            if pages == 0 {
+                out.push(Closed::None);
+                continue;
+            }
+            let base = block * BLOCK;
+            if !done[k - i] {
+                let mut failed = false;
+                for (run, end) in close_runs(pages, join()) {
+                    let (from, len) = (base + run * KERNEL_PAGE, (end - run) * KERNEL_PAGE);
+                    let t = crate::refresh_prof::start();
+                    let ok = protect_run(from, len, windows_sys::Win32::System::Memory::PAGE_READONLY);
+                    crate::refresh_prof::add(crate::refresh_prof::P::Protect4kCalls, 1);
+                    crate::refresh_prof::finish(crate::refresh_prof::P::Protect4kUs, t);
+                    if !ok {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    part_of(&OPEN, block, false).map(|p| p.0[block % super::PART].fetch_or(pages, AcqRel));
+                    count(3, 1);
+                    out.push(Closed::Failed);
+                    continue;
+                }
+            }
+            let asked = now();
+            for k in 0..BLOCK / KERNEL_PAGE {
+                if pages & (1 << k) != 0 {
+                    super::found_set(base + k * KERNEL_PAGE, asked);
+                }
+            }
+            let only = taken[k] & ONLY != 0;
+            count(if only { 1 } else { 2 }, 1);
+            out.push(Closed::Pages { only });
+        }
+        i = j;
+    }
+    out
+}
+
 /// The 4 KiB page ranges `[a, b)` of a block whose open pages are `pages` that the check makes
 /// read-only: each run of open pages, or with `join` one range over all of them.
 fn close_runs(pages: u64, join: bool) -> Vec<(usize, usize)> {
@@ -380,7 +498,15 @@ fn protect_page(at: usize, flags: u32) -> bool {
     protect_run(at, KERNEL_PAGE, flags)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// (Tests) This thread's `VirtualProtect` calls here.
+    pub(super) static CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn protect_run(at: usize, len: usize, flags: u32) -> bool {
+    #[cfg(test)]
+    CALLS.with(|c| c.set(c.get() + 1));
     let mut old = 0;
     // SAFETY: title view memory inside one guarded block; only its protection changes.
     unsafe {
