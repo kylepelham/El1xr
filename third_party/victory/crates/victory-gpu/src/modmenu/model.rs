@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use super::queue::{Call, Outcome, Queue, Script};
-use super::{finder, teleport};
+use super::{finder, stats, teleport};
 use crate::menu::model::{Applied, Apply, Info, Kind, MenuModel, SetError};
 
 /// What an option does.
@@ -86,6 +86,10 @@ pub const HOLD: &[&str] = &[
 
 /// The finders' one value: a button that starts (or restarts) them; the row shows their progress.
 pub const RUN: &[&str] = &["run"];
+/// One-press rows: the row shows what they will use, so each press is a change.
+pub const REFILL: &[&str] = &["refill"];
+pub const CLEAR: &[&str] = &["clear"];
+pub const ON_OFF: &[&str] = &["off", "on"];
 
 /// The hour the clock is held at (`-1`: no hold). The game-thread hook sets the clock to it on
 /// every tick, so the title's own scripts (the prologue puts 7:30 back within 10 s) cannot move it.
@@ -263,6 +267,122 @@ pub const OPTIONS: &[Opt] = &[
             show: show_handle,
         },
         verified: true,
+    },
+    Opt {
+        info: info(
+            "MOD_HEALTH",
+            "Player",
+            "Health (unverified)",
+            "The player's health through the title's health getter (peds: 1000 is full).",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_PLAYER_PED_ID,
+            args: &[],
+            script: Some(stats::health_script),
+            show: show_int,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_HEALTH_MAX",
+            "Player",
+            "Max health (unverified)",
+            "The player's maximum health.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_PLAYER_PED_ID,
+            args: &[],
+            script: Some(stats::max_health_script),
+            show: show_int,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_HEALTH_REFILL",
+            "Player",
+            "Refill health (unverified)",
+            "Sets the player's health to its maximum through the setter Find stats found.",
+            Kind::Choice(REFILL),
+        ),
+        effect: Effect::Own {
+            get: stats::refill_get,
+            set: stats::refill_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_GOD_MODE",
+            "Player",
+            "God mode (unverified)",
+            "Refills the player's health whenever it is below the maximum (checked every 10 game ticks).",
+            Kind::Choice(ON_OFF),
+        ),
+        effect: Effect::Own {
+            get: stats::god_get,
+            set: stats::god_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_ARMOUR_REFILL",
+            "Player",
+            "Refill armour (unverified)",
+            "Sets the player's armour to 100 through the setter Find stats took for armour.",
+            Kind::Choice(REFILL),
+        ),
+        effect: Effect::Own {
+            get: stats::armour_get,
+            set: stats::armour_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_WANTED_CLEAR",
+            "Player",
+            "Clear wanted level (unverified)",
+            "Sets the wanted level to 0 through the setter Find stats found.",
+            Kind::Choice(CLEAR),
+        ),
+        effect: Effect::Own {
+            get: stats::clear_wanted_get,
+            set: stats::clear_wanted_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_NEVER_WANTED",
+            "Player",
+            "Never wanted (unverified)",
+            "Keeps the wanted level at 0 (set every 10 game ticks).",
+            Kind::Choice(ON_OFF),
+        ),
+        effect: Effect::Own {
+            get: stats::never_wanted_get,
+            set: stats::never_wanted_set,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_FIND_STATS",
+            "Player",
+            "Find stats (unverified)",
+            "Calls each candidate health, armour and wanted setter with a test value and keeps the ones a getter reads back; then refills health. Logged line by line.",
+            Kind::Choice(RUN),
+        ),
+        effect: Effect::Own {
+            get: finder::stats_get,
+            set: finder::stats_set,
+        },
+        verified: false,
     },
     Opt {
         info: info(
@@ -812,7 +932,7 @@ mod tests {
             "no ped, no read"
         );
         assert!(
-            working_status().starts_with("7 of 15 confirmed"),
+            working_status().starts_with("7 of 23 confirmed"),
             "{}",
             working_status()
         );
