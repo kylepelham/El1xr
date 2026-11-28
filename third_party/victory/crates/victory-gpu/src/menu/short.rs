@@ -47,6 +47,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_DEFAULT_NO_BACK", "Large shader writes to big card buffers are not copied back to memory."),
     ("VICTORY_DOT2_ACC_NEG", "Fixes a dot product instruction negating its accumulator twice."),
     ("VICTORY_DROP_REASONS", "Logs per frame why draws and dispatches were dropped."),
+    ("VICTORY_DSTORAGE_POLL_WAIT", "The game's disk-read poll returns as reads finish, not a timer tick later."),
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_FACE_WATCH", "Logs bad texture reads by the character material shaders."),
     ("VICTORY_FENCE_TIMELINE", "Logs where each stretch of card idle time comes from."),
