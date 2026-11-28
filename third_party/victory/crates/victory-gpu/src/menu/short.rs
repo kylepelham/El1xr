@@ -54,6 +54,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_DSTORAGE_AUTO_SUBMIT", "title: DirectStorage reads start at the title's Submit, as on console."),
     ("VICTORY_DSTORAGE_FILE_REF", "A DirectStorage read keeps its file open until the read is done."),
     ("VICTORY_DSTORAGE_POLL_WAIT", "The game's disk-read poll returns as reads finish, not a timer tick later."),
+    ("VICTORY_DSTORAGE_STAGING_MB", "More DirectStorage reads in flight at once, for faster loading."),
     ("VICTORY_EARLY_TEXTURES_MS", "Time budget per frame for early placed textures, in ms."),
     ("VICTORY_EXPOSURE_EARLY", "Makes the auto-exposure pipelines early, so the world is not black."),
     ("VICTORY_EXPOSURE_WATCH", "Logs the exposure passes' targets and the constants they read."),

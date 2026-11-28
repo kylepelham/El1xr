@@ -122,7 +122,6 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_DSTORAGE_OWN_HANDLES", Apply::Restart),
     ("VICTORY_DSTORAGE_RETRIES", Apply::Restart),
     ("VICTORY_DSTORAGE_REUSE", Apply::Restart),
-    ("VICTORY_DSTORAGE_STAGING_MB", Apply::Restart),
     ("VICTORY_DSTORAGE_STALE_MS", Apply::Restart),
     ("VICTORY_DSTORAGE_TIMING", Apply::Restart),
     ("VICTORY_DSTORAGE_WAKE_FEW", Apply::Restart),
