@@ -44,6 +44,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_CARD_WRITE_KEEP", "Bake writes into a new on-demand mip still get tiles, so they land."),
     ("VICTORY_COMPARE_APART", "Runs the card copy compare in its own submission after the game's lists."),
     ("VICTORY_COMPUTE_QUAD_LOD", "Compute texture samples pick their mip from lane quads, not level 0."),
+    ("VICTORY_CONSOLE_FORMATS", "Targets in console-only colour formats get a host stand-in, not none."),
     ("VICTORY_CONST_TABLE_TRIM", "Shrinks a shader's constant table to start where its code ends."),
     ("VICTORY_COPIED_SHARED", "Read-only checks of a host copy share its lock instead of queuing."),
     ("VICTORY_DEFAULT_NO_BACK", "Large shader writes to big card buffers are not copied back to memory."),
