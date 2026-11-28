@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" role="img" aria-labelledby="title desc">
   <title id="title">El1xr: Grand Theft Auto VI for Xbox Series, running on a Windows PC</title>
-  <desc id="desc">Banner with a sunset over the sea, palm silhouettes and the El1xr wordmark. Headline figures: 23.1 to 25.7 fps at 4K on an RTX 5090 (two quiet 200-second batch 4 runs), 0 refused GPU pipelines, 27 to 28 seconds from launch to the first world frame, status playable as of 27 November 2026.</desc>
+  <desc id="desc">Banner with a sunset over the sea, palm silhouettes and the El1xr wordmark. Headline figures: 21.6 to 26.0 fps at 4K on an RTX 5090 (quiet batch 5 runs of 110 to 460 seconds), 1 refused GPU pipeline, 24.6 seconds from launch to the first world frame, status playable as of 28 November 2026.</desc>
   <style>
     .d{font-family:"Bahnschrift SemiBold Condensed","Bahnschrift Condensed","DIN Condensed","Roboto Condensed","Arial Narrow",Impact,sans-serif;font-weight:600}
     .s{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
@@ -22,17 +22,13 @@
     </linearGradient>
     <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a1046"/><stop offset=".35" stop-color="#1a0a2e"/><stop offset="1" stop-color="#0b0618"/></linearGradient>
     <linearGradient id="sunbody" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff1a8"/><stop offset=".45" stop-color="#ff8a3d"/><stop offset="1" stop-color="#ff3d8b"/></linearGradient>
-    <linearGradient id="word" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff6d8"/><stop offset=".55" stop-color="#ffc2dc"/><stop offset="1" stop-color="#ff3d8b"/></linearGradient>
     <mask id="sunmask"><rect width="900" height="360" fill="#fff"/><rect x="0" y="230" width="900" height="3.0" fill="#000"/><rect x="0" y="243" width="900" height="4.6" fill="#000"/><rect x="0" y="255" width="900" height="6.2" fill="#000"/><rect x="0" y="266" width="900" height="7.8" fill="#000"/><rect x="0" y="277" width="900" height="9.4" fill="#000"/><rect x="0" y="288" width="900" height="11.0" fill="#000"/><rect x="0" y="297" width="900" height="12.6" fill="#000"/><rect x="0" y="306" width="900" height="14.2" fill="#000"/><rect x="0" y="314" width="900" height="15.8" fill="#000"/><rect x="0" y="322" width="900" height="17.4" fill="#000"/><rect x="0" y="329" width="900" height="19.0" fill="#000"/><rect x="0" y="336" width="900" height="20.6" fill="#000"/></mask>
-    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="14"/></filter>
-    <filter id="neon" x="-10%" y="-30%" width="120%" height="160%"><feGaussianBlur in="SourceGraphic" stdDeviation="6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
     <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="4" height="1" fill="#fff" fill-opacity=".025"/></pattern>
     <clipPath id="heroclip"><rect width="900" height="360" rx="18"/></clipPath>
   </defs>
   <g clip-path="url(#heroclip)">
     <rect width="900" height="246" fill="url(#sky)"/>
-    <circle cx="676" cy="236" r="134" fill="#ff3d8b" opacity=".35" filter="url(#soft)"/>
-    <g class="rise"><circle cx="676" cy="236" r="104" fill="url(#sunbody)" mask="url(#sunmask)"/></g>
+    <g class="fade"><circle cx="676" cy="236" r="104" fill="url(#sunbody)" mask="url(#sunmask)"/></g>
     <path d="M0 247L0 229L25 229L25 227L50 227L50 225L68 225L68 236L101 236L101 210L118 210L118 202L133 202L133 214L147 214L147 204L149 204L149 214L162 214L162 216L169 216L169 206L171 206L171 216L177 216L177 227L185 227L185 217L187 217L187 227L195 227L195 219L220 219L220 210L247 210L247 218L277 218L277 197L315 197L315 226L346 226L346 236L367 236L367 212L390 212L390 215L408 215L408 205L410 205L410 215L427 215L427 219L440 219L440 247Z" transform="translate(470,0)" fill="#1d0b33"/>
     <rect y="246" width="900" height="114" fill="url(#sea)"/>
     <rect y="246" width="900" height="1.5" fill="#ffb27a" opacity=".55"/>
@@ -47,19 +43,19 @@
     <text class="s up" x="46" y="54" font-size="11.5" font-weight="700" fill="#ffd0e4">Grand Theft Auto VI  /  Xbox Series 1.0.2.1  /  Windows PC</text>
   </g>
   <g class="fade t1">
-    <text class="d" x="40" y="160" font-size="118" font-style="italic" letter-spacing="-1" fill="url(#word)" filter="url(#neon)">El1xr</text>
+    <text class="d" x="40" y="160" font-size="118" font-style="italic" letter-spacing="-1" fill="#fff4fa">El1xr</text>
   </g>
   <g class="fade t2">
     <text class="s" x="46" y="198" font-size="17" fill="#fff4fa">The console version of GTA VI, running on a Windows PC.</text>
     <text class="s" x="46" y="222" font-size="14" fill="#f6d6e6">Game code runs natively. Kernel, D3D12.X and RDNA 2 shaders are translated.</text>
   </g>
   <g class="d" font-style="italic">
-    <g class="fade t4"><text x="46" y="300" font-size="30" fill="#ffd36e">23.1-25.7 FPS</text><text class="s up" x="47" y="322" font-size="12" font-style="normal" fill="#ddd3ee">4K, RTX 5090, quiet runs</text></g>
+    <g class="fade t4"><text x="46" y="300" font-size="30" fill="#ffd36e">21.6-26.0 FPS</text><text class="s up" x="47" y="322" font-size="12" font-style="normal" fill="#ddd3ee">4K, RTX 5090, quiet runs</text></g>
     <rect x="226" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t5"><text x="246" y="300" font-size="30" fill="#ffd36e">0</text><text class="s up" x="247" y="322" font-size="12" font-style="normal" fill="#ddd3ee">refused pipelines</text></g>
+    <g class="fade t5"><text x="246" y="300" font-size="30" fill="#ffd36e">1</text><text class="s up" x="247" y="322" font-size="12" font-style="normal" fill="#ddd3ee">refused pipeline</text></g>
     <rect x="391" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t6"><text x="411" y="300" font-size="30" fill="#ffd36e">27-28 S</text><text class="s up" x="412" y="322" font-size="12" font-style="normal" fill="#ddd3ee">launch to world</text></g>
+    <g class="fade t6"><text x="411" y="300" font-size="30" fill="#ffd36e">24.6 S</text><text class="s up" x="412" y="322" font-size="12" font-style="normal" fill="#ddd3ee">launch to world</text></g>
     <rect x="551" y="278" width="1" height="46" fill="#4a3070"/>
-    <g class="fade t7"><text x="571" y="300" font-size="30" fill="#2de2e6">PLAYABLE</text><text class="s up" x="572" y="322" font-size="12" font-style="normal" fill="#ddd3ee">status, 27 Nov 2026</text></g>
+    <g class="fade t7"><text x="571" y="300" font-size="30" fill="#2de2e6">PLAYABLE</text><text class="s up" x="572" y="322" font-size="12" font-style="normal" fill="#ddd3ee">status, 28 Nov 2026</text></g>
   </g>
 </svg>

@@ -5422,6 +5422,34 @@ pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
     }
 }
 
+/// [`title_memory_remapping_range`] if every lock can be had at once (`None` otherwise, holding
+/// none): for the runtime's unmapping thread (`VICTORY_UNMAP_LATER`), which must never wait on a
+/// lock a title thread holds while that thread waits for it.
+#[track_caller]
+pub fn title_memory_remapping_try(at: usize, len: usize) -> Option<Remapping> {
+    #[cfg(feature = "diagnostics")]
+    let asked = std::time::Instant::now();
+    let mut guards = Vec::new();
+    for s in shards(at, len) {
+        match MAPPING[s].try_write() {
+            Ok(guard) => guards.push(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => guards.push(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+    let lazy = crate::shadow::lazy_begin_remapping_barrier();
+    Some(Remapping {
+        _guards: guards,
+        _lazy: lazy,
+        #[cfg(feature = "diagnostics")]
+        taken: (
+            std::time::Instant::now(),
+            asked.elapsed().as_micros() as u64,
+            std::panic::Location::caller(),
+        ),
+    })
+}
+
 /// Diagnostics: the changes of the mapping by where the runtime made them since the
 /// last asking: file, line, and [changes, µs waited for in-place reads to end, µs held,
 /// longest µs held]. The texture refreshes wait on these ("waiting for title memory to
