@@ -17,6 +17,9 @@
 //! The clock hold (`MOD_CLOCK_HOLD`) sets the clock on every game tick while it is on and logs
 //! `mod menu: clock hold at H` / `mod menu: clock hold off` when it changes.
 //!
+//! Health, armour and wanted ([`stats`]): god mode and never wanted are holds run here every
+//! [`stats::HOLD_EVERY`] ticks once Find stats has named their setters.
+//!
 //! Teleport ([`teleport`]) needs a set-coords native that offline analysis did not pin: Find
 //! teleport ([`finder`]) names it in game, or `VICTORY_MOD_MENU_TP_NATIVE=<hash>:<slots>` does at
 //! start (logged as `mod menu: teleport native <hash> from VICTORY_MOD_MENU_TP_NATIVE`).
@@ -28,6 +31,7 @@ pub mod model;
 pub mod natives;
 pub mod probe;
 pub mod queue;
+pub mod stats;
 pub mod teleport;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
@@ -165,6 +169,7 @@ pub fn game_tick() {
     }
     side_logs();
     hold_clock();
+    stats::hold(TICKS.load(Relaxed), &QUEUE);
     let mut native = |hash: u64, args: &[u64]| {
         let rva = table.scan.find(hash)?;
         // SAFETY: a handler the scan found in the mapped image, on the title's thread; the
