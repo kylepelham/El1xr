@@ -1349,6 +1349,8 @@ pub(crate) mod alias_compatible;
 pub(crate) mod find_facts;
 #[cfg(windows)]
 pub(crate) mod idle_sweep;
+#[cfg(all(test, windows))]
+mod class_depth_tests;
 
 #[cfg(windows)]
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
