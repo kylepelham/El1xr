@@ -155,6 +155,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_TABLE_NULL_ONCE", "Leaves a texture slot empty while loading only the first time it is met."),
     ("VICTORY_TABLE_PROF", "Logs a split of descriptor table time each second."),
     ("VICTORY_TABLE_VIEWS_ONCE", "A table looks up all its slots' views under one hold of the lock."),
+    ("VICTORY_TABLE_VIEW_CACHE", "Makes table texture views once and copies them across lists."),
     ("VICTORY_TARGET_REUSE_REREAD", "Rereads textures that sit in memory a render target used."),
     ("VICTORY_TBUFFER_D16", "Fixes a 16-bit buffer load instruction to pack two channels."),
     ("VICTORY_TEXTURES_ONCE", "Refreshes textures once per submission instead of once per list."),
