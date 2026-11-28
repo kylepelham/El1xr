@@ -1652,6 +1652,18 @@ extern "system" fn clear_rtv(
                 }
             });
         }
+        // `VICTORY_BAKE_REPLAY`: a bake target's whole clear, to clear it again before a bake
+        // is drawn again.
+        if rects.is_none() && crate::bake_replay::mode() > 0 {
+            crate::bake_replay::cleared(
+                record.resource as usize,
+                crate::frame::current(),
+                crate::bake_replay::Clear {
+                    view: Some(record.snapshot()),
+                    color: *color,
+                },
+            );
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);

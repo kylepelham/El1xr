@@ -35,7 +35,7 @@ impl State {
             .collect()
     }
 
-    fn bake_fresh_look(
+    pub(super) fn bake_fresh_look(
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
         slot: u32,
@@ -134,7 +134,12 @@ impl State {
                 (slot, f, a)
             })
             .collect();
-        if read.iter().any(|&(_, _, a)| a.incomplete()) {
+        let incomplete = read.iter().any(|&(_, _, a)| a.incomplete());
+        // `VICTORY_BAKE_REPLAY`: the draw is kept to be drawn again once these arrive.
+        if crate::bake_replay::mode() > 0 {
+            bake_replay::BAKE.set(Some(incomplete));
+        }
+        if incomplete {
             crate::bake_fresh::incomplete(crate::frame::current(), bake_pass::bake_hash(p), &read);
         }
     }
