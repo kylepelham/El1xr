@@ -120,6 +120,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_NATIVE_GLASS", "Reflection trace uses native ray queries instead of the software walk."),
     ("VICTORY_NATIVE_RT_BIND", "Counts ray trace dispatches that native structures could serve."),
     ("VICTORY_NATIVE_SHADOW", "Shadow traces use native ray queries instead of the software walk."),
+    ("VICTORY_NATIVE_SHADOW_AUTO", "Finds shadow walks by their shape and gives them native ray queries."),
     ("VICTORY_NORM_NEAREST", "Normalized buffer values load as the nearest float, as on the console."),
     ("VICTORY_OWN_CPUS", "Our threads run on the die the title does not pin its threads to."),
     ("VICTORY_PAGE_ASK", "A write fault asks about its one page, not the whole region around it."),
