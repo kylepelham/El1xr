@@ -237,6 +237,8 @@ mod memory;
 #[cfg(windows)]
 pub mod bvh_premap;
 #[cfg(windows)]
+mod bvh_declare;
+#[cfg(windows)]
 mod skin_fill;
 #[cfg(windows)]
 mod ramline;

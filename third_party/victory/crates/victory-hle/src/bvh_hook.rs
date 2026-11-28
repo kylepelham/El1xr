@@ -262,7 +262,7 @@ extern "C" fn copy(this: *mut u8, list: *mut u8, dest: u64, source: u64, mode: u
         );
     }
     victory_gpu::native_rt::copy(dest, source, mode);
-    victory_gpu::bvh_premap::ranges(&[dest, source]);
+    victory_gpu::bvh_premap::builds(&[dest], &[dest, source]);
     summary();
     // SAFETY: (`this`, ID3D12GraphicsCommandList4*, u64, u64, COPY_MODE).
     let f: extern "C" fn(*mut u8, *mut u8, u64, u64, u32) = unsafe { original(&COPY) };
@@ -412,15 +412,26 @@ unsafe fn triangles(g: *const u8) -> victory_gpu::native_rt::Triangles {
 /// `descs` is null or points to `count` descriptions `size` bytes apart,
 /// each a standard build description first.
 unsafe fn premap(descs: *const u8, count: u32, size: usize) {
-    if !victory_gpu::bvh_premap::on() || descs.is_null() {
+    if !victory_gpu::bvh_premap::wanted() || descs.is_null() {
         return;
     }
-    let mut ranges = Vec::new();
+    let (mut outputs, mut ranges) = (Vec::new(), Vec::new());
     for i in 0..count as usize {
         // SAFETY: by the caller.
         unsafe { build_ranges(descs.add(i * size), &mut ranges) };
+        // SAFETY: as above; destination and scratch.
+        unsafe { outputs.extend(build_outputs(descs.add(i * size))) };
     }
-    victory_gpu::bvh_premap::ranges(&ranges);
+    victory_gpu::bvh_premap::builds(&outputs, &ranges);
+}
+
+/// What a standard build description writes: its destination and scratch.
+///
+/// # Safety
+/// `d` points to a standard build description.
+unsafe fn build_outputs(d: *const u8) -> [u64; 2] {
+    // SAFETY: by the caller.
+    unsafe { [field::<u64>(d, 0), field::<u64>(d, 40)] }
 }
 
 /// The ranges a standard build description names: its destination, source
@@ -695,6 +706,8 @@ mod tests {
         // SAFETY: as above.
         unsafe { build_ranges(desc.as_ptr(), &mut out) };
         assert_eq!(out, [0xa000, 0xb000, 0xc000, 0x5000]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { build_outputs(desc.as_ptr()) }, [0xa000, 0xc000]);
     }
 
     /// A geometry that is not triangles (boxes) is not taken.

@@ -35,6 +35,22 @@ pub fn ranges(addresses: &[u64]) {
     }
 }
 
+/// Whether the hook should hand over its builds' ranges: for [`on`], or for
+/// `VICTORY_BVH_DECLARE_OUTPUTS=1` (`crate::bvh_declare`).
+pub fn wanted() -> bool {
+    on() || crate::bvh_declare::on()
+}
+
+/// The title's builds name `named` (every range, as [`ranges`] takes them)
+/// and write `outputs` of them (destinations, scratch); the others
+/// (vertices, indices, transforms, instances, an update's source) they only
+/// read. Zeros are passed over. Told to `crate::bvh_declare` first, so that
+/// the copies [`ranges`] makes know whether the builder writes them.
+pub fn builds(outputs: &[u64], named: &[u64]) {
+    crate::memory::hook(outputs, named);
+    ranges(named);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

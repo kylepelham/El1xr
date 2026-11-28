@@ -1225,9 +1225,9 @@ fn window_card_base() -> u64 {
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// A buffer in the card's memory for a window of `size` bytes, if it is to
-/// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+/// A buffer in the card's memory for the window of `size` bytes at
+/// `start`, if it is to be there ([`window_card_most`]).
+fn window_card_for(start: u64, size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -1243,7 +1243,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let held = WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-    if held + size > most || !builder_windows::admits(size, window_card_base(), held, card.map(|[b, u, ..]| [b, u])) {
+    if held + size > most || !builder_windows::admits(start, size, window_card_base(), held, card.map(|[b, u, ..]| [b, u])) {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
@@ -1271,7 +1271,7 @@ pub(crate) static REBAR: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A GPU upload buffer for a window of `size` bytes, if it is to have one: within the windows' card
 /// budget (`window_card_most`, counted with the card sides in `WINDOW_CARD_BYTES`) and the
 /// card's own memory (the same fifth kept free as `window_card_for` keeps).
-fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+fn window_rebar_for(start: u64, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let host = host()?;
     if !host.gpu_upload_supported() {
         REBAR[5].fetch_add(1, Ordering::Relaxed);
@@ -1283,7 +1283,7 @@ fn window_rebar_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         && card.is_none_or(|[budget, used, ..]| used + size <= placement::window_line(budget, card_room_kept_on()));
     if !room || {
         let held = WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-        held + size > most || !builder_windows::admits(size, window_card_base(), held, card.map(|[b, u, ..]| [b, u]))
+        held + size > most || !builder_windows::admits(start, size, window_card_base(), held, card.map(|[b, u, ..]| [b, u]))
     } {
         if room {
             WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -5455,6 +5455,7 @@ impl Shadow {
         found: Option<Vec<(usize, usize)>>,
     ) -> usize {
         let n = self.copy_back_inner(address, len, found);
+        crate::bvh_declare::landed(self.id, self.start, self.len, address as u64, n);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event("copy back", address as u64, len as u64, n as u64);
         n
@@ -5603,6 +5604,7 @@ impl Shadow {
     ) -> usize {
         self.stamp.clear();
         let written = self.relay_merge_inner(at, n, now, title);
+        crate::bvh_declare::landed(self.id, self.start, self.len, self.start + at as u64, written);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event("relay merge", self.start + at as u64, n as u64, written as u64);
         written
@@ -7064,6 +7066,12 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        let written = self.card_merge_inner(at, gpu, title);
+        crate::bvh_declare::landed(self.id, self.start, self.len, self.start + at as u64, written);
+        written
+    }
+
+    fn card_merge_inner(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         self.stamp.clear();
         let start = self.start as usize;
         if self.card.is_none() || self.transient() || at + gpu.len() > self.len as usize {
@@ -7139,6 +7147,7 @@ impl Shadow {
     ) -> usize {
         self.stamp.clear();
         let written = self.card_merge_relay_inner(at, gpu, fetched_after, title);
+        crate::bvh_declare::landed(self.id, self.start, self.len, self.start + at as u64, written);
         #[cfg(feature = "diagnostics")]
         crate::trace_va::event(
             "card relay merge",
@@ -7972,13 +7981,13 @@ fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // (a transient window); one that gets none is made as before.
     // (Neptune) With `window_rebar`: one copy in a GPU upload heap, before either.
     let rebar = if window_rebar() {
-        window_rebar_for(len)
+        window_rebar_for(start, len)
     } else {
         None
     };
     let rebar_made = rebar.is_some();
     let transient = if window_upload() && rebar.is_none() {
-        window_card_for(len)
+        window_card_for(start, len)
     } else {
         None
     };
@@ -8010,7 +8019,7 @@ fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
         // With room for windows on the card (`window_card_most`): shaders get a
         // buffer there, and the one just made is the CPU's side.
-        match window_card_for(len) {
+        match window_card_for(start, len) {
             Some(on_card) => {
                 crate::host::name(&on_card, || {
                     format!("title memory {start:#x}+{len:#x} on the card")
