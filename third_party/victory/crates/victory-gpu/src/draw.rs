@@ -5823,7 +5823,7 @@ impl State {
             // (El1xr) `VICTORY_TILE_ARGS_WATCH`: a skin lighting draw's record as the card reads it.
             if crate::tile_args_watch::on() {
                 let path = if after_writer { "sanitized" } else { "raw" };
-                let read = tile_args_watch::Read { path, buffer: (&args.buffer, args.offset(arguments)), ours: false };
+                let read = tile_args_watch::Read { path, buffer: (&args.buffer, args.offset(arguments)), argument: after_writer };
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
             }
@@ -5945,7 +5945,7 @@ impl State {
                     return true;
                 }
                 if crate::tile_args_watch::on() {
-                    let read = tile_args_watch::Read { path: "ahead", buffer: (&slots, at), ours: true };
+                    let read = tile_args_watch::Read { path: "ahead", buffer: (&slots, at), argument: true };
                     self.tile_args_watch(list, p, read, &args, None, (kind, stride, max), arguments);
                 }
                 // SAFETY: an open list with everything set; the list keeps its
@@ -6118,7 +6118,7 @@ impl State {
             self.mesh_scissor(list, true);
         }
         if crate::tile_args_watch::on() && parts.is_none() {
-            let read = tile_args_watch::Read { path: "clamped", buffer: (&bounded, at), ours: true };
+            let read = tile_args_watch::Read { path: "clamped", buffer: (&bounded, at), argument: true };
             let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             self.tile_args_watch(list, p, read, &args, count, (kind, stride, max), arguments);
         }

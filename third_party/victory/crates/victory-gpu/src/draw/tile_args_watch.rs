@@ -14,10 +14,10 @@ pub(super) struct Read<'a> {
     pub(super) path: &'static str,
     /// The buffer the `ExecuteIndirect` reads and the byte in it.
     pub(super) buffer: (&'a ID3D12Resource, u64),
-    /// Our scratch or ahead buffer, left in the indirect-argument state (moved to the copy state
-    /// for the copy and back). Otherwise it is the title's host copy, read as is (as
-    /// `crate::raw_watch` does).
-    pub(super) ours: bool,
+    /// The buffer is in the indirect-argument state (our scratch or ahead buffer, or a host copy
+    /// our pass made safe in place): moved to the copy state for the copy and back. Otherwise it
+    /// is the title's host copy, read as is (as `crate::raw_watch` does).
+    pub(super) argument: bool,
 }
 
 impl State {
@@ -52,11 +52,11 @@ impl State {
             return;
         };
         let bytes = u64::from(stride.min(20));
-        let title_read = !read.ours && std::ptr::eq(read.buffer.0, &args.buffer);
+        let title_read = std::ptr::eq(read.buffer.0, &args.buffer);
         // SAFETY: an open list; live buffers the list keeps (the read-back buffer by the closure
-        // below); our buffer is in the indirect-argument state the clamp left it in, and goes back.
+        // below); a buffer in the indirect-argument state goes back to it after the copy.
         unsafe {
-            if read.ours {
+            if read.argument {
                 list.list.ResourceBarrier(&[crate::host::transition(
                     read.buffer.0,
                     ARGUMENT,
@@ -65,7 +65,7 @@ impl State {
             }
             list.list
                 .CopyBufferRegion(&back, 0, read.buffer.0, read.buffer.1, bytes);
-            if read.ours {
+            if read.argument {
                 list.list.ResourceBarrier(&[crate::host::transition(
                     read.buffer.0,
                     COPY_SOURCE,

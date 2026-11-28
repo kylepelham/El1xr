@@ -182,13 +182,16 @@ pub(crate) struct Words {
     pub(crate) count: Option<u32>,
 }
 
-/// `count_zero` (a count buffer said 0), `ok` (the record read has work), `zeroed_by_us` (the
-/// title's copy has work the buffer read lacks: our clamp or its budget emptied it), or
-/// `zero_written` (no work in the title's copy either: the title's pass wrote none, or what it
-/// wrote did not reach the copy).
+/// `count_zero` (a count buffer said 0), `differs` (the record read has work but not the
+/// title's copy's at the draw: a clamp ahead read it before its writer ran), `ok` (the record
+/// read has work), `zeroed_by_us` (the title's copy has work the buffer read lacks: our clamp,
+/// its budget or a stale read emptied it), or `zero_written` (no work in the title's copy
+/// either: the title's pass wrote none, or what it wrote did not reach the copy).
 pub(crate) fn verdict(w: &Words) -> &'static str {
     if w.count == Some(0) {
         "count_zero"
+    } else if work(&w.read) > 0 && w.title.is_some_and(|t| t[..4] != w.read[..4]) {
+        "differs"
     } else if work(&w.read) > 0 {
         "ok"
     } else if w.title.is_some_and(|t| work(&t) > 0) {
@@ -356,6 +359,8 @@ mod tests {
         );
         assert_eq!(verdict(&w([3, 24, 0, 0, 0], None, Some(0))), "count_zero");
         assert_eq!(verdict(&w([3, 24, 0, 0, 0], None, Some(1))), "ok");
+        assert_eq!(verdict(&w([3, 24, 0, 0, 0], Some([3, 24, 0, 0, 0]), None)), "ok");
+        assert_eq!(verdict(&w([3, 24, 0, 0, 0], Some([3, 36, 0, 0, 0]), None)), "differs");
     }
 
     #[test]
