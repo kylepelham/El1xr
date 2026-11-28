@@ -344,6 +344,11 @@ if ($Quality) {
 # another, 'none' for no file as dev.py's runs use): its values win over the tuned set and -Quality; the switches below
 # and -Override win over it. VIctory reads the same file for what the environment leaves unset.
 $settingsFile = if ($env:VICTORY_SETTINGS_FILE) { $env:VICTORY_SETTINGS_FILE } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'victory\settings.toml' } else { '' }
+# Play launches (the user's settings file, even before the menu first writes it) output at this monitor's resolution
+# until one is chosen in the menu; the file's values and -Override win. dev.py's runs ('none') keep the title's 3840x2160.
+if ($settingsFile -and $settingsFile -ne 'none' -and -not $env:VICTORY_NATIVE_DEFAULT) {
+    $env:VICTORY_NATIVE_DEFAULT = '1'
+}
 if ($settingsFile -and $settingsFile -ne 'none' -and (Test-Path -LiteralPath $settingsFile -PathType Leaf)) {
     foreach ($line in Get-Content -LiteralPath $settingsFile -Encoding UTF8) {
         if ($line -notmatch '^\s*(VICTORY_[A-Z0-9_]+)\s*=\s*(.*?)\s*$') { continue }

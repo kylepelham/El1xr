@@ -597,8 +597,8 @@ mod tests {
         assert_eq!(d.model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("dlaa"));
         tick(&mut d, &[Key::Left], 0);
         assert_eq!(d.model.get("VICTORY_UPSCALE_QUALITY").as_deref(), Some("quality"));
-        // Sharpness, DLSS model, then Frame generation.
-        for (at, pad) in [(1150, DOWN), (1180, 0), (1210, DOWN), (1240, 0), (1270, DOWN), (1300, 0)] {
+        // Ray tracing, then Frame generation.
+        for (at, pad) in [(1150, DOWN), (1180, 0), (1270, DOWN), (1300, 0)] {
             d.tick(at, &[], pad, 0);
         }
         d.tick(1360, &[Key::Enter], 0, 0);

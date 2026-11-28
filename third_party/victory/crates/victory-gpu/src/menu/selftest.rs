@@ -24,6 +24,13 @@ const SETTLE_MS: u64 = 500;
 const RETURN_TIMEOUT_MS: u64 = 3000;
 /// The setting changed and put back unless the plan names one: Live, and harmless to flip.
 const PREFERRED: &str = "VICTORY_OVERLAY";
+/// The rows Kyle asked for, reported when the menu opens: each must be on the Display tab.
+const PICTURE: &[(&str, &str)] = &[
+    ("resolution", "VICTORY_RESOLUTION"),
+    ("upscaler", "VICTORY_UPSCALE"),
+    ("quality", "VICTORY_UPSCALE_QUALITY"),
+    ("ray_tracing", "VICTORY_RAY_TRACING"),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
@@ -208,6 +215,10 @@ impl Selftest {
                     return false;
                 }
                 log(t, format!("opened (title input blocked={blocked})"));
+                match picture(d) {
+                    Ok(line) => log(t, line),
+                    Err(why) => warn(t, why),
+                }
                 self.plan_pass(d, &at);
             }
             Step::OnTab { i, n, tab, rows } => {
@@ -402,6 +413,43 @@ impl Selftest {
     }
 }
 
+/// `display resolution=2560x1440(unset) row=1 ...; render: <Quality's line>` for the [`PICTURE`]
+/// rows as the menu shows them (an unset value as what it stands for, marked `(unset)`), or which
+/// of them the Display tab lacks.
+fn picture(d: &Driver) -> Result<String, String> {
+    let model = &*d.model;
+    let infos = model.infos();
+    let rows = super::state::rows(model, Tab::DISPLAY, d.menu.expert);
+    let row_of = |name: &str| {
+        rows.iter()
+            .position(|row| matches!(*row, Row::Setting(i) if infos[i].name == name))
+    };
+    let mut parts = Vec::new();
+    let mut missing = Vec::new();
+    for &(key, name) in PICTURE {
+        let Some(row) = row_of(name) else {
+            missing.push(name);
+            continue;
+        };
+        let value = model.get(name).filter(|v| !v.trim().is_empty());
+        let default = match rows[row] {
+            Row::Setting(i) if !infos[i].default.is_empty() => infos[i].default,
+            _ => "default",
+        };
+        let shown = match (value, model.effective(name)) {
+            (Some(v), _) => v,
+            (None, Some(e)) => format!("{e}(unset)"),
+            (None, None) => format!("{default}(unset)"),
+        };
+        parts.push(format!("{key}={shown} row={row}"));
+    }
+    if !missing.is_empty() {
+        return Err(format!("display rows missing from the Display tab: {}", missing.join(", ")));
+    }
+    let render = model.detail("VICTORY_UPSCALE").unwrap_or_else(|| "the title's".into());
+    Ok(format!("display {}; render: {render}", parts.join(" ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::model::{Registry, registry_lock};
@@ -454,6 +502,14 @@ mod tests {
         let has = |s: &str| logs.iter().any(|l| l.contains(s));
         assert!(has("menu selftest: pass at 1s starts"));
         assert!(has("menu selftest: opened (title input blocked=true)"));
+        assert!(
+            logs.iter().any(|l| l.starts_with("menu selftest: display resolution=")
+                && l.contains(" upscaler=")
+                && l.contains(" quality=")
+                && l.contains(" ray_tracing=")
+                && l.contains("; render: ")),
+            "{logs:#?}"
+        );
         for (i, tab) in tabs.iter().enumerate() {
             assert!(has(&format!("tab {}/{} {} drawn", i + 1, tabs.len(), tab.title())), "{tab:?}");
         }

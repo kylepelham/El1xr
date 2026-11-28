@@ -26,6 +26,8 @@ mod cold_skip;
 pub mod console;
 #[cfg(windows)]
 mod commitline;
+#[cfg(windows)]
+mod poolslack;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(windows)]
@@ -236,6 +238,8 @@ mod zero_out;
 mod face_watch;
 #[cfg(windows)]
 mod target_reuse;
+#[cfg(windows)]
+mod skin_watch;
 #[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]

@@ -414,7 +414,7 @@ impl Painter {
                 let a = if selected { 255 } else { 110 };
                 fill(&mut bm, r, px(4.0) as f32, a, ROW_SEL);
             }
-            self.row(&mut bm, l, r, rows[i], model, selected);
+            self.row(&mut bm, l, r, rows[i], model, selected, menu.expert);
         }
         if rows.is_empty() {
             t.centre(&mut bm, HELP, "Nothing here yet", l.list, DIM);
@@ -459,6 +459,7 @@ impl Painter {
         row: Row,
         model: &dyn MenuModel,
         selected: bool,
+        expert: bool,
     ) {
         let t = &self.text;
         let px = |v: f32| l.px(v);
@@ -476,11 +477,13 @@ impl Painter {
                     _ => (value, true),
                 };
                 self.value(bm, l, l.value(r), info.name, info.kind, &value, selected, chosen);
+                // The switch's name only for experts: players read the label and the line.
                 let detail = model.detail(info.name);
                 let help = match (detail.as_deref().unwrap_or(info.help), info.label == info.name) {
                     (help, true) => help.to_string(),
                     ("", false) => info.name.to_string(),
-                    (help, false) => format!("{help}   {}", info.name),
+                    (help, false) if expert => format!("{help}   {}", info.name),
+                    (help, false) => help.to_string(),
                 };
                 (info.label.to_string(), help)
             }
