@@ -310,7 +310,9 @@ fn console_only(format: u32, flags: u32) {
         return;
     };
     SEEN[i].call_once(|| {
-        tracing::warn!(format, flags, "console format: a texture in a format the host does not have as the console does");
+        // (El1xr) `stand_in` = `format`: the host refuses it (`VICTORY_CONSOLE_FORMATS`).
+        let stand_in = if flags & 5 != 0 { target_format(format) } else { format };
+        tracing::warn!(format, flags, stand_in, "console format: a texture in a format the host does not have as the console does");
     });
 }
 
@@ -341,9 +343,9 @@ pub(crate) fn target_format(format: u32) -> u32 {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            stand_ins().map(|(f, _)| {
+            stand_ins().iter().map(|&(f, _)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -369,7 +371,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     );
                 }
                 refused
-            })
+            }).collect()
         });
         if refused[i] {
             return stand_ins()[i].1;
@@ -379,8 +381,15 @@ pub(crate) fn target_format(format: u32) -> u32 {
 }
 
 /// The title's format and the stand-in it gets where the host refuses it (see [`target_format`]).
-fn stand_ins() -> [(u32, u32); 3] {
-    [(86, 28), (115, 28), (67, hdr_stand_in())]
+/// (El1xr) With `VICTORY_CONSOLE_FORMATS=1` also the console's own colour formats
+/// ([`console_formats`]).
+fn stand_ins() -> &'static [(u32, u32)] {
+    static ALL: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = vec![(86, 28), (115, 28), (67, hdr_stand_in())];
+        all.extend_from_slice(console_formats::stand_ins());
+        all
+    })
 }
 
 /// The stand-in of R9G9B9E5 (67): R11G11B10_FLOAT (26) by default, which keeps 6 bits of
@@ -1364,6 +1373,9 @@ pub(crate) mod alias_compatible;
 pub(crate) mod find_facts;
 #[cfg(windows)]
 pub(crate) mod idle_sweep;
+pub(crate) mod console_formats;
+#[cfg(test)]
+mod format_table_tests;
 #[cfg(windows)]
 pub(crate) mod card_kept;
 mod first_mip_array;
