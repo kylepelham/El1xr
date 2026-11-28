@@ -32,6 +32,9 @@ pub enum Effect {
 pub struct Opt {
     pub info: Info,
     pub effect: Effect,
+    /// Whether a run confirmed the native does what the row says. Hashes mapped offline by
+    /// behaviour start unverified and say so in their label.
+    pub verified: bool,
 }
 
 pub const READ_EVERY: Duration = Duration::from_millis(500);
@@ -40,7 +43,19 @@ pub const READ_EVERY: Duration = Duration::from_millis(500);
 /// function the handler calls is `+0x3eaf5d0`, see `victory-loader`'s `frame_rate.rs`).
 pub const NATIVE_TITLE_FPS: u64 = 0x0bb2_0f74_b5a2_5613;
 
-const fn info(
+// The clock, mapped offline on 1.0.2.1 (see `AnyXboxX-coord/modmenu/STATE.md`): seven 0-arg int
+// getters side by side each return one dword of the clock's date-time block; the title computes
+// `h * 3600 + m * 60 + s` from three of them, which names the hour, minute and second.
+/// `GET_CLOCK_HOURS`-like: 0 args, int.
+pub const NATIVE_CLOCK_HOURS: u64 = 0x3d4e_6e66_37d3_0df7;
+/// `GET_CLOCK_MINUTES`-like: 0 args, int.
+pub const NATIVE_CLOCK_MINUTES: u64 = 0x47dc_2440_b1e9_ddce;
+/// `SET_CLOCK_TIME`-like: (hour, minute, second, flag); calls the clock's own time setter (the
+/// one the title's "advance to" native also ends in). The flag (1) first runs a step of its own,
+/// unknown; the trainer passes 0.
+pub const NATIVE_SET_CLOCK_TIME: u64 = 0x04d2_1127_c5ad_3a60;
+
+pub(crate) const fn info(
     name: &'static str,
     group: &'static str,
     label: &'static str,
@@ -67,6 +82,10 @@ fn show_int([v, ..]: [u64; 4]) -> String {
     (v as i64 as i32).to_string()
 }
 
+fn clock_time(v: &str) -> Vec<u64> {
+    vec![v.parse().unwrap_or(0), 0, 0, 0]
+}
+
 pub const OPTIONS: &[Opt] = &[
     Opt {
         info: info(
@@ -77,12 +96,13 @@ pub const OPTIONS: &[Opt] = &[
             Kind::Text,
         ),
         effect: Effect::Status(natives_status),
+        verified: true,
     },
     Opt {
         info: info(
             "MOD_TITLE_FPS",
             "Status",
-            "Title frame rate",
+            "Title frame rate (unverified)",
             "Read through the title's own native on its thread: proves calls work.",
             Kind::Text,
         ),
@@ -91,6 +111,51 @@ pub const OPTIONS: &[Opt] = &[
             args: &[],
             show: show_int,
         },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_HOUR",
+            "World",
+            "Hour (unverified)",
+            "The in-game clock's hour, read through the title's clock getter.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_CLOCK_HOURS,
+            args: &[],
+            show: show_int,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_MINUTE",
+            "World",
+            "Minute (unverified)",
+            "The in-game clock's minute.",
+            Kind::Text,
+        ),
+        effect: Effect::Read {
+            hash: NATIVE_CLOCK_MINUTES,
+            args: &[],
+            show: show_int,
+        },
+        verified: false,
+    },
+    Opt {
+        info: info(
+            "MOD_CLOCK_SET_HOUR",
+            "World",
+            "Set hour (unverified)",
+            "Sets the in-game clock to this hour, minute and second 0.",
+            Kind::Int { min: 0, max: 23 },
+        ),
+        effect: Effect::Set {
+            hash: NATIVE_SET_CLOCK_TIME,
+            args: clock_time,
+        },
+        verified: false,
     },
 ];
 
@@ -227,6 +292,7 @@ mod tests {
                 args: &[7],
                 show: show_int,
             },
+            verified: true,
         },
         Opt {
             info: info("T_HOUR", "World", "Hour", "", Kind::Int { min: 0, max: 23 }),
@@ -234,10 +300,12 @@ mod tests {
                 hash: 0xbb,
                 args: hours,
             },
+            verified: true,
         },
         Opt {
             info: info("T_STATUS", "Status", "Status", "", Kind::Text),
             effect: Effect::Status(|| "fine".into()),
+            verified: true,
         },
     ];
 
@@ -302,6 +370,22 @@ mod tests {
                 "not settings: {}",
                 o.info.name
             );
+            let native = !matches!(o.effect, Effect::Status(_));
+            assert_eq!(
+                native && !o.verified,
+                o.info.label.contains("(unverified)"),
+                "unverified natives say so: {}",
+                o.info.name
+            );
         }
+        let set = OPTIONS
+            .iter()
+            .find(|o| o.info.name == "MOD_CLOCK_SET_HOUR")
+            .unwrap();
+        let Effect::Set { hash, args } = set.effect else {
+            panic!("a set row")
+        };
+        assert_eq!(hash, NATIVE_SET_CLOCK_TIME);
+        assert_eq!(args("13"), vec![13, 0, 0, 0], "hour, minute 0, second 0, flag 0");
     }
 }
