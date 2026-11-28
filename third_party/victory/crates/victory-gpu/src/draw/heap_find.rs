@@ -10,6 +10,28 @@ use crate::descriptor::View;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// (round 10, `VICTORY_HEAP_FIND_ENTRY=1`) A buffer word found naming
+/// slot `v` (`what`) becomes a watched entry; the text for its line: the
+/// raw word when its flag bits differ from the slot's number.
+fn entry_found(start: u64, len: u64, at: usize, v: u32, what: &str) -> String {
+    use crate::heap_find::entry;
+    if !entry::on() {
+        return String::new();
+    }
+    let Some(slot) = what
+        .strip_prefix("slot ")
+        .and_then(|w| w.split(' ').next())
+        .and_then(|n| n.parse::<u32>().ok())
+    else {
+        return String::new();
+    };
+    entry::found(start, len, at, slot, what);
+    match entry::read_words(start + 4 * at as u64, 4).and_then(|w| w.first().copied()) {
+        Some(raw) if raw != v => format!(" raw {raw:#x} (bits 27-31 the shader drops)"),
+        _ => String::new(),
+    }
+}
+
 /// The title memory a constant or buffer view shows: start and bytes.
 fn buffer_memory(view: &View) -> Option<(u64, u64)> {
     const BUFFER: u32 = 1;
@@ -105,7 +127,10 @@ impl State {
                 }
                 &Root::View(a) => {
                     if let Some((at, v, what)) = search_memory(a, MOST_SCAN, &filter, &wanted) {
-                        hits.push(format!("ref root{i} view at {a:#x} dword {at} = {v:#x} ({what})"));
+                        hits.push(format!(
+                            "ref root{i} view at {a:#x} dword {at} = {v:#x} ({what}){}",
+                            entry_found(a, MOST_SCAN, at, v, &what)
+                        ));
                     }
                 }
                 _ => {}
@@ -126,12 +151,98 @@ impl State {
                 };
                 if let Some((at, v, what)) = search_memory(start, len, &filter, &wanted) {
                     hits.push(format!(
-                        "ref {} {:?} s{}+{} buffer {start:#x}+{len:#x} dword {at} = {v:#x} ({what})",
-                        stage.shader.stage, u.kind, u.slot, u.table_offset_dwords
+                        "ref {} {:?} s{}+{} buffer {start:#x}+{len:#x} dword {at} = {v:#x} ({what}){}",
+                        stage.shader.stage,
+                        u.kind,
+                        u.slot,
+                        u.table_offset_dwords,
+                        entry_found(start, len, at, v, &what)
                     ));
                 }
             }
         }
+    }
+
+    /// (round 10, `VICTORY_HEAP_FIND_ENTRY=1`) A bind whose buffer views
+    /// hold a watched entry is a reader; one whose root constants, root
+    /// views or constant buffers hold a number just before the entry (the
+    /// start of the record holding it) is named: `entry reader`.
+    fn heap_find_entry(&self, p: &HostPipeline, roots: &[Root], hits: &mut Vec<String>) {
+        let entries = crate::heap_find::entry::entries();
+        if entries.is_empty() {
+            return;
+        }
+        for stage in &p.stages {
+            for u in stage.translated().used.iter() {
+                if u.root != RootType::Table || !matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = roots.get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some((start, len)) = crate::descriptor::view(handle).as_ref().and_then(buffer_memory)
+                else {
+                    continue;
+                };
+                let Some(e) = entries.iter().find(|e| e.address >= start && e.address < start + len) else {
+                    continue;
+                };
+                let off = e.address - start;
+                let near = self.entry_near(p, roots, off);
+                crate::heap_find::entry::reader(near.is_some());
+                if let Some(near) = near {
+                    hits.push(format!(
+                        "entry reader {} {:?} s{}+{} buffer {start:#x}+{len:#x} entry {:#x} (+{off:#x}): {near}",
+                        stage.shader.stage, u.kind, u.slot, u.table_offset_dwords, e.address
+                    ));
+                }
+                return;
+            }
+        }
+    }
+
+    /// The number closest before an entry `off` bytes into its buffer in
+    /// the bind's root constants, root views and constant buffers
+    /// (`crate::heap_find::entry::nearest`), as text.
+    fn entry_near(&self, p: &HostPipeline, roots: &[Root], off: u64) -> Option<String> {
+        use crate::heap_find::entry::{MOST_NEAR_SCAN, nearest, read_words};
+        let mut best: Option<(u64, String)> = None;
+        let mut take = |words: &[u32], place: String| {
+            if let Some((at, v, how, d)) = nearest(words, off)
+                && best.as_ref().is_none_or(|b| d < b.0)
+            {
+                best = Some((d, format!("{place} dword {at} = {v:#x} ({how}, {d} bytes before the entry)")));
+            }
+        };
+        for (i, r) in roots.iter().enumerate() {
+            match r {
+                Root::Constants(c) => take(c, format!("root{i} constants")),
+                &Root::View(a) => {
+                    if let Some(w) = read_words(a, MOST_NEAR_SCAN) {
+                        take(&w, format!("root{i} view at {a:#x}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stage in &p.stages {
+            for u in stage.translated().used.iter() {
+                if u.root != RootType::Table || u.kind != ResourceType::Cbv {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = roots.get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(View::Constant(a, size)) = crate::descriptor::view(handle)
+                    && let Some(w) = read_words(a, u64::from(size).min(MOST_NEAR_SCAN))
+                {
+                    take(&w, format!("{} cbv s{}+{}", stage.shader.stage, u.slot, u.table_offset_dwords));
+                }
+            }
+        }
+        best.map(|b| b.1)
     }
 
     /// (round 9) Whether the bind is searched in the frames after a Bink
@@ -264,6 +375,7 @@ impl State {
                 ));
             }
         }
+        self.heap_find_entry(p, roots, &mut hits);
         if crate::heap_find::refs() {
             if crate::heap_find::refs_all() || self.heap_find_searched(compute, &spans) {
                 crate::heap_find::refs_bind();
