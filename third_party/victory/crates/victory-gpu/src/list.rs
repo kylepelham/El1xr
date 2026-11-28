@@ -2191,8 +2191,8 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::drop_why::indirect_dropped();
     crate::drop_why::count("indirect");
-    crate::flicker_catch::dropped(0);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

@@ -119,6 +119,8 @@ mod list_reap;
 #[cfg(windows)]
 mod output_views;
 pub mod menu;
+#[cfg(windows)]
+mod menu_shot;
 pub mod modmenu;
 #[cfg(windows)]
 mod overlay;
@@ -152,6 +154,7 @@ mod present_audit;
 #[cfg(windows)]
 mod hold_frame;
 mod flicker_catch;
+mod raw_except;
 #[cfg(windows)]
 mod hdr_scrub;
 #[cfg(windows)]

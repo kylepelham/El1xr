@@ -513,6 +513,10 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
 /// would give the cross-lane code behind it a part of the wave.
 ///
 /// Ported from readmet3xt-lab/foxhound `9f8838b109` (GPL-3.0), `VICTORY_LOOPS_WAVE=1`.
+///
+/// With `VICTORY_LANE_MASK_WIDE` ([`crate::lane_split`]), besides `wide`, every branch on a lane
+/// mask whose arms the console runs with lanes whose own bit went the other way
+/// ([`Lanes::lane_split_loses`]) is kept as the console has it.
 pub fn structure_wide_host(
     program: &Program,
     wide: &HashSet<usize>,
@@ -521,6 +525,7 @@ pub fn structure_wide_host(
     let mut l = Lanes::new(program)?;
     l.wide = wide.union(host).copied().collect();
     l.host = host.difference(wide).copied().collect();
+    let exact = crate::lane_split::on();
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -529,7 +534,13 @@ pub fn structure_wide_host(
             return Err(TOO_LARGE);
         }
         if wrong.is_empty() && new_derived.is_empty() {
-            return l.finish(&execs, &cond);
+            let loses = if exact { l.lane_split_loses(&execs) } else { Vec::new() };
+            if loses.is_empty() {
+                return l.finish(&execs, &cond);
+            }
+            l.wide.extend(loses);
+            l.reset();
+            continue;
         }
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
@@ -683,6 +694,71 @@ impl<'a> Lanes<'a> {
             wave_any: vec![None; blocks.len()],
             quad_sources,
         })
+    }
+
+    /// The branches on a lane mask (SCC of a mask operation, VCC) that splitting per lane
+    /// gets wrong: the console takes one of them with the whole wave, and an arm runs vector
+    /// instructions under an EXEC that holds lanes whose own bit went the other way. With
+    /// `s_and_b64 s, vcc, exec` and `s_cbranch_scc0` around arms that keep EXEC, every active
+    /// lane runs the arm the wave chose (cool_fox #66); split per lane, those whose own bit is
+    /// clear ran the other one. Where the arm narrows EXEC to the lanes that went its way
+    /// (`s_and_saveexec_b64` and `s_cbranch_execz`), the split is exact and kept. Not branches
+    /// every lane decides alike (`when` over uniform atoms only). Ported from
+    /// DoubleGhosty/cool_fox `34e99a33b4` (GPL-3.0).
+    fn lane_split_loses(&mut self, execs: &[Vec<Option<Bool>>]) -> Vec<usize> {
+        let p = self.p;
+        let n = p.blocks.len();
+        let succ = |b: usize| -> Vec<usize> {
+            match p.blocks[b].exit {
+                Exit::Jump(t) => vec![t],
+                Exit::Branch { taken, not_taken } => vec![taken, not_taken],
+                _ => Vec::new(),
+            }
+        };
+        // the blocks reachable from `from` without passing `d` again
+        let reach = |d: usize, from: usize| -> Vec<bool> {
+            let mut seen = vec![false; n];
+            let mut work = vec![from];
+            while let Some(b) = work.pop() {
+                if b == d || seen[b] {
+                    continue;
+                }
+                seen[b] = true;
+                work.extend(succ(b));
+            }
+            seen
+        };
+        let mut out = Vec::new();
+        for d in 0..n {
+            let Exit::Branch { taken, not_taken } = p.blocks[d].exit else { continue };
+            let (Some(when), Some(_)) = (self.when[d], self.wave_any[d]) else { continue };
+            let Some(last) = p.blocks[d].insts.last() else { continue };
+            let name = last.name();
+            if self.wide.contains(&d) || !(name.starts_with("s_cbranch_scc") || name.starts_with("s_cbranch_vcc")) {
+                continue;
+            }
+            if self.b.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+                continue;
+            }
+            let (t, f) = (reach(d, taken), reach(d, not_taken));
+            let not_when = self.b.not(when);
+            let loses = (0..n).any(|b| {
+                // blocks of one arm only (past the join both arms run)
+                let side = match (t[b], f[b]) {
+                    (true, false) => when,
+                    (false, true) => not_when,
+                    _ => return false,
+                };
+                p.blocks[b].insts.iter().zip(&execs[b]).any(|(inst, exec)| {
+                    !matches!(inst.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. })
+                        && exec.is_some_and(|e| !self.b.implies(e, side))
+                })
+            });
+            if loses {
+                out.push(d);
+            }
+        }
+        out
     }
 
     fn reset(&mut self) {

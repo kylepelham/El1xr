@@ -4,9 +4,11 @@
 //! held key takes ([`super::Driver::tick`]): the hotkey opens the menu, the next-tab key steps
 //! through every tab, Right then Left changes one Live Display setting and puts it back
 //! (`VICTORY_OVERLAY` unless `:<SETTING>` names another), and Esc closes it. Each step logs a
-//! `menu selftest:` line, and the window grabs the screen over the game window (the menu as it
-//! is seen, over the game) after each tab, the change and the close. With no key in its plan
-//! nothing here runs; it has no OS calls.
+//! `menu selftest:` line, and after each tab, the change and the close the window asks the present
+//! for a picture ([`crate::menu_shot`]): the next presented frame read back from the swap chain's
+//! texture with the menu's own bitmap laid over it, never the screen. The keys go through the
+//! driver whatever window is in front. With no key in its plan nothing here runs; it has no OS
+//! calls.
 
 use std::collections::VecDeque;
 
@@ -15,7 +17,8 @@ use super::input::Key;
 use super::model::{Apply, Kind};
 use super::state::{Row, Tab};
 
-/// How long a picture stays on screen before it is grabbed (the window drawn and composed).
+/// How long a step settles before its picture is asked for (the menu drawn, the title's frame
+/// caught up).
 const SETTLE_MS: u64 = 500;
 /// How long the closing keys may take to let the title have its input back.
 const RETURN_TIMEOUT_MS: u64 = 3000;
@@ -52,7 +55,7 @@ pub fn parse(text: &str) -> Option<Plan> {
 pub enum Out {
     Log(String),
     Warn(String),
-    /// Grab the screen over the game window into this file name.
+    /// A picture of the game's next presented frame with the menu over it, into this file name.
     Grab(String),
 }
 
@@ -61,8 +64,6 @@ pub struct Tick {
     /// Keys held this poll, on top of the real ones.
     pub keys: Vec<Key>,
     pub out: Vec<Out>,
-    /// A pass is running: the window shows the open menu even if the game is not in front.
-    pub active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,7 +170,6 @@ impl Selftest {
             self.pass = Some(at);
             self.steps = [Step::Press(Key::Hotkey), Step::Opened].into();
         }
-        t.active = true;
         while let Some(step) = self.steps.front().cloned() {
             if !self.run(step, now, driver, blocked, &mut t) {
                 return t;
