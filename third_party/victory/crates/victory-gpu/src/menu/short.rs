@@ -33,6 +33,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_BAKE_ZERO_WAIT", "How long a bake waits for input textures that are still all zeros, in ms."),
     ("VICTORY_BIND_FAST_HASH", "Uses a faster hash for draw binding lookups; same results, less CPU."),
     ("VICTORY_BLOCKED_INDEX", "Notes which list steps read game memory, so flight checks look at fewer."),
+    ("VICTORY_BUDGET_ON_CARD", "Keeps indirect clamp budgets in card memory: no PCIe atomics per draw."),
     ("VICTORY_BVH_NO_HIT", "Ray tests return a clean miss when the BVH builder is off."),
     ("VICTORY_CARD_AWAKE", "Sends small jobs while the card is idle to keep its clocks up."),
     ("VICTORY_CARD_BATCH", "Fetches card-compared changes of settled submissions in one wait."),
