@@ -8472,6 +8472,7 @@ impl Meter {
                 ram_mb = self.ram_mb
             );
             crate::defrag::log_progress();
+            crate::loop_cap::log();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

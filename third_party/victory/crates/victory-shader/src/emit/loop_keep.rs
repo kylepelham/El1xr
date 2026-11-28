@@ -77,7 +77,7 @@ impl Lower<'_> {
     }
 
     /// Loops closed by a plain jump: each header with the blocks of its loop.
-    fn jump_loops(&mut self) -> &[(usize, Vec<bool>)] {
+    pub(super) fn jump_loops(&mut self) -> &[(usize, Vec<bool>)] {
         if self.jump_loops.is_none() {
             let p = self.x.p;
             let mut out = Vec::new();
