@@ -18,7 +18,7 @@ impl Lower<'_> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.numeric_sop {
             return Err(LANE_MASK);
         }
         if matches!(

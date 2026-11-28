@@ -80,6 +80,7 @@ pub const SHORT: &[(&str, &str)] = &[
     ("VICTORY_LOG", "Log filter, such as info or debug."),
     ("VICTORY_LOOPS_WAVE", "Translates wave64 compute loops so each host wave branches together."),
     ("VICTORY_MAP_THREADS_ALL", "Runs the remaining memory mapping calls on the mapping threads too."),
+    ("VICTORY_MASK_ELSEWHERE", "Computes lane masks read as numbers from their operands, not refusing."),
     ("VICTORY_MATERIAL_TEXTURE_DEMAND", "Loads character material textures first in the next texture pass."),
     ("VICTORY_MEET_PRUNE", "Shader translator proves more loops uniform, avoiding slow fallbacks."),
     ("VICTORY_MERGE_SUBMISSIONS", "Sends consecutive game submissions as one host submission."),

@@ -47,6 +47,8 @@ mod dpp;
 mod descriptor_data;
 #[path = "heap_address.rs"]
 pub(super) mod heap_address;
+#[path = "mask_elsewhere.rs"]
+pub(super) mod mask_elsewhere;
 
 /// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
 /// module so it shares the emitter's state.
@@ -476,6 +478,9 @@ struct Lower<'a> {
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
+    /// (`VICTORY_MASK_ELSEWHERE`) A scalar instruction writing a mask is lowered as numbers
+    /// (`mask_elsewhere`).
+    numeric_sop: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
@@ -1466,6 +1471,7 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
+            numeric_sop: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
@@ -3477,6 +3483,10 @@ impl<'a> Lower<'a> {
         let whole = self.twin.is_some()
             || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // (`VICTORY_MASK_ELSEWHERE`) A scalar result is a number of its operands.
+            if let Some(x) = self.mask_by_writer(v) {
+                return Ok(x);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }

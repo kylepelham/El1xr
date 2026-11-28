@@ -10,8 +10,8 @@ fn off_by_default() {
 /// folder of their containers, `<name>.<hash>.cdxil`): refused without the switch ("a
 /// descriptor read only as data"); with it each translates, validates and reads the host's
 /// table of view addresses, but FullAdaptive, which stops next at a lane mask read as data in
-/// its third walk's candidate test (0xae80, `s_cbranch_vccnz` on `exec & s1` where not every
-/// lane runs), a limit of its own.
+/// its third walk's candidate test (0xae80) without `VICTORY_MASK_ELSEWHERE`
+/// (`mask_elsewhere`, whose tests take it with both).
 #[test]
 fn the_trace_shadow_rays_programs_translate_with_heap_view_addresses() {
     let Some(dir) = std::env::var_os("SHADOW_TRACE_DIR") else {
