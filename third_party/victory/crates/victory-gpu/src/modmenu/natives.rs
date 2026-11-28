@@ -391,6 +391,13 @@ pub(crate) mod tests {
         let fps = s.find(super::super::model::NATIVE_TITLE_FPS);
         println!("natives {} repeated {} unplaced {} title fps {fps:x?}", s.natives.len(), s.repeated, s.unplaced);
         assert!(s.natives.len() > 6000);
+        let sites = s
+            .natives
+            .iter()
+            .filter(|n| super::super::census::site(&img, 0, n.rva as usize).is_some())
+            .count();
+        println!("census sites {sites}");
+        assert!(sites > 6000);
     }
 
     #[test]

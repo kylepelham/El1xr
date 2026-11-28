@@ -34,7 +34,9 @@ pub(crate) mod prepare;
 #[cfg(all(test, windows))]
 mod read_marks_tests;
 mod reinterpret;
+pub(crate) mod settle_reread;
 mod short_remap;
+mod slice_len;
 mod stage_unlocked;
 pub(crate) mod staged_ask;
 mod stale_audit;
@@ -1938,8 +1940,15 @@ impl Staging {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = slice_len::subresource_len(
+                footprint.Offset as usize,
+                pitch,
+                rows as usize,
+                f.Depth as usize,
+                self.bytes as usize,
+            );
+            // SAFETY: the subresource's part of the mapped staging buffer, up
+            // to its end (`slice_len`).
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };

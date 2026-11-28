@@ -38,8 +38,18 @@ pub(in crate::watch) static ENDS: AtomicU64 = AtomicU64::new(0);
 pub(in crate::watch) fn ask(pieces: &[(usize, usize)]) {
     let ends = ENDS.load(std::sync::atomic::Ordering::Acquire);
     let mut written: Vec<usize> = Vec::new();
+    let hot = super::hot::Round::begin();
     let ahead = plan(pieces, |first, last| {
-        asked_kernel(first, last, &mut written)
+        if let Some(all) = hot.skipping(first, last) {
+            written.extend(all);
+            return true;
+        }
+        let before = written.len();
+        let answered = asked_kernel(first, last, &mut written);
+        if answered {
+            hot.judge(first, last, written.len() - before);
+        }
+        answered
     });
     let now = next_asking();
     let noting = std::time::Instant::now();

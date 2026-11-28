@@ -204,6 +204,18 @@ pub(crate) fn on(role: Role) -> bool {
             ))
 }
 
+/// Whether the screen probes' rays find nothing ([`rays_find`] for the diffuse light), the
+/// stand-in set or not (`crate::zero_out`'s inject).
+pub(crate) fn probes_blind() -> bool {
+    !(crate::pipeline::builder_runs()
+        && rays_find(
+            Role::Resolve,
+            victory_core::settings::ray_tracing::on(),
+            crate::rt_hit_only::reflections_walk(),
+            crate::rt_hit_only::probes_walk(),
+        ))
+}
+
 /// With the structure builder running: whether the rays `role`'s stand-in
 /// stands in for find something. Turned on by its own switches, the builder
 /// lets every ray walk (the whole stand-in steps aside, as before).
@@ -325,6 +337,35 @@ fn settle() -> Option<Settle> {
     let bits = SET.get();
     let [ms, jump] = unpack(bits);
     (bits != 0).then_some(Settle { ms, jump })
+}
+
+/// What the raise does with the light the title's own resolve left
+/// (`VICTORY_AMBIENT_LEFTOVER`; TheSmurphilicious/victorious-foxwoodhound-lite
+/// 7b74603e07, after codec_d 30e54b4). Without rays that is the probes' sky
+/// light, indoors too, or whatever that memory held. Unset or `keep` (0): the
+/// larger of the two per channel, the leftover's brightness bounded, as
+/// before. `hue` (1): its brightness, within the same bound, in the
+/// estimate's colour. `off` (2): the estimate alone.
+fn leftover() -> u32 {
+    static SET: OnceLock<u32> = OnceLock::new();
+    *SET.get_or_init(|| leftover_mode(&std::env::var("VICTORY_AMBIENT_LEFTOVER").unwrap_or_default()))
+}
+
+fn leftover_mode(set: &str) -> u32 {
+    match set.trim() {
+        s if s.eq_ignore_ascii_case("hue") => 1,
+        s if s.eq_ignore_ascii_case("off") => 2,
+        _ => 0,
+    }
+}
+
+/// The define of [`leftover`]'s mode (none for `keep`: the raise as before).
+fn leftover_define(mode: u32) -> &'static str {
+    match mode {
+        1 => "#define LEFTOVER_HUE\n",
+        2 => "#define LEFTOVER_OFF\n",
+        _ => "",
+    }
 }
 
 /// Strength and radius of the creases' shade.
@@ -584,12 +625,23 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
+#if defined(LEFTOVER_OFF)
+    // (Smurph 7b74603e07) The estimate alone: no sky light the probes leave indoors.
+    float3 now = found;
+    was = 0.0;
+#elif defined(LEFTOVER_HUE)
+    // Only the leftover's brightness counts, in the estimate's colour: the
+    // colour of other memory is no light.
+    float3 now = found * max(1.0, min(has, top) / max(dot(found, LUMA), 1e-6));
+    was = now - found;
+#else
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    float3 now = max(was, found);
+#endif
+    light[p] = pack(now);
 #ifdef ONCE
     // (readmet3xt-lab 8cf0a75) At the places the next keep reads, the share
     // of the light that is the title's own.
-    float3 now = max(was, found);
     float2 gc = (float2(p) + 0.5) / size * float2(CX, CY);
     uint2 cell = min(uint2(gc), uint2(CX - 1, CY - 1));
     uint2 place = min(uint2((gc - float2(cell)) * 5.0), uint2(4, 4));
@@ -827,12 +879,13 @@ fn violet() -> bool {
     *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_VIOLET").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// The defines every pass is made with: the violet drop's and the green and
-/// cyan scrub's (`crate::ambient_sky::chroma`), both read at start.
+/// The defines every pass is made with: the violet drop's, the green and
+/// cyan scrub's (`crate::ambient_sky::chroma`) and the leftover's
+/// ([`leftover`]), all read at start.
 fn defines() -> String {
     let violet = if violet() { "#define VIOLET\n" } else { "" };
     let chroma = if crate::ambient_sky::chroma() { "#define CHROMA\n" } else { "" };
-    format!("{violet}{chroma}")
+    format!("{violet}{chroma}{}", leftover_define(leftover()))
 }
 
 /// A pass made only once a live switch first asks for it
@@ -1399,6 +1452,29 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// `VICTORY_AMBIENT_LEFTOVER`: kept unless set otherwise; its `hue` and
+    /// `off` forms of the raise (plain and `ONCE`) compile and differ from
+    /// the plain one.
+    #[test]
+    fn the_leftover_forms_compile() {
+        assert_eq!(leftover_mode(""), 0);
+        assert_eq!(leftover_mode("keep"), 0);
+        assert_eq!(leftover_mode(" Hue "), 1);
+        assert_eq!(leftover_mode("OFF"), 2);
+        assert_eq!(leftover_mode("whatever"), 0);
+        assert_eq!(leftover_define(0), "");
+        let raise = |defines: &str| {
+            crate::host::compile(&format!("#define RAISE\n{defines}{SOURCE}"), s!("raise"), s!("cs_5_1"))
+                .unwrap_or_else(|e| panic!("{defines}: {e}"))
+        };
+        for once in ["", "#define ONCE\n"] {
+            let plain = raise(once);
+            for mode in [1, 2] {
+                assert_ne!(plain, raise(&format!("{once}{}", leftover_define(mode))), "mode {mode} {once}");
+            }
+        }
     }
 
     /// `VICTORY_AMBIENT_VIOLET=1`'s form of the light-raising pass compiles, and differs.

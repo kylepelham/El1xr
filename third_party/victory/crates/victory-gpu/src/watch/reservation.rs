@@ -7,6 +7,8 @@ static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// (worldstream) `VICTORY_ASK_OUTSIDE=1`: the asking's kernel calls made without the journal's lock.
 pub(super) mod outside;
+/// (worldstream) `VICTORY_HOT_SKIP=1`: ranges rewritten whole answered without the kernel.
+mod hot;
 
 pub(super) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -32,6 +34,8 @@ pub(super) fn count_kernel(pages: usize) {
 
 pub(crate) fn line(frames: f64) {
     super::ask_split::line(frames);
+    hot::line(frames);
+    super::look_skip::line(frames);
     if stats() && frames > 0.0 {
         let _journal = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         let [calls, pages, regions] = STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
@@ -217,6 +221,8 @@ pub(super) fn ask(ranges: &[(usize, usize)]) {
     use super::ask_split::{self as split, add_us};
     let started = std::time::Instant::now();
     let _asking = split::Asking::begin();
+    // Counted until after `KEPT` is published (`end_fast`).
+    let _under = super::end_fast::Under::begin();
     ask_timed(ranges, started);
     add_us(split::ASK_US, started);
 }
@@ -314,7 +320,18 @@ fn run(j: &mut Journal, pieces: &[(usize, usize)]) {
     j.ahead.clear();
     j.ordered = true;
     j.kept = !pieces.is_empty();
-    j.ahead = plan(pieces, |first, last| ask_kernel(j, first, last));
+    let hot = hot::Round::begin();
+    j.ahead = plan(pieces, |first, last| {
+        if let Some(all) = hot.skipping(first, last) {
+            note_kernel_batch(&all, j.ahead_asked);
+            return true;
+        }
+        let found = ask_kernel_found(j, first, last);
+        if let Some(found) = found {
+            hot.judge(first, last, found);
+        }
+        found.is_some()
+    });
 }
 
 /// The groups `pieces` are asked about in, each asked with `ask` (true: the

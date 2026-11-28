@@ -603,7 +603,14 @@ mod tests {
                 window: Duration::from_millis(600),
                 out: PathBuf::new(),
             };
-            let profile = sample(&config);
+            let mut profile = sample(&config);
+            // A machine starved by parallel builds can give a window one tick: try again.
+            for _ in 0..5 {
+                if profile.ticks >= 3 {
+                    break;
+                }
+                profile = sample(&config);
+            }
             stop.store(true, Ordering::Relaxed);
             drop(park_tx);
             busy.join().unwrap();

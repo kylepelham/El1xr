@@ -25,6 +25,25 @@
 //!   (programs, the bind's place in the frame, each binding that holds it
 //!   with its heap slot). Draws that pick views by index are counted in
 //!   the scan line of the next frame walked (they cannot be resolved).
+//!
+//! (round 6) The video target moves every run (0xe3d400000 in part E,
+//! 0xb9d000000 in part G), so `VICTORY_HEAP_FIND=bink` finds it itself: the
+//! render target 0 of every draw of the title's Bink pixel program
+//! ([`BINK_PIXEL`], or a program named `*Bink*`) narrower than 1920 (the
+//! phone's 736x1280 video, not the whole-screen ones) is followed, up to
+//! [`MOST_FOLLOWED`] targets, each over its whole memory, not one address:
+//! - `heap find: follow` when a target is first followed and `heap find:
+//!   write` at each later Bink draw into it (frame, seconds, the target);
+//!   the frames right after a write are walked whatever the 1 s rate;
+//! - the walk also reads the slots holding no view of ours (descriptors the
+//!   title wrote itself, raw) as image and buffer descriptors and logs
+//!   `heap find: raw slot` for those whose address lies in a followed
+//!   target;
+//! - a draw that picks views by index from a heap that holds a slot found
+//!   logs `heap find: draw ... by_index` with those slots (it may read
+//!   them), and root views into the memory are named as `root<slot>`;
+//! - copies, resolves and memory copies from or into the memory log `heap
+//!   find: copy` in any frame (at most [`MOST_COPY_LINES`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -35,7 +54,7 @@ use victory_core::settings::Live;
 use crate::descriptor::View;
 use crate::object::This;
 
-static FIND: Live = Live::new("VICTORY_HEAP_FIND", |v| v.and_then(address).unwrap_or(0));
+static FIND: Live = Live::new("VICTORY_HEAP_FIND", |v| v.and_then(parse_find).unwrap_or(0));
 static WINDOW: Live = Live::new("VICTORY_HEAP_FIND_WINDOW", |v| {
     crate::draw_dump::window(v).map_or(0, |(from, to)| u64::from(from) << 32 | u64::from(to))
 });
@@ -44,7 +63,19 @@ static EVERY_MS: Live = Live::new("VICTORY_HEAP_FIND_EVERY_MS", |v| {
 });
 
 /// Frames walked in a run at most.
-const MOST_FRAMES: u32 = 90;
+const MOST_FRAMES: u32 = 120;
+/// [`FIND`]'s value for `bink`: follow the video targets (no address is 1).
+const FOLLOW: u64 = 1;
+/// The title's Bink YUV-to-RGB pixel program (`PS_BinkNoAlpha`).
+const BINK_PIXEL: &str = "3bfe730f7e24ee1a";
+/// Targets followed at once at most (the newest kept).
+const MOST_FOLLOWED: usize = 4;
+/// Frames walked after each Bink write, whatever the rate.
+const AFTER_WRITE: u32 = 3;
+/// Copy lines of a run at most.
+const MOST_COPY_LINES: u32 = 300;
+/// Write lines of a run at most.
+const MOST_WRITE_LINES: u32 = 200;
 /// Slots a walk keeps at most.
 const MOST_SLOTS: usize = 256;
 /// Draw lines of one frame at most.
@@ -63,9 +94,113 @@ fn address(value: &str) -> Option<u64> {
     u64::from_str_radix(v, 16).ok().filter(|&a| a != 0)
 }
 
-/// The address looked for, 0 when off.
-pub(crate) fn find() -> u64 {
-    FIND.get()
+fn parse_find(value: &str) -> Option<u64> {
+    if value.trim().eq_ignore_ascii_case("bink") {
+        return Some(FOLLOW);
+    }
+    address(value)
+}
+
+/// Whether the switch is on.
+pub(crate) fn on() -> bool {
+    FIND.get() != 0
+}
+
+/// Whether the video targets are followed (`bink`).
+pub(crate) fn follows() -> bool {
+    FIND.get() == FOLLOW
+}
+
+/// A target followed: its memory, description, the frames of its first and
+/// last Bink write.
+struct Followed {
+    start: u64,
+    len: u64,
+    text: String,
+    first: u64,
+    last: u64,
+    writes: u32,
+}
+
+static FOLLOWED: Mutex<Vec<Followed>> = Mutex::new(Vec::new());
+/// Frames still to walk whatever the rate (set at a Bink write).
+static FORCED: AtomicU32 = AtomicU32::new(0);
+static COPY_LINES: AtomicU32 = AtomicU32::new(0);
+static WRITE_LINES: AtomicU32 = AtomicU32::new(0);
+
+/// The memory looked for: half-open ranges (one byte for an address).
+pub(crate) fn spans() -> Vec<(u64, u64)> {
+    match FIND.get() {
+        0 => Vec::new(),
+        FOLLOW => FOLLOWED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|f| (f.start, f.start + f.len.max(1)))
+            .collect(),
+        a => vec![(a, a + 1)],
+    }
+}
+
+/// Whether pixel program `hash` named `name` is a Bink pass.
+pub(crate) fn may_be_bink(hash: &str, name: &str) -> bool {
+    hash == BINK_PIXEL || name.contains("Bink")
+}
+
+/// Whether a draw of pixel program `hash` named `name` writing a target of
+/// `width` is a phone-sized Bink pass.
+fn is_bink(hash: &str, name: &str, width: u64) -> bool {
+    may_be_bink(hash, name) && width < 1920
+}
+
+/// A draw of a Bink program into render target 0 (`start`, `len` bytes,
+/// `width`, `text` its description): the target is followed and the frames
+/// after it walked.
+pub(crate) fn bink_draw(hash: &str, name: &str, start: u64, len: u64, width: u64, text: String) {
+    if !is_bink(hash, name, width) {
+        return;
+    }
+    let frame = crate::frame::current();
+    let at = crate::snap::seconds().unwrap_or(0.0);
+    let mut followed = FOLLOWED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = followed.iter_mut().find(|f| f.start == start && f.len == len) {
+        if f.last == frame {
+            return;
+        }
+        f.last = frame;
+        f.writes += 1;
+        if WRITE_LINES.fetch_add(1, Ordering::Relaxed) < MOST_WRITE_LINES {
+            tracing::warn!(
+                frame,
+                at_s = format_args!("{at:.2}"),
+                writes = f.writes,
+                first_frame = f.first,
+                ps = format_args!("{hash} ({name})"),
+                "heap find: write rt0 [{}]",
+                f.text
+            );
+        }
+    } else {
+        tracing::warn!(
+            frame,
+            at_s = format_args!("{at:.2}"),
+            ps = format_args!("{hash} ({name})"),
+            "heap find: follow rt0 [{text}]"
+        );
+        followed.insert(
+            0,
+            Followed {
+                start,
+                len,
+                text,
+                first: frame,
+                last: frame,
+                writes: 1,
+            },
+        );
+        followed.truncate(MOST_FOLLOWED);
+    }
+    FORCED.store(AFTER_WRITE, Ordering::Relaxed);
 }
 
 /// The frame being walked (`u64::MAX`: none).
@@ -92,10 +227,14 @@ pub(crate) fn recording() -> bool {
     FINDING.load(Ordering::Relaxed) == frame
 }
 
-fn decide(frame: u64, find: u64) {
+fn decide(frame: u64, _find: u64) {
     let Some(at) = crate::snap::seconds() else {
         return;
     };
+    let spans = spans();
+    if spans.is_empty() {
+        return;
+    }
     let bits = WINDOW.get();
     let (from, to) = if bits == 0 {
         (0.0, f64::INFINITY)
@@ -104,7 +243,11 @@ fn decide(frame: u64, find: u64) {
     };
     {
         let mut last = LAST_AT.lock().unwrap_or_else(|e| e.into_inner());
-        if !crate::draw_dump::due(at, from, to, *last, EVERY_MS.get())
+        let forced = FORCED.load(Ordering::Relaxed) > 0 && at >= from && at < to;
+        if forced {
+            FORCED.fetch_sub(1, Ordering::Relaxed);
+        }
+        if !(forced || crate::draw_dump::due(at, from, to, *last, EVERY_MS.get()))
             || FRAMES.load(Ordering::Relaxed) >= MOST_FRAMES
         {
             return;
@@ -115,13 +258,20 @@ fn decide(frame: u64, find: u64) {
     BINDS.store(0, Ordering::Relaxed);
     LINES.store(0, Ordering::Relaxed);
     FINDING.store(frame, Ordering::Relaxed);
-    scan(frame, at, find);
+    scan(frame, at, &spans);
+}
+
+/// Whether `[start, start + len)` meets one of `spans`.
+pub(crate) fn meets(spans: &[(u64, u64)], start: u64, len: u64) -> bool {
+    spans
+        .iter()
+        .any(|&(lo, hi)| start < hi && lo < start.saturating_add(len.max(1)))
 }
 
 /// Where the memory of `view` starts and how many bytes it takes, if it
-/// holds `find`.
-pub(crate) fn covers(view: &View, find: u64) -> Option<(u64, u64)> {
-    let near = |start: u64| start <= find && find - start < FARTHEST;
+/// meets `[lo, hi)`.
+pub(crate) fn covers(view: &View, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let near = |start: u64| start < hi && lo.saturating_sub(start) < FARTHEST;
     let (start, len) = match view {
         View::Placed(_, resource, desc) => {
             let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -139,18 +289,27 @@ pub(crate) fn covers(view: &View, find: u64) -> Option<(u64, u64)> {
         }
         _ => return None,
     };
-    (find < start.saturating_add(len.max(1))).then_some((start, len))
+    (lo < start.saturating_add(len.max(1))).then_some((start, len))
+}
+
+/// The first of `spans` the memory of `view` meets: (lo, hi, view start,
+/// view bytes).
+pub(crate) fn covers_any(view: &View, spans: &[(u64, u64)]) -> Option<(u64, u64, u64, u64)> {
+    spans
+        .iter()
+        .find_map(|&(lo, hi)| covers(view, lo, hi).map(|(s, l)| (lo, hi, s, l)))
 }
 
 /// A view and what it shows, for a line.
-pub(crate) fn view_text(view: &View, find: u64) -> String {
+pub(crate) fn view_text(view: &View, spans: &[(u64, u64)]) -> String {
     use crate::resource::find_facts as f;
-    let span = covers(view, find).map_or_else(String::new, |(start, len)| {
-        format!(
-            "memory {start:#x}..{:#x} (+{:#x})",
-            start + len,
-            find - start
-        )
+    let span = covers_any(view, spans).map_or_else(String::new, |(lo, _, start, len)| {
+        let at = if lo >= start {
+            format!("found at +{:#x}", lo - start)
+        } else {
+            format!("found starts {:#x} in", start - lo)
+        };
+        format!("memory {start:#x}..{:#x} ({at})", start + len)
     });
     let made = match view {
         View::Placed(false, resource, desc) if resource[0] != 1 => {
@@ -185,15 +344,66 @@ struct Seen {
 
 static SEEN: Mutex<Option<HashMap<(u64, u32), Seen>>> = Mutex::new(None);
 
-fn scan(frame: u64, at: f64, find: u64) {
+/// The slots of the last walk, by heap start: what a draw picking views by
+/// index from that heap may read.
+static SLOTS_NOW: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+/// The slots of the last walk in the heap starting at `heap`.
+pub(crate) fn slots_in(heap: u64) -> Vec<u32> {
+    SLOTS_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|s| s.0 == heap)
+        .map(|s| s.1)
+        .collect()
+}
+
+/// The addresses a raw descriptor's first words name: as an image
+/// descriptor (address >> 8 in word 0, bits 40-47 in word 1's low byte)
+/// and as a buffer descriptor (address bits 0-31 in word 0, 32-47 in word
+/// 1's low half).
+fn raw_addresses(words: &[u32; 8]) -> [u64; 2] {
+    let (w0, w1) = (u64::from(words[0]), u64::from(words[1]));
+    [((w1 & 0xff) << 32 | w0) << 8, (w1 & 0xffff) << 32 | w0]
+}
+
+/// Which reading of a raw descriptor lies in `spans`, if one does.
+fn raw_hit(words: &[u32; 8], spans: &[(u64, u64)]) -> Option<&'static str> {
+    let [image, buffer] = raw_addresses(words);
+    let inside = |a: u64| a != 0 && spans.iter().any(|&(lo, hi)| lo <= a && a < hi);
+    if inside(image) {
+        Some("image")
+    } else if inside(buffer) {
+        Some("buffer")
+    } else {
+        None
+    }
+}
+
+fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
     let started = std::time::Instant::now();
-    let found = crate::descriptor::shader_views_where(|v| covers(v, find).is_some(), MOST_SLOTS);
+    let found =
+        crate::descriptor::shader_views_where(|v| covers_any(v, spans).is_some(), MOST_SLOTS);
+    let raw = if follows() {
+        crate::descriptor::raw_slots_where(|w| raw_hit(w, spans).is_some(), MOST_SLOTS)
+    } else {
+        Vec::new()
+    };
+    *SLOTS_NOW.lock().unwrap_or_else(|e| e.into_inner()) = found
+        .iter()
+        .map(|f| (f.0, f.1))
+        .chain(raw.iter().map(|r| (r.0, r.1)))
+        .collect();
     let by_index = BY_INDEX.swap(0, Ordering::Relaxed);
+    let find = spans.first().map_or(0, |s| s.0);
     tracing::warn!(
         frame,
         at_s = format_args!("{at:.2}"),
         find = format_args!("{find:#x}"),
+        followed = spans.len(),
         slots = found.len(),
+        raw_slots = raw.len(),
         target = %crate::resource::find_facts::target_text(find),
         binds_by_index_of_the_last_walked_frame = by_index,
         walk_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
@@ -223,9 +433,68 @@ fn scan(frame: u64, at: f64, find: u64) {
             first_seen_frame = s.first,
             changed_frame = s.changed,
             "heap find: slot {}",
-            view_text(&view, find)
+            view_text(&view, spans)
         );
     }
+    for (heap, index, words) in raw {
+        let record = [words[0], words[1], words[2]];
+        let mut new = false;
+        let s = seen.entry((heap, index)).or_insert_with(|| {
+            new = true;
+            Seen {
+                record,
+                first: frame,
+                changed: frame,
+            }
+        });
+        if !new && s.record == record {
+            continue;
+        }
+        s.record = record;
+        s.changed = frame;
+        let [image, buffer] = raw_addresses(&words);
+        tracing::warn!(
+            frame,
+            heap = format_args!("{heap:#x}"),
+            index,
+            read_as = raw_hit(&words, spans).unwrap_or("?"),
+            image_address = format_args!("{image:#x}"),
+            buffer_address = format_args!("{buffer:#x}"),
+            words = format_args!("{words:08x?}"),
+            first_seen_frame = s.first,
+            changed_frame = s.changed,
+            "heap find: raw slot (a descriptor the title wrote itself)"
+        );
+    }
+}
+
+/// A copy (`kind`) on list `list` from `from` into `to`, each a memory
+/// range if known: logged if either meets the memory looked for.
+pub(crate) fn copy(kind: &str, list: usize, to: Option<(u64, u64)>, from: Option<(u64, u64)>) {
+    let spans = spans();
+    let hits = |r: Option<(u64, u64)>| r.is_some_and(|(s, l)| meets(&spans, s, l));
+    if !(hits(to) || hits(from)) || COPY_LINES.fetch_add(1, Ordering::Relaxed) >= MOST_COPY_LINES {
+        return;
+    }
+    let text = |r: Option<(u64, u64)>| {
+        r.map_or_else(|| "?".into(), |(s, l)| format!("{s:#x}..{:#x}", s + l))
+    };
+    tracing::warn!(
+        frame = crate::frame::current(),
+        at_s = format_args!("{:.2}", crate::snap::seconds().unwrap_or(0.0)),
+        list = format_args!("{list:#x}"),
+        reads_found = hits(from),
+        writes_found = hits(to),
+        "heap find: copy {kind} from {} into {}",
+        text(from),
+        text(to)
+    );
+}
+
+/// [`copy`] of title resources.
+pub(crate) fn copy_resources(kind: &str, list: usize, to: This, from: This) {
+    use crate::resource::find_facts::object_span;
+    copy(kind, list, object_span(to), object_span(from));
 }
 
 /// A walked frame's bind that picks views by index: counted.
@@ -260,6 +529,47 @@ mod tests {
         assert_eq!(address(" e3d400000 "), Some(0xe_3d40_0000));
         assert_eq!(address("0"), None);
         assert_eq!(address("zz"), None);
+        assert_eq!(parse_find(" Bink "), Some(FOLLOW));
+        assert_eq!(parse_find("0x10"), Some(0x10));
+    }
+
+    /// The phone's Bink pass is followed; the whole-screen video drawn by
+    /// the same program and other programs are not.
+    #[test]
+    fn only_narrow_bink_targets_are_followed() {
+        assert!(is_bink(BINK_PIXEL, "", 736));
+        assert!(is_bink("0000000000000000", "PS_BinkNoAlpha_e9aa19fd", 736));
+        assert!(!is_bink(BINK_PIXEL, "PS_BinkNoAlpha_e9aa19fd", 1920));
+        assert!(!is_bink("2df9f97cd6586068", "TL_PS_PBR_MATERIAL_EMISSIVE", 736));
+    }
+
+    /// A raw image descriptor of the target's memory is found, as is a raw
+    /// buffer descriptor inside it; zeros and other memory are not.
+    #[test]
+    fn raw_descriptors_read_as_image_or_buffer_addresses() {
+        let target = (0xb_9d00_0000u64, 0xb_9d00_0000u64 + 736 * 1280 * 4);
+        let mut image = [0u32; 8];
+        image[0] = (0xb_9d00_0000u64 >> 8) as u32;
+        image[1] = 0x1234_5600;
+        assert_eq!(raw_addresses(&image)[0], 0xb_9d00_0000);
+        assert_eq!(raw_hit(&image, &[target]), Some("image"));
+        let mut buffer = [0u32; 8];
+        buffer[0] = 0x9d01_0000;
+        buffer[1] = 0x000b;
+        assert_eq!(raw_hit(&buffer, &[target]), Some("buffer"));
+        assert_eq!(raw_hit(&[0; 8], &[target]), None);
+        image[0] = (0xa_0000_0000u64 >> 8) as u32;
+        assert_eq!(raw_hit(&image, &[target]), None);
+    }
+
+    /// Memory meets a span when the two overlap at all.
+    #[test]
+    fn spans_meet_overlapping_memory() {
+        let spans = [(0x1000, 0x2000)];
+        assert!(meets(&spans, 0x1800, 0x1000));
+        assert!(meets(&spans, 0x800, 0x900));
+        assert!(!meets(&spans, 0x2000, 0x100));
+        assert!(!meets(&spans, 0x800, 0x800));
     }
 
     #[test]
@@ -267,7 +577,7 @@ mod tests {
         victory_core::settings::check_live(
             "VICTORY_HEAP_FIND",
             "0xe3d400000",
-            find,
+            || FIND.get(),
             0,
             0xe_3d40_0000,
         );
@@ -300,13 +610,19 @@ mod tests {
             View::Placed(false, resource, desc)
         };
         let find = 0xe_3d40_0000;
-        assert_eq!(covers(&view(find, 0x1000), find), Some((find, 0x1000)));
+        let end = find + 1;
+        assert_eq!(covers(&view(find, 0x1000), find, end), Some((find, 0x1000)));
         assert_eq!(
-            covers(&view(find - 0x100, 0x200), find),
+            covers(&view(find - 0x100, 0x200), find, end),
             Some((find - 0x100, 0x200))
         );
-        assert_eq!(covers(&view(find - 0x100, 0x100), find), None);
-        assert_eq!(covers(&view(find + 0x100, 0x1000), find), None);
-        assert_eq!(covers(&View::Constant(find, 256), find), None);
+        assert_eq!(covers(&view(find - 0x100, 0x100), find, end), None);
+        assert_eq!(covers(&view(find + 0x100, 0x1000), find, end), None);
+        assert_eq!(covers(&View::Constant(find, 256), find, end), None);
+        // A view lying inside a followed target, not at its start.
+        assert_eq!(
+            covers(&view(find + 0x100, 0x100), find, find + 0x1000),
+            Some((find + 0x100, 0x100))
+        );
     }
 }

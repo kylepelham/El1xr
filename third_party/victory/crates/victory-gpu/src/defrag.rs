@@ -253,6 +253,7 @@ fn log_capped(host: &Host) {
         let Ok(list) = read.list.cast::<ID3D12CommandList>() else {
             return;
         };
+        crate::host::send_thread::wait_idle();
         host.queue.ExecuteCommandLists(&[Some(list)]);
         let next = read.sent + 1;
         if host.queue.Signal(&read.fence, next).is_ok() {
@@ -332,6 +333,7 @@ fn read_defrag_counters(host: &Host) -> Option<(u64, u64, u64, u64)> {
         )]);
         list.CopyBufferRegion(&counter.readback, 0, &counter.gpu, 0, 16);
         list.Close().ok()?;
+        crate::host::send_thread::wait_idle();
         host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
         let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         host.queue.Signal(&fence, 1).ok()?;

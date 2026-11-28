@@ -28,6 +28,7 @@ use crate::watch::PAGE;
 pub(crate) mod lazy;
 #[path = "shadow_build.rs"]
 mod build;
+mod builder_windows;
 mod placement;
 #[path = "shadow_pending.rs"]
 mod pending;
@@ -1206,6 +1207,7 @@ fn window_card_most() -> u64 {
         // (`VICTORY_CARD_SIDE=1`: never under the placement's total.)
         let switch = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         placement::windows_most(switch, if switch.is_none() { unset() << 20 } else { 0 }, placement::set())
+            .saturating_add(builder_windows::more())
     })
 }
 
