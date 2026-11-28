@@ -172,6 +172,12 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// The shared container for `bytes` (a container put together from loose pieces, [`pieces`]).
+#[cfg(windows)]
+fn shader_of(stage: &'static str, bytes: std::borrow::Cow<[u8]>) -> Arc<Shader> {
+    shader(stage, &bytes)
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -340,6 +346,10 @@ impl Shader {
                         e,
                     ),
                     Err(e) => self.log_refused(e),
+                }
+                #[cfg(windows)]
+                if done.is_err() {
+                    pieces::note_untranslated(&self.container);
                 }
                 done.ok()
             });
@@ -1389,6 +1399,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod pieces;
 mod early;
 #[cfg(windows)]
 mod library;

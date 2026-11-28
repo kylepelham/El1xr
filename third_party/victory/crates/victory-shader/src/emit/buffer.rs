@@ -37,6 +37,11 @@ impl Lower<'_> {
         let guard = self.guard(b, i)?;
         let guard = self.thread_limit_guard(name, guard);
         let c = self.cur;
+        // Through a vertex buffer's descriptor: one of the program's own
+        // vertex fetches (a program made from loose pieces).
+        if let Some(byte) = self.vertex_fetch_entry(site) {
+            return self.vertex_fetch(inst, byte, guard);
+        }
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.

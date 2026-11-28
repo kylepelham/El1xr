@@ -80,6 +80,10 @@ mod raw_watch;
 mod drop_why;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pieces_diag;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pieces_log;
+#[cfg(windows)]
+mod read_there;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;

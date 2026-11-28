@@ -367,6 +367,23 @@ fn translate_container(
     victory_shader::emit::translate(container).map_err(|e| e.to_string())
 }
 
+/// What names a container that did not translate, for the list of them pipelines from pieces
+/// keep between runs (`pipeline::pieces`): its BLAKE3 under the translator's identity (the
+/// build key [`host_shader`] files it under).
+#[cfg(windows)]
+pub(crate) fn untranslated_key(container: &[u8]) -> [u8; 32] {
+    let build = build(
+        allow_wave_wide(container),
+        allow_wave_pairs(container),
+        allow_wave_pairs_vt(container),
+        allow_uniform_strict(container),
+    );
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(blake3::hash(container).as_bytes());
+    *hash.finalize().as_bytes()
+}
+
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
