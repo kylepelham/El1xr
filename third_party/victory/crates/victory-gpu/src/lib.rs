@@ -75,6 +75,8 @@ mod bake_publish;
 #[cfg(windows)]
 mod bake_replay;
 #[cfg(windows)]
+mod bake_reuse;
+#[cfg(windows)]
 mod bake_spread;
 #[cfg(windows)]
 mod bind_hash;
