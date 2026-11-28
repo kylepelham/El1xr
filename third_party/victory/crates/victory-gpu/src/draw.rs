@@ -5331,6 +5331,7 @@ impl State {
             return false;
         }
         if kind == DISPATCH && self.zero_out(list, p) {
+            crate::flicker_catch::path(self.pipeline, crate::flicker_catch::Path::Zeroed);
             return true;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -5402,6 +5403,7 @@ impl State {
             }
             #[cfg(windows)]
             self.cost_title(list, "indirect");
+            crate::flicker_catch::path(self.pipeline, crate::flicker_catch::Path::Raw);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 self.op_text(
@@ -5473,7 +5475,10 @@ impl State {
         }
         // (El1xr) `VICTORY_SPLIT_RAW=1`: and a dispatch split into parts, in one piece.
         let split_raw = split && crate::indirect::split_raw();
-        let raw = raw_all() && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split;
+        let raw = raw_all()
+            && matches!(kind, DRAW | INDEXED | MESH | DISPATCH)
+            && !split
+            && !crate::raw_except::excepted(self.pipeline);
         // (El1xr) `VICTORY_RAW_CHECK`: a raw record is read first (`crate::indirect::raw_check`).
         let checked = if raw && !after_writer && !split_raw {
             crate::indirect::raw_check::check(list, (kind, stride, max), arguments, count, || {
@@ -5515,6 +5520,14 @@ impl State {
             }
             #[cfg(windows)]
             self.cost_title(list, "indirect");
+            crate::flicker_catch::path(
+                self.pipeline,
+                if after_writer {
+                    crate::flicker_catch::Path::Sanitized
+                } else {
+                    crate::flicker_catch::Path::Raw
+                },
+            );
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 self.op_text(
@@ -5626,6 +5639,7 @@ impl State {
                 }
                 #[cfg(windows)]
                 self.cost_title(list, "indirect");
+                crate::flicker_catch::path(self.pipeline, crate::flicker_catch::Path::Ahead);
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| {
                     self.op_text(
@@ -5810,6 +5824,7 @@ impl State {
         }
         #[cfg(windows)]
         self.cost_title(list, "indirect");
+        crate::flicker_catch::path(self.pipeline, crate::flicker_catch::Path::Clamped);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(
