@@ -6,8 +6,31 @@
 use victory_shader::{ResourceType, RootType};
 
 use super::{HostList, Root, State};
+use crate::descriptor::View;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+
+/// The title memory a constant or buffer view shows: start and bytes.
+fn buffer_memory(view: &View) -> Option<(u64, u64)> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        View::Shader(r, Some(d)) if d[1] == BUFFER => {
+            let (start, len) = crate::resource::find_facts::object_span(*r as This)?;
+            // The buffer union from word 4: first element (two words),
+            // elements, stride, flags (raw: 4-byte elements).
+            let first = u64::from(d[4]) | u64::from(d[5]) << 32;
+            let each = u64::from(if d[7] != 0 { d[7] } else { 4 });
+            let skip = first.saturating_mul(each).min(len);
+            Some((start + skip, (u64::from(d[6]) * each).min(len - skip)))
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER => Some((
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            crate::resource::find_facts::words_bytes(resource)?,
+        )),
+        _ => None,
+    }
+}
 
 impl State {
     /// (`VICTORY_HEAP_FIND=bink`) A draw of the Bink pixel program: its
@@ -38,6 +61,77 @@ impl State {
             width,
             crate::resource::find_facts::object_text(rt0 as This),
         );
+    }
+
+    /// (`VICTORY_HEAP_FIND_REFS=1`) The bind's tables that reach a found
+    /// slot, and the words of its root constants, root views and buffer
+    /// views that name one (`crate::heap_find::wanted`).
+    fn heap_find_refs(&self, p: &HostPipeline, roots: &[Root], hits: &mut Vec<String>) {
+        use crate::heap_find::{MOST_SCAN, near, search, search_memory, slots_in, wanted};
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let slots = slots_in(heap.start);
+        if slots.is_empty() {
+            return;
+        }
+        let tables: Vec<(u8, u32)> = roots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match *r {
+                Root::Table(t) => heap.index(t).map(|x| (i as u8, x)),
+                _ => None,
+            })
+            .collect();
+        for (root, t, s) in near(&slots, &tables) {
+            hits.push(format!("table{root} at slot {t} reaches found slot {s} at +{}", s - t));
+        }
+        let wanted = wanted(heap.start, &slots, &tables);
+        let key = tables.iter().fold(0u64, |k, &(r, t)| {
+            k.rotate_left(7) ^ (u64::from(r) << 32 | u64::from(t))
+        });
+        for (i, r) in roots.iter().enumerate() {
+            match r {
+                Root::Constants(c) => {
+                    if let Some((at, v, what)) = search(c, &wanted) {
+                        hits.push(format!("ref root{i} constants dword {at} = {v:#x} ({what})"));
+                    }
+                }
+                &Root::View(a) => {
+                    if let Some((at, v, what)) = search_memory(a, MOST_SCAN, key, &wanted) {
+                        hits.push(format!("ref root{i} view at {a:#x} dword {at} = {v:#x} ({what})"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stage in &p.stages {
+            for u in stage.translated().used.iter() {
+                if u.root != RootType::Table || !matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
+                    continue;
+                }
+                let Some(&Root::Table(table)) = roots.get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some((start, len)) = crate::descriptor::view(handle).as_ref().and_then(buffer_memory)
+                else {
+                    continue;
+                };
+                if let Some((at, v, what)) = search_memory(start, len, key, &wanted) {
+                    hits.push(format!(
+                        "ref {} {:?} s{}+{} buffer {start:#x}+{len:#x} dword {at} = {v:#x} ({what})",
+                        stage.shader.stage, u.kind, u.slot, u.table_offset_dwords
+                    ));
+                }
+            }
+        }
     }
 
     pub(super) fn heap_find(&self, list: &HostList, p: &HostPipeline, compute: bool) {
@@ -114,6 +208,9 @@ impl State {
                     "by_index from heap {heap:#x}, which holds found slots {slots:?}"
                 ));
             }
+        }
+        if crate::heap_find::refs() {
+            self.heap_find_refs(p, roots, &mut hits);
         }
         if hits.is_empty() {
             return;

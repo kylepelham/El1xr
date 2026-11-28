@@ -3867,6 +3867,21 @@ impl HostHeap {
         (self.mirror(index, handle, true), None)
     }
 
+    /// (#115, `crate::heap_find`) What host slot `index` shows against the
+    /// title's record `[tag, i, generation]` there: `made` (that view),
+    /// `null`, `other_view`, or `past_the_host_heap`.
+    pub(crate) fn made_state(&self, index: u32, record: [u32; 3]) -> &'static str {
+        let Some(made) = self.made_too.get(index as usize) else {
+            return "past_the_host_heap";
+        };
+        let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+        match made.load(std::sync::atomic::Ordering::Acquire) {
+            0 => "null",
+            k if k == key => "made",
+            _ => "other_view",
+        }
+    }
+
     /// Whether slot `index` is backed by a made host descriptor (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {

@@ -44,6 +44,26 @@
 //!   them), and root views into the memory are named as `root<slot>`;
 //! - copies, resolves and memory copies from or into the memory log `heap
 //!   find: copy` in any frame (at most [`MOST_COPY_LINES`]).
+//!
+//! (round 7) Translated shaders read every view through the heap: the slot
+//! is (table's byte offset + the load's offset + a register offset) / 32,
+//! so a draw may read a slot past its tables' first views, or one picked
+//! by a number in its constants, which the lines above do not see. The scan
+//! line now says what each found slot's host slot shows (`host_slots`:
+//! `made` = the found view, `null`, `other_view`), and
+//! `VICTORY_HEAP_FIND_REFS=1` (live) also looks, for each bind of a walked
+//! frame, at:
+//! - its tables: `heap find: draw ... table<n> at slot <t> reaches found
+//!   slot <s> at +<s - t>` when a found slot lies less than [`NEAR`] slots
+//!   past a table's first;
+//! - its root constants and the first [`MOST_SCAN`] bytes of every
+//!   constant buffer, root view and buffer view it binds: `heap find: draw
+//!   ... ref <where> dword <n> = <value> (<what>)` when a word holds a
+//!   found slot as an index or a byte offset in its heap, from the heap's
+//!   start or from one of the draw's tables, or the slot's handle (low
+//!   half). Each buffer is read once a frame per table set, at most
+//!   [`MOST_FRAME_SCAN`] bytes a frame (`refs_bytes`, `refs_full` on the
+//!   scan line).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -60,6 +80,9 @@ static WINDOW: Live = Live::new("VICTORY_HEAP_FIND_WINDOW", |v| {
 });
 static EVERY_MS: Live = Live::new("VICTORY_HEAP_FIND_EVERY_MS", |v| {
     v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1000)
+});
+static REFS: Live = Live::new("VICTORY_HEAP_FIND_REFS", |v| {
+    u64::from(v.is_some_and(|v| v.trim() == "1"))
 });
 
 /// Frames walked in a run at most.
@@ -80,6 +103,19 @@ const MOST_WRITE_LINES: u32 = 200;
 const MOST_SLOTS: usize = 256;
 /// Draw lines of one frame at most.
 const MOST_DRAW_LINES: u32 = 400;
+/// Slots past a table's first named as within its reach.
+pub(crate) const NEAR: u32 = 1024;
+/// Bytes of a view slot as translated shaders count them (slot = byte
+/// offset >> 5).
+const SLOT_BYTES: u64 = 32;
+/// Bytes of one buffer looked at, from its start.
+pub(crate) const MOST_SCAN: u64 = 16 << 10;
+/// Bytes of buffers looked at in one walked frame.
+const MOST_FRAME_SCAN: u64 = 256 << 20;
+/// Values below this are too common in constants to be told apart.
+const SMALLEST: u32 = 256;
+/// Found slots named on the scan line.
+const MOST_HOST_SLOTS: usize = 8;
 /// A view starting further than this before the address is not looked at
 /// closer (its size is not worked out): no texture is so big.
 const FARTHEST: u64 = 1 << 32;
@@ -104,6 +140,12 @@ fn parse_find(value: &str) -> Option<u64> {
 /// Whether the switch is on.
 pub(crate) fn on() -> bool {
     FIND.get() != 0
+}
+
+/// Whether binds of walked frames are searched for the found slots
+/// (`VICTORY_HEAP_FIND_REFS=1`).
+pub(crate) fn refs() -> bool {
+    REFS.get_bool()
 }
 
 /// Whether the video targets are followed (`bink`).
@@ -397,6 +439,22 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
         .collect();
     let by_index = BY_INDEX.swap(0, Ordering::Relaxed);
     let find = spans.first().map_or(0, |s| s.0);
+    let host_slots: Vec<String> = found
+        .iter()
+        .take(MOST_HOST_SLOTS)
+        .map(|f| {
+            format!(
+                "{:#x}[{}]:{}",
+                f.0,
+                f.1,
+                crate::descriptor::host_slot_state(f.0, f.1, f.2)
+            )
+        })
+        .collect();
+    let (refs_bytes, refs_full) = SCANNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .start(frame);
     tracing::warn!(
         frame,
         at_s = format_args!("{at:.2}"),
@@ -406,6 +464,9 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
         raw_slots = raw.len(),
         target = %crate::resource::find_facts::target_text(find),
         binds_by_index_of_the_last_walked_frame = by_index,
+        host_slots = format_args!("[{}]", host_slots.join(", ")),
+        refs_bytes_of_the_last_walked_frame = refs_bytes,
+        refs_full = refs_full,
         walk_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
         "heap find: scan"
     );
@@ -432,6 +493,7 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
             index,
             first_seen_frame = s.first,
             changed_frame = s.changed,
+            host = crate::descriptor::host_slot_state(heap, index, record),
             "heap find: slot {}",
             view_text(&view, spans)
         );
@@ -507,6 +569,139 @@ pub(crate) fn next_bind() -> u32 {
     BINDS.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A number a bind may hold that names a found slot, and what it is.
+pub(crate) type Wanted = (u32, String);
+
+/// The numbers that name slot `slots` of the heap starting at `heap` (a
+/// handle's low half, an index or a byte offset from the heap's start)
+/// and, for each of a bind's `tables` (root slot, first slot) in that
+/// heap, an index or byte offset from the table's first; those under
+/// [`SMALLEST`] left out, each number once.
+pub(crate) fn wanted(heap: u64, slots: &[u32], tables: &[(u8, u32)]) -> Vec<Wanted> {
+    let mut out: Vec<Wanted> = Vec::new();
+    let mut push = |value: u64, what: String| {
+        if let Ok(v) = u32::try_from(value)
+            && v >= SMALLEST
+            && !out.iter().any(|w| w.0 == v)
+        {
+            out.push((v, what));
+        }
+    };
+    for &s in slots {
+        let s64 = u64::from(s);
+        push(s64, format!("slot {s} as an index"));
+        push(s64 * SLOT_BYTES, format!("slot {s} as a byte offset"));
+        push(
+            heap.wrapping_add(s64 * SLOT_BYTES) & 0xffff_ffff,
+            format!("slot {s} handle low half"),
+        );
+        for &(root, t) in tables {
+            if let Some(rel) = s.checked_sub(t) {
+                let rel = u64::from(rel);
+                push(rel, format!("slot {s} as an index from table{root} at {t}"));
+                push(
+                    rel * SLOT_BYTES,
+                    format!("slot {s} as a byte offset from table{root} at {t}"),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The first word of `words` that is a `wanted` number: its place and
+/// what it names.
+pub(crate) fn search<'a>(words: &[u32], wanted: &'a [Wanted]) -> Option<(usize, u32, &'a str)> {
+    words.iter().enumerate().find_map(|(i, &w)| {
+        wanted
+            .iter()
+            .find(|x| x.0 == w)
+            .map(|x| (i, w, x.1.as_str()))
+    })
+}
+
+/// The tables of a bind within [`NEAR`] slots before a found slot:
+/// (root slot, table's first slot, found slot).
+pub(crate) fn near(slots: &[u32], tables: &[(u8, u32)]) -> Vec<(u8, u32, u32)> {
+    let mut out = Vec::new();
+    for &(root, t) in tables {
+        for &s in slots {
+            if s >= t && s - t < NEAR {
+                out.push((root, t, s));
+            }
+        }
+    }
+    out
+}
+
+/// Buffers searched in the walked frame: by (start, the bind's table set),
+/// what was found; and the bytes read.
+struct Scanned {
+    frame: u64,
+    bytes: u64,
+    full: bool,
+    seen: Option<HashMap<(u64, u64), Option<(usize, u32, String)>>>,
+}
+
+impl Scanned {
+    /// A new walked frame: the last one's bytes and whether it ran out.
+    fn start(&mut self, frame: u64) -> (u64, bool) {
+        let last = (self.bytes, self.full);
+        self.frame = frame;
+        self.bytes = 0;
+        self.full = false;
+        self.seen = None;
+        last
+    }
+}
+
+static SCANNED: Mutex<Scanned> = Mutex::new(Scanned {
+    frame: u64::MAX,
+    bytes: 0,
+    full: false,
+    seen: None,
+});
+
+/// [`search`] of the first [`MOST_SCAN`] bytes of title memory at `start`
+/// (`len` bytes) for a bind whose table set is `key`, once a walked frame
+/// each; `None` if nothing is found or it cannot be read.
+pub(crate) fn search_memory(start: u64, len: u64, key: u64, wanted: &[Wanted]) -> Option<(usize, u32, String)> {
+    let len = len.min(MOST_SCAN) & !3;
+    if start == 0 || len == 0 || start % 4 != 0 {
+        return None;
+    }
+    {
+        let mut scanned = SCANNED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = scanned.seen.as_ref().and_then(|s| s.get(&(start, key))) {
+            return found.clone();
+        }
+        if scanned.bytes + len > MOST_FRAME_SCAN {
+            scanned.full = true;
+            return None;
+        }
+        scanned.bytes += len;
+    }
+    let mut bytes = vec![0u8; len as usize];
+    let found = if crate::host::read_into(start as *const u8, &mut bytes) {
+        let words: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        search(&words, wanted).map(|(i, v, what)| (i, v, what.to_string()))
+    } else {
+        None
+    };
+    SCANNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .seen
+        .get_or_insert_with(HashMap::new)
+        .insert((start, key), found.clone());
+    found
+}
+
 /// A bind of a walked frame that holds the address: its line.
 pub(crate) fn log_draw(bind: u32, head: &str, hits: &[String]) {
     if LINES.fetch_add(1, Ordering::Relaxed) >= MOST_DRAW_LINES {
@@ -572,8 +767,65 @@ mod tests {
         assert!(!meets(&spans, 0x800, 0x800));
     }
 
+    /// A found slot is named by its index, byte offset and handle from
+    /// the heap's start, and by its index or byte offset from a table's
+    /// first; small numbers and tables past the slot are left out.
+    #[test]
+    fn found_slots_are_wanted_in_every_encoding() {
+        let heap = 0x2234_0000;
+        let w = wanted(heap, &[114_106], &[(2, 114_000), (3, 200_000), (4, 114_100)]);
+        let values: Vec<u32> = w.iter().map(|x| x.0).collect();
+        assert!(values.contains(&114_106));
+        assert!(values.contains(&(114_106 * 32)));
+        assert!(values.contains(&(0x2234_0000 + 114_106 * 32)));
+        assert!(values.contains(&(106 * 32)));
+        assert!(!values.contains(&106), "under the smallest number searched");
+        assert!(!values.contains(&6), "too small");
+        assert!(w.iter().all(|x| !x.1.contains("table3")), "a table past the slot");
+        let words = [7, 0, 106 * 32, 114_106];
+        assert_eq!(
+            search(&words, &w),
+            Some((2, 106 * 32, "slot 114106 as a byte offset from table2 at 114000"))
+        );
+        assert_eq!(search(&[1, 2, 3], &w), None);
+    }
+
+    /// A table within reach of a found slot is named; one past it or too
+    /// far before it is not.
+    #[test]
+    fn tables_near_a_found_slot_are_named() {
+        let tables = [(1, 114_000), (2, 114_107), (3, 100_000)];
+        assert_eq!(near(&[114_106], &tables), vec![(1, 114_000, 114_106)]);
+        assert!(near(&[114_106], &[(0, 114_106 - NEAR)]).is_empty());
+        assert_eq!(near(&[5], &[(0, 0)]), vec![(0, 0, 5)]);
+    }
+
+    /// Buffers are read once a walked frame per table set; a new frame
+    /// starts over and reports what the last one read.
+    #[test]
+    fn buffers_are_searched_once_a_frame() {
+        let data: Vec<u32> = vec![1, 2, 114_106, 4];
+        let start = data.as_ptr() as u64;
+        let w = wanted(0x1000_0000, &[114_106], &[]);
+        let _ = SCANNED.lock().unwrap_or_else(|e| e.into_inner()).start(1);
+        assert_eq!(
+            search_memory(start, 16, 9, &w),
+            Some((2, 114_106, "slot 114106 as an index".to_string()))
+        );
+        assert_eq!(
+            search_memory(start, 16, 9, &w).map(|f| f.0),
+            Some(2),
+            "kept for the frame"
+        );
+        let (bytes, full) = SCANNED.lock().unwrap_or_else(|e| e.into_inner()).start(2);
+        assert_eq!((bytes, full), (16, false));
+        assert_eq!(search_memory(0, 16, 9, &w), None);
+        assert_eq!(search_memory(start + 2, 16, 9, &w), None, "unaligned");
+    }
+
     #[test]
     fn the_switches_are_live() {
+        victory_core::settings::check_live("VICTORY_HEAP_FIND_REFS", "1", refs, false, true);
         victory_core::settings::check_live(
             "VICTORY_HEAP_FIND",
             "0xe3d400000",
