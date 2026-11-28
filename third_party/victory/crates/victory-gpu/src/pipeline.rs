@@ -69,6 +69,10 @@ pub(crate) struct Shader {
     /// A skin lighting pixel stage (`crate::skin_fill`), looked up on first asking.
     #[cfg(windows)]
     skin: OnceLock<bool>,
+    /// What its dispatches become under `VICTORY_ZERO_OUT` (`crate::zero_out`), looked up on
+    /// first asking.
+    #[cfg(windows)]
+    zero: OnceLock<Option<crate::zero_out::Zero>>,
 }
 
 impl Shader {
@@ -84,6 +88,17 @@ impl Shader {
     #[cfg(windows)]
     pub(crate) fn skin(&self) -> bool {
         *self.skin.get_or_init(|| self.stage == "pixel" && crate::skin_fill::skin_program(&self.container))
+    }
+
+    /// Whether `VICTORY_ZERO_OUT` names it (a compute program), and what its dispatches
+    /// become (`crate::zero_out`).
+    #[cfg(windows)]
+    pub(crate) fn zeroed(&self) -> Option<crate::zero_out::Zero> {
+        *self.zero.get_or_init(|| {
+            (self.stage == "compute")
+                .then(|| crate::zero_out::of(&self.hash, &self.container))
+                .flatten()
+        })
     }
 }
 
@@ -185,6 +200,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 skin: OnceLock::new(),
+                #[cfg(windows)]
+                zero: OnceLock::new(),
             })
         })
         .clone()
@@ -207,6 +224,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
             .flatten(),
         translated: OnceLock::new(),
         skin: OnceLock::new(),
+        zero: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)
