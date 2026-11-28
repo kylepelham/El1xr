@@ -251,6 +251,8 @@ mod zero_fill;
 #[cfg(windows)]
 mod face_watch;
 #[cfg(windows)]
+mod exposure_watch;
+#[cfg(windows)]
 mod target_reuse;
 #[cfg(windows)]
 mod skin_watch;
