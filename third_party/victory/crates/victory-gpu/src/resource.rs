@@ -3491,6 +3491,7 @@ impl Drop for Resource {
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);
+                    crate::target_reuse::released(at, || footprint(&self.desc).map(|f| f.size));
                 }
             }
         }
