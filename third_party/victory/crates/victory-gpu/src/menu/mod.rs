@@ -10,6 +10,10 @@
 //! It works on the settings registry (`victory_core::settings`) through [`model::Registry`]: tabs
 //! are the registry's groups, each row's LIVE / RESTART / REBUILD tag is `apply_of`, changes go
 //! through `settings::set`, and SAVE writes the settings file.
+//!
+//! The trainer menu ([`crate::modmenu`], `VICTORY_MOD_MENU=1`, F8) is a second window of the same
+//! kind over its own model, with its own hotkey and press counters; either one open blocks the
+//! title's input.
 
 pub mod display;
 pub mod input;
@@ -40,6 +44,50 @@ static PAD_DOWN: AtomicU32 = AtomicU32::new(0);
 static PAD_PRESSED: AtomicU32 = AtomicU32::new(0);
 /// Mouse wheel notches over the game window, in WHEEL_DELTA units.
 static WHEEL: AtomicI32 = AtomicI32::new(0);
+/// The trainer window's own: blocked, presses and wheel (each window takes its counters).
+static TRAINER_BLOCKED: AtomicBool = AtomicBool::new(false);
+static TRAINER_PRESSED: AtomicU32 = AtomicU32::new(0);
+static TRAINER_WHEEL: AtomicI32 = AtomicI32::new(0);
+
+/// One menu window: its hotkey, model, counters and log name.
+pub(crate) struct Spec {
+    pub thread: &'static str,
+    pub class: &'static str,
+    pub what: &'static str,
+    pub hotkey: fn() -> u8,
+    pub model: fn() -> Box<dyn MenuModel>,
+    pub blocked: &'static AtomicBool,
+    pub pressed: &'static AtomicU32,
+    pub wheel: &'static AtomicI32,
+    /// Runs `VICTORY_MENU_SELFTEST`.
+    pub selftest: bool,
+}
+
+#[cfg(windows)]
+static SETTINGS: Spec = Spec {
+    thread: "victory-menu",
+    class: "El1xrMenu",
+    what: "menu on (VICTORY_MENU=1; View + Menu held 1 s also opens it)",
+    hotkey,
+    model: || Box::new(model::Registry::default()),
+    blocked: &BLOCKED,
+    pressed: &PAD_PRESSED,
+    wheel: &WHEEL,
+    selftest: true,
+};
+
+#[cfg(windows)]
+static TRAINER: Spec = Spec {
+    thread: "victory-mod-menu",
+    class: "El1xrModMenu",
+    what: "mod menu: trainer window on (VICTORY_MOD_MENU=1)",
+    hotkey: crate::modmenu::hotkey,
+    model: crate::modmenu::trainer,
+    blocked: &TRAINER_BLOCKED,
+    pressed: &TRAINER_PRESSED,
+    wheel: &TRAINER_WHEEL,
+    selftest: false,
+};
 
 const VK_F9: u8 = 0x78;
 
@@ -52,18 +100,19 @@ pub fn enabled() -> bool {
 
 /// Whether the title's input is blocked now.
 pub fn blocked() -> bool {
-    BLOCKED.load(Relaxed)
+    BLOCKED.load(Relaxed) || TRAINER_BLOCKED.load(Relaxed)
 }
 
 /// Called by the HLE at each input poll with the first pad's buttons (GameInput bits) and left
 /// stick; returns whether the title's input is blocked.
 pub fn feed_pad(buttons: u32, stick_x: f32, stick_y: f32) -> bool {
-    if !enabled() {
+    if !enabled() && !crate::modmenu::enabled() {
         return false;
     }
     let bits = buttons | input::stick_bits(stick_x, stick_y);
     let before = PAD_DOWN.swap(bits, Relaxed);
     PAD_PRESSED.fetch_or(bits & !before, Relaxed);
+    TRAINER_PRESSED.fetch_or(bits & !before, Relaxed);
     blocked()
 }
 
@@ -78,12 +127,13 @@ pub fn chord_mask(buttons: u32) -> u32 {
 
 /// Whether the menu's hotkey is `vk` (other F-key users stand aside).
 pub fn owns_key(vk: u8) -> bool {
-    enabled() && hotkey() == vk
+    (enabled() && hotkey() == vk) || (crate::modmenu::enabled() && crate::modmenu::hotkey() == vk)
 }
 
 /// The game window got wheel movement while the menu is open.
 pub fn wheel(delta: i32) {
     WHEEL.fetch_add(delta, Relaxed);
+    TRAINER_WHEEL.fetch_add(delta, Relaxed);
 }
 
 /// The hotkey's virtual key.
@@ -114,17 +164,25 @@ pub fn parse_key(v: &str) -> Option<u8> {
 }
 
 pub fn hotkey_name() -> String {
-    match hotkey() {
+    key_name(hotkey())
+}
+
+pub fn key_name(vk: u8) -> String {
+    match vk {
         k @ 0x70..=0x87 => format!("F{}", k - 0x6F),
         k => format!("key 0x{k:02X}"),
     }
 }
 
-/// Starts the menu's window thread for the game window `hwnd` (`VICTORY_MENU=1`, first call only).
+/// Starts the menus' window threads for the game window `hwnd` (`VICTORY_MENU=1`,
+/// `VICTORY_MOD_MENU=1`; first call only).
 #[cfg(windows)]
 pub(crate) fn start(hwnd: windows::Win32::Foundation::HWND) {
     if enabled() {
-        window::start(hwnd.0 as usize);
+        window::start(hwnd.0 as usize, &SETTINGS);
+    }
+    if crate::modmenu::enabled() {
+        window::start(hwnd.0 as usize, &TRAINER);
     }
 }
 
@@ -141,7 +199,7 @@ pub struct Driver {
 impl Driver {
     pub fn new(model: Box<dyn MenuModel>) -> Self {
         Driver {
-            menu: Menu::default(),
+            menu: Menu::for_model(&*model),
             model,
             inputs: Inputs::default(),
             draining: false,

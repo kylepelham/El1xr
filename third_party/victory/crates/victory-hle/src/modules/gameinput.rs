@@ -761,6 +761,8 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     input_trace::current(kind);
+    // (El1xr) The trainer's native calls run here, on the title's thread, before our lock.
+    victory_gpu::modmenu::game_tick();
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {

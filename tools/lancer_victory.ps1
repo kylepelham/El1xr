@@ -109,6 +109,15 @@
   Discord Rich Presence stays off (VICTORY_DISCORD=0).
   The ocean's height maps are copied back for the title's CPU (VICTORY_OCEAN_READBACK=1), or boats sit on the sea bed.
 
+.PARAMETER FrameGen
+  Optional. NVIDIA DLSS frame generation through Streamline (VICTORY_FRAME_GEN=dlss): about 44 presented fps from
+  22 real in batch 5. The menu's Frame generation = dlss does the same at the next launch. Either way the launcher
+  adds what it needs when unset: VICTORY_CAMERA_CAPTURE=1, VICTORY_DLSSG_EVERY_FRAME=1 and VICTORY_STREAMLINE_DIR.
+
+.PARAMETER StreamlineDir
+  Optional. Folder with the Streamline DLLs (sl.interposer.dll); default: a vendor\streamline\bin\x64 folder next to
+  this copy of El1xr or one of its parent folders.
+
 .EXAMPLE
   .\tools\lancer_victory.ps1 -GameDir D:\Games\MyPackage -Warm
 
@@ -138,6 +147,8 @@ param(
     [switch]$Quality,
     [switch]$Mute,
     [switch]$SkipIntro,
+    [switch]$FrameGen,
+    [string]$StreamlineDir,
     [string]$DataDir,
     [string[]]$TitleArgs = @(),
     [hashtable]$Override = @{}
@@ -303,7 +314,7 @@ if (-not $NoTunedSettings) {
         VICTORY_WIDE_WAKE_ONE            = '1'         # batch 5: spread work wakes one kept thread per job (+1.4 fps with WAIT_SPIN)
         VICTORY_WAIT_SPIN                = '50'        # batch 5: spin 50 us for the last helper before sleeping
         VICTORY_AMBIENT_ONCE             = '1'         # batch 5: ambient stand-in counts one bounce (steady p99 -11 ms)
-        VICTORY_PRESENT_SMOOTH_READY     = '2'         # batch 5: no present smoothing before the world (first world frame 20.3 s vs 26.1)
+        VICTORY_SKIP_WC_BACK             = '1'         # batch 5: large shader writes to write-combining memory stay on the card (24.6 fps vs 21.5, prep -7 ms)
         VICTORY_HOLD_LAST_FRAME          = '1'         # batch 4: an all-black present shows the last good frame (40 of 71 hidden)
         VICTORY_MENU                     = '1'         # in-game settings menu: F9 (or View+Menu held 1 s); inert while closed
     }
@@ -342,6 +353,29 @@ if ($settingsFile -and $settingsFile -ne 'none' -and (Test-Path -LiteralPath $se
 }
 if ($Mute) {
     $env:VICTORY_MUTE = '1'
+}
+if ($FrameGen) {
+    $env:VICTORY_FRAME_GEN = 'dlss'
+}
+if ($env:VICTORY_FRAME_GEN -eq 'dlss') {
+    if (-not $env:VICTORY_CAMERA_CAPTURE) { $env:VICTORY_CAMERA_CAPTURE = '1' }
+    if (-not $env:VICTORY_DLSSG_EVERY_FRAME) { $env:VICTORY_DLSSG_EVERY_FRAME = '1' }
+    if ($StreamlineDir) {
+        $env:VICTORY_STREAMLINE_DIR = $StreamlineDir
+    } elseif (-not $env:VICTORY_STREAMLINE_DIR) {
+        $dir = $repo
+        while ($dir) {
+            $candidate = Join-Path $dir 'vendor\streamline\bin\x64'
+            if (Test-Path -LiteralPath (Join-Path $candidate 'sl.interposer.dll')) {
+                $env:VICTORY_STREAMLINE_DIR = $candidate
+                break
+            }
+            $dir = Split-Path -Parent $dir
+        }
+        if (-not $env:VICTORY_STREAMLINE_DIR) {
+            Write-Warning 'Frame generation: no vendor\streamline\bin\x64 found; pass -StreamlineDir.'
+        }
+    }
 }
 if ($SkipIntro) {
     $env:VICTORY_SKIP_INTRO = '1'

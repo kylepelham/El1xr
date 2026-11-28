@@ -18,9 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use super::draw::Painter;
 use super::input::Key;
 use super::layout::Layout;
-use super::model::Registry;
 use super::selftest::{Out, Selftest};
-use super::{BLOCKED, Driver, PAD_DOWN, PAD_PRESSED, WHEEL, hotkey};
+use super::{Driver, PAD_DOWN, Spec};
 use crate::pixels::Bitmap;
 
 const TICK: usize = 1;
@@ -55,6 +54,7 @@ const KEYS: [(i32, Key); 13] = [
 ];
 
 struct Ctx {
+    spec: &'static Spec,
     game: HWND,
     window: HWND,
     driver: Driver,
@@ -73,12 +73,14 @@ thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
 }
 
-pub(super) fn start(game: usize) {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
+pub(super) fn start(game: usize, spec: &'static Spec) {
+    static SETTINGS: Once = Once::new();
+    static TRAINER: Once = Once::new();
+    let once = if spec.selftest { &SETTINGS } else { &TRAINER };
+    once.call_once(|| {
         let spawned = std::thread::Builder::new()
-            .name("victory-menu".into())
-            .spawn(move || run(game as HWND));
+            .name(spec.thread.into())
+            .spawn(move || run(game as HWND, spec));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "menu thread not started");
         }
@@ -125,7 +127,7 @@ impl Ctx {
         let front = ours_in_front();
         let mut keys = Vec::new();
         if front {
-            if down(i32::from(hotkey())) {
+            if down(i32::from((self.spec.hotkey)())) {
                 keys.push(Key::Hotkey);
             }
             if self.driver.menu.open || self.driver.blocked() {
@@ -134,7 +136,7 @@ impl Ctx {
         }
         let mut testing = false;
         if let Some(test) = self.selftest.as_mut() {
-            let t = test.tick(now, &mut self.driver, BLOCKED.load(Relaxed), front);
+            let t = test.tick(now, &mut self.driver, self.spec.blocked.load(Relaxed), front);
             keys.extend(t.keys);
             testing = t.active;
             for out in t.out {
@@ -145,10 +147,10 @@ impl Ctx {
                 }
             }
         }
-        let pad = PAD_DOWN.load(Relaxed) | PAD_PRESSED.swap(0, Relaxed);
-        let wheel = WHEEL.swap(0, Relaxed);
+        let pad = PAD_DOWN.load(Relaxed) | self.spec.pressed.swap(0, Relaxed);
+        let wheel = self.spec.wheel.swap(0, Relaxed);
         self.dirty |= self.driver.tick(now, &keys, pad, wheel);
-        BLOCKED.store(self.driver.blocked(), Relaxed);
+        self.spec.blocked.store(self.driver.blocked(), Relaxed);
         self.show(front || testing);
     }
 
@@ -411,7 +413,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
                     let hit = ctx.hit(lp);
                     if ctx.driver.click(hit) {
                         ctx.dirty = true;
-                        BLOCKED.store(ctx.driver.blocked(), Relaxed);
+                        ctx.spec.blocked.store(ctx.driver.blocked(), Relaxed);
                         ctx.show(true);
                     }
                 });
@@ -422,8 +424,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
     }
 }
 
-fn run(game: HWND) {
-    let class = wide("El1xrMenu");
+fn run(game: HWND, spec: &'static Spec) {
+    let class = wide(spec.class);
     let (awareness, dpi) = match_dpi(game);
     // SAFETY: window class and window made and used on this thread only.
     unsafe {
@@ -459,9 +461,10 @@ fn run(game: HWND) {
             tracing::warn!("menu window not created");
             return;
         }
-        tracing::info!(hotkey = %super::hotkey_name(), dpi_awareness = awareness, dpi, "menu on (VICTORY_MENU=1; View + Menu held 1 s also opens it)");
+        tracing::info!(hotkey = %super::key_name((spec.hotkey)()), dpi_awareness = awareness, dpi, "{}", spec.what);
         let selftest = std::env::var("VICTORY_MENU_SELFTEST")
             .ok()
+            .filter(|_| spec.selftest)
             .and_then(|v| super::selftest::parse(&v))
             .map(Selftest::new);
         if let Some(test) = &selftest {
@@ -471,9 +474,10 @@ fn run(game: HWND) {
         }
         CTX.with(|c| {
             *c.borrow_mut() = Some(Ctx {
+                spec,
                 game,
                 window,
-                driver: Driver::new(Box::new(Registry::default())),
+                driver: Driver::new((spec.model)()),
                 painter: None,
                 layout: None,
                 at: POINT { x: 0, y: 0 },
@@ -513,6 +517,7 @@ pub(super) fn render(driver: &mut Driver, w: i32, h: i32) -> Option<Bitmap> {
 #[cfg(test)]
 mod tests {
     use super::super::input::{PAD_DOWN as DOWN, PAD_RB};
+    use super::super::model::Registry;
     use super::super::state::Tab;
     use super::*;
 

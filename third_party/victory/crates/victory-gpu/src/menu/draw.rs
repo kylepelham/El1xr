@@ -345,7 +345,7 @@ impl Painter {
         let ty = l.header.y + (l.header.h - nh) / 2;
         t.draw(&mut bm, TITLE, "El1xr", l.panel.x + pad, ty, TEXT);
         let sub_y = ty + t.ascent[TITLE] - t.ascent[TAB];
-        t.draw(&mut bm, TAB, "Settings", l.panel.x + pad + nw + px(12.0), sub_y, DIM);
+        t.draw(&mut bm, TAB, model.title(), l.panel.x + pad + nw + px(12.0), sub_y, DIM);
         // Expert switch and close, as plain text at the right.
         let e = l.expert;
         let state = if menu.expert { "ON" } else { "OFF" };
@@ -355,7 +355,7 @@ impl Painter {
         let lw = t.measure(CAPS, label).0;
         t.mid(&mut bm, CAPS, label, e.right() - sw - px(8.0) - lw, e, DIM);
         // What the tags mean, ending before the expert switch when there is room.
-        let sub_w = t.measure(TAB, "Settings").0;
+        let sub_w = t.measure(TAB, model.title()).0;
         let room = (
             l.panel.x + pad + nw + px(12.0) + sub_w + px(40.0),
             e.right() - sw - px(8.0) - lw - px(40.0),

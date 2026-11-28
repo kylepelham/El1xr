@@ -35,6 +35,10 @@ pub trait MenuModel: Send {
     fn detail(&self, _name: &str) -> Option<String> {
         None
     }
+    /// What the menu is, after the name in its header.
+    fn title(&self) -> &'static str {
+        "Settings"
+    }
 }
 
 /// The live registry. `save` is the registry's unless a test swaps it.
