@@ -60,7 +60,7 @@ impl Access {
                 Access::Texture(at, len)
             }
             Step::Run(_) => Access::Anywhere,
-            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => Access::Other,
+            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => Access::Other,
         }
     }
 }

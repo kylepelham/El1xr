@@ -1074,3 +1074,173 @@ mod first_diff_tests {
         }
     }
 }
+
+/// (feedcard #88) `VICTORY_HOST_ALONE`: a host step recorded alone does not
+/// wait for the texture checks started before it, the others do; the
+/// skipped checks are joined at the next join (before any prelude), so
+/// every check still ends before the uploads are recorded.
+#[test]
+fn host_steps_alone_skip_the_texture_join_and_the_next_join_takes_it() {
+    use std::sync::{Arc, Mutex};
+    let Some(host) = host() else { return };
+    for (switch, alone, host_first) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        run_wait::FORCED.with(|f| f.set(Some((switch, false))));
+        let events: Arc<Mutex<Vec<&str>>> = Arc::default();
+        let list = host.new_list().unwrap();
+        let seen = events.clone();
+        let work = move || seen.lock().unwrap().push("host");
+        if alone {
+            list.defer_host_alone(work);
+        } else {
+            list.defer_host(work);
+        }
+        let mut batch = Batch::default();
+        let seen = events.clone();
+        batch.early.start(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            seen.lock().unwrap().push("check");
+        });
+        let (_, textures) = list.run_deferred(&mut batch, false);
+        assert!(textures.is_empty());
+        assert_eq!(batch.early.started(), host_first, "switch={switch} alone={alone}");
+        // The join the preludes are made after.
+        batch.flush_textures();
+        let want = if host_first { ["host", "check"] } else { ["check", "host"] };
+        assert_eq!(*events.lock().unwrap(), want, "switch={switch} alone={alone}");
+        list.close();
+    }
+    run_wait::FORCED.with(|f| f.set(None));
+}
+
+/// (feedcard #88) `VICTORY_PRELUDE_AHEAD`: a prelude reset with its list is
+/// recorded into as it was left, after a submission that needed none too;
+/// the card runs it as one reset at submission.
+#[test]
+fn preludes_reset_ahead_record_and_run() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(host) = host() else { return };
+    let copy = test_texture(host);
+    for on in [false, true] {
+        run_wait::FORCED.with(|f| f.set(Some((false, on))));
+        let list = host.new_list().unwrap();
+        // Texture rounds need a prelude (the texture is left a copy source,
+        // the list starts with it a copy destination); round 2 needs none.
+        for round in 0..5 {
+            if round != 2 {
+                list.settle(&copy, COPY_DEST);
+                list.settle(&copy, COPY_SOURCE);
+            }
+            list.close();
+            host.execute(&[&list]);
+            assert!(
+                list.prelude.get().is_some_and(Option::is_some),
+                "on={on} round={round}: made at the first round"
+            );
+            list.reset();
+            assert_eq!(list.prelude_open.load(Relaxed), on, "on={on} round={round}");
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "on={on}");
+        // Off again with the prelude left open: it is recorded into as it is.
+        run_wait::FORCED.with(|f| f.set(Some((false, false))));
+        list.settle(&copy, COPY_DEST);
+        list.settle(&copy, COPY_SOURCE);
+        list.close();
+        host.execute(&[&list]);
+        assert!(!list.prelude_open.load(Relaxed));
+        list.reset();
+        assert!(!list.prelude_open.load(Relaxed));
+        list.close();
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "on={on}");
+    }
+    run_wait::FORCED.with(|f| f.set(None));
+}
+
+const COPY_DEST: u32 = 0x400;
+const COPY_SOURCE: u32 = 0x800;
+
+/// A 4x4 texture's host copy, in the common state.
+fn test_texture(host: &Host) -> std::sync::Arc<crate::resource::HostTexture> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4,
+        Height: 4,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: a valid description and output.
+    unsafe {
+        host.device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut texture,
+            )
+            .unwrap();
+    }
+    std::sync::Arc::new(crate::resource::HostTexture::new(texture.unwrap(), 0))
+}
+
+/// (feedcard #88) What a prelude's list resets and close cost on the
+/// submitting thread, and the resets ahead: 400 submissions of a list whose
+/// prelude moves one texture, each way (`--ignored --nocapture`).
+#[test]
+#[ignore = "microbenchmark"]
+fn bench_prelude_resets_and_close() {
+    let Some(host) = host() else { return };
+    let copy = test_texture(host);
+    for on in [false, true, false, true] {
+        run_wait::FORCED.with(|f| f.set(Some((false, on))));
+        let list = host.new_list().unwrap();
+        list.settle(&copy, COPY_DEST);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let _ = run_wait::taken();
+        let started = std::time::Instant::now();
+        for _ in 0..400 {
+            list.settle(&copy, COPY_DEST);
+            list.settle(&copy, COPY_SOURCE);
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        }
+        let wall = started.elapsed();
+        let c = run_wait::taken();
+        let us = |ns: u64, n: u64| ns as f64 / 1e3 / n.max(1) as f64;
+        println!(
+            "PRELUDE_AHEAD={}: {} preludes {:.1} us each (resets {} at {:.1} us, close {:.1} us), ahead {} at {:.1} us; wall {:?}",
+            u8::from(on),
+            c[5],
+            us(c[7], c[5]),
+            c[8],
+            us(c[9], c[8]),
+            us(c[10], c[5]),
+            c[12],
+            us(c[13], c[12]),
+            wall
+        );
+        list.close();
+    }
+    run_wait::FORCED.with(|f| f.set(None));
+}
