@@ -82,6 +82,9 @@ pub(crate) struct Shader {
     /// Its part in a producer and consumer chain (`crate::consumer_gate`), looked up on first asking.
     #[cfg(windows)]
     chain: OnceLock<Option<crate::consumer_gate::Role>>,
+    /// Its number in the loop cap buffer (`crate::loop_cap`), given on first asking.
+    #[cfg(windows)]
+    loop_cap: OnceLock<u32>,
 }
 
 impl Shader {
@@ -107,6 +110,14 @@ impl Shader {
             (self.stage == "compute")
                 .then(|| crate::zero_out::of(&self.hash, &self.container))
                 .flatten()
+        })
+    }
+
+    /// Its number in the loop cap buffer (`crate::loop_cap`, `VICTORY_LOOP_CAP_WATCH`).
+    #[cfg(windows)]
+    pub(crate) fn loop_cap(&self) -> u32 {
+        *self.loop_cap.get_or_init(|| {
+            crate::loop_cap::register(self.stage, &self.hash, program_name(&self.container))
         })
     }
 
@@ -230,6 +241,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 bake: OnceLock::new(),
                 #[cfg(windows)]
                 chain: OnceLock::new(),
+                #[cfg(windows)]
+                loop_cap: OnceLock::new(),
             })
         })
         .clone()
@@ -256,6 +269,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         zero: OnceLock::new(),
         bake: OnceLock::new(),
         chain: OnceLock::new(),
+        loop_cap: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute)
@@ -1010,6 +1024,7 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    crate::flicker_catch::region::first_bound(this as usize);
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");

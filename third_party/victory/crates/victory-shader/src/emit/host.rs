@@ -651,6 +651,99 @@ pub enum Root {
     /// A root SRV of a host top level built from this scene before the
     /// dispatch, or of address 0 for `None` ([`Host::dispatch`] only).
     Tlas(Option<super::host_tlas::Scene>),
+    /// A root UAV over a zeroed buffer of as many dwords as this holds; the run's contents
+    /// replace them.
+    Uav(std::cell::RefCell<Vec<u32>>),
+}
+
+/// A [`Root::Uav`] buffer, the read-back buffer it is copied to and the dwords it goes back to.
+#[cfg(test)]
+struct RootUav<'a> {
+    buffer: ID3D12Resource,
+    readback: ID3D12Resource,
+    back: &'a std::cell::RefCell<Vec<u32>>,
+}
+
+#[cfg(test)]
+impl<'a> RootUav<'a> {
+    /// A zeroed (committed) buffer of `back`'s dwords, and its read-back buffer.
+    fn new(dev: &ID3D12Device, back: &'a std::cell::RefCell<Vec<u32>>) -> Result<Self, String> {
+        let bytes = (back.borrow().len() as u64 * 4).max(4);
+        let make = |kind, flags, state| {
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: a plain buffer description.
+            unsafe {
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: kind,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: bytes,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    state,
+                    None,
+                    &mut r,
+                )
+                .map_err(err)?;
+            }
+            r.ok_or_else(|| "no resource".to_string())
+        };
+        Ok(Self {
+            buffer: make(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )?,
+            readback: make(
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?,
+            back,
+        })
+    }
+
+    /// Records the copy into the read-back buffer, after the run that wrote it.
+    fn copy(&self, list: &ID3D12GraphicsCommandList) {
+        // SAFETY: an open list; both buffers live until the caller's fence.
+        unsafe {
+            // (Promoted from the common state by the run.)
+            list.ResourceBarrier(&[transition(
+                &self.buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let bytes = self.back.borrow().len() as u64 * 4;
+            list.CopyBufferRegion(&self.readback, 0, &self.buffer, 0, bytes);
+        }
+    }
+
+    /// The copied dwords back into the caller's, once the card is done.
+    fn read(&self) -> Result<(), String> {
+        let mut back = self.back.borrow_mut();
+        // SAFETY: the copy finished; the mapping covers the dwords.
+        unsafe {
+            let mut p = std::ptr::null_mut();
+            self.readback.Map(0, None, Some(&mut p)).map_err(err)?;
+            let n = back.len();
+            back.copy_from_slice(std::slice::from_raw_parts(p.cast::<u32>(), n));
+            self.readback.Unmap(0, None);
+        }
+        Ok(())
+    }
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -865,6 +958,7 @@ impl Host {
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
+            let mut root_uavs = Vec::new();
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) if data.is_empty() => {
@@ -889,6 +983,14 @@ impl Host {
                         let mut at = heap.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(back) => {
+                        let u = RootUav::new(dev, back)?;
+                        list.SetGraphicsRootUnorderedAccessView(
+                            *param,
+                            u.buffer.GetGPUVirtualAddress(),
+                        );
+                        root_uavs.push(u);
                     }
                     Root::View { .. } | Root::Tlas(_) => return Err("root views in a draw".into()),
                 }
@@ -921,6 +1023,9 @@ impl Host {
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
+            }
+            for u in &root_uavs {
+                u.copy(&list);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -985,6 +1090,9 @@ impl Host {
                 out.extend_from_slice(row);
             }
             readback.Unmap(0, None);
+            for u in &root_uavs {
+                u.read()?;
+            }
             drop(keep);
             Ok(out)
         }
@@ -1472,6 +1580,7 @@ impl Host {
             let mut tlas = tlas.into_iter();
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            let mut root_uavs = Vec::new();
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) if data.is_empty() => {
@@ -1511,10 +1620,21 @@ impl Host {
                         let at = if scene.is_some() { tlas.next().unwrap_or(0) } else { 0 };
                         list.SetComputeRootShaderResourceView(*param, at);
                     }
+                    Root::Uav(back) => {
+                        let u = RootUav::new(dev, back)?;
+                        list.SetComputeRootUnorderedAccessView(
+                            *param,
+                            u.buffer.GetGPUVirtualAddress(),
+                        );
+                        root_uavs.push(u);
+                    }
                 }
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
+            for u in &root_uavs {
+                u.copy(&list);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1566,6 +1686,9 @@ impl Host {
                 };
                 rb.Unmap(0, None);
                 out.push(words);
+            }
+            for u in &root_uavs {
+                u.read()?;
             }
             drop(keep);
             Ok(out)

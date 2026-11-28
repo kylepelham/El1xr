@@ -83,7 +83,9 @@ mod half_meet;
 pub(super) use half_meet::{half_meets, meet_lds_sites, meet_sites, with_half_meets};
 
 #[path = "halves.rs"]
-mod halves;
+pub(super) mod halves;
+#[path = "f16_round.rs"]
+pub(super) mod f16_round;
 
 /// Infinities held at ±65504 by the NaN scrub, colours held to the HDR range
 /// (`VICTORY_NAN_SCRUB_INF=1`, `VICTORY_HDR_CLAMP`).
@@ -175,6 +177,8 @@ mod trips;
 pub(super) mod thread_limit;
 #[path = "loop_keep.rs"]
 pub(super) mod loop_keep;
+#[path = "loop_watch.rs"]
+pub(super) mod loop_watch;
 
 type Why = &'static str;
 
@@ -384,6 +388,8 @@ struct Lower<'a> {
     half_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// (`VICTORY_F16_ROUND_MODE`) [`f16_round::modes`], made at the first f16 result.
+    f16_modes: Option<HashMap<usize, Option<u8>>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1390,6 +1396,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
             halves_only: Default::default(),
+            f16_modes: None,
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -8359,10 +8366,14 @@ impl<'a> Lower<'a> {
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
+                // (`VICTORY_LOOP_CAP_WATCH`) An exit at the limit is counted on its way.
+                let [(t, from_t), (f, from_f)] = self.watch_exits(b, (taken, t), (not_taken, f));
+                for (to, via, watched) in [(taken, t, from_t), (not_taken, f, from_f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
+                        let from = if let Some(from) = watched {
+                            from
+                        } else if Some(via) == self.block[to] {
                             self.cur
                         } else {
                             via
@@ -8439,6 +8450,10 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        // (`VICTORY_LOOP_CAP_WATCH`) Counted before the discard: a helper lane writes nothing.
+        if loop_watch::on() {
+            self.cap_hit(a, loop_watch::ENDED);
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

@@ -104,8 +104,14 @@ impl<'a> Lower<'a> {
     /// halves, a raw or scalar load, a descriptor chosen by control flow),
     /// and so is every place of a table the program also picks from at run
     /// time: what the program makes of such a view is not halves alone.
+    /// `VICTORY_HALF_VIEWS_OFF` ([`half_views_off`]): `1` names no place, `loads` counts a
+    /// format load read only as halves as an access of numbers.
     pub(super) fn places_read_as_halves(&self) -> std::collections::BTreeSet<(u8, u32)> {
+        let off = half_views_off();
         let mut halves = std::collections::BTreeSet::new();
+        if off == HalfViewsOff::All {
+            return halves;
+        }
         let mut other = std::collections::BTreeSet::new();
         let mut picked = HashSet::new();
         for d in &self.x.res.descriptors {
@@ -121,7 +127,7 @@ impl<'a> Lower<'a> {
             let half = matches!(d.source, Source::Loaded { .. })
                 && inst.is_some_and(|i| {
                     (i.name().starts_with("buffer_") && i.name().contains("_format_d16_"))
-                        || self.format_load_read_as_halves(i)
+                        || (off != HalfViewsOff::Loads && self.format_load_read_as_halves(i))
                 });
             for leaf in d.source.leaves() {
                 let Source::Loaded { load, .. } = leaf else {
@@ -147,6 +153,61 @@ impl<'a> Lower<'a> {
         }
         halves.retain(|p| !other.contains(p) && !picked.contains(&p.0));
         halves
+    }
+}
+
+/// `VICTORY_HALF_VIEWS_OFF`: which 16-bit accesses through a view of a table move their bits
+/// as unsigned integers ([`super::super::HostShader::half_views`]) are sent back through the
+/// float path, as before the half views. Kitty6 `046f8d0` (after klbf-lab PR #113) had the
+/// opt-out: the 16-bit views and loads made sun shadows and faces blocky on one NVIDIA card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfViewsOff {
+    /// `0` (default): d16 accesses and format loads read only as halves use the half views.
+    No,
+    /// `1`: no half view at all. A d16 load reads the float view and narrows each channel
+    /// (`legacyF32ToF16`), a d16 store widens each half; a format load read as halves loads a
+    /// float (the face network's output reads zeros again: no lip sync).
+    All,
+    /// `loads`: d16 accesses keep their views; a format load read only as halves loads a float
+    /// (Kitty6's `K6_HALF_LOADS=0`).
+    Loads,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's `VICTORY_HALF_VIEWS_OFF`.
+    pub(in crate::emit) static TEST_HALF_VIEWS_OFF: std::cell::Cell<Option<HalfViewsOff>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `value` of `VICTORY_HALF_VIEWS_OFF` read: `1` or `loads`, anything else the default.
+fn parse_half_views_off(value: Option<&std::ffi::OsStr>) -> HalfViewsOff {
+    match value.and_then(|v| v.to_str()) {
+        Some("1") => HalfViewsOff::All,
+        Some("loads") => HalfViewsOff::Loads,
+        _ => HalfViewsOff::No,
+    }
+}
+
+/// `VICTORY_HALF_VIEWS_OFF` ([`HalfViewsOff`]). Part of the shader cache key.
+pub fn half_views_off() -> HalfViewsOff {
+    #[cfg(test)]
+    if let Some(off) = TEST_HALF_VIEWS_OFF.get() {
+        return off;
+    }
+    static OFF: std::sync::OnceLock<HalfViewsOff> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| parse_half_views_off(std::env::var_os("VICTORY_HALF_VIEWS_OFF").as_deref()))
+}
+
+#[cfg(test)]
+#[test]
+fn half_views_off_reads_one_or_loads() {
+    use std::ffi::OsStr;
+    assert_eq!(parse_half_views_off(None), HalfViewsOff::No);
+    assert_eq!(parse_half_views_off(Some(OsStr::new("1"))), HalfViewsOff::All);
+    assert_eq!(parse_half_views_off(Some(OsStr::new("loads"))), HalfViewsOff::Loads);
+    for v in ["0", "", "2", "LOADS"] {
+        assert_eq!(parse_half_views_off(Some(OsStr::new(v))), HalfViewsOff::No);
     }
 }
 
