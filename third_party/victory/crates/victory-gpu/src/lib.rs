@@ -237,6 +237,8 @@ mod face_watch;
 #[cfg(windows)]
 mod target_reuse;
 #[cfg(windows)]
+mod skin_watch;
+#[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
 mod memory;
