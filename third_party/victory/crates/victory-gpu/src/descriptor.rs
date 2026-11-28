@@ -13,6 +13,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 mod busy_later;
 #[cfg(windows)]
+pub(crate) mod copies;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod sync_in_place;
@@ -695,6 +697,7 @@ impl Drop for Heap {
             let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
             heaps.retain(|&(_, _, h)| h != at);
         }
+        copies::unregister(at);
         if let Some(Some(host)) = self.host.get() {
             crate::draw::forget_heap_ranges(host.id());
         }
@@ -1453,8 +1456,14 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
-/// The title released `resource`: the views naming it go stale.
+/// The title released `resource`: the views naming it go stale. With
+/// `VICTORY_HEAP_FIND` on, the memory it lies in is kept for the records
+/// of those views ([`copies::note_former`]).
 pub(crate) fn forget(resource: usize) {
+    #[cfg(windows)]
+    let former = crate::heap_find::on()
+        .then(|| crate::resource::find_facts::object_span(resource as This))
+        .flatten();
     #[cfg(windows)]
     WAITING
         .lock()
@@ -1474,6 +1483,10 @@ pub(crate) fn forget(resource: usize) {
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        #[cfg(windows)]
+        if let Some(span) = former {
+            copies::note_former(i, generation, span);
+        }
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -1954,6 +1967,10 @@ pub(crate) extern "system" fn create_heap(
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
+    }
+    #[cfg(windows)]
+    if desc.kind == VIEWS_KIND {
+        copies::register(std::ptr::from_ref::<Heap>(&heap) as usize);
     }
     #[cfg(not(windows))]
     let _ = visible;

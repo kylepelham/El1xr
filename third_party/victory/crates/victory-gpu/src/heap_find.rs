@@ -62,8 +62,39 @@
 //!   found slot as an index or a byte offset in its heap, from the heap's
 //!   start or from one of the draw's tables, or the slot's handle (low
 //!   half). Each buffer is read once a frame per table set, at most
-//!   [`MOST_FRAME_SCAN`] bytes a frame (`refs_bytes`, `refs_full` on the
-//!   scan line).
+//!   256 MiB a frame (`refs_bytes`, `refs_full` on the scan line; round 8
+//!   below).
+//!
+//! (round 8) Part K: no reader in the frames of the table shot, with the
+//! search whole there (`refs_full=false` at frames 866-980), so the reader
+//! names the view some other way, or reads a copy of it. Now:
+//! - `VICTORY_HEAP_FIND_REFS=1` searches only the draws that render to the
+//!   scene colour or a UI target ([`scene_or_ui`]: rt0 at least 1280 wide,
+//!   or at least 512 tall and not wider than tall, and not the followed
+//!   target itself) in the
+//!   [`REFS_AFTER`] frames after a Bink write; `=2` searches every bind as
+//!   before. Small buffers are read whole and large ones up to 1 MiB, from
+//!   budgets of their own, and buffers that hash as before are not
+//!   searched again ([`refs`]); the scan line says what each walked frame
+//!   searched (`refs_searched_small`/`_large`, `refs_unchanged`,
+//!   `refs_buffers`, `refs_binds`, `refs_full`).
+//! - Draws and dispatches not run (no host pipeline: part K's frame line
+//!   says about 1400 draws a frame, which never reach the bind's walk) are
+//!   searched too, by their tables and root constants and root views:
+//!   `heap find: draw ... dropped draw|dispatch pipeline=<title pipeline>
+//!   [<stages and names>] made=<host pipeline now>`.
+//! - (`bink`) every view heap, shader-visible or not, is walked for slots
+//!   that name the found view another way
+//!   (`crate::descriptor::copies`): its very record at another index
+//!   (`same_record`), a view of the memory in a heap the card does not see
+//!   (`same_memory`), a record of a view freed with its resource whose
+//!   memory was the target's (`stale`: reads as no view, its host slot is
+//!   null), a record copied off a slot's start (`shifted`), a raw
+//!   descriptor in a heap the card does not see (`raw`): `heap find: copy
+//!   slot` lines, and `copies`, `stale_visible`, `view_heaps` on the scan
+//!   line.
+
+mod refs;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -82,7 +113,11 @@ static EVERY_MS: Live = Live::new("VICTORY_HEAP_FIND_EVERY_MS", |v| {
     v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1000)
 });
 static REFS: Live = Live::new("VICTORY_HEAP_FIND_REFS", |v| {
-    u64::from(v.is_some_and(|v| v.trim() == "1"))
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 });
 
 /// Frames walked in a run at most.
@@ -108,10 +143,16 @@ pub(crate) const NEAR: u32 = 1024;
 /// Bytes of a view slot as translated shaders count them (slot = byte
 /// offset >> 5).
 const SLOT_BYTES: u64 = 32;
-/// Bytes of one buffer looked at, from its start.
+/// Bytes of a root view looked at, from its address (its size is not
+/// known; buffer views are read by their own size: [`refs::taken`]).
 pub(crate) const MOST_SCAN: u64 = 16 << 10;
-/// Bytes of buffers looked at in one walked frame.
-const MOST_FRAME_SCAN: u64 = 256 << 20;
+/// Frames after a Bink write whose scene and UI draws are searched.
+const REFS_AFTER: u64 = 30;
+/// Narrowest render target 0 of a scene or UI draw (a portrait one is
+/// taken at any width).
+const SCENE_WIDTH: u64 = 1280;
+/// Shortest portrait or square UI target.
+const UI_HEIGHT: u64 = 512;
 /// Values below this are too common in constants to be told apart.
 const SMALLEST: u32 = 256;
 /// Found slots named on the scan line.
@@ -145,7 +186,34 @@ pub(crate) fn on() -> bool {
 /// Whether binds of walked frames are searched for the found slots
 /// (`VICTORY_HEAP_FIND_REFS=1`).
 pub(crate) fn refs() -> bool {
-    REFS.get_bool()
+    REFS.get() != 0
+}
+
+/// Whether every bind is searched (`VICTORY_HEAP_FIND_REFS=2`), not only
+/// scene and UI draws after a Bink write.
+pub(crate) fn refs_all() -> bool {
+    REFS.get() == 2
+}
+
+/// Whether a draw whose render target 0 is `width` x `height` renders the
+/// scene colour or a UI (a phone's portrait or square one included, from
+/// [`UI_HEIGHT`] tall).
+pub(crate) fn scene_or_ui(width: u64, height: u64) -> bool {
+    width >= SCENE_WIDTH || (height >= UI_HEIGHT && height >= width)
+}
+
+/// Whether this frame is one of the [`REFS_AFTER`] after a Bink write
+/// (always, when an address is looked for).
+pub(crate) fn after_write() -> bool {
+    if !follows() {
+        return true;
+    }
+    let frame = crate::frame::current();
+    FOLLOWED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|f| frame.saturating_sub(f.last) <= REFS_AFTER)
 }
 
 /// Whether the video targets are followed (`bink`).
@@ -451,10 +519,19 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
             )
         })
         .collect();
-    let (refs_bytes, refs_full) = SCANNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .start(frame);
+    let spent = RefsState::with(refs::Refs::start);
+    let (copies, walked) = if follows() {
+        let records: Vec<(u64, u32, [u32; 3])> = found.iter().map(|f| (f.0, f.1, f.2)).collect();
+        crate::descriptor::copies::copies_where(
+            &records,
+            |v| covers_any(v, spans).is_some(),
+            |start, len| meets(spans, start, len),
+            |w| raw_hit(w, spans).is_some(),
+            MOST_SLOTS,
+        )
+    } else {
+        Default::default()
+    };
     tracing::warn!(
         frame,
         at_s = format_args!("{at:.2}"),
@@ -465,8 +542,15 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
         target = %crate::resource::find_facts::target_text(find),
         binds_by_index_of_the_last_walked_frame = by_index,
         host_slots = format_args!("[{}]", host_slots.join(", ")),
-        refs_bytes_of_the_last_walked_frame = refs_bytes,
-        refs_full = refs_full,
+        refs_searched_small = spent.searched[0],
+        refs_searched_large = spent.searched[1],
+        refs_unchanged = spent.unchanged,
+        refs_buffers = spent.buffers,
+        refs_binds = spent.binds,
+        refs_full = spent.full,
+        copies = copies.len(),
+        stale_visible = walked.stale_visible,
+        view_heaps = format_args!("{}/{}_visible", walked.heaps, walked.visible_heaps),
         walk_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
         "heap find: scan"
     );
@@ -526,6 +610,45 @@ fn scan(frame: u64, at: f64, spans: &[(u64, u64)]) {
             first_seen_frame = s.first,
             changed_frame = s.changed,
             "heap find: raw slot (a descriptor the title wrote itself)"
+        );
+    }
+    for c in copies {
+        let record = [c.words[0], c.words[1], c.words[2]];
+        let mut new = false;
+        let s = seen.entry((c.heap, c.index)).or_insert_with(|| {
+            new = true;
+            Seen {
+                record,
+                first: frame,
+                changed: frame,
+            }
+        });
+        if !new && s.record == record {
+            continue;
+        }
+        s.record = record;
+        s.changed = frame;
+        let host = if c.visible {
+            crate::descriptor::host_slot_state(c.heap, c.index, record)
+        } else {
+            "not_shader_visible"
+        };
+        let former = c.former.map_or_else(
+            || "-".to_string(),
+            |(start, len)| format!("{start:#x}..{:#x}", start + len),
+        );
+        tracing::warn!(
+            frame,
+            heap = format_args!("{:#x}", c.heap),
+            visible = c.visible,
+            index = c.index,
+            kind = c.kind.text(),
+            words = format_args!("{:08x?}", c.words),
+            former = %former,
+            first_seen_frame = s.first,
+            changed_frame = s.changed,
+            host,
+            "heap find: copy slot (the found view named at another slot)"
         );
     }
 }
@@ -612,11 +735,13 @@ pub(crate) fn wanted(heap: u64, slots: &[u32], tables: &[(u8, u32)]) -> Vec<Want
 /// The first word of `words` that is a `wanted` number: its place and
 /// what it names.
 pub(crate) fn search<'a>(words: &[u32], wanted: &'a [Wanted]) -> Option<(usize, u32, &'a str)> {
+    let mut values: Vec<(u32, usize)> = wanted.iter().enumerate().map(|(n, x)| (x.0, n)).collect();
+    values.sort_unstable();
     words.iter().enumerate().find_map(|(i, &w)| {
-        wanted
-            .iter()
-            .find(|x| x.0 == w)
-            .map(|x| (i, w, x.1.as_str()))
+        values
+            .binary_search_by_key(&w, |v| v.0)
+            .ok()
+            .map(|at| (i, w, wanted[values[at].1].1.as_str()))
     })
 }
 
@@ -634,72 +759,46 @@ pub(crate) fn near(slots: &[u32], tables: &[(u8, u32)]) -> Vec<(u8, u32, u32)> {
     out
 }
 
-/// Buffers searched in the walked frame: by (start, the bind's table set),
-/// what was found; and the bytes read.
-struct Scanned {
-    frame: u64,
-    bytes: u64,
-    full: bool,
-    seen: Option<HashMap<(u64, u64), Option<(usize, u32, String)>>>,
-}
+static REFS_STATE: Mutex<Option<refs::Refs>> = Mutex::new(None);
 
-impl Scanned {
-    /// A new walked frame: the last one's bytes and whether it ran out.
-    fn start(&mut self, frame: u64) -> (u64, bool) {
-        let last = (self.bytes, self.full);
-        self.frame = frame;
-        self.bytes = 0;
-        self.full = false;
-        self.seen = None;
-        last
+/// What the buffer searches of the walked frame spend ([`refs::Refs`]).
+struct RefsState;
+
+impl RefsState {
+    fn with<T>(f: impl FnOnce(&mut refs::Refs) -> T) -> T {
+        f(REFS_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default))
     }
 }
 
-static SCANNED: Mutex<Scanned> = Mutex::new(Scanned {
-    frame: u64::MAX,
-    bytes: 0,
-    full: false,
-    seen: None,
-});
+/// A bind of a walked frame has its buffers searched.
+pub(crate) fn refs_bind() {
+    RefsState::with(refs::Refs::bind);
+}
 
-/// [`search`] of the first [`MOST_SCAN`] bytes of title memory at `start`
-/// (`len` bytes) for a bind whose table set is `key`, once a walked frame
-/// each; `None` if nothing is found or it cannot be read.
+/// [`search`] of title memory at `start` (`len` bytes; small buffers whole,
+/// large ones their first [`MOST_SCAN`]) for a bind whose table set is
+/// `key`: once a walked frame each, not again while its bytes hash the
+/// same ([`refs`]); `None` if nothing is found or it cannot be read.
 pub(crate) fn search_memory(start: u64, len: u64, key: u64, wanted: &[Wanted]) -> Option<(usize, u32, String)> {
-    let len = len.min(MOST_SCAN) & !3;
+    let len = refs::taken(len);
     if start == 0 || len == 0 || start % 4 != 0 {
         return None;
     }
-    {
-        let mut scanned = SCANNED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(found) = scanned.seen.as_ref().and_then(|s| s.get(&(start, key))) {
-            return found.clone();
-        }
-        if scanned.bytes + len > MOST_FRAME_SCAN {
-            scanned.full = true;
-            return None;
-        }
-        scanned.bytes += len;
+    let k = (start, len, key);
+    let known = RefsState::with(|r| r.known(k).ok_or_else(|| r.may_read(len)));
+    match known {
+        Ok(found) => return found,
+        Err(false) => return None,
+        Err(true) => {}
     }
     let mut bytes = vec![0u8; len as usize];
-    let found = if crate::host::read_into(start as *const u8, &mut bytes) {
-        let words: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b))
-            .collect();
-        search(&words, wanted).map(|(i, v, what)| (i, v, what.to_string()))
-    } else {
-        None
-    };
-    SCANNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .seen
-        .get_or_insert_with(HashMap::new)
-        .insert((start, key), found.clone());
-    found
+    if !crate::host::read_into(start as *const u8, &mut bytes) {
+        return None;
+    }
+    RefsState::with(|r| r.take(k, &bytes, |b| refs::search_bytes(b, wanted)))
 }
 
 /// A bind of a walked frame that holds the address: its line.
@@ -801,13 +900,13 @@ mod tests {
     }
 
     /// Buffers are read once a walked frame per table set; a new frame
-    /// starts over and reports what the last one read.
+    /// starts over and reports what the last one searched.
     #[test]
     fn buffers_are_searched_once_a_frame() {
         let data: Vec<u32> = vec![1, 2, 114_106, 4];
         let start = data.as_ptr() as u64;
         let w = wanted(0x1000_0000, &[114_106], &[]);
-        let _ = SCANNED.lock().unwrap_or_else(|e| e.into_inner()).start(1);
+        let _ = RefsState::with(refs::Refs::start);
         assert_eq!(
             search_memory(start, 16, 9, &w),
             Some((2, 114_106, "slot 114106 as an index".to_string()))
@@ -817,15 +916,29 @@ mod tests {
             Some(2),
             "kept for the frame"
         );
-        let (bytes, full) = SCANNED.lock().unwrap_or_else(|e| e.into_inner()).start(2);
-        assert_eq!((bytes, full), (16, false));
+        let spent = RefsState::with(refs::Refs::start);
+        assert_eq!((spent.searched, spent.buffers, spent.full), ([16, 0], 1, false));
         assert_eq!(search_memory(0, 16, 9, &w), None);
         assert_eq!(search_memory(start + 2, 16, 9, &w), None, "unaligned");
+    }
+
+    /// Scene and UI targets are wide or portrait; small landscape ones
+    /// (shadow, bake and effect targets) are not.
+    #[test]
+    fn scene_and_ui_targets_are_wide_or_portrait() {
+        assert!(scene_or_ui(3840, 2160));
+        assert!(scene_or_ui(1280, 720));
+        assert!(scene_or_ui(736, 1280), "a phone's UI");
+        assert!(scene_or_ui(1024, 1024), "a square UI");
+        assert!(!scene_or_ui(256, 256));
+        assert!(!scene_or_ui(1024, 512));
     }
 
     #[test]
     fn the_switches_are_live() {
         victory_core::settings::check_live("VICTORY_HEAP_FIND_REFS", "1", refs, false, true);
+        victory_core::settings::check_live("VICTORY_HEAP_FIND_REFS", "2", refs_all, false, true);
+        victory_core::settings::check_live("VICTORY_HEAP_FIND_REFS", "1", refs_all, false, false);
         victory_core::settings::check_live(
             "VICTORY_HEAP_FIND",
             "0xe3d400000",
