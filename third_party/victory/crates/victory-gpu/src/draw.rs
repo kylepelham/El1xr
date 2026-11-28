@@ -3702,6 +3702,7 @@ impl State {
             } else {
                 None
             };
+            crate::table_null::unstaged(resource as usize, crate::table_null::Why::Pass);
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;

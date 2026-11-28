@@ -200,6 +200,8 @@ mod stretch;
 #[cfg(windows)]
 mod table_defer;
 #[cfg(windows)]
+mod table_null;
+#[cfg(windows)]
 mod readable_once;
 #[cfg(windows)]
 mod dlss;

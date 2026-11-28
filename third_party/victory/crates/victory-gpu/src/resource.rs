@@ -2577,6 +2577,7 @@ pub(crate) fn let_go_idle() {
             if idle {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
+                crate::table_null::unstaged(at, crate::table_null::Why::HostIdle);
                 crate::texture::unstage(at as This);
                 made.take()
             } else {
@@ -2741,6 +2742,7 @@ fn slot_evict_with(all: &std::collections::BTreeSet<usize>, need: u64, idle_ms: 
                     && std::sync::Arc::strong_count(host) == 1
             });
             if idle {
+                crate::table_null::unstaged(at, crate::table_null::Why::Evicted);
                 crate::texture::unstage(at as This);
                 r.host
                     .slot_evicted

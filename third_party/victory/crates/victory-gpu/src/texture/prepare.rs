@@ -558,6 +558,7 @@ fn work(job: &Job) -> Outcome {
 }
 
 fn finish(job: Job, outcome: Outcome) {
+    let done = matches!(outcome, Outcome::Done(Some(_)));
     let replaced = {
         let mut q = queue();
         let slots = q
@@ -606,6 +607,9 @@ fn finish(job: Job, outcome: Outcome) {
             }
         }
     };
+    if done {
+        crate::table_null::made(job.resource);
+    }
     // Outside the lock: the last of the title's resource may go with it.
     let n = usize::from(replaced.is_some());
     super::prepare_fenced::let_go(replaced, n, false);
@@ -788,6 +792,7 @@ impl Queue {
             while i < all.len() {
                 if old(all[i].at) {
                     let ready = all.swap_remove(i);
+                    crate::table_null::pruned(resource);
                     risks += usize::from(risky(resource, ready.first));
                     stale.push(ready);
                 } else {
