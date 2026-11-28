@@ -23,6 +23,7 @@ fn kept() -> bool {
 /// address refreshed to the highest end.
 pub(super) fn ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
     use crate::watch::ask_split::{self as split, add, add_us};
+    crate::watch::look_skip::submission(runs.iter().map(|&list| std::ptr::from_ref(list) as usize));
     let started = std::time::Instant::now();
     let mut spans = 0u64;
     let each = |visit: &mut dyn FnMut(usize, usize, usize)| {
