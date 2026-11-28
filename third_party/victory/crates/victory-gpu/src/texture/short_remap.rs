@@ -62,6 +62,9 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
         use windows_sys::Win32::System::Memory::*;
+        // No lazy test meanwhile: the remap on a thread of this test's own
+        // would bar every page from arming in it (#78).
+        let _lazy = crate::shadow::lazy::test_disable_lazy_copyback();
 
         const PAGE: usize = 4096;
         for (sparse, release_early) in [(false, false), (false, true), (true, false), (true, true)]

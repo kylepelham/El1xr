@@ -7763,11 +7763,20 @@ mod mapping_tests {
     /// second's "at once" would meet.
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The lazy copy-back off, and no lazy test running, while these tests'
+    /// remaps run: a remap on a thread of their own (unnamed, so in a lazy
+    /// test's scope, `lazy_test_scoped`) bars every page from arming, and a
+    /// lazy test running then armed none (#78).
+    fn lazy_off() -> crate::shadow::lazy::LazyTestGuard {
+        crate::shadow::lazy::test_disable_lazy_copyback()
+    }
+
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
         let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _lazy = lazy_off();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -7830,6 +7839,7 @@ mod mapping_tests {
     #[test]
     fn a_read_holds_off_changes_of_its_own_addresses_only() {
         let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _lazy = lazy_off();
         // Addresses no other test takes, far apart in the locks.
         let (here, there) = (0x7_0000_0000 + (40 << 24), 0x7_0000_0000 + (90 << 24));
         let reading = title_memory_reading_range(here, 64 << 10);
