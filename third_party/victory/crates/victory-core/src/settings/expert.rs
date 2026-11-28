@@ -207,6 +207,8 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_INPLACE_MB", Apply::Restart),
     ("VICTORY_INPLACE_PROBE", Apply::Restart),
     ("VICTORY_INPLACE_PROBE_MB", Apply::Restart),
+    ("VICTORY_INPLACE_WINDOWS", Apply::Restart),
+    ("VICTORY_INPLACE_WINDOWS_MIN_KB", Apply::Restart),
     ("VICTORY_INPUT_TRACE", Apply::Restart),
     ("VICTORY_KBM_GTA", Apply::Restart),
     ("VICTORY_KEEP_OTHER_VIEWS", Apply::Restart),

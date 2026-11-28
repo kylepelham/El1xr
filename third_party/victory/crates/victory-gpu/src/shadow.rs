@@ -5738,6 +5738,13 @@ impl Shadow {
     /// last submission that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
+            // (El1xr) `VICTORY_INPLACE_WINDOWS`: the card wrote title memory
+            // itself; copies of the same bytes are told now that it is done.
+            if crate::inplace::windows_on() {
+                for &(from, to) in ranges {
+                    crate::inplace::told_written(from, to.saturating_sub(from));
+                }
+            }
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -7933,18 +7940,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    let ask = (!unsized_ask).then(|| end - address);
     if build::loose_on() {
         // Made outside the windows' table's lock (`VICTORY_LOOSE_ALLOC_OUTSIDE`).
         drop(map);
         return build::loose_outside(
             (start, len),
             |map| loose_key(map, address, end, unsized_ask, any),
-            || loose_copy(start, len),
+            || loose_copy(start, len, ask),
             note,
         )
         .unwrap_or_else(|| loose(address, end, unsized_ask, any));
     }
-    let shadow = loose_copy(start, len)?;
+    let shadow = loose_copy(start, len, ask)?;
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
@@ -7978,8 +7986,11 @@ fn loose_key(
 
 /// The copy of window `[start, start + len)` of title memory outside
 /// buffers: in a GPU upload heap, on the card alone (transient), or in the
-/// PC's memory with or without a card side.
-fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
+/// PC's memory with or without a card side; or, with
+/// `VICTORY_INPLACE_WINDOWS=1`, instead of the last with no card side, the
+/// title's own memory (`crate::inplace::place_window`). `ask`: the length
+/// of the ask that makes it, `None` if unsized.
+fn loose_copy(start: u64, len: u64, ask: Option<u64>) -> Option<Arc<Shadow>> {
     // (Neptune) With `window_upload`, a window that gets a card side has no CPU side
     // (a transient window); one that gets none is made as before.
     // (Neptune) With `window_rebar`: one copy in a GPU upload heap, before either.
@@ -7994,6 +8005,12 @@ fn loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
     } else {
         None
     };
+    // (El1xr) Without `window_upload` the card side is asked for after the
+    // CPU side is made: such a window may still get one, so it is not tried.
+    let card = rebar_made || transient.is_some() || (!window_upload() && cards() && window_card_most() > 0);
+    if let Some(placed) = crate::inplace::place_window(start, len, ask, card) {
+        return Some(Arc::new(Shadow::placed(placed, start, len, true)));
+    }
     let (buffer, data, card) = if let Some((buffer, data)) = rebar {
         crate::host::name(&buffer, || {
             format!("title memory {start:#x}+{len:#x} in a GPU upload heap")

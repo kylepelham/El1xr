@@ -41,10 +41,13 @@ pub(crate) fn order_on() -> bool {
     crate::port::on() && *ON.get_or_init(|| switch("VICTORY_PORT_CONSTANTS_ORDER"))
 }
 
-/// `VICTORY_PORT_CONSTANTS_ACCOUNT=1` (port 1 alone makes memory in place).
+/// `VICTORY_PORT_CONSTANTS_ACCOUNT=1` (port 1 alone makes memory in place);
+/// (El1xr) also with `VICTORY_INPLACE_WINDOWS=1`, whose shader writes in
+/// place are told written when their submission is done
+/// (`crate::inplace::told_written`).
 pub(crate) fn account_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| switch("VICTORY_PORT_CONSTANTS_ACCOUNT"))
+    *ON.get_or_init(|| switch("VICTORY_PORT_CONSTANTS_ACCOUNT") || crate::inplace::windows_on())
 }
 
 /// Since the last line: indirect executions with arguments or count in
