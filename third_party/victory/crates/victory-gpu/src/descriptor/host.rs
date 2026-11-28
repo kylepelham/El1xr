@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod buffer_format;
+mod copy_first;
 mod flicker;
 pub(crate) mod host_textures;
 mod keep_shown;
@@ -3611,6 +3612,18 @@ impl HostHeap {
             && let Some(view) = view_at(i, generation)
         {
             return Some((view, None));
+        }
+        // `VICTORY_MIRROR_COPY_FIRST`: the texture's host copy is made before the lock.
+        if tag == VIEW_TAG
+            && copy_first::wanted(
+                copy_first::on(),
+                for_draw,
+                self.made_too[index as usize].load(std::sync::atomic::Ordering::Acquire),
+                key,
+            )
+            && let Some(view) = view_at(i, generation)
+        {
+            copy_first::make_copy(&view);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         self.mirror_with_made(&mut made, index, handle, for_draw, record_change, None)

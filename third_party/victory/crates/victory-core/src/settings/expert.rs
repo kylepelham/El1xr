@@ -232,6 +232,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_MESH_OUTPUT_STRICT", Apply::Retranslate),
     ("VICTORY_MESH_PRIM_9BIT", Apply::Retranslate),
     ("VICTORY_MESH_TEST", Apply::Restart),
+    ("VICTORY_MIRROR_COPY_FIRST", Apply::Live),
     ("VICTORY_MODULE_NAME_CLEARS_ERROR", Apply::Live),
     ("VICTORY_MOD_MENU_SELFTEST", Apply::Restart),
     ("VICTORY_MOUSE", Apply::Live),
