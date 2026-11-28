@@ -3376,14 +3376,14 @@ impl State {
         if spread {
             let ahead = std::time::Instant::now();
             if room {
-                crate::bake_ahead::host_copies_of(heap, &due[..pinned], budget, 2);
+                crate::bake_ahead::host_copies_of(heap, &due[..pinned], budget, 2, 512 << 20);
             }
             let took = ahead.elapsed();
             crate::bake_spread::add(crate::bake_spread::C::AheadUs, took.as_micros() as u64);
             budget = crate::bake_spread::budget_left(spread_mode, budget, took);
         } else if room && PASS_BUDGET.get().is_some_and(|(_, _, now)| now) {
             let ahead = std::time::Instant::now();
-            crate::bake_ahead::host_copies(heap, &due, budget);
+            crate::bake_ahead::host_copies(heap, &due, budget, PASS_BUDGET.get().map_or(0, |b| b.1));
             budget = crate::bake_ahead::left_after(budget, ahead.elapsed());
         }
         let mut laps = Laps::new();
