@@ -60,6 +60,7 @@ mod guard4k;
 pub(crate) fn guard_4k_join() -> bool {
     guard4k::join()
 }
+pub(crate) mod empty_notice;
 mod holes;
 pub(crate) mod ask_split;
 mod reservation;
@@ -5223,6 +5224,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if empty_notice::skip(at, len) {
+        return;
+    }
     holes::forget(at, len);
     crate::texback::remapped(at, len);
     if reservation::enabled() {
