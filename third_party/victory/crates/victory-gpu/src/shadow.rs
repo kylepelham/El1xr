@@ -5145,6 +5145,11 @@ impl Shadow {
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
+    /// Marks the copy in use, as a [`find`] that finds it does.
+    pub(crate) fn touch(&self) {
+        self.used.store(crate::host::moment(), Ordering::Relaxed);
+    }
+
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         #[cfg(feature = "diagnostics")]
@@ -7379,6 +7384,11 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 /// what a thread found there before the count moved it need not look up again ([`lookup`]).
 static SHAPE: AtomicU64 = AtomicU64::new(0);
 
+/// (`VICTORY_ROOT_VIEW_MEMO`) [`SHAPE`] as it stands: while it does, [`find`] gives what it gave.
+pub(crate) fn shape() -> u64 {
+    SHAPE.load(Ordering::Acquire)
+}
+
 /// The windows' table, to change it.
 fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
     SHAPE.fetch_add(1, Ordering::Release);
@@ -7388,8 +7398,8 @@ fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Ar
 thread_local! {
     /// (Neptune) What this thread's look-ups found, while [`SHAPE`] stands: the count, and
     /// the copy by (address, length, any).
-    static FOUND: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64, bool), Arc<Shadow>>)> =
-        std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new()));
+    static FOUND: std::cell::RefCell<(u64, crate::bind_hash::Map<(u64, u64, bool), Arc<Shadow>>)> =
+        std::cell::RefCell::new((u64::MAX, crate::bind_hash::Map::default()));
 }
 
 /// (Neptune) Whether a thread remembers what its look-ups found
