@@ -87,6 +87,7 @@ mod bitcode;
 mod container;
 pub mod glass_record;
 pub(crate) mod glass_splice;
+pub(crate) mod shadow_splice;
 mod glass_patch;
 mod hit_only;
 #[cfg(all(test, windows))]
@@ -149,6 +150,7 @@ pub use lower::set_host_max_wave;
 pub use lower::with_uniform_strict;
 pub use rect::rect_list_gs;
 pub use glass_splice::{GLASS_TRACE, Marker, native_glass};
+pub use shadow_splice::native_shadow;
 pub use miss_sky::miss_sky_key;
 pub use shadow_raster::shadow_raster_key;
 pub use hit_only::with_rays_missed;
