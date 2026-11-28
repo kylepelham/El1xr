@@ -872,6 +872,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         crate::round_share::stamp_lists(lists);
+        crate::flicker_catch::submitted(lists.len(), || lists.iter().filter(|&&l| crate::list::host_list(l).is_none()).count());
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -936,6 +937,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             format!("SUBMIT queue kind {kind:?} held {kept} lists {named:?}")
         });
         if kept {
+            crate::flicker_catch::count(crate::flicker_catch::Kind::HeldSubmits);
             return;
         }
         let host_lists: Vec<_> = lists

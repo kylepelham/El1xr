@@ -4318,6 +4318,7 @@ impl Host {
         if !late() {
             return;
         }
+        crate::flicker_catch::settled(why);
         if relay() {
             // Nothing is settled here: the thread that lands flights does
             // it, in order, and this waits until nothing is in the air and
@@ -8436,7 +8437,7 @@ impl Host {
             // (racefix, #57) A black present may show the last good frame
             // (`VICTORY_HOLD_LAST_FRAME`): the texture is read by its scan too.
             let hold = over.is_none() && crate::hold_frame::most() > 0;
-            let read = if hold {
+            let read = if hold || crate::flicker_catch::on() {
                 crate::hold_frame::READ
             } else {
                 D3D12_RESOURCE_STATE_COPY_SOURCE
@@ -8471,6 +8472,7 @@ impl Host {
             };
             let watched = crate::popwatch::take(&self.device, list, texture);
             let audited = crate::present_audit::take(&self.device, list, texture, index, frame);
+            let caught = crate::flicker_catch::pass::take(&self.device, list, texture, frame);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
@@ -8516,6 +8518,9 @@ impl Host {
             }
             if let Some(slot) = held {
                 crate::hold_frame::sent(slot, flown);
+            }
+            if let Some(caught) = caught {
+                crate::flicker_catch::pass::sent(caught, flown);
             }
             crate::snap::finish(snap, slot.map_or(0, |i| p.ahead[i].1));
             if let Some(shot) = shot {

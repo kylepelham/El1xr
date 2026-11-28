@@ -382,6 +382,7 @@ pub(crate) fn commit_show_now(heap: usize, index: u32, handle: u64, expected_key
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
         if tag == VIEW_TAG && key == expected_key {
+            crate::flicker_catch::count(crate::flicker_catch::Kind::ShowCommitted);
             let _ = host.mirror(index, handle, true);
             return true;
         }
@@ -399,6 +400,7 @@ pub(crate) fn requeue_show(heap: usize, index: u32) {
         // SAFETY: registered heaps are live (removed when dropped, which takes `.write()`).
         && let Some(Some(host)) = unsafe { &*(heap as *const super::Heap) }.host.get()
     {
+        crate::flicker_catch::count(crate::flicker_catch::Kind::ShowRequeued);
         let mut textures = host.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.changed(index, 0, 0);
         host.note_slot(index, SLOT_IN_TEXTURES, true);
@@ -2597,6 +2599,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsNulled);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -3626,6 +3629,7 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                crate::flicker_catch::count(crate::flicker_catch::Kind::ViewGone);
                 made[index as usize] = 0;
                 self.made_too[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
@@ -3731,6 +3735,7 @@ impl HostHeap {
                 // D3D12 `Create*View` for every buffer slot a frame
                 // (`heap_buffers` mirrors thousands).
                 if made[index as usize] != 0 {
+                    crate::flicker_catch::count(crate::flicker_catch::Kind::NulledWaiting);
                     made[index as usize] = 0;
                     self.made_too[index as usize].store(0, std::sync::atomic::Ordering::Release);
                     if !self.sampler {
@@ -3742,6 +3747,7 @@ impl HostHeap {
                 // Shows what it showed until the new texture has a level
                 // (`levels_wait`, `VICTORY_LEVELS_WAIT_SHOWN`).
             } else {
+                crate::flicker_catch::count(crate::flicker_catch::Kind::SlotsMade);
                 made[index as usize] = key;
                 match make(&view, self.cpu(index)) {
                     Some((kept, copy)) => {
@@ -3802,6 +3808,7 @@ impl HostHeap {
             && let Some(view) = view_at(i, generation)
             && shows_texture(&view)
         {
+            crate::flicker_catch::count(crate::flicker_catch::Kind::ShowHeld);
             return (Some(view), Some(key));
         }
         (self.mirror(index, handle, true), None)

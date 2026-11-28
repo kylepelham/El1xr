@@ -132,6 +132,7 @@ pub(super) const EXPERT: &[(&str, Apply)] = &[
     ("VICTORY_FAST_CORES", Apply::Restart),
     ("VICTORY_FIRSTLANE_OWN", Apply::Retranslate),
     ("VICTORY_FIRST_HALF", Apply::Retranslate),
+    ("VICTORY_FLICKER_CATCH", Apply::Live),
     ("VICTORY_FLICKER_KEEP", Apply::Live),
     ("VICTORY_FLICKER_KEEP_READ", Apply::Live),
     ("VICTORY_FLICKER_WATCH", Apply::Live),

@@ -1576,6 +1576,7 @@ impl State {
                 };
                 self.targets.push(record.resource as usize);
                 crate::present_audit::target_bound(record.resource as usize);
+                crate::flicker_catch::target(record.resource as usize);
                 #[cfg(feature = "diagnostics")]
                 crate::capture::note_target(record.resource);
                 let desc = record.desc();
@@ -3956,7 +3957,7 @@ impl State {
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && (!role.holds_image() || crate::ambient_reflect::follows(Some([x, y, z]), false))
-            && self.ambient(list, p, role)
+            && crate::flicker_catch::ambient(role as usize, self.ambient(list, p, role))
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
@@ -3967,6 +3968,7 @@ impl State {
     /// its kind and pipeline.
     #[cfg(windows)]
     fn cost_title(&self, list: &HostList, kind: &'static str) {
+        crate::flicker_catch::ran(self.pipeline);
         crate::dred::op(list, kind, self.pipeline, || {
             crate::pipeline::host_pipeline(self.pipeline as This)
                 .map_or_else(|| "(no host pipeline)".to_owned(), |p| p.name.clone())
@@ -5195,7 +5197,7 @@ impl State {
                 role => role.holds_image() && crate::ambient_reflect::follows(None, count.is_some()),
             }
             && crate::ambient::on()
-            && self.ambient(list, p, role)
+            && crate::flicker_catch::ambient(role as usize, self.ambient(list, p, role))
         {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
