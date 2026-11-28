@@ -54,8 +54,25 @@ const KEPT: usize = 4;
 
 static ALIVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static CARD: Mutex<Pool<Mem>> = Mutex::new(Pool::fresh(KEPT, &ALIVE[0]));
-static SHARED: Mutex<Pool<Mem>> = Mutex::new(Pool::new(KEPT, &ALIVE[1]));
-static UPLOAD: Mutex<Pool<Mem>> = Mutex::new(Pool::new(KEPT, &ALIVE[2]));
+static SHARED: Mutex<Pool<Mem>> = Mutex::new(Pool::new(KEPT, &ALIVE[1]).capped());
+static UPLOAD: Mutex<Pool<Mem>> = Mutex::new(Pool::new(KEPT, &ALIVE[2]).capped());
+
+/// (El1xr) Blocks alive: card, shared, upload.
+pub(super) fn blocks_alive() -> [u64; 3] {
+    ALIVE.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
+/// (El1xr) The shared and upload pools' rested pieces freed and every empty
+/// block let go (`VICTORY_UPLOAD_CAP_MB`): the blocks let go.
+pub(super) fn trim(at: u64, finished: u64) -> u64 {
+    let mut n = 0;
+    for kind in [Kind::Shared, Kind::Upload] {
+        let freed = lock(kind.pool()).trim(at, finished);
+        n += freed.len() as u64;
+        super::let_go(kind.which(), freed);
+    }
+    n
+}
 
 /// A block: its heap, and for the kinds the CPU maps a buffer over all of
 /// it, mapped once, that the pieces' mappings are cut from (a `Map` of each
@@ -265,7 +282,7 @@ fn placed(device: &ID3D12Device, kind: Kind, size: u64) -> Option<(ID3D12Resourc
         kind.which(),
         len,
         u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
-        Ripe::ahead(KEPT),
+        Ripe::ahead(if kind != Kind::Card && crate::commitline::upload_over_cap() { 1 } else { KEPT }),
         || block(device, kind),
     );
     let Some((piece, mem, again)) = taken else {
