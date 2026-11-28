@@ -4573,6 +4573,7 @@ impl Host {
             }
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        crate::descriptor::host::remade_safe::point(flying);
         crate::timeline::mark(2);
         let behind = late && flying();
         if async_heap_sync {
@@ -7917,6 +7918,7 @@ impl Meter {
         crate::indirect::rest::line(frames);
         crate::indirect::raw_check::line(frames);
         crate::indirect::wide::line(frames);
+        crate::send_own::line(frames);
         {
             let [texture_us, slots] =
                 [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));

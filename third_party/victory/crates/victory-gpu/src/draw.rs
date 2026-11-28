@@ -3561,7 +3561,10 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go. (`VICTORY_BAKE_KEEP_GONE=1`:
                     // not a bake draw's own input, which would read the null view.)
-                    if !crate::bake_publish::keeps_gone(i < pinned) {
+                    // (`VICTORY_AWAY_GRACE`: its own view's slot keeps its last upload a while.)
+                    if !crate::bake_publish::keeps_gone(i < pinned)
+                        && !host.texture_slot_keeps_away(index, heap.handle(index), frame)
+                    {
                         host.texture_slot_gone(index);
                     }
                     host.texture_slot_later(index, write, frame, most);
