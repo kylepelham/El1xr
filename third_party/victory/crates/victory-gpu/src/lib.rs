@@ -200,6 +200,8 @@ mod stretch;
 #[cfg(windows)]
 mod table_defer;
 #[cfg(windows)]
+mod table_null;
+#[cfg(windows)]
 mod readable_once;
 #[cfg(windows)]
 mod dlss;
@@ -234,6 +236,8 @@ mod zero_out;
 mod face_watch;
 #[cfg(windows)]
 mod target_reuse;
+#[cfg(windows)]
+mod skin_watch;
 #[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]

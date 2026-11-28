@@ -130,9 +130,14 @@ pub(crate) enum Kind {
     TableNulledFilled,
     /// Such slots read as they are (`VICTORY_PREPARE_PRUNE_SAFE`).
     TableKeptFilled,
+    /// Table slots left null for a texture a table left null before
+    /// (`crate::table_null`).
+    TableNulledSeen,
+    /// Such slots read as they are (`VICTORY_TABLE_NULL_ONCE`).
+    TableKeptSeen,
 }
 
-pub(crate) const KINDS: usize = 36;
+pub(crate) const KINDS: usize = 38;
 const NAMES: [&str; KINDS] = [
     "ran",
     "dropped",
@@ -170,6 +175,8 @@ const NAMES: [&str; KINDS] = [
     "table_nulled",
     "table_nulled_filled",
     "table_kept_filled",
+    "table_nulled_seen",
+    "table_kept_seen",
 ];
 
 static NOW: [AtomicU32; KINDS] = [const { AtomicU32::new(0) }; KINDS];
