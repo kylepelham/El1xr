@@ -197,10 +197,14 @@ impl<'a> Lower<'a> {
     /// temporal upscaler spreads into black or white patches that stay in its
     /// history (seen on NVIDIA as black blobs on faces and in the air).
     /// Supersedes `nan_guard` on those sites when enabled; part of the shader
-    /// cache key.
+    /// cache key. `VICTORY_NAN_SCRUB_INF=1`: an infinity is held at ±65504
+    /// instead ([`Lower::scrub_holding_infinity`]).
     pub(super) fn scrub_nan(&mut self, f: V) -> V {
         if !nan_scrub() {
             return f;
+        }
+        if super::hdr_hold::scrub_holds_infinity() {
+            return self.scrub_holding_infinity(f);
         }
         // NaN or an infinity: |f| >= inf, unordered (true for NaN too).
         let c = self.cur;

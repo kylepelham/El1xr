@@ -1,6 +1,7 @@
 //! `VICTORY_HEAP_FIND` (`crate::heap_find`): the bindings of a bind of a
-//! walked frame that hold the address looked for. Reads descriptors only;
-//! nothing recorded changes.
+//! walked frame that hold the memory looked for, and (`bink`) the Bink
+//! draws whose render target is followed. Reads descriptors only; nothing
+//! recorded changes.
 
 use victory_shader::{ResourceType, RootType};
 
@@ -9,8 +10,38 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 impl State {
+    /// (`VICTORY_HEAP_FIND=bink`) A draw of the Bink pixel program: its
+    /// render target 0 is followed.
+    pub(super) fn heap_find_follow(&self, p: &HostPipeline) {
+        let Some(&rt0) = self.targets.first() else {
+            return;
+        };
+        let Some(pixel) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let name = crate::draw_dump::name(std::sync::Arc::as_ptr(&pixel.shader) as usize, || {
+            pixel.shader.camera_name()
+        });
+        if !crate::heap_find::may_be_bink(&pixel.shader.hash, &name) {
+            return;
+        }
+        let facts = crate::resource::find_facts::object_span(rt0 as This)
+            .zip(crate::resource::find_facts::object_width(rt0 as This));
+        let Some(((start, len), width)) = facts else {
+            return;
+        };
+        crate::heap_find::bink_draw(
+            &pixel.shader.hash,
+            &name,
+            start,
+            len,
+            width,
+            crate::resource::find_facts::object_text(rt0 as This),
+        );
+    }
+
     pub(super) fn heap_find(&self, list: &HostList, p: &HostPipeline, compute: bool) {
-        let find = crate::heap_find::find();
+        let spans = crate::heap_find::spans();
         let bind = crate::heap_find::next_bind();
         let by_index = p.stages.iter().any(|s| {
             s.translated()
@@ -24,7 +55,7 @@ impl State {
         let mut hits = Vec::new();
         let object = |name: String, t: This| {
             let (start, len) = crate::resource::find_facts::object_span(t)?;
-            (start <= find && find < start.saturating_add(len.max(1)))
+            crate::heap_find::meets(&spans, start, len)
                 .then(|| format!("{name} {}", crate::resource::find_facts::object_text(t)))
         };
         if !compute {
@@ -41,6 +72,13 @@ impl State {
         } else {
             &self.graphics
         };
+        for (slot, root) in roots.iter().enumerate() {
+            if let &Root::View(address) = root
+                && crate::heap_find::meets(&spans, address, 1)
+            {
+                hits.push(format!("root{slot} view at {address:#x}"));
+            }
+        }
         for stage in &p.stages {
             for u in stage.translated().used.iter() {
                 let prefix = match (u.kind, u.root) {
@@ -55,7 +93,7 @@ impl State {
                 let Some(view) = crate::descriptor::view(handle) else {
                     continue;
                 };
-                if crate::heap_find::covers(&view, find).is_none() {
+                if crate::heap_find::covers_any(&view, &spans).is_none() {
                     continue;
                 }
                 let slot = crate::descriptor::shader_heap_slot(handle)
@@ -64,7 +102,16 @@ impl State {
                     "{} {prefix}{} slot {slot} {}",
                     stage.shader.stage,
                     u.lower_bound,
-                    crate::heap_find::view_text(&view, find)
+                    crate::heap_find::view_text(&view, &spans)
+                ));
+            }
+        }
+        if by_index && self.heaps[0] != 0 {
+            let heap = crate::descriptor::heap(self.heaps[0] as This).start;
+            let slots = crate::heap_find::slots_in(heap);
+            if !slots.is_empty() {
+                hits.push(format!(
+                    "by_index from heap {heap:#x}, which holds found slots {slots:?}"
                 ));
             }
         }

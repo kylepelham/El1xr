@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 /// normal to the camera (flat floors). (The description's words are
 /// D3D12_SHADER_RESOURCE_VIEW_DESC's: its union starts at word 4, so a 2D
 /// view's plane is word 6.)
-fn stencil_view(view: Option<View>) -> bool {
+pub(super) fn stencil_view(view: Option<View>) -> bool {
     let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
     match view {
         Some(View::Shader(_, Some(d))) => {
@@ -29,7 +29,7 @@ fn stencil_view(view: Option<View>) -> bool {
 }
 
 /// A 2D texture of a depth format, or of the typeless format one is viewed through.
-fn depth_like(d: &D3D12_RESOURCE_DESC) -> bool {
+pub(super) fn depth_like(d: &D3D12_RESOURCE_DESC) -> bool {
     d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && matches!(
             d.Format,

@@ -33,6 +33,11 @@ pub(crate) fn object_span(this: This) -> Option<(u64, u64)> {
     Some((r.data() as u64, size))
 }
 
+/// The width of title resource `this`.
+pub(crate) fn object_width(this: This) -> Option<u64> {
+    (!this.is_null()).then(|| resource(this).desc.width)
+}
+
 fn desc_text(d: &ResourceDesc) -> String {
     format!(
         "dim {} {}x{}x{} lv {} fmt {} layout {:#x} flags {:#x}",
